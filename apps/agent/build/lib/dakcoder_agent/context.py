@@ -1,0 +1,773 @@
+"""The context manager: the only component allowed to build a message list.
+
+Why this is a component and not a helper
+----------------------------------------
+The frontend agent has no context management inside a run. ``AgentRun.messages``
+is append-only across up to forty turns; the only trimming anywhere in that
+codebase is a forty-*message* cap that applies solely to resumed sessions. Tool
+results enter history untruncated — one ``read_file`` can contribute 25k tokens
+and stay there for the rest of the task. ``repo_map`` alone contributes 20-30k,
+permanently, from turn one.
+
+Worked out for a 25-turn brownfield task (Part A §5.2)::
+
+    fixed overhead per turn            5,700 tok
+    repo_map, resident from turn 1    25,000 tok
+    average new content per turn       1,500 tok
+
+    prompt at turn 25  ~ 5,700 + 25,000 + 25 x 1,500        ~    68,000 tok
+    total prefill      ~ 25 x 30,700 + 1,500 x (25*26/2)    ~ 1,250,000 tok
+
+Roughly 95% of that is recomputation of a prefix that never changed. None of it
+is a criticism of a system that shipped and works — it is what happens when
+context is nobody's component. Here it is a component, owned and budgeted, and
+``tests/test_budget_regression.py`` is the CI gate that keeps it that way.
+
+The four disciplines
+--------------------
+**Budget.** A hard prompt cap per mode, allocated across layers in eviction
+order. The cap is a *quality* decision as much as a latency one: the
+context-rot literature is consistent that accuracy degrades with input length
+across every frontier model tested, so a large window is not free even when the
+GPU allows it.
+
+**Insertion caps.** Every tool result is capped at the moment it enters history,
+not at display time. Elision always leaves a machine-readable marker, so the
+model knows it can re-read rather than concluding the content does not exist.
+
+**The file-slice ledger.** An agent that reads a file, patches it, re-reads,
+patches, and re-reads again currently keeps three full copies forever. Only the
+newest read of each path survives; older ones collapse to a one-line stub. This
+bounds the working set by *distinct files touched* rather than by *number of
+reads*, and it is the largest single win on edit-heavy tasks.
+
+**Stable-prefix discipline.** One system prompt for every mode, and the message
+list is append-only below the pinned head. Mode switches append an instruction
+rather than rebuilding the list. The frontend agent assigns a fresh
+``run_state.messages`` with a different system prompt in each of ``_run_planner``,
+``_run_coder`` and ``_run_debugger`` — three cold prefills per task, by design,
+even with prefix caching switched on.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+from typing import Any, Callable, Iterable, Sequence
+
+from dakcoder_shared.tokens import Calibration
+
+from .modes import Mode, ModeConfig, config_for
+
+__all__ = [
+    "Message",
+    "Role",
+    "Layer",
+    "ToolCap",
+    "TOOL_CAPS",
+    "Usage",
+    "Recap",
+    "ContextManager",
+    "OverBudgetError",
+]
+
+
+class Role(StrEnum):
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+
+class Layer(StrEnum):
+    """Eviction priority, in the order Part A §6.1 allocates them.
+
+    Listed lowest-priority first: the working set is what compaction consumes,
+    and the pinned layers are the last things standing.
+    """
+
+    WORKING_SET = "working_set"
+    RECAP = "recap"
+    TASK = "task"
+    MODE = "mode"
+    SYSTEM = "system"
+
+
+#: Layers that are never evicted. The task and the acceptance criteria are what
+#: the whole run is measured against; an agent that compacts away what it was
+#: asked to do will confidently finish something else.
+PINNED_LAYERS = frozenset({Layer.SYSTEM, Layer.MODE, Layer.TASK})
+
+
+@dataclass(frozen=True, slots=True)
+class Message:
+    """One message.
+
+    Frozen on purpose. §6.4's rule — the message list is append-only below the
+    pinned head, and any mutation of ``messages[0..k]`` is a cache-invalidating
+    bug — is easy to state and easy to violate by accident three refactors
+    later. Immutability makes the accident impossible rather than merely
+    detectable.
+    """
+
+    role: Role
+    content: str
+    layer: Layer = Layer.WORKING_SET
+    #: Provenance, for the context inspector (Part B §10.2) and for the ledger.
+    source: str = ""
+    #: Set on tool results, so a stale slice can be found and replaced.
+    path: str | None = None
+    tool_call_id: str | None = None
+    #: Turn this message was appended on, for the recap and the inspector.
+    turn: int = 0
+
+    def wire(self) -> dict[str, Any]:
+        """Render to the OpenAI chat shape, dropping our own bookkeeping."""
+        out: dict[str, Any] = {"role": str(self.role), "content": self.content}
+        if self.tool_call_id:
+            out["tool_call_id"] = self.tool_call_id
+        return out
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCap:
+    """The insertion cap for one tool (Part A §6.2)."""
+
+    max_tokens: int
+    #: How to elide. ``head`` keeps the beginning, ``tail`` the end, and
+    #: ``errors`` keeps every line that looks like a compiler diagnostic.
+    strategy: str = "tail"
+    #: Rendered into the elision marker, telling the model how to get the rest.
+    recover: str = ""
+
+
+#: Per-tool caps. The numbers are Part A §6.2's.
+#:
+#: `go_build` and friends get the special strategy for a reason worth stating:
+#: their error lines are the single most useful thing in the whole context, and
+#: a naive head-or-tail truncation of a long build log throws away exactly the
+#: `file:line:col` messages the agent needs while keeping the package list it
+#: does not.
+TOOL_CAPS: dict[str, ToolCap] = {
+    "read_file": ToolCap(6_000, "head", "re-read the file with a narrower line range"),
+    "repo_map": ToolCap(4_000, "head", 'call repo_map(package="<dir>") for one package in full'),
+    "search_repo": ToolCap(2_000, "head", "narrow the pattern or pass a glob"),
+    "go_build": ToolCap(4_000, "errors", "fix the reported errors and re-run"),
+    "go_vet": ToolCap(4_000, "errors", "fix the reported findings and re-run"),
+    "go_test": ToolCap(4_000, "errors", "re-run with a package pattern to narrow the output"),
+    "rules_lint": ToolCap(3_000, "head", "pass `paths` to scope the lint to what you changed"),
+    "legacy_audit": ToolCap(3_000, "head", "pass `paths` to scope the audit"),
+    "go_diagnostics": ToolCap(2_000, "head", "narrow to one file with `path`"),
+}
+
+#: Everything not named above. §6.2's "everything else".
+DEFAULT_TOOL_CAP = ToolCap(2_000, "tail", "call the tool again with narrower arguments")
+
+#: The recap's allocation from §6.1. Reserved when deciding how much of the
+#: working set to retain, because the recap grows as history is evicted and
+#: budgeting against its current size would leave no room for the one about to
+#: replace it.
+RECAP_BUDGET_TOKENS = 2_000
+
+#: Lines that must survive an `errors`-strategy elision. A build log is mostly
+#: noise around a handful of these.
+_DIAGNOSTIC_MARKERS = (
+    ".go:",
+    "error:",
+    "Error:",
+    "FAIL",
+    "--- FAIL",
+    "panic:",
+    "cannot use",
+    "undefined:",
+    "declared and not used",
+    "missing dependencies",
+    "could not build arguments",
+)
+
+
+class OverBudgetError(RuntimeError):
+    """Raised when a prompt cannot be brought inside its budget.
+
+    Distinct from silently truncating: an assembled prompt that quietly dropped
+    the task description would produce a confident answer to the wrong question.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class Usage:
+    """Per-layer token accounting for one assembled prompt."""
+
+    by_layer: dict[Layer, int]
+    total: int
+    budget: int
+    tools: int = 0
+
+    @property
+    def used_pct(self) -> float:
+        return 0.0 if self.budget <= 0 else round(100.0 * self.total / self.budget, 1)
+
+    @property
+    def over_budget(self) -> bool:
+        return self.total > self.budget
+
+
+@dataclass(frozen=True, slots=True)
+class Recap:
+    """A structured compaction recap (Part A §6.5).
+
+    Structured, not prose, and with two properties that matter more than the
+    summary itself: ``do_not_retry`` records dead ends, which is what stops the
+    post-compaction agent cheerfully repeating them; and ``markdown()`` is
+    persisted to ``.dakcoder/session-<id>/recap.md``, so a compaction, a restart
+    or a new session on Monday can pick it up.
+    """
+
+    goal: str = ""
+    plan_step: str = ""
+    files_created: tuple[str, ...] = ()
+    files_modified: tuple[str, ...] = ()
+    decisions: tuple[str, ...] = ()
+    verified: tuple[str, ...] = ()
+    open_items: tuple[str, ...] = ()
+    do_not_retry: tuple[str, ...] = ()
+    turns: tuple[int, int] = (0, 0)
+
+    def markdown(self) -> str:
+        lo, hi = self.turns
+
+        def block(label: str, items: Iterable[str]) -> str:
+            items = [i for i in items if i]
+            if not items:
+                return ""
+            head = f"{label + ':':17}{items[0]}\n"
+            return head + "".join(f"{'':17}{i}\n" for i in items[1:])
+
+        out = [f"## Recap (turns {lo}–{hi}, compacted)\n"]
+        if self.goal:
+            out.append(f"{'Goal:':17}{self.goal}\n")
+        if self.plan_step:
+            out.append(f"{'Plan step:':17}{self.plan_step}\n")
+        out.append(block("Files created", self.files_created))
+        out.append(block("Files modified", self.files_modified))
+        out.append(block("Decisions", self.decisions))
+        out.append(block("Verified", self.verified))
+        out.append(block("Open", self.open_items))
+        out.append(block("Do not retry", self.do_not_retry))
+        return "".join(out)
+
+
+# A summariser turns the evicted messages into a Recap. Injected rather than
+# imported so the context manager stays testable without a model: §6.5 runs
+# compaction on the `fast` role, which today resolves to the same 27B model, so
+# a real compaction is a real model call and its cost shows up in telemetry.
+Summariser = Callable[[Sequence[Message]], Recap]
+
+
+class ContextManager:
+    """Owns the message list for one run.
+
+    Nothing else assembles messages. That is the whole point: the moment two
+    places can append to history, the budget stops being enforceable and the
+    prefix stops being stable.
+    """
+
+    def __init__(
+        self,
+        *,
+        mode: Mode | str = Mode.CODER,
+        system_prompt: str,
+        tool_schema_tokens: int = 0,
+        calibration: Calibration | None = None,
+        compact_at: float = 0.70,
+    ) -> None:
+        self._config: ModeConfig = config_for(mode)
+        self._calibration = calibration or Calibration()
+        self._compact_at = compact_at
+        self._turn = 0
+        self._compactions = 0
+
+        # The pinned head. Byte-identical for every mode and every task in the
+        # repository, which is what makes it a permanent prefix-cache hit —
+        # roughly 2.4k tokens that never need prefilling again.
+        self._system = Message(Role.SYSTEM, system_prompt, Layer.SYSTEM, source="system")
+        self._tool_schema_tokens = tool_schema_tokens
+
+        self._mode_messages: list[Message] = []
+        self._task: Message | None = None
+        self._task_text = ""
+        self._plan_text = ""
+        self._acceptance: tuple[str, ...] = ()
+        self._recap: Message | None = None
+        self._working: list[Message] = []
+
+        # path -> index into _working of the newest read. The ledger.
+        self._slices: dict[str, int] = {}
+
+    # ── properties ──────────────────────────────────────────────────────────
+
+    @property
+    def mode(self) -> Mode:
+        return self._config.mode
+
+    @property
+    def budget(self) -> int:
+        return self._config.prompt_budget
+
+    @property
+    def turn(self) -> int:
+        return self._turn
+
+    @property
+    def compactions(self) -> int:
+        return self._compactions
+
+    # ── assembly ────────────────────────────────────────────────────────────
+
+    def build(self) -> list[Message]:
+        """Assemble the message list.
+
+        The only builder. Order is fixed and the head is stable:
+
+            system  ->  mode instructions  ->  task  ->  recap  ->  working set
+        """
+        out: list[Message] = [self._system]
+        out.extend(self._mode_messages)
+        if self._task is not None:
+            out.append(self._task)
+        if self._recap is not None:
+            out.append(self._recap)
+        out.extend(self._working)
+        return out
+
+    def wire(self) -> list[dict[str, Any]]:
+        """Assemble in the shape the API expects."""
+        return [m.wire() for m in self.build()]
+
+    def prefix_signature(self) -> str:
+        """A stable identifier for the cacheable head.
+
+        Exposed so telemetry can alert when it changes. §18 makes a falling
+        prefix-cache hit rate an alert rather than a dashboard, and this is the
+        signal that says *why* it fell — but note the caveat: mode filtering
+        means the tool schemas differ per mode (§7.1) while §6.4 asserts the
+        ``system + schemas`` prefix is identical across phases. Both cannot be
+        literally true. What is enforced here is the stronger half and the one
+        that dominates: the system message is byte-identical across every mode
+        and every turn, so a 25-turn run in one mode reuses its prefix
+        throughout, and a mode switch costs one prefill rather than a rebuild.
+        """
+        return f"{len(self._system.content)}:{hash(self._system.content) & 0xFFFFFFFF:08x}"
+
+    # ── appending ───────────────────────────────────────────────────────────
+
+    def set_task(self, task: str, *, plan: str = "", acceptance: Sequence[str] = ()) -> None:
+        """Pin the task, the plan and the acceptance criteria.
+
+        Replaced rather than appended, because there is exactly one task per
+        run — and it sits above the working set so compaction can never reach
+        it.
+        """
+        self._task_text = task.strip()
+        self._plan_text = plan.strip()
+        self._acceptance = tuple(acceptance)
+        self._rebuild_task()
+
+    def set_plan(self, plan: str) -> None:
+        """Pin the plan the Planner produced, keeping the task and criteria.
+
+        A separate method rather than another ``set_task`` call, because the
+        caller would otherwise have to hold the task and the acceptance criteria
+        itself just to re-supply them — two copies of the same state, one of
+        which will eventually be stale.
+        """
+        self._plan_text = plan.strip()
+        self._rebuild_task()
+
+    @property
+    def task_text(self) -> str:
+        return self._task_text
+
+    @property
+    def acceptance(self) -> tuple[str, ...]:
+        return self._acceptance
+
+    def _rebuild_task(self) -> None:
+        parts = [f"# Task\n{self._task_text}"]
+        if self._plan_text:
+            parts.append(f"\n# Plan\n{self._plan_text}")
+        if self._acceptance:
+            criteria = "\n".join(f"- {c}" for c in self._acceptance)
+            parts.append(f"\n# Accepts\n{criteria}")
+        self._task = Message(Role.USER, "\n".join(parts), Layer.TASK, source="task")
+
+    def switch_mode(self, mode: Mode | str, instruction: str) -> None:
+        """Move to a new mode by *appending* its instruction.
+
+        Not by rebuilding the list with a different system prompt. That is
+        finding S6, and it is what makes a planner-to-coder handoff cost one
+        message rather than a full prefill of everything already in context.
+        """
+        self._config = config_for(mode)
+        self._mode_messages.append(
+            Message(Role.USER, instruction.strip(), Layer.MODE, source=f"mode:{self._config.mode}")
+        )
+
+    def begin_turn(self) -> int:
+        self._turn += 1
+        return self._turn
+
+    def append_assistant(self, content: str) -> Message:
+        msg = Message(Role.ASSISTANT, content, Layer.WORKING_SET, source="assistant", turn=self._turn)
+        self._working.append(msg)
+        return msg
+
+    def append_user(self, content: str) -> Message:
+        """A follow-up or a steering message from the developer mid-run."""
+        msg = Message(Role.USER, content, Layer.WORKING_SET, source="user", turn=self._turn)
+        self._working.append(msg)
+        return msg
+
+    def append_tool_result(
+        self,
+        tool: str,
+        content: str,
+        *,
+        tool_call_id: str = "",
+        path: str | None = None,
+        line_range: tuple[int, int] | None = None,
+    ) -> Message:
+        """Append a tool result, capped at insertion.
+
+        Capped *here*, not at display time. The frontend agent caps the SSE
+        event at 4,000 characters while ``ToolResult.to_payload()`` applies no
+        cap at all, so the developer sees a tidy preview of something that put
+        25k tokens into history permanently (finding S8).
+        """
+        cap = TOOL_CAPS.get(tool, DEFAULT_TOOL_CAP)
+        capped = self._apply_cap(content, cap, path=path, line_range=line_range)
+
+        msg = Message(
+            Role.TOOL,
+            capped,
+            Layer.WORKING_SET,
+            source=f"tool:{tool}",
+            path=path,
+            tool_call_id=tool_call_id or None,
+            turn=self._turn,
+        )
+
+        if path:
+            self._supersede_slice(path)
+            self._slices[path] = len(self._working)
+        self._working.append(msg)
+        return msg
+
+    # ── the ledger ──────────────────────────────────────────────────────────
+
+    def _supersede_slice(self, path: str) -> None:
+        """Collapse an earlier read of the same path to a one-line stub.
+
+        Replaced in place rather than removed, because removing a message
+        renumbers everything after it — and a tool result whose matching
+        ``tool_call_id`` has vanished is a malformed conversation, not a
+        smaller one.
+        """
+        index = self._slices.get(path)
+        if index is None or index >= len(self._working):
+            return
+        old = self._working[index]
+        if old.content.startswith("[stale read of "):
+            return
+        self._working[index] = replace(
+            old,
+            content=(
+                f"[stale read of {path} — superseded by a later read in this "
+                f"conversation; re-read if needed]"
+            ),
+        )
+
+    def stale_slices(self) -> int:
+        """How many reads the ledger has collapsed. For telemetry."""
+        return sum(1 for m in self._working if m.content.startswith("[stale read of "))
+
+    # ── caps ────────────────────────────────────────────────────────────────
+
+    def _apply_cap(
+        self,
+        content: str,
+        cap: ToolCap,
+        *,
+        path: str | None,
+        line_range: tuple[int, int] | None,
+    ) -> str:
+        tokens = self._calibration.estimate(content)
+        if tokens <= cap.max_tokens:
+            return content
+
+        lines = content.splitlines()
+        if cap.strategy == "errors":
+            kept, elided = self._keep_diagnostics(lines, cap.max_tokens)
+        elif cap.strategy == "head":
+            kept, elided = self._keep_edge(lines, cap.max_tokens, head=True)
+        else:
+            kept, elided = self._keep_edge(lines, cap.max_tokens, head=False)
+
+        marker = self._marker(elided, cap, path=path, line_range=line_range)
+        if cap.strategy == "tail":
+            return marker + "\n" + "\n".join(kept)
+        return "\n".join(kept) + "\n" + marker
+
+    def _keep_edge(self, lines: list[str], budget: int, *, head: bool) -> tuple[list[str], int]:
+        ordered = lines if head else list(reversed(lines))
+        kept: list[str] = []
+        used = 0
+        for line in ordered:
+            cost = self._calibration.estimate(line) + 1
+            if used + cost > budget:
+                break
+            kept.append(line)
+            used += cost
+        if not head:
+            kept.reverse()
+        return kept, len(lines) - len(kept)
+
+    def _keep_diagnostics(self, lines: list[str], budget: int) -> tuple[list[str], int]:
+        """Keep every diagnostic line, then fill with context around them.
+
+        Diagnostics first and unconditionally: they are the agent's best fuel,
+        and a build log that elided its own error messages is worse than no
+        build log, because the agent will conclude the build passed.
+        """
+        keep_flags = [any(m in line for m in _DIAGNOSTIC_MARKERS) for line in lines]
+
+        kept_idx: list[int] = []
+        used = 0
+        for i, line in enumerate(lines):
+            if not keep_flags[i]:
+                continue
+            cost = self._calibration.estimate(line) + 1
+            kept_idx.append(i)
+            used += cost
+
+        # Then as much surrounding context as fits, nearest-first.
+        for i, line in enumerate(lines):
+            if keep_flags[i]:
+                continue
+            cost = self._calibration.estimate(line) + 1
+            if used + cost > budget:
+                continue
+            kept_idx.append(i)
+            used += cost
+
+        kept_idx.sort()
+        return [lines[i] for i in kept_idx], len(lines) - len(kept_idx)
+
+    @staticmethod
+    def _marker(
+        elided: int,
+        cap: ToolCap,
+        *,
+        path: str | None,
+        line_range: tuple[int, int] | None,
+    ) -> str:
+        """Render the elision marker.
+
+        Always machine-readable and always actionable. An elision the model
+        cannot see is one it treats as absence — it concludes the symbol it was
+        looking for does not exist, and plans around a repository that has more
+        in it than it was shown.
+        """
+        where = ""
+        if path and line_range:
+            where = f" of {path}:{line_range[0]}-{line_range[1]}"
+        elif path:
+            where = f" of {path}"
+        recover = f" — {cap.recover}" if cap.recover else ""
+        return f"[... {elided} line(s) elided{where}{recover} ...]"
+
+    # ── budget ──────────────────────────────────────────────────────────────
+
+    def usage(self) -> Usage:
+        by_layer: dict[Layer, int] = {layer: 0 for layer in Layer}
+        for msg in self.build():
+            by_layer[msg.layer] += self._calibration.estimate(msg.content)
+        total = sum(by_layer.values()) + self._tool_schema_tokens
+        return Usage(
+            by_layer=by_layer,
+            total=total,
+            budget=self.budget,
+            tools=self._tool_schema_tokens,
+        )
+
+    def should_compact(self) -> bool:
+        """Whether the assembled prompt has reached the compaction threshold."""
+        return self.usage().total >= self.budget * self._compact_at
+
+    def novel_tokens(self, previous: Sequence[Message] | None) -> int:
+        """Tokens in this prompt that were not in the previous one's prefix.
+
+        This is what a prefix cache actually has to prefill, and it is the
+        metric the design controls. The raw prompt total is what gets prefilled
+        with no cache at all; the truth is between them, and *where* between
+        them is plan.md §9 Q1 — ``prompt_tokens_details.cached_tokens`` is absent
+        from this endpoint, so the hit rate cannot currently be measured.
+
+        §18 proposes alerting on P95 prompt tokens as a stand-in until that
+        field appears. This is a better stand-in: P95 catches a prompt growing,
+        but novel tokens catches the thing that actually costs money, which is a
+        prefix being *invalidated* — a mutated system message, a mode switch
+        inserted in the wrong place, a compaction rewriting the middle of the
+        list. Those cost a full prefill while leaving P95 untouched.
+        """
+        current = self.build()
+        if not previous:
+            return sum(self._calibration.estimate(m.content) for m in current)
+
+        shared = 0
+        for old, new in zip(previous, current):
+            if old.content != new.content or old.role is not new.role:
+                break
+            shared += 1
+        return sum(self._calibration.estimate(m.content) for m in current[shared:])
+
+    def observe_usage(self, *, prompt_tokens: int) -> None:
+        """Fold a real ``prompt_tokens`` back into the estimate.
+
+        Called once per turn from the streamed usage chunk. This is the whole
+        reason ``stream_options: {"include_usage": true}`` is sent on every
+        call: without it there is no measurement, and the estimate stays a
+        guess for the life of the process.
+        """
+        chars = sum(len(m.content) for m in self.build())
+        self._calibration.observe(estimated_chars=chars, actual_tokens=prompt_tokens)
+
+    # ── compaction ──────────────────────────────────────────────────────────
+
+    def compact(
+        self,
+        summarise: Summariser,
+        *,
+        retain_pct: float = 0.35,
+        keep_recent: int | None = None,
+    ) -> Recap:
+        """Summarise the working set and replace it with a recap.
+
+        Summarise, do not truncate. This is the lesson from Cline's move away
+        from truncation: truncation silently drops the decision that explains
+        the current diff, and the agent then re-derives it wrongly.
+        Summarisation preserves it.
+
+        The most recent turns are kept verbatim — the agent is usually mid-edit,
+        and a summary of what it did four seconds ago is strictly worse than the
+        thing itself.
+
+        **How much is kept is measured in tokens, not messages**, and that
+        distinction is the whole reason this signature has a percentage in it.
+        Part B §10.4 retires the frontend agent's ``contextMaxMessages`` setting
+        on exactly this ground — "a message *count* is the wrong unit; forty
+        messages can be 5k tokens or 200k" — and keeping a fixed number of
+        recent messages reproduces the mistake one layer down. Four capped
+        ``read_file`` results are 24k tokens, which is 73% of a coder budget: a
+        count-based compaction hands back a context that is already over the
+        70% threshold, so the next turn compacts again. The budget regression
+        test caught it thrashing sixteen times in a twenty-five turn run.
+
+        Compacting to a floor instead means compaction is rare, and rarity
+        matters twice over: each compaction rewrites the middle of the message
+        list, which invalidates every cached prefix below it.
+
+        ``keep_recent`` is accepted for the cases where a caller genuinely wants
+        a fixed number — the tests do — but it is not the default and it is not
+        what the loop should use.
+        """
+        if not self._working:
+            return Recap(turns=(self._turn, self._turn))
+
+        if keep_recent is not None:
+            cut = max(0, len(self._working) - keep_recent)
+        else:
+            cut = self._retention_cut(retain_pct)
+
+        evicted, retained = self._working[:cut], self._working[cut:]
+        if not evicted:
+            return Recap(turns=(self._turn, self._turn))
+
+        recap = summarise(evicted)
+        self._recap = Message(
+            Role.USER, recap.markdown(), Layer.RECAP, source="recap", turn=self._turn
+        )
+        self._working = retained
+        self._reindex_slices()
+        self._compactions += 1
+        return recap
+
+    def _retention_cut(self, retain_pct: float) -> int:
+        """Index of the first message to keep, walking back from the newest.
+
+        Budgeted in tokens against the *whole* prompt, not against the working
+        set alone: the pinned head and the recap are what the retained messages
+        share the budget with, and ignoring them is how a compaction leaves the
+        context above the threshold it just fired at.
+
+        Always keeps at least the most recent message. A compaction that
+        summarised away the tool result the agent is currently reacting to would
+        be worse than not compacting at all.
+        """
+        overhead = (
+            self._tool_schema_tokens
+            + self._calibration.estimate(self._system.content)
+            + sum(self._calibration.estimate(m.content) for m in self._mode_messages)
+            + (self._calibration.estimate(self._task.content) if self._task else 0)
+            # The recap is about to be replaced, so budget for a full-sized one
+            # rather than for whatever is there now.
+            + RECAP_BUDGET_TOKENS
+        )
+        allowance = max(0, int(self.budget * retain_pct) - overhead)
+
+        used = 0
+        cut = len(self._working)
+        for i in range(len(self._working) - 1, -1, -1):
+            cost = self._calibration.estimate(self._working[i].content)
+            if used + cost > allowance and cut < len(self._working):
+                break
+            used += cost
+            cut = i
+        return cut
+
+    def _reindex_slices(self) -> None:
+        """Rebuild the ledger after the working set is re-sliced."""
+        self._slices = {
+            msg.path: i
+            for i, msg in enumerate(self._working)
+            if msg.path and not msg.content.startswith("[stale read of ")
+        }
+
+    # ── inspection ──────────────────────────────────────────────────────────
+
+    def inspect(self) -> dict[str, Any]:
+        """A snapshot for the context inspector (Part B §10.2).
+
+        The extension renders this rather than reconstructing it client-side:
+        contract C5 makes the server authoritative on context, and a client that
+        recomputes it will eventually disagree.
+        """
+        use = self.usage()
+        return {
+            "mode": str(self.mode),
+            "turn": self._turn,
+            "total_tokens": use.total,
+            "budget": use.budget,
+            "used_pct": use.used_pct,
+            "tool_schema_tokens": use.tools,
+            "by_layer": {str(k): v for k, v in use.by_layer.items() if v},
+            "messages": len(self.build()),
+            "compactions": self._compactions,
+            "stale_slices": self.stale_slices(),
+            "calibrated": self._calibration.calibrated,
+            "prefix": self.prefix_signature(),
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<ContextManager {json.dumps(self.inspect(), sort_keys=True)}>"

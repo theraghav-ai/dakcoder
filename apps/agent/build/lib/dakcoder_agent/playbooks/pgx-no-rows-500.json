@@ -1,0 +1,14 @@
+{
+  "id": "pgx-no-rows-500",
+  "symptom": "A GET for a row that does not exist returns 500 instead of 404.",
+  "cause": "The handler passes the repository error straight to the failure envelope. pgx.ErrNoRows is a normal outcome of a lookup, not a server fault, and only the handler knows that this particular query missing means 'not found'.",
+  "steps": [
+    "In the handler, check errors.Is(err, pgx.ErrNoRows) before the generic error branch.",
+    "Return the not-found envelope from handler/response for that resource.",
+    "Keep the order: validation errors, then not-found, then the generic 500. Reversing it makes the specific cases unreachable.",
+    "The repository returns the error unwrapped \u2014 do not translate it there, or every caller loses the ability to tell absence from failure."
+  ],
+  "tool": "patch_file",
+  "watch_out": "errors.Is, not ==. The driver wraps the sentinel in several paths and a bare comparison silently stops matching.",
+  "citation": "@skill:errors"
+}

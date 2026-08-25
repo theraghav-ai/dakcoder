@@ -7,7 +7,12 @@ name = "dakcoder-shared"
 version = "0.1.0"
 description = "Shared config, contracts and helpers for the dakcoder agent and gateway"
 requires-python = ">=3.11"
-dependencies = []
+# `dakcoder_shared.llm` imports httpx at module scope, so this is a hard
+# dependency, not an optional one. It was undeclared until an offline install
+# into a clean venv produced a runtime that could not import itself — which is
+# precisely the first-run failure the vendored wheels exist to prevent, arriving
+# by a different door.
+dependencies = ["httpx>=0.27"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

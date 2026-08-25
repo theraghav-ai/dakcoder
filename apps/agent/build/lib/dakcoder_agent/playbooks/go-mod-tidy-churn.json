@@ -1,0 +1,14 @@
+{
+  "id": "go-mod-tidy-churn",
+  "symptom": "go mod tidy keeps changing go.mod or go.sum, and the gate reports drift on every run.",
+  "cause": "An import references a module that is not in require, or a dependency was added transitively and is now used directly.",
+  "steps": [
+    "Run go_mod with op='tidy' and read the diff it reports.",
+    "If a new direct dependency appeared, that is a review decision, not a formatting one \u2014 stop and say which module and why it is needed.",
+    "If it is a private module, check GOPRIVATE covers gitlab.cept.gov.in before assuming the requirement is wrong.",
+    "Re-run the gate. Tidy must be a no-op there."
+  ],
+  "tool": "go_mod",
+  "watch_out": "The reference template's own go.mod requires api-db while the code imports n-api-db. Tidy will want to fix that, and fixing it is correct \u2014 but it is a template bug, so report it rather than burying it in an unrelated change.",
+  "citation": "@skill:go-idiom"
+}

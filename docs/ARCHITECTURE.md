@@ -1150,6 +1150,130 @@ and says so.
 
 ---
 
+**D-71 · The approval id is minted with the request, not by the runtime**
+
+`ApprovalRequest` carries its own `id`, generated in the router where the request
+is created. The loopback keys its `PendingApproval` table on that id rather than
+minting a second one.
+
+The first version had the loopback mint an id inside `approve()` — which the loop
+calls *after* it has already yielded `tool_pending`. So the event announcing an
+approval carried no id at all, and `POST /v1/approvals/{id}` had nothing to take.
+The most-used interaction in the product could not be actioned from the event
+that raises it. §7 of this document asserted the opposite, which is worse: a
+handover document that is confidently wrong costs a day before anyone suspects it.
+
+It was also a race. Even with an id on the event, registration happening after
+emission means a client that answers the instant it reads the event can arrive
+before the approval exists. So the loop calls `on_pending(request)` *before* the
+yield, and the runtime registers there. Ordering, not luck.
+
+`as_dict()` also carries `protected: list[str]` — which of the paths tripped the
+flag. `reason` named them in prose and `paths` listed everything without saying
+which, so a client wanting to badge the offending file had to parse a sentence.
+
+**D-72 · `_summarise` returns a `Recap`, and the fallback returns one too**
+
+`ContextManager.compact` is typed `Callable[[Sequence[Message]], Recap]` and
+calls `.markdown()` on the result. `AgentLoop._summarise` was `(str) -> str`.
+
+The failure was worse than a plain type error, because the `except Exception`
+that was meant to protect a degraded recap swallowed the `TypeError` and returned
+`text[-4000:]` — a *list slice* — which then died on `.markdown()` one frame
+later, where the cause was invisible. The first compaction of any long run killed
+it.
+
+461 tests were green over this. Every compaction test supplied its own
+correctly-typed summariser and drove `ContextManager` directly, so the summariser
+that ships was never called by anything. The unit under test was not the unit
+that ships, and that is the general lesson: a collaborator's contract is only
+tested if the real collaborator is on the other end of it.
+
+The replacement asks for structured JSON and parses it tolerantly (fenced or
+bare), because `do_not_retry` is the field that earns the compaction — without it
+the post-compaction agent cheerfully repeats the dead end that made compaction
+necessary — and a prose summary loses exactly that. Both failure paths, a dead
+gateway and an unparseable reply, return a real `Recap` built from the tail.
+
+**D-73 · Steering: a correction the run reads before its next turn**
+
+`POST /v1/sessions/{id}/messages` queues text that `AgentLoop` drains at the top
+of each turn and appends as a user message.
+
+The interface design review found the gap and it is the largest one in the
+product: nothing let a developer disagree with a run in progress. The answer to
+"the agent is going the wrong way at turn 12" was Stop, which ends the run and
+discards twelve turns of context. The alternatives all failed — a queued message
+did not arrive until `finish`, a rejection carries no words because the approval
+route has no reason field, and `edit` fires only when an approval happens to
+raise, which on `patch_file` over an unprotected path never happens. On a run
+touching no protected path there was no intervention point at all.
+
+Appended as a *user* message rather than a tool result, so the model treats it as
+instruction rather than as output it can weigh against its own plan.
+
+**D-74 · Wind-down is a different request from abort**
+
+`POST /v1/sessions/{id}/wind-down` sets a flag the loop checks only *between*
+turns; `abort` sets one checked *inside* them. A turn can be several minutes long
+and can be halfway through a file, so "let it finish and then stop" and "stop
+now" are different asks and neither substitutes for the other.
+
+**D-75 · A failing gate stage carries its output; a passing one does not**
+
+`GateReport.as_dict()` dropped `StageResult.content` entirely, so the client could
+say *which* stage blocked and never *why* — the compiler errors went to the model
+as a tool message and nowhere else. Now `content` (capped at 4000 bytes, with
+`truncated`) is carried for stages that failed, plus a top-level `blocked_by`.
+
+Only for failures, deliberately: thirteen clean stages every gate is a lot of
+bytes nobody reads.
+
+This does not replace re-running the stage locally. Decision D2 puts the Go
+toolchain on the developer's own machine, so a ▶ that re-runs `go build ./...` as
+a real Task with a `problemMatcher` gives navigable errors in the Problems panel
+for zero tokens and works signed out. The agent says which stage failed; the
+editor says why.
+
+**D-76 · `protected` is computed at serialisation, once**
+
+`Mutation.as_dict()` calls `is_protected()`. The alternative was the extension
+reimplementing `PROTECTED_GLOBS` in TypeScript — a security-relevant constant
+duplicated across the seam with no test binding the copies, and the matcher is
+custom rather than `fnmatch`, so a naive port disagrees at exactly the edges that
+matter. Computing it where the value is serialised means every surface that shows
+a mutation shows the badge, from one implementation.
+
+**D-77 · `usage` carries the absolute budget and the reasoning count every turn**
+
+`budget_used_pct` alone forced clients to divide to recover the denominator, and
+two surfaces dividing independently produced two different numbers on screen at
+low usage — which is precisely what the interface review found between the
+console row and the header meter. One number, sent once.
+
+`reasoning_tokens` was previously emitted only as `reasoning_leaked`, on the
+anomaly path where a thinking-off mode was charged for reasoning. Every mode
+ships thinking-off, so on a healthy run the key was always absent and a developer
+could never see what "plan this carefully" costs.
+
+**D-78 · An approval can be given more time**
+
+`POST /v1/approvals/{id}/extend`. The runtime releases an unanswered approval
+after ten minutes and records it as a rejection, with no way to ask for longer —
+a WCAG 2.2.1 (Timing Adjustable) failure, because the user can neither turn off
+nor extend the limit and the consequence is a decision made on their behalf. The
+people most likely to exceed ten minutes are those reviewing a seven-file
+changeset with a screen reader, on exactly the cards that matter most.
+
+**D-79 · Scaffold notes are carried structurally, not only in prose**
+
+`payload['notes']` — the steps the scaffolder deliberately leaves for a human,
+most often "apply this DDL" — were flattened into the content string as
+`  NOTE:` lines and existed nowhere else. A client wanting a follow-ups panel had
+to parse a prefix back out of a string it shares with the file listing, which
+breaks the first time a note contains a newline. The Go side already had
+`Notes []string`; only the bridge was lossy.
+
 ## 4. Verification strategy
 
 The load-bearing assertions, and what each is guarding against:
@@ -1207,6 +1331,173 @@ The load-bearing assertions, and what each is guarding against:
 ---
 
 ## 5. Changelog
+
+### 2026-08-26 — Part B, completion: the wheels and the two real hosts
+
+The two gaps left open when the extension first went green, closed — and each
+closed by a test that found a bug the moment it ran for real.
+
+**The vendored wheel closure.** 20 wheels, 3.6 MB, installed with
+`--no-index --find-links`. `scripts/offline-smoke.py` builds a clean venv from
+them, spawns `dakcoderd` with the exact environment `runtime.ts` constructs,
+reads the port off stdout and drives 14 checks over HTTP. Nothing is stubbed.
+
+It failed on its first run: `dakcoder_shared.llm` imports `httpx` at module
+scope and **no `pyproject.toml` declared it**, so the offline install produced a
+runtime that could not import itself. Every developer machine had httpx sitting
+in a shared environment, which is exactly why nothing caught it — and behind the
+proxy the vendored wheels are the only source, so the first pilot developer
+would have hit it on day one. That is the failure mode §4.3 exists to remove,
+arriving through a different door.
+
+It also surfaced a first-run bug in the extension. The runtime refuses to start
+without a JWT, correctly — every model call goes through the gateway as the
+developer and there is no local key. But `ready()` spawned first and read the
+refusal off stderr, so the first task after install died as *"the runtime exited
+with 2"*. Sign-in is now asked for properly, before the spawn.
+
+**Integration tests in a real VS Code** (`@vscode/test-electron`, 9 tests).
+They assert what a regex over source cannot: that the host loads the bundle,
+that every declared command resolves in the *running* registry, that the
+`dakcoder-proposed` scheme has a provider, that the forbidden settings do not
+exist, and that the approval timeout still defaults to waiting indefinitely.
+
+The first run found **two views sharing the id `dakcoder.chat`** — VS Code
+refuses to register the second, so the extension loaded with a panel missing.
+The merge that assembles `package.json` from eight modules deduplicated arrays
+on `command`, and views key on `id`. The merger is fixed; the manifest is
+checked.
+
+Getting the suite to run at all took three findings worth recording, because
+each presented as something else entirely:
+
+- `node:test`'s `run()` executes each file in a **child process**, which inside
+  the extension host has no `vscode` module to import. It hung for seven minutes
+  and was killed — with no indication the tests had never started. Replaced with
+  a ten-line in-process harness rather than adding mocha to an extension whose
+  discipline is zero dependencies.
+- `ELECTRON_RUN_AS_NODE` was set in the environment and is inherited, so
+  `Code.exe` ran as a bare Node interpreter, rejected every one of its own flags
+  as *"bad option"*, and tried to `require` the workspace path as a module. The
+  runner now clears it.
+- A positional folder path in `launchArgs` is consumed as the test entry point by
+  this launcher, so the suite opens no folder — which is also the path a
+  developer takes when they install the extension before opening a repo.
+
+**Two CI jobs added.** `offline-smoke` builds the wheels and proves the
+network-free install; `extension` now runs the integration suite under `xvfb`.
+
+#### Verification
+
+```
+python      467 passed, 33 skipped
+go          12 packages, vet clean, gofmt clean
+extension   32 unit + 9 integration (real VS Code), 0 type errors
+            52/52 commands resolve, no credentials in 15 packaged files
+offline     20 wheels, network-free install, 14 spawn checks
+vsix        3.72 MB, 35 files
+```
+
+### 2026-08-26 — Part B: the extension
+
+Ten TypeScript modules, a webview, and the manifest. Zero runtime dependencies;
+esbuild bundles to 190 KB against a 400 KB budget.
+
+| Module | What it owns |
+|---|---|
+| `protocol.ts` | The wire contract. Additive-only: every type is a *lower bound*. |
+| `client.ts` | Typed REST for both servers, plus a resumable SSE parser. |
+| `runtime.ts` | Python discovery, offline wheel install, credential-stripped spawn. |
+| `session-state.ts` | `RunState` — the single derivation of every number a surface shows. |
+| `statusbar.ts` | The two ambient items, polled only while a task runs. |
+| `auth.ts` | GitLab PKCE as a real `AuthenticationProvider`, with a loopback fallback. |
+| `chat.ts` + `media/chat/*` | The panel. Real files, not a template string. |
+| `approvals.ts` | Native diff, editor-title actions, the multi-file changeset. |
+| `trees.ts` | Sessions, quota, context inspector. |
+| `doctor.ts` | The Go toolchain matrix, every failure with a remedy. |
+| `diagnostics.ts` | `gotools lint --format json` → real `Diagnostic`s, plus seven code actions. |
+| `wizard.ts` | The scaffold wizard and the migration plan viewer. |
+
+**One state, many surfaces.** `RunState` consumes the event stream once and
+every surface reads its getters. Nothing else parses SSE, calls `parsePlan`, or
+divides tokens by a budget — which is what stopped the two-context-readings bug
+the interface review found between the console row and the header meter.
+
+**Two de-duplication rules live in the renderer that owns the transcript.** The
+server emits `assistant` and then `plan` from the same text on the planner's
+final turn, and `error` followed by `finish` carrying the identical string.
+Without suppression the first plan prints twice and every failure states itself
+twice. A row is held for one event (or 400 ms) so its twin can supersede it.
+
+**The webview's live region is one announcer, not the container.** `aria-live`
+on the transcript announces every descendant insertion — on a forty-turn run
+that narrates every code block and all thirty gate cells, which is exactly the
+flood the accessibility contract exists to prevent. So the transcript is
+`role="log"` with no `aria-live`, and one visually-hidden `role="status"`
+sibling receives a single composed sentence per event.
+
+**Two gates that hold an invariant nobody would otherwise check.**
+`check-no-credentials.mjs` fails the build on a model key anywhere in the
+packaged extension — verified by planting one, which failed with exit 1.
+`check-commands.mjs` fails on a palette command with no registration, which
+typechecks, bundles and packages perfectly and then throws for the first person
+who finds the feature. It caught two.
+
+#### The bug the SSE tests found twenty minutes after the parser was written
+
+Under CRLF the frame terminator is `\r\n\r\n`, which contains no `\n\n`. A
+parser searching for `\n\n` emits **nothing at all** against a CRLF server — not
+a corruption, a total silence. A lone trailing CR is now held back across chunk
+boundaries rather than normalised per chunk, because a chunk boundary can fall
+between the CR and its LF; both the whole-frame and byte-shredded cases are
+tested.
+
+#### Verification
+
+```
+python      467 passed, 33 skipped
+go          12 packages, vet clean, gofmt clean
+extension   32 tests, 0 type errors, 52/52 commands registered
+            190 KB bundle, no credentials in 15 packaged files
+```
+
+The 33 skips are the Redis and Postgres conformance suites, which run in CI
+against real servers and are labelled as never having spoken to one locally.
+
+### 2026-08-26 — Part B, phase 0: the blockers Part A had to clear first
+
+Designing the interface against the *running code* rather than the plan found
+fifteen places where the client was asked to display something the server does
+not send. Two were defects (D-71, D-72) and both were load-bearing: the approval
+card could not be actioned from the event that raises it, and the first
+compaction of any long run killed it — under 461 green tests.
+
+- **`tool_pending` carries an id, registered before it is announced** (D-71).
+- **Compaction survives** (D-72), with a regression test proven to fail against
+  the original code by restoring it, which reproduced
+  `AttributeError: 'list' object has no attribute 'markdown'` exactly.
+- **Steering** (D-73) and **wind-down** (D-74): the product previously had no way
+  to disagree with a run in progress except Stop, which discards its context.
+- **`POST /v1/sessions/{id}/resume`** runs a session again on the same
+  transcript, sharing `_spawn` with `start` so the two paths cannot drift.
+- **`GET /v1/sessions/{id}/context`** — `ContextManager.inspect()` already
+  returned exactly what the inspector needs, and no route exposed it.
+- **Failing gate stages carry their output** (D-75), plus a top-level
+  `blocked_by`.
+- **`protected` on every mutation** (D-76); **`ms` on every tool result**;
+  **`budget` and `reasoning_tokens` on every usage** (D-77).
+- **Approvals can be extended** (D-78). **Scaffold notes are structured** (D-79).
+
+Extension foundation laid: `protocol.ts` (the wire contract, additive-only),
+`client.ts` (typed REST plus a resumable SSE parser), `runtime.ts` (offline wheel
+install, credential-stripped spawn, port read from stdout).
+
+The SSE parser's own tests found a real defect in it within twenty minutes of it
+being written: under CRLF the frame terminator is `\r\n\r\n`, which contains no
+`\n\n` — so a parser searching for `\n\n` emits **nothing at all** against a CRLF
+server. A lone trailing CR is now held back across chunk boundaries rather than
+normalised per chunk, and both the whole-frame and byte-shredded CRLF cases are
+tested.
 
 ### 2026-08-25 — Phase 0, part 3: the three contracts
 

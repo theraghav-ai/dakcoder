@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="{{lang}}">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      default-src 'none' and a per-load nonce. Nothing here fetches: no CDN, no
+      font host, no image host beyond the extension's own resource origin. A
+      webview that cannot reach the network cannot leak a transcript to one.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src {{csp}}; font-src {{csp}}; img-src {{csp}} data:; script-src 'nonce-{{nonce}}';"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="{{style}}" />
+    <title>dakcoder</title>
+  </head>
+  <body>
+    <!--
+      The skip link is the first focusable thing in the panel and is revealed
+      only while an approval is pending, so there is always a keyboard route to
+      the card without a permanent target that goes nowhere.
+    -->
+    <button id="skip" class="skip" type="button" hidden></button>
+
+    <header id="meter" class="meter"></header>
+
+    <!--
+      role="log" and deliberately NO aria-live.
+
+      An aria-live ancestor announces every descendant insertion. On a forty-turn
+      run that is every code block, every tool row and all thirty cells of the
+      gate grid read aloud in order, which is unusable. One composed sentence per
+      event goes to #announce instead, which is a sibling and therefore not an
+      ancestor of anything the renderer appends here.
+    -->
+    <main id="transcript" class="transcript" role="log" tabindex="-1"></main>
+
+    <div id="announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <footer class="composer">
+      <p id="offline" class="offline" hidden></p>
+
+      <div id="queued" class="queued" hidden></div>
+
+      <!--
+        A textarea as combobox: ARIA 1.2 allows it, and it keeps multi-line
+        input working while the slash/mention popup is open.
+      -->
+      <label class="sr-only" for="input" id="input-label"></label>
+      <textarea
+        id="input"
+        class="input"
+        rows="1"
+        role="combobox"
+        aria-expanded="false"
+        aria-controls="popup"
+        aria-autocomplete="list"
+        aria-labelledby="input-label"
+      ></textarea>
+
+      <ul id="popup" class="popup" role="listbox" hidden></ul>
+
+      <div class="actions">
+        <div id="working" class="working" hidden></div>
+        <span class="spacer"></span>
+        <button id="wind-down" class="secondary" type="button" hidden></button>
+        <button id="stop" class="secondary" type="button" hidden></button>
+        <button id="send" class="primary" type="button"></button>
+      </div>
+    </footer>
+
+    <script nonce="{{nonce}}" src="{{script}}"></script>
+  </body>
+</html>

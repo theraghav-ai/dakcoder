@@ -1,0 +1,967 @@
+{
+  "name": "dakcoder-go",
+  "displayName": "dakcoder",
+  "description": "The India Post IT 2.0 backend coding agent for Go services on the n-api-template contract.",
+  "version": "0.1.0",
+  "publisher": "dop",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Machine Learning",
+    "Testing"
+  ],
+  "main": "./dist/extension.js",
+  "l10n": "./l10n",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "dakcoder runs the Go toolchain and writes files in the workspace."
+    }
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "scripts": {
+    "compile": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build:test": "tsc --outDir dist-test --module CommonJS --moduleResolution Node --target ES2022 --lib ES2022,DOM --skipLibCheck --rootDir src --esModuleInterop --types node,vscode src/test/protocol.test.ts src/test/state.test.ts",
+    "test": "npm run build:test && node --test dist-test/test/protocol.test.js dist-test/test/state.test.js",
+    "verify": "npm run typecheck && npm run test && npm run compile && npm run check:credentials && npm run check:commands && npm run check:l10n && npm run check:gotools",
+    "package": "npm run verify && npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository",
+    "check:credentials": "node scripts/check-no-credentials.mjs",
+    "build:integration": "tsc --outDir dist-test --module CommonJS --moduleResolution Node --target ES2022 --lib ES2022,DOM --skipLibCheck --rootDir src --esModuleInterop --types node,vscode src/test/runIntegration.ts src/test/integration/index.ts src/test/integration/activation.test.ts",
+    "test:integration": "npm run compile && npm run build:integration && node dist-test/test/runIntegration.js",
+    "build:gotools": "node scripts/build-gotools.mjs",
+    "l10n": "node scripts/extract-l10n.mjs",
+    "check:l10n": "node scripts/extract-l10n.mjs --check",
+    "check:commands": "node scripts/check-commands.mjs",
+    "check:gotools": "node scripts/build-gotools.mjs --check"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^3.1.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dakcoder",
+          "title": "dakcoder",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "dakcoder": [
+        {
+          "id": "dakcoder.chat",
+          "name": "Chat",
+          "type": "webview"
+        },
+        {
+          "id": "dakcoder.sessions",
+          "name": "Sessions",
+          "type": "tree"
+        },
+        {
+          "id": "dakcoder.quota",
+          "name": "Quota",
+          "type": "tree"
+        },
+        {
+          "id": "dakcoder.context",
+          "name": "Context",
+          "type": "tree",
+          "visibility": "collapsed"
+        },
+        {
+          "id": "dakcoder.doctor",
+          "name": "Doctor",
+          "type": "tree",
+          "visibility": "collapsed"
+        },
+        {
+          "id": "dakcoder.changeset",
+          "name": "Proposed Changes",
+          "type": "tree",
+          "when": "dakcoder.changesetOpen"
+        },
+        {
+          "id": "dakcoder.migration",
+          "name": "Migration Plan",
+          "type": "tree",
+          "visibility": "collapsed"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "dakcoder",
+      "properties": {
+        "dakcoder.serverGatewayUrl": {
+          "type": "string",
+          "default": "https://aiops.cept.gov.in/coder/backend",
+          "description": "The IT 2.0 gateway: sign-in, quota, and the model proxy. The agent itself always runs on this machine — your repository, build output and git history never leave it. The prompt the agent builds does go to the India Post model endpoint, over internal infrastructure only."
+        },
+        "dakcoder.gatewayUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Advanced override for the gateway URL, in both modes."
+        },
+        "dakcoder.model": {
+          "type": "string",
+          "default": "",
+          "description": "Display-only override, and only for a role the server already permits. Empty uses the server's configured coder model."
+        },
+        "dakcoder.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python 3.11+ for the local runtime. Empty auto-detects: this setting, then the Python extension's interpreter, then py/python3/python."
+        },
+        "dakcoder.goPath": {
+          "type": "string",
+          "default": "",
+          "description": "Override the go binary Doctor and the gate use."
+        },
+        "dakcoder.goplsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Override gopls. Empty prefers the golang.go extension's managed copy, then GOBIN, then PATH."
+        },
+        "dakcoder.requireApproval": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "default": "write_side",
+          "description": "Which tool calls need a human first: none, all, write_side, destructive, or an explicit list of tool names. Nothing under configs/** is ever auto-approved, whatever this says."
+        },
+        "dakcoder.approvalTimeoutSeconds": {
+          "type": "number",
+          "default": 0,
+          "description": "How long an approval waits. 0 waits indefinitely — a slow review must never auto-reject."
+        },
+        "dakcoder.autoApproveTrivialPatches": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-approve small, unambiguous patches. Never applies under configs/**."
+        },
+        "dakcoder.defaultMode": {
+          "type": "string",
+          "enum": [
+            "multi",
+            "planner",
+            "scaffolder",
+            "coder",
+            "verifier",
+            "debugger"
+          ],
+          "default": "multi",
+          "description": "Which mode a new task starts in. Multi lets the agent switch as the work demands."
+        },
+        "dakcoder.requestTimeoutSeconds": {
+          "type": "number",
+          "default": 600,
+          "description": "How long a single model request may take."
+        },
+        "dakcoder.runtimeIdleTimeoutMinutes": {
+          "type": "number",
+          "default": 30,
+          "description": "Stop the local runtime after this long with no task. 0 never stops it."
+        },
+        "dakcoder.showTokenMeter": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the context and reasoning meter in the chat header."
+        },
+        "dakcoder.verbose": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log every tool call to the output channel."
+        },
+        "dakcoder.telemetry": {
+          "type": "boolean",
+          "default": true,
+          "description": "Send anonymous usage counts. Honours the editor's own telemetry setting regardless of this."
+        },
+        "dakcoder.gotoolsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Override the gotools analyser. Empty uses the checksum-verified binary bundled with the extension, then any gotools on PATH."
+        },
+        "dakcoder.lintOnSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Re-run template compliance on the file you just saved. Local, offline, and costs no quota; off by default because it re-analyses the whole module on every save."
+        }
+      }
+    },
+    "walkthroughs": [
+      {
+        "id": "dakcoder.setup",
+        "title": "Get started with dakcoder",
+        "description": "Sign in, check your Go toolchain, and scaffold your first resource.",
+        "steps": [
+          {
+            "id": "signin",
+            "title": "Sign in with GitLab",
+            "description": "dakcoder runs as you, so quota and audit are yours.\n[Sign In](command:dakcoder.signIn)",
+            "media": {
+              "markdown": "media/walkthrough/signin.md"
+            },
+            "completionEvents": [
+              "onCommand:dakcoder.signIn"
+            ]
+          },
+          {
+            "id": "doctor",
+            "title": "Check your Go toolchain",
+            "description": "Doctor finds the setup problems that would otherwise surface as a failed build.\n[Run Doctor](command:dakcoder.doctor)",
+            "media": {
+              "markdown": "media/walkthrough/doctor.md"
+            },
+            "completionEvents": [
+              "onCommand:dakcoder.doctor"
+            ]
+          },
+          {
+            "id": "open",
+            "title": "Open a Go service",
+            "description": "dakcoder works on repositories built on the n-api-template contract.",
+            "media": {
+              "markdown": "media/walkthrough/open.md"
+            },
+            "completionEvents": [
+              "onContext:dakcoder.hasGoModule"
+            ]
+          },
+          {
+            "id": "scaffold",
+            "title": "Scaffold a resource",
+            "description": "The wizard produces the spec, so the model never has to guess it.\n[Scaffold Resource](command:dakcoder.scaffoldResource)",
+            "media": {
+              "markdown": "media/walkthrough/scaffold.md"
+            },
+            "completionEvents": [
+              "onCommand:dakcoder.scaffoldResource"
+            ]
+          },
+          {
+            "id": "review",
+            "title": "Review the diff",
+            "description": "Every write is yours to accept, reject, or correct.",
+            "media": {
+              "markdown": "media/walkthrough/review.md"
+            },
+            "completionEvents": [
+              "onCommand:dakcoder.acceptApproval"
+            ]
+          }
+        ]
+      }
+    ],
+    "authentication": [
+      {
+        "id": "dakcoder",
+        "label": "dakcoder (GitLab)"
+      }
+    ],
+    "commands": [
+      {
+        "command": "dakcoder.signIn",
+        "title": "Sign In",
+        "category": "dakcoder",
+        "icon": "$(sign-in)"
+      },
+      {
+        "command": "dakcoder.signOut",
+        "title": "Sign Out",
+        "category": "dakcoder",
+        "icon": "$(sign-out)"
+      },
+      {
+        "command": "dakcoder.sessions.refresh",
+        "title": "Refresh Sessions",
+        "category": "dakcoder",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dakcoder.sessions.filterStatus",
+        "title": "Filter Sessions by Status",
+        "category": "dakcoder",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "dakcoder.sessions.filterWorkspace",
+        "title": "Filter Sessions by Workspace",
+        "category": "dakcoder",
+        "icon": "$(root-folder)"
+      },
+      {
+        "command": "dakcoder.sessions.clearFilters",
+        "title": "Clear Session Filters",
+        "category": "dakcoder",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "dakcoder.sessions.open",
+        "title": "Open Session",
+        "category": "dakcoder",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "dakcoder.sessions.resume",
+        "title": "Resume Session",
+        "category": "dakcoder",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "dakcoder.sessions.followUp",
+        "title": "Ask a Follow-up",
+        "category": "dakcoder",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "dakcoder.sessions.revert",
+        "title": "Revert Files This Session Changed",
+        "category": "dakcoder",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "dakcoder.sessions.delete",
+        "title": "Delete Session",
+        "category": "dakcoder",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "dakcoder.sessions.copyId",
+        "title": "Copy Session Id",
+        "category": "dakcoder",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "dakcoder.quota.refresh",
+        "title": "Refresh Quota",
+        "category": "dakcoder",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dakcoder.context.refresh",
+        "title": "Refresh Context Inspector",
+        "category": "dakcoder",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dakcoder.showContextInspector",
+        "title": "Show Context Inspector",
+        "category": "dakcoder",
+        "icon": "$(inspect)"
+      },
+      {
+        "command": "dakcoder.approval.accept",
+        "title": "Accept Proposed Change",
+        "category": "dakcoder",
+        "icon": "$(check)"
+      },
+      {
+        "command": "dakcoder.approval.reject",
+        "title": "Reject Proposed Change",
+        "category": "dakcoder",
+        "icon": "$(close)"
+      },
+      {
+        "command": "dakcoder.approval.showDiff",
+        "title": "Show Proposed Diff",
+        "category": "dakcoder",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "dakcoder.approval.editArgs",
+        "title": "Edit Arguments",
+        "category": "dakcoder",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "dakcoder.approval.extend",
+        "title": "Give the Review More Time",
+        "category": "dakcoder",
+        "icon": "$(watch)"
+      },
+      {
+        "command": "dakcoder.approval.openChangeset",
+        "title": "Review Proposed Changes",
+        "category": "dakcoder",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "dakcoder.approval.openAllDiffs",
+        "title": "Open All Proposed Diffs",
+        "category": "dakcoder",
+        "icon": "$(diff-multiple)"
+      },
+      {
+        "command": "dakcoder.approval.submitArgs",
+        "title": "Send Corrected Arguments",
+        "category": "dakcoder",
+        "icon": "$(send)"
+      },
+      {
+        "command": "dakcoder.approval.cancelArgs",
+        "title": "Discard Argument Correction",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.approval.showReceipt",
+        "title": "Show Corrected Arguments",
+        "category": "dakcoder",
+        "icon": "$(note)"
+      },
+      {
+        "command": "dakcoder.doctor",
+        "title": "Doctor",
+        "category": "dakcoder",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "dakcoder.doctor.refresh",
+        "title": "Re-run Doctor Checks",
+        "category": "dakcoder",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dakcoder.doctor.copyReport",
+        "title": "Copy Doctor Report",
+        "category": "dakcoder",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "dakcoder.doctor.showLog",
+        "title": "Show Doctor Log",
+        "category": "dakcoder",
+        "icon": "$(output)"
+      },
+      {
+        "command": "dakcoder.doctor.applyFix",
+        "title": "Apply Fix",
+        "category": "dakcoder",
+        "icon": "$(wrench)"
+      },
+      {
+        "command": "dakcoder.clearChat",
+        "title": "Clear Chat",
+        "category": "dakcoder",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "dakcoder.focusComposer",
+        "title": "Focus Chat Composer",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.scaffoldResource",
+        "title": "Scaffold Resource...",
+        "category": "dakcoder",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "dakcoder.migration.run",
+        "title": "Migrate to n-api-template...",
+        "category": "dakcoder",
+        "icon": "$(play)"
+      },
+      {
+        "command": "dakcoder.migration.refresh",
+        "title": "Reload the Migration Plan",
+        "category": "dakcoder",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dakcoder.migration.openPlanFile",
+        "title": "Open plan.md",
+        "category": "dakcoder",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "dakcoder.migration.reclassify",
+        "title": "Reclassify Unit...",
+        "category": "dakcoder",
+        "icon": "$(tag)"
+      },
+      {
+        "command": "dakcoder.migration.moveUp",
+        "title": "Move Unit Earlier",
+        "category": "dakcoder",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "dakcoder.migration.moveDown",
+        "title": "Move Unit Later",
+        "category": "dakcoder",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "dakcoder.migration.openUnit",
+        "title": "Open the Unit's File",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.migration.openCommit",
+        "title": "Open the Commit",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.auditTemplate",
+        "title": "Audit Template Compliance",
+        "category": "dakcoder",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "dakcoder.auditLegacy",
+        "title": "Audit Legacy Patterns",
+        "category": "dakcoder",
+        "icon": "$(history)"
+      },
+      {
+        "command": "dakcoder.clearDiagnostics",
+        "title": "Clear Findings",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.explainRule",
+        "title": "Explain This Rule",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.fixDiagnostic",
+        "title": "Fix This Finding",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.debugDiagnostic",
+        "title": "Debug This Error",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.migrateHandler",
+        "title": "Migrate This Handler",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.wireIntoFx",
+        "title": "Wire Into FX",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.regenerateValidators",
+        "title": "Regenerate Validators",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.extractToRepository",
+        "title": "Extract SQL to Repository",
+        "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.rerunGateStage",
+        "title": "Run Gate Stage Locally",
+        "category": "dakcoder"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "dakcoder.sessions.open",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.sessions.resume",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.sessions.followUp",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.sessions.revert",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.sessions.delete",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.sessions.copyId",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.approval.accept",
+          "when": "dakcoder.approvalPending"
+        },
+        {
+          "command": "dakcoder.approval.reject",
+          "when": "dakcoder.approvalPending"
+        },
+        {
+          "command": "dakcoder.approval.showDiff",
+          "when": "dakcoder.approvalPending"
+        },
+        {
+          "command": "dakcoder.approval.editArgs",
+          "when": "dakcoder.approvalPending"
+        },
+        {
+          "command": "dakcoder.approval.extend",
+          "when": "dakcoder.approvalPending"
+        },
+        {
+          "command": "dakcoder.approval.openChangeset",
+          "when": "dakcoder.approvalPending"
+        },
+        {
+          "command": "dakcoder.approval.openAllDiffs",
+          "when": "dakcoder.approvalPending"
+        },
+        {
+          "command": "dakcoder.approval.submitArgs",
+          "when": "dakcoder.editingArgs"
+        },
+        {
+          "command": "dakcoder.approval.cancelArgs",
+          "when": "dakcoder.editingArgs"
+        },
+        {
+          "command": "dakcoder.approval.showReceipt",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.doctor.applyFix",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.clearChat",
+          "when": "true"
+        },
+        {
+          "command": "dakcoder.focusComposer",
+          "when": "true"
+        },
+        {
+          "command": "dakcoder.migration.openUnit",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.migration.openCommit",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.migration.moveUp",
+          "when": "dakcoder.hasMigrationPlan && !dakcoder.migrationLocked"
+        },
+        {
+          "command": "dakcoder.migration.moveDown",
+          "when": "dakcoder.hasMigrationPlan && !dakcoder.migrationLocked"
+        },
+        {
+          "command": "dakcoder.migration.reclassify",
+          "when": "dakcoder.hasMigrationPlan && !dakcoder.migrationLocked"
+        },
+        {
+          "command": "dakcoder.migrateHandler",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.debugDiagnostic",
+          "when": "false"
+        },
+        {
+          "command": "dakcoder.extractToRepository",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "dakcoder.sessions.filterStatus",
+          "when": "view == dakcoder.sessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dakcoder.sessions.filterWorkspace",
+          "when": "view == dakcoder.sessions",
+          "group": "navigation@2"
+        },
+        {
+          "command": "dakcoder.sessions.clearFilters",
+          "when": "view == dakcoder.sessions && dakcoder.sessionsFiltered",
+          "group": "navigation@3"
+        },
+        {
+          "command": "dakcoder.sessions.refresh",
+          "when": "view == dakcoder.sessions",
+          "group": "navigation@4"
+        },
+        {
+          "command": "dakcoder.quota.refresh",
+          "when": "view == dakcoder.quota",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dakcoder.context.refresh",
+          "when": "view == dakcoder.context",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dakcoder.approval.accept",
+          "group": "navigation@1",
+          "when": "view == dakcoder.changeset"
+        },
+        {
+          "command": "dakcoder.approval.openAllDiffs",
+          "group": "navigation@2",
+          "when": "view == dakcoder.changeset"
+        },
+        {
+          "command": "dakcoder.approval.editArgs",
+          "group": "navigation@3",
+          "when": "view == dakcoder.changeset"
+        },
+        {
+          "command": "dakcoder.approval.reject",
+          "group": "navigation@4",
+          "when": "view == dakcoder.changeset"
+        },
+        {
+          "command": "dakcoder.approval.extend",
+          "group": "1_time@1",
+          "when": "view == dakcoder.changeset"
+        },
+        {
+          "command": "dakcoder.doctor.refresh",
+          "when": "view == dakcoder.doctor",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dakcoder.doctor.copyReport",
+          "when": "view == dakcoder.doctor",
+          "group": "navigation@2"
+        },
+        {
+          "command": "dakcoder.doctor.showLog",
+          "when": "view == dakcoder.doctor",
+          "group": "navigation@3"
+        },
+        {
+          "command": "dakcoder.clearChat",
+          "when": "view == dakcoder.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dakcoder.migration.run",
+          "when": "view == dakcoder.migration && dakcoder.hasMigrationPlan && !dakcoder.migrationLocked",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dakcoder.migration.refresh",
+          "when": "view == dakcoder.migration",
+          "group": "navigation@2"
+        },
+        {
+          "command": "dakcoder.migration.openPlanFile",
+          "when": "view == dakcoder.migration",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "dakcoder.sessions.resume",
+          "when": "view == dakcoder.sessions && viewItem == dakcoder.session.resumable",
+          "group": "inline@1"
+        },
+        {
+          "command": "dakcoder.sessions.followUp",
+          "when": "view == dakcoder.sessions && viewItem == dakcoder.session.done",
+          "group": "inline@1"
+        },
+        {
+          "command": "dakcoder.sessions.open",
+          "when": "view == dakcoder.sessions && viewItem =~ /^dakcoder\\.session\\.(running|done|resumable|unknown)$/",
+          "group": "1_open@1"
+        },
+        {
+          "command": "dakcoder.sessions.resume",
+          "when": "view == dakcoder.sessions && viewItem == dakcoder.session.resumable",
+          "group": "1_open@2"
+        },
+        {
+          "command": "dakcoder.sessions.followUp",
+          "when": "view == dakcoder.sessions && viewItem == dakcoder.session.done",
+          "group": "1_open@2"
+        },
+        {
+          "command": "dakcoder.sessions.revert",
+          "when": "view == dakcoder.sessions && viewItem =~ /^dakcoder\\.session\\.(done|resumable|unknown)$/",
+          "group": "2_modify@1"
+        },
+        {
+          "command": "dakcoder.sessions.delete",
+          "when": "view == dakcoder.sessions && viewItem =~ /^dakcoder\\.session\\.(done|resumable|unknown)$/",
+          "group": "3_danger@1"
+        },
+        {
+          "command": "dakcoder.sessions.copyId",
+          "when": "view == dakcoder.sessions && viewItem =~ /^dakcoder\\.session\\.(running|done|resumable|unknown)$/",
+          "group": "4_copy@1"
+        },
+        {
+          "command": "dakcoder.approval.showDiff",
+          "group": "inline@1",
+          "when": "view == dakcoder.changeset && viewItem == dakcoder.changesetFile"
+        },
+        {
+          "command": "dakcoder.doctor.applyFix",
+          "when": "view == dakcoder.doctor && viewItem == dakcoder.check.fixable",
+          "group": "inline"
+        },
+        {
+          "command": "dakcoder.migration.moveUp",
+          "when": "view == dakcoder.migration && viewItem == dakcoder.migration.unit",
+          "group": "inline@1"
+        },
+        {
+          "command": "dakcoder.migration.moveDown",
+          "when": "view == dakcoder.migration && viewItem == dakcoder.migration.unit",
+          "group": "inline@2"
+        },
+        {
+          "command": "dakcoder.migration.reclassify",
+          "when": "view == dakcoder.migration && viewItem == dakcoder.migration.unit",
+          "group": "1_order@1"
+        },
+        {
+          "command": "dakcoder.migration.openUnit",
+          "when": "view == dakcoder.migration && viewItem =~ /^dakcoder\\.migration\\.unit/",
+          "group": "2_open@1"
+        },
+        {
+          "command": "dakcoder.migration.openCommit",
+          "when": "view == dakcoder.migration && viewItem == dakcoder.migration.commit",
+          "group": "2_open@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "dakcoder.approval.accept",
+          "group": "navigation@1",
+          "when": "resourceScheme == dakcoder-proposed"
+        },
+        {
+          "command": "dakcoder.approval.reject",
+          "group": "navigation@2",
+          "when": "resourceScheme == dakcoder-proposed"
+        },
+        {
+          "command": "dakcoder.approval.editArgs",
+          "group": "navigation@3",
+          "when": "resourceScheme == dakcoder-proposed"
+        },
+        {
+          "command": "dakcoder.approval.submitArgs",
+          "group": "navigation@1",
+          "when": "dakcoder.editingArgs && resourceExtname == .json"
+        },
+        {
+          "command": "dakcoder.approval.cancelArgs",
+          "group": "navigation@2",
+          "when": "dakcoder.editingArgs && resourceExtname == .json"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "key": "1",
+        "command": "dakcoder.approval.accept",
+        "when": "dakcoder.approvalPending && (resourceScheme == dakcoder-proposed || focusedView == dakcoder.changeset)"
+      },
+      {
+        "key": "2",
+        "command": "dakcoder.approval.reject",
+        "when": "dakcoder.approvalPending && (resourceScheme == dakcoder-proposed || focusedView == dakcoder.changeset)"
+      },
+      {
+        "key": "3",
+        "command": "dakcoder.approval.showDiff",
+        "when": "dakcoder.approvalPending && (resourceScheme == dakcoder-proposed || focusedView == dakcoder.changeset)"
+      },
+      {
+        "key": "4",
+        "command": "dakcoder.approval.editArgs",
+        "when": "dakcoder.approvalPending && (resourceScheme == dakcoder-proposed || focusedView == dakcoder.changeset)"
+      },
+      {
+        "command": "dakcoder.migration.moveUp",
+        "key": "alt+up",
+        "when": "focusedView == dakcoder.migration && !dakcoder.migrationLocked"
+      },
+      {
+        "command": "dakcoder.migration.moveDown",
+        "key": "alt+down",
+        "when": "focusedView == dakcoder.migration && !dakcoder.migrationLocked"
+      }
+    ],
+    "viewsWelcome": [
+      {
+        "view": "dakcoder.doctor",
+        "contents": "Doctor checks the Go toolchain, private-module credentials, the local runtime and your sign-in — and offers a one-click fix for everything it finds.\n[Run Doctor](command:dakcoder.doctor)"
+      },
+      {
+        "view": "dakcoder.migration",
+        "contents": "No migration plan yet.\n\nRun the legacy audit to inventory every handler and repo, its classification and the rules it violates. The plan is written to .dakcoder/migration/plan.md and nothing is migrated until you confirm the order here.\n[Audit Legacy Patterns](command:dakcoder.auditLegacy)\n[Reload the plan](command:dakcoder.migration.refresh)",
+        "when": "!dakcoder.hasMigrationPlan"
+      }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "dakcoder",
+        "required": [
+          "stage"
+        ],
+        "properties": {
+          "stage": {
+            "type": "string",
+            "description": "The verification gate stage to run locally: go_build, go_vet, go_test, go_mod tidy, govalid_gen, golangci_lint or govulncheck."
+          }
+        }
+      }
+    ],
+    "problemPatterns": [
+      {
+        "name": "dakcoder-go",
+        "regexp": "^\\s*(.+\\.go):(\\d+):(?:(\\d+):)?\\s+(.*)$",
+        "file": 1,
+        "line": 2,
+        "column": 3,
+        "message": 4
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "dakcoder-go",
+        "label": "Go compiler, vet and test output",
+        "owner": "dakcoder-gate",
+        "source": "gate",
+        "severity": "error",
+        "fileLocation": [
+          "autoDetect",
+          "${workspaceFolder}"
+        ],
+        "pattern": "$dakcoder-go"
+      }
+    ]
+  }
+}

@@ -172,6 +172,88 @@ baseline:
   rules:
     - exists: [new-template/go.mod]
 
+extension:
+  stage: verify
+  image: node:22
+  before_script: []
+  script:
+    - cd extension
+    - npm ci --no-audit --no-fund
+    # The sidecar the audit commands and every code action run. Built before
+    # `verify`, because one of verify's gates checks the manifest against it.
+    - apt-get update -qq && apt-get install -y -qq golang-go >/dev/null || true
+    - npm run build:gotools
+    # Typecheck, unit tests, bundle, and four gates that each hold an invariant
+    # nothing else checks: no credential in the package, no palette command
+    # without a registration, no stale l10n bundle, no sidecar whose checksum
+    # does not match. A green local run means a green pipeline.
+    - npm run verify
+    # Budgets are asserted, not aspired to. The extension host is shared with
+    # every other extension in the window, and a regression here is invisible
+    # unless something fails on it.
+    - |
+      SIZE=$(stat -c%s dist/extension.js)
+      echo "bundle: $((SIZE / 1024)) KB"
+      test "$SIZE" -le 409600 || { echo "bundle exceeds the 400 KB budget"; exit 1; }
+    # Every command in the palette must have a registration. One that does not
+    # throws when invoked, and the palette is exactly where someone finds it.
+    - node scripts/check-commands.mjs
+    # Inside a real VS Code. Catches what a regex over source cannot: a command
+    # registered in a branch that never runs, two views sharing an id, a
+    # webview scheme with no provider. The duplicate-view bug was found here.
+    - apt-get update -qq && apt-get install -y -qq libnss3 libatk-bridge2.0-0 libgtk-3-0 libasound2 xvfb >/dev/null
+    - xvfb-run -a npm run test:integration
+  artifacts:
+    when: always
+    paths: [extension/dist/]
+    expire_in: 7 days
+
+offline-smoke:
+  stage: verify
+  image: python:3.12
+  before_script: []
+  script:
+    # Build the wheels, then install them into a clean venv with --no-index and
+    # spawn the runtime exactly as the extension does. This is the only test
+    # that proves a new developer behind the proxy reaches a working runtime:
+    # it found an undeclared httpx dependency that made the offline install
+    # produce a runtime unable to import itself.
+    - pip install --quiet build
+    - python -m build --wheel --outdir extension/runtime apps/shared
+    - python -m build --wheel --outdir extension/runtime apps/agent
+    # Quoted whole: `--only-binary=:all:` followed by a space reads as a YAML
+    # key/value pair otherwise, and the file stops parsing.
+    - 'pip download --quiet --dest extension/runtime --only-binary=:all: "fastapi>=0.110" "uvicorn>=0.30" "httpx>=0.27" "pyyaml>=6"'
+    - python scripts/offline-smoke.py
+  artifacts:
+    when: on_success
+    paths: [extension/runtime/*.whl]
+    expire_in: 7 days
+
+vsix:
+  stage: release
+  needs: [extension]
+  image: node:22
+  before_script: []
+  script:
+    - cd extension
+    - npm ci --no-audit --no-fund
+    # The wheel closure, per platform tag. This is what removes the network from
+    # first run: the runtime installs with --no-index --find-links, so a
+    # corporate proxy cannot break a new developer's first task.
+    - pip download --dest runtime dakcoder-agent dakcoder-shared || echo "wheels are built by the agent job; see runtime/README.md"
+    - npm run package
+    # The leak that would matter most, checked on the artifact itself rather
+    # than on the source it was built from.
+    - npm run check:credentials
+  artifacts:
+    name: dakcoder-${CI_COMMIT_REF_SLUG}
+    paths: [extension/*.vsix]
+    expire_in: 90 days
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 dist:
   stage: release
   needs: [verify, baseline]

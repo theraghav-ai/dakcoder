@@ -1,0 +1,14 @@
+{
+  "id": "config-zero-value",
+  "symptom": "A config value reads as an empty string, zero, or false at runtime, with no error.",
+  "cause": "The key path or its casing does not match the YAML, or the key is absent from the config for the active environment. A missing key yields the zero value rather than failing.",
+  "steps": [
+    "Run rules_lint and read the config-key-exists finding \u2014 it names the exact path and the environment file that lacks it.",
+    "Check the key exists in the config for the environment you are running, not only in app.yaml.",
+    "Match the path exactly, including case. db.QueryTimeoutLow and db.querytimeoutlow are different keys.",
+    "Add the key to every environment config, not just the one you tested."
+  ],
+  "tool": "rules_lint",
+  "watch_out": "config.prod.yaml in the reference template has no cache: block at all, so fifteen cache keys read as zero in production. Check prod specifically.",
+  "citation": "@skill:config-keys"
+}
