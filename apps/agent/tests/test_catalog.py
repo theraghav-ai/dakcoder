@@ -1,0 +1,104 @@
+"""The published C1 catalogue must match the registry.
+
+A hand-maintained contract document drifts from the code within weeks, and the
+drift is silent: nobody reads a table to check it is still true. Generating it
+and failing CI when the file disagrees is the only version of "the documentation
+is accurate" that survives.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from dakcoder_agent.modes import Mode
+from dakcoder_agent.tools import registry
+from dakcoder_agent.tools.catalog import as_json, as_markdown, conformance
+
+DOCS = Path(__file__).resolve().parents[3] / "docs"
+
+
+def test_the_registry_satisfies_c1() -> None:
+    """A second check that does not share the first one's code path.
+
+    The registry refuses to construct a violating spec at import. That is a claim
+    about a safety property, and a claim worth making is worth verifying from
+    outside the thing that makes it.
+    """
+    assert conformance() == []
+
+
+def test_the_published_catalogue_is_current() -> None:
+    path = DOCS / "TOOL-CATALOG.md"
+    if not path.is_file():
+        pytest.skip("catalogue not generated yet; run `make tool-catalog`")
+    assert path.read_text(encoding="utf-8") == as_markdown(), (
+        "docs/TOOL-CATALOG.md is stale. Run `make tool-catalog` and commit the result."
+    )
+
+
+def test_the_published_schemas_are_current() -> None:
+    path = DOCS / "tool-catalog.json"
+    if not path.is_file():
+        pytest.skip("catalogue not generated yet; run `make tool-catalog`")
+    assert path.read_text(encoding="utf-8") == as_json(), (
+        "docs/tool-catalog.json is stale. Run `make tool-catalog` and commit the result."
+    )
+
+
+def test_the_json_is_a_usable_contract() -> None:
+    """What the gateway and the extension bind against.
+
+    Checked as data rather than by eye: the extension renders approval dialogues
+    from `approval` and `mutates`, and a field that silently changed name would
+    turn every approval into a silent auto-approve.
+    """
+    payload = json.loads(as_json("1.2.3"))
+
+    assert payload["contract"] == "C1"
+    assert payload["version"] == "1.2.3"
+    assert payload["limits"]["max_params"] == registry.MAX_PARAMS
+
+    names = {t["name"] for t in payload["tools"]}
+    assert names == set(registry.REGISTRY)
+
+    for tool in payload["tools"]:
+        assert tool["approval"] in {"none", "conditional", "always"}
+        assert tool["provider"] in {"python", "gotools", "gopls"}
+        assert isinstance(tool["mutates"], bool)
+        assert "parameters" in tool
+
+
+def test_every_mode_listing_matches_the_registry() -> None:
+    payload = json.loads(as_json())
+    for mode in Mode:
+        assert payload["visible_per_mode"][str(mode)] == list(registry.names_for(mode))
+
+
+def test_gate_only_tools_are_marked_and_invisible() -> None:
+    """They are part of the contract — the extension shows them in a gate report
+    — but they are not offered to the model, and the document has to say which."""
+    payload = json.loads(as_json())
+    gate = {t["name"] for t in payload["tools"] if t.get("gate_only")}
+    assert gate == set(registry.gate_tools())
+    for mode in Mode:
+        assert not gate & set(payload["visible_per_mode"][str(mode)])
+
+
+def test_unavailable_tools_are_published_with_their_reason() -> None:
+    """Kept in the catalogue so it is the whole contract rather than only the
+    finished part of it, and marked so nothing binds against them yet."""
+    payload = json.loads(as_json())
+    unavailable = {t["name"]: t for t in payload["tools"] if t.get("unavailable")}
+    assert set(unavailable) == {s.name for s in registry.unavailable()}
+    for tool in unavailable.values():
+        assert tool["unavailable"]
+        assert tool["instead"], "an unavailable tool must name a substitute"
+
+
+def test_the_markdown_names_every_tool(  ) -> None:
+    text = as_markdown()
+    for name in registry.REGISTRY:
+        assert f"`{name}`" in text

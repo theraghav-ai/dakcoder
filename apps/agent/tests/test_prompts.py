@@ -1,0 +1,154 @@
+"""Tests for the prompts.
+
+A prompt is the easiest thing in a codebase to grow by accident: every addition
+looks individually reasonable, and nothing fails when it gets too long — the
+working set just quietly shrinks. So the budget is a test, and the stable-prefix
+rule is a test, because neither is otherwise observable.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from dakcoder_agent.context import ContextManager
+from dakcoder_agent.modes import Mode
+from dakcoder_agent.prompts import MODE_BUDGET, SYSTEM_BUDGET, mode_instruction, system_prompt
+from dakcoder_agent.tools import registry
+from dakcoder_shared.tokens import estimate_tokens
+
+
+def test_the_system_prompt_fits_its_budget() -> None:
+    """Part A section 6.1 gives it 1,200 tokens of a 32,768 prompt.
+
+    Every token here is spent on every turn of every task, so the budget is not
+    a style preference — it is the share of context that cannot hold code.
+    """
+    used = estimate_tokens(system_prompt())
+    assert used <= SYSTEM_BUDGET, f"system prompt is {used} tokens, budget {SYSTEM_BUDGET}"
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_each_mode_overlay_stays_small(mode: Mode) -> None:
+    """A mode overlay needing three hundred tokens to explain itself is usually
+    a mode that has not been decided."""
+    used = estimate_tokens(mode_instruction(mode))
+    assert used <= MODE_BUDGET, f"{mode} overlay is {used} tokens, budget {MODE_BUDGET}"
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_every_mode_has_an_overlay(mode: Mode) -> None:
+    text = mode_instruction(mode)
+    assert text.strip()
+    assert str(mode) in text.lower() or mode.name.lower() in text.lower()
+
+
+# ── the stable prefix ───────────────────────────────────────────────────────
+
+
+def test_every_mode_gets_the_same_system_prompt() -> None:
+    """Finding S6, as a test.
+
+    The frontend agent assigned a fresh message list with a different system
+    prompt in each of `_run_planner`, `_run_coder` and `_run_debugger` — three
+    cold prefills per task, by design, even with prefix caching switched on.
+    """
+    first = system_prompt()
+    for _mode in Mode:
+        assert system_prompt() is first, "the system prompt must be one object, shared"
+
+
+def test_a_mode_switch_appends_and_does_not_rewrite_the_head() -> None:
+    """The rule §6.4 states: the message list is append-only below the pinned
+    head, and any mutation of messages[0..k] is a cache-invalidating bug."""
+    context = ContextManager(mode=Mode.PLANNER, system_prompt=system_prompt())
+    context.set_task("Add a Pension resource")
+    before = context.prefix_signature()
+    head = context.build()[0].content
+
+    for mode in (Mode.SCAFFOLDER, Mode.CODER, Mode.VERIFIER, Mode.DEBUGGER):
+        context.switch_mode(mode, mode_instruction(mode))
+
+    assert context.prefix_signature() == before
+    assert context.build()[0].content == head
+
+
+def test_the_prompt_is_normalised_so_a_checkout_cannot_change_it() -> None:
+    """A prefix whose bytes depend on the reader's git configuration is not a
+    stable prefix: it produces a different cache key on a colleague's machine
+    for a file neither of them edited."""
+    assert "\r" not in system_prompt()
+    for mode in Mode:
+        assert "\r" not in mode_instruction(mode)
+
+
+# ── what the prompt has to say ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "dblib.Psql",
+        "pgx.ErrNoRows",
+        "fx.Annotate",
+        ".Name(",
+        "request_*_validator.go",
+        "gin.Context",
+    ],
+)
+def test_the_contract_essentials_are_stated(phrase: str) -> None:
+    """The five failure classes that recur (§13.2) are each named here, because
+    a rule the model has to look up is a rule it applies one turn late."""
+    assert phrase in system_prompt()
+
+
+def test_the_gate_is_described_as_something_the_model_does_not_control() -> None:
+    """Not as a request. "Please verify your work" is a hope; "your work is
+    verified by a gate you cannot skip" is a fact the model can reason from."""
+    text = system_prompt().lower()
+    assert "cannot skip" in text or "do not control" in text
+
+
+def test_the_irreversible_actions_are_named() -> None:
+    text = system_prompt().lower()
+    assert "ddl" in text, "the agent never applies DDL"
+    assert "credential" in text or "password" in text
+
+
+def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
+    """The instruction that keeps a partial result honest. Without it a model
+    that could not finish reports the part it did finish."""
+    assert "say so" in system_prompt().lower()
+
+
+# ── the whole prefix ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_the_prefix_is_reported_honestly_against_the_target(mode: Mode) -> None:
+    """§6.4 estimates system + schemas at ~2,400 tokens. Two modes exceed it.
+
+    Asserted at the real ceiling rather than the estimate, and recorded in
+    ARCHITECTURE D-43: the overage is in the *stable prefix*, paid once per
+    prefix rather than per turn, and buying it back would mean shortening tool
+    descriptions that exist to stop the model misusing the tools.
+    """
+    prefix = estimate_tokens(system_prompt()) + estimate_tokens(
+        json.dumps(registry.schemas_for(mode))
+    )
+    assert prefix <= 3_100, f"{mode} prefix is {prefix} tokens"
+
+
+def test_the_system_prompt_and_schemas_leave_the_working_set_intact() -> None:
+    """The number that actually matters: what is left for code.
+
+    §6.1 allocates ~27,500 to the live working set. The prefix eating into it is
+    the real cost of every token spent above, and this is where it shows up.
+    """
+    context = ContextManager(mode=Mode.CODER, system_prompt=system_prompt())
+    context.set_task("Add a Pension resource", acceptance=["go build ./... clean"])
+    schemas = estimate_tokens(json.dumps(registry.schemas_for(Mode.CODER)))
+
+    remaining = context.budget - context.usage().total - schemas
+    assert remaining >= 26_000, f"only {remaining} tokens left for the working set"

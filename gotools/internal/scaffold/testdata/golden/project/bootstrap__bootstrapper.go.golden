@@ -1,0 +1,38 @@
+package bootstrap
+
+import (
+	handler "gitlab.cept.gov.in/it-2.0/pension-api/handler"
+	repo "gitlab.cept.gov.in/it-2.0/pension-api/repo/postgres"
+
+	serverHandler "gitlab.cept.gov.in/it-2.0-common/n-api-server/handler"
+	"go.uber.org/fx"
+)
+
+// FxRepo provides the repositories.
+//
+// A repository is a plain provider: nothing else needs to find it by tag, so
+// fx.Provide on its own is correct.
+var FxRepo = fx.Module(
+	"Repomodule",
+	fx.Provide(
+		repo.NewPensionRepository,
+	),
+)
+
+// FxHandler provides the HTTP handlers.
+//
+// Handlers are NOT plain providers. The server collects them as a group, so
+// each one has to be annotated as satisfying serverHandler.Handler and tagged
+// with ServerControllersGroupTag. A handler registered with a bare fx.Provide
+// compiles, starts without complaint, and silently serves none of its routes —
+// so use fx_wire to add entries here rather than editing by hand.
+var FxHandler = fx.Module(
+	"Handlermodule",
+	fx.Provide(
+		fx.Annotate(
+			handler.NewPensionHandler,
+			fx.As(new(serverHandler.Handler)),
+			fx.ResultTags(serverHandler.ServerControllersGroupTag),
+		),
+	),
+)

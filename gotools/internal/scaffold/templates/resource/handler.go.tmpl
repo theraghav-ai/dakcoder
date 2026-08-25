@@ -1,0 +1,155 @@
+package handler
+
+{{.Imports}}
+
+// {{.R.HandlerType}} serves the {{.R.RouteBase}} routes.
+//
+// The embedded *serverHandler.Base is what makes this type satisfy
+// serverHandler.Handler. Omitting it compiles cleanly and then fails at start-up
+// as an Uber-FX graph error naming a type rather than a file, which is a
+// materially harder thing to debug than a compile error.
+type {{.R.HandlerType}} struct {
+	*serverHandler.Base
+	svc *repo.{{.R.RepoType}}
+}
+
+func New{{.R.HandlerType}}(svc *repo.{{.R.RepoType}}) *{{.R.HandlerType}} {
+	base := serverHandler.New("{{.R.PluralTitle}}").SetPrefix("/v1").AddPrefix("")
+	return &{{.R.HandlerType}}{Base: base, svc: svc}
+}
+
+// Routes declares this handler's routes.
+//
+// Every route carries .Name(...) because the generated OpenAPI document takes
+// its operation names from it — an unnamed route is missing from
+// /docs/v3Doc.json even though it serves correctly.
+func (h *{{.R.HandlerType}}) Routes() []serverRoute.Route {
+	return []serverRoute.Route{
+{{- if .R.Has "create"}}
+		serverRoute.POST("{{.R.RouteBase}}", h.{{.R.HandlerCreate}}).Name("Create {{.R.Title}}"),
+{{- end}}
+{{- if .R.Has "list"}}
+		serverRoute.GET("{{.R.RouteBase}}", h.{{.R.HandlerList}}).Name("List {{.R.PluralTitle}}"),
+{{- end}}
+{{- if .R.Has "get"}}
+		serverRoute.GET("{{.R.RouteBase}}/:id", h.{{.R.HandlerGet}}).Name("Get {{.R.Title}} By ID"),
+{{- end}}
+{{- if .R.Has "update"}}
+		serverRoute.PUT("{{.R.RouteBase}}/:id", h.{{.R.HandlerUpdate}}).Name("Update {{.R.Title}} By ID"),
+{{- end}}
+{{- if .R.Has "delete"}}
+		serverRoute.DELETE("{{.R.RouteBase}}/:id", h.{{.R.HandlerDelete}}).Name("Delete {{.R.Title}} By ID"),
+{{- end}}
+	}
+}
+{{if .R.Has "create"}}
+func (h *{{.R.HandlerType}}) {{.R.HandlerCreate}}(sctx *serverRoute.Context, req {{.R.CreateReq}}) (*resp.{{.R.CreateResp}}, error) {
+	{{.R.Var}}, err := h.svc.{{.R.RepoCreate}}(sctx.Ctx, {{selargs "req." .R.CreateParams}})
+	if err != nil {
+		log.Error(sctx.Ctx, "Error creating {{.R.Var}}: %v", err)
+		return nil, err
+	}
+	log.Info(sctx.Ctx, "{{.R.Title}} created with ID: %d", {{.R.Var}}.ID)
+	r := &resp.{{.R.CreateResp}}{
+		StatusCodeAndMessage: port.CreateSuccess,
+		Data:                 resp.{{.R.NewItemResp}}({{.R.Var}}),
+	}
+	return r, nil
+}
+{{end}}
+{{- if .R.Has "list"}}
+{{- if .R.UseListParams}}
+func (h *{{.R.HandlerType}}) {{.R.HandlerList}}(sctx *serverRoute.Context, req {{.R.ListParams}}) (*resp.{{.R.ListResp}}, error) {
+{{- range .R.ListFilters}}
+	var {{.Var}}Filter *{{.GoType}}
+	if {{.ZeroTest}} {
+		{{.Var}}Filter = &req.{{.Go}}
+	}
+{{- end}}
+
+	{{.R.PluralVar}}, err := h.svc.{{.R.RepoList}}(sctx.Ctx, req.Skip, req.Limit{{range .R.ListFilters}}, {{.Var}}Filter{{end}})
+	if err != nil {
+		log.Error(sctx.Ctx, "Error fetching {{.R.PluralVar}}: %v", err)
+		return nil, err
+	}
+	data := resp.{{.R.NewItemsResp}}({{.R.PluralVar}})
+	md := port.NewMetaDataResponse(req.Skip, req.Limit, uint64(len(data)))
+	r := &resp.{{.R.ListResp}}{
+		StatusCodeAndMessage: port.ListSuccess,
+		MetaDataResponse:     md,
+		Data:                 data,
+	}
+	return r, nil
+}
+{{- else}}
+func (h *{{.R.HandlerType}}) {{.R.HandlerList}}(sctx *serverRoute.Context, _ struct{}) (*resp.{{.R.ListResp}}, error) {
+	{{.R.PluralVar}}, err := h.svc.{{.R.RepoList}}(sctx.Ctx)
+	if err != nil {
+		log.Error(sctx.Ctx, "Error fetching {{.R.PluralVar}}: %v", err)
+		return nil, err
+	}
+	data := resp.{{.R.NewItemsResp}}({{.R.PluralVar}})
+	md := port.NewMetaDataResponse(0, 0, uint64(len(data)))
+	r := &resp.{{.R.ListResp}}{
+		StatusCodeAndMessage: port.ListSuccess,
+		MetaDataResponse:     md,
+		Data:                 data,
+	}
+	return r, nil
+}
+{{- end}}
+{{end}}
+{{- if .R.Has "get"}}
+func (h *{{.R.HandlerType}}) {{.R.HandlerGet}}(sctx *serverRoute.Context, req {{.R.IDUri}}) (*resp.{{.R.FetchResp}}, error) {
+	{{.R.Var}}, err := h.svc.{{.R.RepoGet}}(sctx.Ctx, req.ID)
+	if err != nil {
+		log.Error(sctx.Ctx, "Error fetching {{.R.Var}} by ID: %v", err)
+		return nil, err
+	}
+	r := &resp.{{.R.FetchResp}}{
+		StatusCodeAndMessage: port.FetchSuccess,
+		Data:                 resp.{{.R.NewItemResp}}({{.R.Var}}),
+	}
+	return r, nil
+}
+{{end}}
+{{- if .R.Has "update"}}
+func (h *{{.R.HandlerType}}) {{.R.HandlerUpdate}}(sctx *serverRoute.Context, req {{.R.UpdateReq}}) (*resp.{{.R.UpdateResp}}, error) {
+{{- range .R.UpdateParams}}
+	var {{.Name}} {{.Type}}
+{{- if .AlwaysSet}}
+	// A false bool is indistinguishable from an omitted one on a value-typed
+	// request field, so this column is always written.
+	{{.Name}} = &req.{{.Field.Go}}
+{{- else}}
+	if {{.ZeroTest "req."}} {
+		{{.Name}} = &req.{{.Field.Go}}
+	}
+{{- end}}
+{{- end}}
+
+	{{.R.Var}}, err := h.svc.{{.R.RepoUpdate}}(sctx.Ctx, req.ID, {{args .R.UpdateParams}})
+	if err != nil {
+		log.Error(sctx.Ctx, "Error updating {{.R.Var}} by ID: %v", err)
+		return nil, err
+	}
+	r := &resp.{{.R.UpdateResp}}{
+		StatusCodeAndMessage: port.UpdateSuccess,
+		Data:                 resp.{{.R.NewItemResp}}({{.R.Var}}),
+	}
+	return r, nil
+}
+{{end}}
+{{- if .R.Has "delete"}}
+func (h *{{.R.HandlerType}}) {{.R.HandlerDelete}}(sctx *serverRoute.Context, req {{.R.IDUri}}) (*resp.{{.R.DeleteResp}}, error) {
+	err := h.svc.{{.R.RepoDelete}}(sctx.Ctx, req.ID)
+	if err != nil {
+		log.Error(sctx.Ctx, "Error deleting {{.R.Var}} by ID: %v", err)
+		return nil, err
+	}
+	r := &resp.{{.R.DeleteResp}}{
+		StatusCodeAndMessage: port.DeleteSuccess,
+	}
+	return r, nil
+}
+{{end}}

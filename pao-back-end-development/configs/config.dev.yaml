@@ -1,0 +1,111 @@
+appname: "Pao-App" # change appname accordingly. This is necessary for tracing. else will not work.
+trace:
+  enabled: true #trace enable/disable
+  processor: 
+    type: "otlp-grpc"
+    options:
+      host: "localhost:4317"
+  sampler:
+    type: always-on
+    # type: parent-based-trace-id-ratio
+    options: 
+      ratio: 0.1
+db:
+  username: "" # change to your database username
+  password: "" # change to your database password
+  host: "" # change to your database host
+  port: "" # change to your database port
+  database: "" # change to your database name
+  schema: "" # change to your database schema
+  maxconns: 10
+  minconns: 1
+  maxconnlifetime: 30
+  maxconnidletime: 10
+  healthcheckperiod: 5
+  QueryTimeoutLow : 2s
+  QueryTimeoutMed : 5s
+info:  ## This is the information that will be displayed in the swagger
+  name: "Pao-App"
+  version: "1.0.0"
+  description: "Pao service"
+  title: "PaoApp"
+  terms: "https://example.com/terms"
+  email: "test@gmail.com" ## This is the email address to contact the API maintainer and this reflects in swagger
+metrics:
+  expose: true   #metrics enable/disable.
+  buckets: 
+  collect: 
+    build: false
+    go: false
+    process: false  
+    routes: true
+server: 
+  debug:
+    stats:
+      expose: true #stats enable/disable
+      path: "/debug/statsviz"
+    pprof:
+      expose: true #pprof enable/disable
+      path: "/debug/pprof"
+  dashboard:
+    Enabled: true #dashboard enable/disable
+  healthcheck:
+    expose: true     #healthcheck enable/disable
+    path: "/healthzz"   
+  bodylimit: 1000485
+  readbuffersize: 16384
+  addr: ":8080"
+  readtimeout: 10s
+  writetimeout: 10s
+  timeout: 40 ## Over all timeout for the request  
+  cors:       
+    alloworigins:
+      - "http://localhost:3000"
+      - "http://localhost:8080"        
+    allowheaders:
+      - "Authorization"
+      - "Content-Type"
+      - "X-Request-Id"
+    allowmethods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+      - "OPTIONS" 
+log:
+  level: "debug"
+  format: "json"
+  output: "stdout"
+client: 
+  baseurl: "http://localhost:8080"
+minio:
+  url: ""
+  accessKey: ""
+  secretKey: ""
+  bucketName: ""
+
+ecms:
+# token_url: http://172.24.23.159/server/api/ecms/item/token
+# upload_url: http://172.24.23.159/server/api/ecms/item/PLI/create
+baseUrl: http://172.24.23.159/server/api/ecms
+access_key: pao123
+secret_key: pao-secret-key-123
+service_name: /bepao/
+
+temporal:
+  host: ""
+  port: ""
+  certpath: ""
+pfms:
+  username: "POSTwebsvc"
+  requestsource: "POST"
+  password: "jhI5nAdyb1qOEjmcB3JvWrHRYyr2pv8PRhzu6Flbp2U="
+  baseurl: "https://stgapi.pfms.gov.in/gifmisapi"
+urls:
+  budgetcall: $https://dev.cept.gov.in/bebudget/v1/consumptions/transfer-entry
+  subaccountscall1: "https://dev.cept.gov.in/besubaccounts/v1/cash-books/delete"
+  subaccountscall2: "https://dev.cept.gov.in/besubaccounts/v1/cash-books"
+  subaccountscall3: "https://dev.cept.gov.in/besubaccounts/v1/cash-books/validate"
+  subaccountscall4: "https://dev.cept.gov.in/besubaccounts/v1/cash-accounts/deletecashaccount"
+  subaccountscall5: "https://dev.cept.gov.in/besubaccounts/v1/transfer-entries"
+

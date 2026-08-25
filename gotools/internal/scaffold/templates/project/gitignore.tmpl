@@ -1,0 +1,28 @@
+# Build output
+/bin/
+/dist/
+{{.P.BinaryName}}
+{{.P.BinaryName}}.exe
+*.test
+*.out
+
+# Coverage and test artefacts. These end up committed surprisingly often, and
+# a legacy-audit rule exists specifically because they were.
+cover.html
+coverage
+coverage.*
+test_results.txt
+gin.log
+
+# Local environment
+.env
+.env.*
+*.local.yaml
+
+# Editor and tooling
+.idea/
+.vscode/
+.DS_Store
+
+# Agent working state
+.dakcoder/

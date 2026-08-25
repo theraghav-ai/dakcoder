@@ -1,0 +1,20 @@
+# Golden snapshots are byte-exact fixtures. Two of them — handler/request.go
+# and bootstrap/bootstrapper.go — are patched copies of the reference template,
+# which is CRLF throughout, and preserving those line endings is one of the
+# properties the tests assert (a patch that normalises them turns a three-line
+# insertion into a diff touching every line).
+#
+# Without this, git's autocrlf would rewrite the snapshots on checkout and the
+# golden tests would fail on one platform and pass on another. The .golden
+# extension keeps gofmt away from them; this keeps git away.
+internal/scaffold/testdata/golden/*.golden -text -diff
+internal/scaffold/testdata/golden/**/*.golden -text -diff
+
+# Everything else is normal text.
+* text=auto eol=lf
+*.go text eol=lf
+*.tmpl text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Makefile text eol=lf

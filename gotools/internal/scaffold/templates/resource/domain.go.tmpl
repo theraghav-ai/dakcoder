@@ -1,0 +1,18 @@
+package domain
+
+{{.Imports}}
+
+// {{.R.Name}} is the domain model for the {{.R.Table}} table.
+//
+// Every field carries both a json and a db tag. The db tag is not decoration:
+// pgx.RowToStructByName matches result columns to fields through it, so a
+// missing or misspelt db tag is a silent scan failure at runtime rather than a
+// compile error.
+type {{.R.Name}} struct {
+	ID int64 `json:"id" db:"id"`
+{{- range .R.Fields}}
+	{{.Go}} {{.GoType}} `json:"{{.JSON}}" db:"{{.DB}}"`
+{{- end}}
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
+}

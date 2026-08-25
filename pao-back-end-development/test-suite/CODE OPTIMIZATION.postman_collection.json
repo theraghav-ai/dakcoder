@@ -1,0 +1,1550 @@
+{
+	"info": {
+		"_postman_id": "634ebcd8-80b5-48f5-bc1e-0633b9397db4",
+		"name": "CODE OPTIMIZATION",
+		"schema": "https://schema.getpostman.com/json/collection/v2.0.0/collection.json",
+		"_exporter_id": "29582432",
+		"_collection_link": "https://api333-5502.postman.co/workspace/API-Workspace~965242f6-65ed-4793-8f11-db70aa95ed24/collection/29582432-634ebcd8-80b5-48f5-bc1e-0633b9397db4?action=share&source=collection_link&creator=29582432"
+	},
+	"item": [
+		{
+			"name": "HOA-CONFIG",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n        {\r\n            \"hoa\": \"999999999999999\",\r\n            \"account_code\": \"9999999558\",\r\n            \"account_code_description\": \"your_account_code_description_value_1\",\r\n            \"receipt_payment\": \"P\",\r\n            \"value_sign\":\"P\",\r\n            \"brief_description\": \"your_brief_description_value_1\",\r\n            \"part\": \"II\",\r\n            \"data_source_module\": \"your_data_source_module_value_1\",\r\n            \"created_by\": \"123458\",\r\n            \"grant_no\": \"013\",\r\n                        \"category\": \"9\",\r\n            \"fund_type\":\"Consolidated\",\r\n            \"authorisation_status\": \"1\"\r\n        }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/hoa-config"
+			},
+			"response": []
+		},
+		{
+			"name": "HOA",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/hoa-config/hoa?id=320107200020063&type=1",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"hoa-config",
+						"hoa"
+					],
+					"query": [
+						{
+							"key": "id",
+							"value": "320107200020063"
+						},
+						{
+							"key": "type",
+							"value": "1"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "OFFICE-NAME",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/office-names/21070552?type=1",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"office-names",
+						"21070552"
+					],
+					"query": [
+						{
+							"key": "type",
+							"value": "1"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "CASHBOOK-DDO-LIST",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/078103/cashbook/ddo-lists?date=2024-07-19",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"078103",
+						"cashbook",
+						"ddo-lists"
+					],
+					"query": [
+						{
+							"key": "date",
+							"value": "2024-07-19"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "CASHBOOK-DDO-DETAILS",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/ddo/102604/cashbook/ddo-details?date=2024-07-19",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"ddo",
+						"102604",
+						"cashbook",
+						"ddo-details"
+					],
+					"query": [
+						{
+							"key": "date",
+							"value": "2024-07-19"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "CASHBOOK-VERIFICATION-PENDING",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/078109/cashbook/verification-pending?from-date=2024-01-01&to-date=2024-10-01",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"078109",
+						"cashbook",
+						"verification-pending"
+					],
+					"query": [
+						{
+							"key": "from-date",
+							"value": "2024-01-01"
+						},
+						{
+							"key": "to-date",
+							"value": "2024-10-01"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "HOA-SEARCH",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/hoa-config/hoa-only?hoa=Parcel",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"hoa-config",
+						"hoa-only"
+					],
+					"query": [
+						{
+							"key": "hoa",
+							"value": "Parcel"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "CASHACCOUNT-DDO-DETAILS",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/ddo/102604/cashaccount/ddo-details?period=072024",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"ddo",
+						"102604",
+						"cashaccount",
+						"ddo-details"
+					],
+					"query": [
+						{
+							"key": "period",
+							"value": "072024"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "CASHACCOUNT-DDO-LIST",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/078109/cashaccount/ddo-lists?period=072024",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"078109",
+						"cashaccount",
+						"ddo-lists"
+					],
+					"query": [
+						{
+							"key": "period",
+							"value": "072024"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "TRANSFER-ENTRY-REPORT",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/099999/transfer-entry/reports?from-date=2024-04-01&to-date=2024-09-25&xml-generation-status=pending&verification-status=1",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"099999",
+						"transfer-entry",
+						"reports"
+					],
+					"query": [
+						{
+							"key": "from-date",
+							"value": "2024-04-01"
+						},
+						{
+							"key": "to-date",
+							"value": "2024-09-25"
+						},
+						{
+							"key": "xml-generation-status",
+							"value": "pending"
+						},
+						{
+							"key": "verification-status",
+							"value": "1"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "HOA-EXEMPTION",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/hoa-config/hoa-exemp?type=1&id=988888888888888",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"hoa-config",
+						"hoa-exemp"
+					],
+					"query": [
+						{
+							"key": "type",
+							"value": "1"
+						},
+						{
+							"key": "id",
+							"value": "988888888888888"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "ACCOUNT-CODE",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/hoa-config/acc-code?id=082110700500000",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"hoa-config",
+						"acc-code"
+					],
+					"query": [
+						{
+							"key": "id",
+							"value": "082110700500000"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "OBJECTION REPORT",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/objection/pao/report?code=102557&type=2&status=not-closed&from-date=2024-01-01&to-date=2024-10-01",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"objection",
+						"pao",
+						"report"
+					],
+					"query": [
+						{
+							"key": "code",
+							"value": "102557"
+						},
+						{
+							"key": "type",
+							"value": "2"
+						},
+						{
+							"key": "status",
+							"value": "not-closed"
+						},
+						{
+							"key": "from-date",
+							"value": "2024-01-01"
+						},
+						{
+							"key": "to-date",
+							"value": "2024-10-01"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "DDOs",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": "http://localhost:8080/v1/pao-gen/pao/078109/ddos"
+			},
+			"response": []
+		},
+		{
+			"name": "PAOs",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": "http://localhost:8080/v1/pao-gen/pao"
+			},
+			"response": []
+		},
+		{
+			"name": "PUBLIC ACCOUNT- BROAD-SHEET",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/ddo/102591/public-acct/broad-sheet?type=3&month-year=042024&major-head=8001",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"ddo",
+						"102591",
+						"public-acct",
+						"broad-sheet"
+					],
+					"query": [
+						{
+							"key": "type",
+							"value": "3"
+						},
+						{
+							"key": "month-year",
+							"value": "042024"
+						},
+						{
+							"key": "major-head",
+							"value": "8001"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "SUBACCOUNTS TE DDO REPORT",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/ddo/102557/transfer-entry/sub-accounts/reports?from-date=2023-01-01&to-date=2024-07-25&status=approved",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"ddo",
+						"102557",
+						"transfer-entry",
+						"sub-accounts",
+						"reports"
+					],
+					"query": [
+						{
+							"key": "from-date",
+							"value": "2023-01-01"
+						},
+						{
+							"key": "to-date",
+							"value": "2024-07-25"
+						},
+						{
+							"key": "status",
+							"value": "approved"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "SUBACCOUNTS TE PAO REPORT",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/078109/transfer-entry/sub-accounts/pao-reports?from-date=2023-01-01&to-date=2024-07-25&status=approved&type=1",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"078109",
+						"transfer-entry",
+						"sub-accounts",
+						"pao-reports"
+					],
+					"query": [
+						{
+							"key": "from-date",
+							"value": "2023-01-01"
+						},
+						{
+							"key": "to-date",
+							"value": "2024-07-25"
+						},
+						{
+							"key": "status",
+							"value": "approved"
+						},
+						{
+							"key": "type",
+							"value": "1"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "SUBACCOUNT TE DETAILS",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": "http://localhost:8080/v1/transfer-entry/sub-accounts/details/68000120240226113437"
+			},
+			"response": []
+		},
+		{
+			"name": "OBJECTION PRAO DETAILS",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/objection/prao/code?code=80000000&status=not-closed&type=1",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"objection",
+						"prao",
+						"code"
+					],
+					"query": [
+						{
+							"key": "code",
+							"value": "80000000"
+						},
+						{
+							"key": "status",
+							"value": "not-closed"
+						},
+						{
+							"key": "type",
+							"value": "1"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "APPROPRIATION ACCOUNT 1",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/public-acct/appr-acct-one?year=2022",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"public-acct",
+						"appr-acct-one"
+					],
+					"query": [
+						{
+							"key": "year",
+							"value": "2022"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "APPROPRIATION ACCOUNT 2",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/public-acct/appr-acct-two?year=2024",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"public-acct",
+						"appr-acct-two"
+					],
+					"query": [
+						{
+							"key": "year",
+							"value": "2024"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "PRAO ACCOUNT FETCH",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/078109/prao/accounts?period=032024",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"078109",
+						"prao",
+						"accounts"
+					],
+					"query": [
+						{
+							"key": "period",
+							"value": "032024"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "PRAO-ACCOUNT-SUBMISSION-STATUS",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/078109/prao/account-submission-status?period=032024",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"078109",
+						"prao",
+						"account-submission-status"
+					],
+					"query": [
+						{
+							"key": "period",
+							"value": "032024"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "PRAO-ACCOUNT-SUBMISSION-LIST",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/prao/823940734/account-submission-list?period=042024",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"prao",
+						"823940734",
+						"account-submission-list"
+					],
+					"query": [
+						{
+							"key": "period",
+							"value": "042024"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "XML-GENERATION-STATUS",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/078109/xml-generation-status?type=2&from-date=&to-date=&uniqueIdentifier=TE-07810920240606114555",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"078109",
+						"xml-generation-status"
+					],
+					"query": [
+						{
+							"key": "type",
+							"value": "2"
+						},
+						{
+							"key": "from-date",
+							"value": ""
+						},
+						{
+							"key": "to-date",
+							"value": ""
+						},
+						{
+							"key": "uniqueIdentifier",
+							"value": "TE-07810920240606114555"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "TE-XML-GENERATION-STATUS",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/078109/te-xml-generation-status?type=2&from-date=&to-date=&uniqueIdentifier=TE-07810920240703121359",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"078109",
+						"te-xml-generation-status"
+					],
+					"query": [
+						{
+							"key": "type",
+							"value": "2"
+						},
+						{
+							"key": "from-date",
+							"value": ""
+						},
+						{
+							"key": "to-date",
+							"value": ""
+						},
+						{
+							"key": "uniqueIdentifier",
+							"value": "TE-07810920240703121359"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "DOWNLOAD FILE",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "",
+						"value": "",
+						"type": "text",
+						"disabled": true
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "http://localhost:8080/v1/objection-file/download?key=pao-back-end/handler/dummy_pdf",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"objection-file",
+						"download"
+					],
+					"query": [
+						{
+							"key": "key",
+							"value": "pao-back-end/handler/dummy_pdf"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "GET REMUNERATION",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/public-acct/remuneration?type=1&id=2024",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"public-acct",
+						"remuneration"
+					],
+					"query": [
+						{
+							"key": "type",
+							"value": "1"
+						},
+						{
+							"key": "id",
+							"value": "2024"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "GET OBJECTION BY ID",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": "http://localhost:8080/v1/objection/OBJ102558202406251601163704/details"
+			},
+			"response": []
+		},
+		{
+			"name": "GET OBJECTION PRAO",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": "http://localhost:8080/v1/objection/OBJ078109202406251648358218/prao/details"
+			},
+			"response": []
+		},
+		{
+			"name": "CASHBOOK UPDATE",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/078109/cashbook/ddo-lists?from-date=2024-04-12&to-date=2024-10-12",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"078109",
+						"cashbook",
+						"ddo-lists"
+					],
+					"query": [
+						{
+							"key": "from-date",
+							"value": "2024-04-12"
+						},
+						{
+							"key": "to-date",
+							"value": "2024-10-12"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "CASHACCOUNT UPDATE",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/pao/078109/cashaccount/ddo-lists?period=072024",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"pao",
+						"078109",
+						"cashaccount",
+						"ddo-lists"
+					],
+					"query": [
+						{
+							"key": "period",
+							"value": "072024"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "OBJECTION PAO REPORT",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/objection/pao/report?code=078109&from-date=2023-01-01&to-date=2024-10-25&status=closed&type=1",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"objection",
+						"pao",
+						"report"
+					],
+					"query": [
+						{
+							"key": "code",
+							"value": "078109"
+						},
+						{
+							"key": "from-date",
+							"value": "2023-01-01"
+						},
+						{
+							"key": "to-date",
+							"value": "2024-10-25"
+						},
+						{
+							"key": "status",
+							"value": "closed"
+						},
+						{
+							"key": "type",
+							"value": "1"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "OBJECTION PRAO REPORT",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/objection/prao/report?code=PRAO12&from-date=2024-01-01&to-date=2024-10-25&status=closed&type=1",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"objection",
+						"prao",
+						"report"
+					],
+					"query": [
+						{
+							"key": "code",
+							"value": "PRAO12"
+						},
+						{
+							"key": "from-date",
+							"value": "2024-01-01"
+						},
+						{
+							"key": "to-date",
+							"value": "2024-10-25"
+						},
+						{
+							"key": "status",
+							"value": "closed"
+						},
+						{
+							"key": "type",
+							"value": "1"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "BULK HOA UPDATE",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[{\r\n            \"hoa\": \"999999999999999\",\r\n            \"account_code\": \"9999999558\",\r\n            \"account_code_description\": \"your_account_code_description_value_1\",\r\n            \"receipt_payment\": \"R\",\r\n            \"value_sign\": \"P\",\r\n            \"brief_description\": \"updated one\",\r\n            \"part\": \"I\",\r\n            \"data_source_module\": \"your_data_source_module_value_1\",\r\n            \"updated_by\": \"123458\",\r\n            \"status_flag\": true,\r\n             \"grant_no\": \"091\",\r\n                        \"category\": \"6\",\r\n             \"authorisation_status\": \"2\",\r\n  \"fund_type\": \"Consolidated\"\r\n        }]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/hoa-config/bulk-hoa"
+			},
+			"response": []
+		},
+		{
+			"name": "CASHBOOK VERIFICATION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n        {\r\n            \"ddo_code\": \"102604\",\r\n            \"business_date\": \"2024-07-19T00:00:00Z\",\r\n            \"closing_bal\": 21000,\r\n            \"opening_bal\": 11000,\r\n            \"verified_by\": \"10257696\",\r\n            \"h_verification\": \"true\",\r\n            \"hoa\": \"120100101200400\",\r\n            \"payment\": 0,\r\n            \"receipt\": 28000,\r\n            \"account_array\": [\r\n                {\r\n                    \"account_code\": \"1201005700\",\r\n                    \"account_code_description\": \"DEDUCT- COMMISSION PAID TO OUTSOURCED AGENTS FOR S\",\r\n                    \"receipt\": 28000,\r\n                    \"payment\": 0\r\n                }\r\n            ]\r\n        }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/pao-gen/cashbook/verifications"
+			},
+			"response": []
+		},
+		{
+			"name": "XML GENERATION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n  {\"office_id\": \"999999\", \"cb_date\": \"2024-03-08\",\"pao_code\":\"234323\",\"fin_year\":\"2023\"},\r\n    {\"office_id\": \"999999\", \"cb_date\": \"2024-03-09\",\"pao_code\":\"234323\",\"fin_year\":\"2023\"}\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/pao-gen/xml-generation"
+			},
+			"response": []
+		},
+		{
+			"name": "CASHACCOUNT VERIFICATION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n        {\r\n            \"ddo_code\": \"102604\",\r\n            \"period\": \"072024\",\r\n            \"closing_bal\": 35600000,\r\n            \"opening_bal\": 25600000,\r\n            \"verified_by\": \"10257696\",\r\n            \"h_verification\": \"true\",\r\n            \"hoa\": \"120100800130100\",\r\n            \"payment\": 118000,\r\n            \"receipt\": 2000000,\r\n            \"te_payment\": 0,\r\n            \"te_receipt\": 0,\r\n            \"account_array\": [\r\n                {\r\n                    \"account_code\": \"1201018400\",\r\n                    \"account_code_description\": \"Logistic Post - Transp. charges-FTL (Surafce)\",\r\n                    \"receipt\": 0,\r\n                    \"payment\": 118000\r\n                },\r\n                {\r\n                    \"account_code\": \"1201019900\",\r\n                    \"account_code_description\": \"Advance for Logistic Mails Service\",\r\n                    \"receipt\": 2000000,\r\n                    \"payment\": 0\r\n                }\r\n            ]\r\n        }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/pao-gen/cashaccount/verifications"
+			},
+			"response": []
+		},
+		{
+			"name": "TE POSTING",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n    {\r\n        \"pao_code\": \"099999\",\r\n        \"ddo_code\":        \"999991\",\r\n        \"hoa\": \"320108101030228\",\r\n        \"transfer_amount\": 110,\r\n        \"transfer_type\": \"D\",\r\n        \"created_by\": \"10257696\",\r\n        \"created_date\": \"2024-04-06\",\r\n        \"te_source_office_type\": \"PAO\",\r\n        \"remarks\":               \"created\"\r\n    },\r\n    {\r\n        \"pao_code\": \"099999\",\r\n        \"ddo_code\":        \"999991\",\r\n        \"hoa\": \"320107911010070\",\r\n        \"transfer_amount\": 110,\r\n        \"transfer_type\": \"C\",\r\n        \"created_by\": \"10257696\",\r\n        \"created_date\": \"2024-04-06\",\r\n        \"te_source_office_type\": \"PAO\",\r\n        \"remarks\":               \"created\"\r\n    }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/transfer-entry"
+			},
+			"response": []
+		},
+		{
+			"name": "HOA EXEMPTION CREATION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n        {\r\n            \"hoa\": \"999999999999984\",\r\n            \"year\": \"2024\",\r\n            \"circle\": \"11\",\r\n            \"created_by\":\"4555454\"\r\n        }\r\n    ]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/hoa-config/hoa-exemp"
+			},
+			"response": []
+		},
+		{
+			"name": "UPDATE EXEMPTION",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n       {\r\n            \"hoa\": \"999999999950001\",\r\n            \"year\": \"2024\",\r\n            \"circle\": \"11\",\r\n            \"updated_by\":\"7978999\",\r\n            \"updated_date\": \"2024-04-09T11:49:11.607458Z\",\r\n            \"status\": false,\r\n           \"authorisation_status\": \"3\"\r\n        }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/hoa-config/bulk-hoa-exemp"
+			},
+			"response": []
+		},
+		{
+			"name": "OBJECTION CREATION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n  \"pao_code\": \"078109\",\r\n  \"ddo_code\": \"102558\",\r\n  \"description\": \"Sample objection description\",\r\n  \"created_by\": \"John Doe\",\r\n  \"remarks\": [\r\n  ],\r\n  \"status_flag\": \"pending\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/objection"
+			},
+			"response": []
+		},
+		{
+			"name": "OBJECTION UPDATE",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n  \"objection_id\": \"OBJ303512202410160937222888\",\r\n  \"remarks\":\r\n    {\r\n      \"data\": \"\",\r\n      \"commented_by\": \"Jane Smith\",\r\n      \"commented_date\": \"2024-04-16T12:30:00Z\",\r\n      \"commented_office_id\": \"Office123\",\r\n\"filepath\": \"test\"\r\n    },\r\n\"updated_by\":   \"1025796\",\r\n    \"updated_date\": \"2024-06-19T00:00:00Z\"\r\n\r\n\r\n}\r\n",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/objection/OBJ303512202410160937222888/remarks"
+			},
+			"response": []
+		},
+		{
+			"name": "OBJECTION CLOSURE",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n    \"objection_id\": \"OBJ303512202410160937222888\",\r\n    \"status_flag\": \"Closed\",\r\n    \"remarks\": {\r\n        \"data\": \"Closure 5\",\r\n        \"commented_by\": \"Jane Smith\",\r\n        \"commented_date\": \"2024-04-16T12:30:00Z\",\r\n        \"commented_office_id\": \"Office123\"\r\n    },\r\n    \"closed_by\": \"1025796\",\r\n    \"closed_date\": \"2024-06-19T00:00:00Z\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/objection/OBJ303512202410160937222888/closure"
+			},
+			"response": []
+		},
+		{
+			"name": "SUBACCOUNTS TE VERIFICATION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n    \"sub_tes\":[\r\n   {\r\n            \"pao_code\": \"078109\",\r\n            \"ddo_code\": \"102595\",\r\n            \"trans_id\": \"68000120240418163719\",\r\n            \"hoa\": \"021001103000000\",\r\n            \"account_code\": \"9210000100\",\r\n            \"transfer_amount\": 1000,\r\n            \"transfer_type\": \"D\",\r\n            \"created_by\": \"11100011\",\r\n            \"created_date\": \"2024-08-10T05:58:27Z\",\r\n            \"status\": \"approved\",\r\n            \"approved_by\":\"10257696\",\r\n            \"approved_date\": \"2024-08-10T05:58:27Z\",\r\n            \"approver_remarks\": \"approver remark\"\r\n        }\r\n    ]\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/transfer-entry/sub-accounts/verification"
+			},
+			"response": []
+		},
+		{
+			"name": "TE-XML-GENERATION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n  {\"te_id\": \"09999920240507142633\",\"te_date\": \"2024-03-08\",\"pao_code\":\"099999\",\"fin_year\":\"2024\"},\r\n    { \"te_id\": \"09999920240508065734\",\"te_date\": \"2024-03-08\",\"pao_code\":\"099999\",\"fin_year\":\"2024\"}\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/transfer-entry/xml-generation"
+			},
+			"response": []
+		},
+		{
+			"name": "OBJECTION PRAO CREATION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n  \"prao_code\": \"PRAO12\",\r\n  \"pao_code\": \"078109\",\r\n  \"description\": \"Sample objection description\",\r\n  \"objection_id\": \"\",\r\n  \"created_by\": \"John Doe\",\r\n  \"created_date\": \"2024-04-16T10:00:00Z\",\r\n  \"remarks\": [\r\n    {\r\n      \"data\": \"Sample remark data 1\",\r\n      \"commented_by\": \"Jane Smith\",\r\n      \"commented_date\": \"2024-04-16T12:30:00Z\",\r\n      \"commented_office_id\": \"Office123\"\r\n    },\r\n    {\r\n      \"data\": \"Sample remark data 2\",\r\n      \"commented_by\": \"John Doe\",\r\n      \"commented_date\": \"2024-04-17T08:45:00Z\",\r\n      \"commented_office_id\": \"Office456\"\r\n    }\r\n  ],\r\n  \"status_flag\": \"pending\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/objection/prao"
+			},
+			"response": []
+		},
+		{
+			"name": "OBJECTION PRAO UPDATE",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n  \"objection_id\": \"OBJ078118202410110913158530\",\r\n  \"remarks\":\r\n    {\r\n      \"data\": \"Sample remark data 10\",\r\n      \"commented_by\": \"Jane Smith\",\r\n      \"commented_date\": \"2024-04-16T12:30:00Z\",\r\n      \"commented_office_id\": \"Office123\"\r\n    },\r\n    \"updated_by\":   \"1025796\",\r\n        \"updated_date\": \"2024-06-19T00:00:00Z\",\r\n        \"status_flag\":  \"DDO\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/objection/OBJ078118202410110913158530/prao/remarks"
+			},
+			"response": []
+		},
+		{
+			"name": "OBJECTION PRAO CLOSURE",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n  \"objection_id\": \"OBJ078118202410110913158530\",\r\n  \"status_flag\": \"Closed\",\r\n  \"remarks\":\r\n    {\r\n      \"data\": \"Closure 5\",\r\n      \"commented_by\": \"Jane Smith\",\r\n      \"commented_date\": \"2024-04-16T12:30:00Z\",\r\n      \"commented_office_id\": \"Office123\"\r\n    }\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/objection/OBJ078118202410110913158530/prao/closure"
+			},
+			"response": []
+		},
+		{
+			"name": "PRAO ACCOUNT SUBMISSION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n    \"pao_code\": \"078109\",\r\n    \"period\": \"072024\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/pao-gen/prao/account-submission"
+			},
+			"response": []
+		},
+		{
+			"name": "TE BULK-VERIFICATION",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n        {\r\n            \"ddo_code\": \"102595\",\r\n            \"hoa\": \"021001103000000\",\r\n            \"transfer_amount\": 1000,\r\n            \"transfer_type\": \"D\",\r\n            \"created_date\": \"2024-08-10T05:58:27Z\",\r\n            \"transfer_entry_id\": \"68000120240418163719\",\r\n            \"verification_status\": \"2\",\r\n            \"verified_by\": \"10257696\",\r\n            \"verified_date\": \"2024-08-10T05:58:27Z\",\r\n            \"approver_remarks\": \"verified by Sreejith\",\r\n            \"office_id\": 21280551\r\n        }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/transfer-entry/bulk-verification"
+			},
+			"response": []
+		},
+		{
+			"name": "UPLOAD FILE",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "formdata",
+					"formdata": [
+						{
+							"key": "folderPath",
+							"value": "pao-back-end/handler",
+							"type": "text"
+						},
+						{
+							"key": "file",
+							"type": "file",
+							"src": "/C:/Users/playm/Music/PAO OPTIMISATION/pao-back-end/handler/dummy-pdf.pdf"
+						}
+					]
+				},
+				"url": "http://localhost:8080/v1/objection-file/upload"
+			},
+			"response": []
+		},
+		{
+			"name": "REMUNERATION CREATION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n    {\r\n        \"financial-year\": \"2024\",\r\n        \"remuneration-item\": \"Savings Deposits\",\r\n        \"remuneration-type\": \"NAN\",\r\n        \"remuneration-rate\": 219.26,\r\n        \"updated-by\": \"1223222\", // to be used only when updating the rates\r\n        \"updated-date\": \"2024-06-28T00:00:00Z\",\r\n        \"approved-by\": \"1223222\", // to be used only when approving the rates\r\n        \"approved-date\": \"2024-06-28T00:00:00Z\",\r\n        \"status\": true,\r\n        \"authorisation-status\": \"2\"\r\n    }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/public-acct/remuneration"
+			},
+			"response": []
+		},
+		{
+			"name": "BULK-REMUNERATION-UPDATE",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n    {\r\n        \"financial-year\": \"2024\",\r\n        \"remuneration-item\": \"Savings Deposits\",\r\n        \"remuneration-type\": \"NA\",\r\n        \"remuneration-rate\": 219.23,\r\n        \"updated-by\": \"1223222\",\r\n        \"updated-date\": \"2024-06-28T00:00:00Z\",\r\n        \"status\": true,\r\n        \"authorisation-status\": \"Approved\"\r\n    }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/public-acct/bulk-remuneration"
+			},
+			"response": []
+		},
+		{
+			"name": "HOA DESCRIPTION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n    {\r\n        \"hoa\": \"320108102030126\"\r\n    },\r\n    {\r\n        \"hoa\": \"320105101010327\"\r\n    },\r\n    {\r\n        \"hoa\": \"320105053030121\"\r\n    }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/hoa-config/hoa/description"
+			},
+			"response": []
+		},
+		{
+			"name": "HOA DESCRIPTION EXEMPTION",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n    {\r\n        \"hoa\": \"320108102030126\",\r\n        \"year\": \"2024\",\r\n        \"office_id\": \"26000000\"\r\n    },\r\n    {\r\n        \"hoa\": \"320105101010327\",\r\n        \"year\": \"2024\",\r\n        \"office_id\": \"26000000\"\r\n    },\r\n    {\r\n        \"hoa\": \"320101001010108\",\r\n        \"year\": \"2024\",\r\n        \"office_id\": \"26000000\"\r\n    }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/hoa-config/hoa/description-exemp"
+			},
+			"response": []
+		},
+		{
+			"name": "TE BULK VERIFICATION",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "[\r\n        {\r\n            \"ddo_code\": \"102595\",\r\n            \"hoa\": \"021001103000000\",\r\n            \"transfer_amount\": 1000,\r\n            \"transfer_type\": \"D\",\r\n            \"created_date\": \"2024-08-10T05:58:27Z\",\r\n            \"transfer_entry_id\": \"68000120240418163719\",\r\n            \"verification_status\": \"2\",\r\n            \"verified_by\": \"10257696\",\r\n            \"verified_date\": \"2024-08-10T05:58:27Z\",\r\n            \"approver_remarks\": \"verified by Sreejith\",\r\n            \"office_id\": 21280551\r\n        }\r\n]",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": "http://localhost:8080/v1/transfer-entry/bulk-verification"
+			},
+			"response": []
+		},
+		{
+			"name": "TAX DETAILS",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/v1/pao-gen/ddo/102555/tax-details?period=032024&type=3",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"v1",
+						"pao-gen",
+						"ddo",
+						"102555",
+						"tax-details"
+					],
+					"query": [
+						{
+							"key": "period",
+							"value": "032024"
+						},
+						{
+							"key": "type",
+							"value": "3"
+						}
+					]
+				}
+			},
+			"response": []
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					"pm.test(\"Response has the required fields - success, message, data\", function () {\r",
+					"   // const responseData = pm.response.json();\r",
+					"    \r",
+					"    pm.expect(pm.response.code).to.be.within(200, 299);  // Check for any 2XX status code\r",
+					"    // pm.expect(responseData).to.be.an('object');\r",
+					"    // pm.expect(responseData).to.have.property('success');\r",
+					"    // pm.expect(responseData).to.have.property('message');\r",
+					"    // pm.expect(responseData).to.have.property('data');\r",
+					"});"
+				]
+			}
+		}
+	]
+}

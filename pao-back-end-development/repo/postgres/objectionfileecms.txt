@@ -1,0 +1,262 @@
+package repository
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
+	"strings"
+	"sync"
+	"time"
+
+	config "gitlab.cept.gov.in/it-2.0-common/api-config"
+
+	"github.com/gin-gonic/gin"
+)
+
+type ECMSObjectionFileRepository struct {
+	Cfg *config.Config
+
+	httpClient *http.Client
+	mu         sync.Mutex
+	token      string
+	cookies    []*http.Cookie
+	tokenExp   time.Time
+}
+
+func NewECMSObjectionFileRepository(Cfg *config.Config) *ECMSObjectionFileRepository {
+	return &ECMSObjectionFileRepository{
+		Cfg:        Cfg,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+func (fr *ECMSObjectionFileRepository) baseURL() string {
+	return strings.TrimRight(firstNonEmptyECMS(
+		fr.Cfg.GetString("ecms.baseUrl"),
+		fr.Cfg.GetString("ecms.base_url"),
+	), "/")
+}
+
+func (fr *ECMSObjectionFileRepository) serviceName() string {
+	return strings.Trim(firstNonEmptyECMS(
+		fr.Cfg.GetString("ecms.serviceName"),
+		fr.Cfg.GetString("ecms.service_name"),
+	), "/")
+}
+
+func (fr *ECMSObjectionFileRepository) ServiceName() string {
+	return fr.serviceName()
+}
+
+func (fr *ECMSObjectionFileRepository) getToken(ctx context.Context) (string, []*http.Cookie, error) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+
+	if fr.token != "" && time.Now().Before(fr.tokenExp.Add(-30*time.Second)) {
+		return fr.token, fr.cookies, nil
+	}
+
+	payload, err := json.Marshal(map[string]string{
+		"access_key": firstNonEmptyECMS(
+			fr.Cfg.GetString("ecms.accessKey"),
+			fr.Cfg.GetString("ecms.access_key"),
+		),
+		"secret_key": firstNonEmptyECMS(
+			fr.Cfg.GetString("ecms.secretKey"),
+			fr.Cfg.GetString("ecms.secret_key"),
+		),
+		"service_name": fr.serviceName(),
+	})
+	if err != nil {
+		return "", nil, fmt.Errorf("marshal ecms token payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fr.baseURL()+"/token", bytes.NewReader(payload))
+	if err != nil {
+		return "", nil, fmt.Errorf("create ecms token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := fr.httpClient.Do(req)
+	if err != nil {
+		return "", nil, fmt.Errorf("call ecms token api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return "", nil, fmt.Errorf("ecms token error (%d): %s", resp.StatusCode, compactECMS(b))
+	}
+
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", nil, fmt.Errorf("decode ecms token response: %w", err)
+	}
+	if strings.TrimSpace(out.Token) == "" {
+		return "", nil, fmt.Errorf("ecms token response did not include token")
+	}
+
+	fr.token = out.Token
+	fr.cookies = resp.Cookies()
+	fr.tokenExp = time.Now().Add(15 * time.Minute)
+	return fr.token, fr.cookies, nil
+}
+
+func (fr *ECMSObjectionFileRepository) UploadFile(gctx *gin.Context, objectID, transactionID string, file multipart.File, filename, contentType string) error {
+	ctx := gctx.Request.Context()
+	defer file.Close()
+
+	token, cookies, err := fr.getToken(ctx)
+	if err != nil {
+		return err
+	}
+
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+
+	fw, err := w.CreateFormFile("file", filename)
+	if err != nil {
+		return fmt.Errorf("create ecms file part: %w", err)
+	}
+	if _, err := io.Copy(fw, file); err != nil {
+		return fmt.Errorf("write ecms file part: %w", err)
+	}
+
+	if err := w.WriteField("token", token); err != nil {
+		return fmt.Errorf("write ecms token field: %w", err)
+	}
+
+	meta, err := json.Marshal(map[string]string{
+		"object_id":      objectID,
+		"transaction_id": transactionID,
+		"service_name":   fr.serviceName(),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal ecms metadata: %w", err)
+	}
+
+	metaHeader := make(textproto.MIMEHeader)
+	metaHeader.Set("Content-Disposition", `form-data; name="metadata"`)
+	metaHeader.Set("Content-Type", "application/json")
+	metaPart, err := w.CreatePart(metaHeader)
+	if err != nil {
+		return fmt.Errorf("create ecms metadata part: %w", err)
+	}
+	if _, err := metaPart.Write(meta); err != nil {
+		return fmt.Errorf("write ecms metadata part: %w", err)
+	}
+
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("close ecms multipart writer: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fr.baseURL()+"/"+fr.serviceName()+"/create", body)
+	if err != nil {
+		return fmt.Errorf("create ecms upload request: %w", err)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Token", token)
+	for _, ck := range cookies {
+		req.AddCookie(ck)
+	}
+
+	resp, err := fr.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("call ecms upload api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("ecms create failed (%d): %s", resp.StatusCode, compactECMS(b))
+	}
+	return nil
+}
+
+func (fr *ECMSObjectionFileRepository) DownloadFile(gctx *gin.Context, objectID, transactionID string) ([]byte, error) {
+	ctx := gctx.Request.Context()
+
+	token, cookies, err := fr.getToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+
+	identifier, err := json.Marshal(map[string]string{
+		"object_id":      objectID,
+		"transaction_id": transactionID,
+		"service_name":   fr.serviceName(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal ecms identifier: %w", err)
+	}
+
+	idHeader := make(textproto.MIMEHeader)
+	idHeader.Set("Content-Disposition", `form-data; name="identifier"`)
+	idHeader.Set("Content-Type", "application/json")
+	idPart, err := w.CreatePart(idHeader)
+	if err != nil {
+		return nil, fmt.Errorf("create ecms identifier part: %w", err)
+	}
+	if _, err := idPart.Write(identifier); err != nil {
+		return nil, fmt.Errorf("write ecms identifier part: %w", err)
+	}
+
+	if err := w.WriteField("token", token); err != nil {
+		return nil, fmt.Errorf("write ecms token field: %w", err)
+	}
+
+	if err := w.Close(); err != nil {
+		return nil, fmt.Errorf("close ecms multipart writer: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fr.baseURL()+"/"+fr.serviceName()+"/retrieve/bitstream", body)
+	if err != nil {
+		return nil, fmt.Errorf("create ecms retrieve request: %w", err)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Token", token)
+	for _, ck := range cookies {
+		req.AddCookie(ck)
+	}
+
+	resp, err := fr.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call ecms retrieve api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("ecms retrieve failed (%d): %s", resp.StatusCode, compactECMS(b))
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+func compactECMS(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 500 {
+		return s[:500] + "...(truncated)"
+	}
+	return s
+}
+
+func firstNonEmptyECMS(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}

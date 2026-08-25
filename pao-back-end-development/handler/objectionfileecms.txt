@@ -1,0 +1,140 @@
+package handler
+
+import (
+	"mime"
+	"net/http"
+	"path/filepath"
+	"strings"
+
+	config "gitlab.cept.gov.in/it-2.0-common/api-config"
+
+	repo "gotemplate/repo/postgres"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
+	apierrors "gitlab.cept.gov.in/it-2.0-common/api-errors"
+	log "gitlab.cept.gov.in/it-2.0-common/api-log"
+	validation "gitlab.cept.gov.in/it-2.0-common/api-validation"
+)
+
+type ECMSFileHandler struct {
+	svc    *repo.ECMSObjectionFileRepository
+	Config *config.Config
+}
+
+func NewECMSObjectionFileHandler(svc *repo.ECMSObjectionFileRepository, Config *config.Config) *ECMSFileHandler {
+	return &ECMSFileHandler{svc, Config}
+}
+
+// UploadObjectionFileHandler godoc
+//
+//	@Summary		Upload an objection file to ECMS
+//	@Description	Uploads a file to ECMS against an already-created objection.
+//	@Tags			ECMS-FILE
+//	@Accept			multipart/form-data
+//	@Produce		json
+//	@Param			objection_id	formData	string	true	"Existing objection ID"
+//	@Param			file			formData	file	true	"File to upload (PDF OR JPG OR JPEG ONLY)"
+//	@Success		201				{object}	map[string]string
+//	@Failure		400				{object}	apierrors.APIErrorResponse
+//	@Failure		500				{object}	apierrors.APIErrorResponse
+//	@Router			/v1/ecms/objection-file/upload [post]
+func (fh *ECMSFileHandler) UploadObjectionFileHandler(c *gin.Context) {
+	objectionID := strings.TrimSpace(c.PostForm("objection_id"))
+	if objectionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "objection_id is required"})
+		return
+	}
+
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file is required"})
+		return
+	}
+
+	if header.Size <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Uploaded file is empty"})
+		return
+	}
+
+	maxAllowedFileSize := int64(1 * 1024 * 1024)
+	if header.Size > maxAllowedFileSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File size should be less than 1MB"})
+		return
+	}
+
+	allowedExtensions := map[string]bool{"jpg": true, "pdf": true, "jpeg": true}
+	ext := filepath.Ext(header.Filename)
+	if !allowedExtensions[strings.ToLower(strings.TrimPrefix(ext, "."))] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file type. Only JPG and PDF are allowed"})
+		return
+	}
+
+	filename := strings.ToLower(header.Filename)
+	filename = strings.ReplaceAll(filename, " ", "_")
+	filename = strings.ReplaceAll(filename, "-", "_")
+
+	transactionID := uuid.New().String()
+	contentType := header.Header.Get("Content-Type")
+
+	err = fh.svc.UploadFile(c, objectionID, transactionID, file, filename, contentType)
+	if err != nil {
+		log.Error(c, "ECMS Upload File Repo call failed: %s", err.Error())
+		apierrors.HandleDBError(c, err)
+		return
+	}
+
+	defer c.Request.MultipartForm.RemoveAll()
+
+	c.JSON(http.StatusCreated, gin.H{
+		"transaction_id": transactionID,
+		"service_name":   fh.svc.ServiceName(),
+	})
+}
+
+type ECMSFileDownloadRequest struct {
+	ObjectionId   string `form:"objection_id" validate:"required,max=30"`
+	TransactionId string `form:"transaction_id" validate:"required"`
+}
+
+// FetchECMSObjectionFileHandler godoc
+//
+//	@Summary		Retrieve an objection file from ECMS
+//	@Tags			ECMS-FILE
+//	@Accept			json
+//	@Produce		application/octet-stream
+//	@Param			objection_id	query	string	true	"Objection ID"
+//	@Param			transaction_id	query	string	true	"ECMS transaction ID"
+//	@Success		200				{file}	file
+//	@Failure		400				{object}	apierrors.APIErrorResponse
+//	@Failure		404				{object}	apierrors.APIErrorResponse
+//	@Failure		500				{object}	apierrors.APIErrorResponse
+//	@Router			/v1/ecms/objection-file/download [get]
+func (fh *ECMSFileHandler) FetchECMSObjectionFileHandler(ctx *gin.Context) {
+	var req ECMSFileDownloadRequest
+	if err := ctx.ShouldBindQuery(&req); err != nil {
+		apierrors.HandleBindingError(ctx, err)
+		log.Error(ctx, "Binding failed for ECMSFileDownloadRequest: %s", err.Error())
+		return
+	}
+	if err := validation.ValidateStruct(req); err != nil {
+		apierrors.HandleValidationError(ctx, err)
+		log.Error(ctx, "Validation failed for ECMSFileDownloadRequest: %s", err.Error())
+		return
+	}
+
+	fileBytes, err := fh.svc.DownloadFile(ctx, req.ObjectionId, req.TransactionId)
+	if err != nil {
+		log.Error(ctx, "ECMS Download Repo call failed: %s", err.Error())
+		apierrors.HandleError(ctx, err)
+		return
+	}
+
+	contentType := mime.TypeByExtension(".pdf")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	ctx.Data(http.StatusOK, contentType, fileBytes)
+}

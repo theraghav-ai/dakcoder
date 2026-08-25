@@ -1,0 +1,46 @@
+{{if .R.Has "create"}}
+// {{.R.CreateReq}} is the payload to create a {{.R.Var}}.
+type {{.R.CreateReq}} struct {
+{{- range .R.Fields}}
+	{{.Go}} {{.GoType}} `json:"{{.JSON}}" validate:"{{.CreateValidate}}"`
+{{- end}}
+}
+{{end}}
+{{- if .R.Has "update"}}
+// {{.R.UpdateReq}} is the payload to update a {{.R.Var}}. Every field is
+// optional — an omitted field leaves its column unchanged.
+type {{.R.UpdateReq}} struct {
+	ID int64 `uri:"id" validate:"required"`
+{{- range .R.Fields}}
+	{{.Go}} {{.GoType}} `json:"{{.JSON}}" validate:"{{.UpdateValidate}}"`
+{{- end}}
+}
+{{end}}
+{{- if .R.NeedsIDUri}}
+// {{.R.IDUri}} binds the :id path parameter.
+type {{.R.IDUri}} struct {
+	ID int64 `uri:"id" validate:"required"`
+}
+{{end}}
+{{- if .R.Has "list"}}
+type {{.R.ListParams}} struct {
+	port.MetadataRequest
+{{- range .R.ListFilters}}
+	{{.Go}} {{.GoType}} `form:"{{.Form}}" validate:"omitempty"`
+{{- end}}
+}
+{{- if .R.NeedsManualListValidate}}
+
+// Validate satisfies the framework's request-validator interface.
+//
+// It is hand-written because govalid generates a Validate() only for structs
+// that declare their own `validate` tags, and this one declares none — the tags
+// it relies on belong to the embedded port.MetadataRequest, which lives in a
+// file govalid does not read. Adding a filter field to this struct gives
+// govalid something to generate, at which point this method must be deleted or
+// it becomes a duplicate declaration.
+func (p *{{.R.ListParams}}) Validate() error {
+	return nil
+}
+{{- end}}
+{{end}}

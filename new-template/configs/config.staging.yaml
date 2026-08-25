@@ -1,0 +1,120 @@
+appname: "go-pis" 
+trace:
+  enabled: true #trace enable/disable
+  processor: 
+    type: "otlp-grpc"
+    options:
+      host: "localhost:4317"
+  sampler:
+    type: always-on
+    # type: parent-based-trace-id-ratio
+    options: 
+      ratio: 0.1
+cache:
+  redisserver: 10.212.116.107:6379
+  redispassword: DRETetfRohQidPeflsUwphHKrepgslUFolsPrjeamzuvtlgsRoqlamzUegnsoegK 
+  redisdbindex: 4
+  redisexpirationtime: 10m
+  lccapacity: 10000
+  lcnumshards: 20
+  lcttl: 2m 
+  lcevictionpercentage: 10
+  lcminrefreshdelay: 15m
+  lcmaxrefreshdelay: 30m
+  lcretrybasedelay: 1s
+  lcbatchsize: 10
+  lcbatchbuffertimeout: 30s
+  isredisenabled: true
+  islocalcacheenabled: false
+db: 
+  username: 
+  password: 
+  host:  
+  port: 
+  database: 
+  schema: 
+  maxconns: 10
+  minconns: 1
+  maxconnlifetime: 30
+  maxconnidletime: 10
+  healthcheckperiod: 5
+  QueryTimeoutLow: 2s
+  QueryTimeoutMed: 5s  
+info:  ## This is the information that will be displayed in the swagger
+  name: "go-pis"
+  version: "1.0.0"
+  description: "test service"
+  title: "go-pis"
+  terms: "https://example.com/terms"
+  email: "test@gmail.com" ## This is the email address to contact the API maintainer and this reflects in swagger
+metrics:
+  expose: true   #metrics enable/disable.
+  buckets: 
+  collect: 
+    build: false
+    go: false
+    process: false  
+    routes: true
+server: 
+  debug:
+    stats:
+      expose: true #stats enable/disable
+      path: "/debug/statsviz"
+    pprof:
+      expose: true #pprof enable/disable
+      path: "/debug/pprof"
+  dashboard:
+    Enabled: true #dashboard enable/disable
+  healthcheck:
+    expose: true     #healthcheck enable/disable
+    path: "/healthzz"   
+  bodylimit: 2097152
+  readbuffersize: 16384
+  addr: ":8080"
+  readtimeout: 10s
+  writetimeout: 60s
+  timeout: 40 ## Over all timeout for the request  
+  cors:       
+    alloworigins:
+      - "http://localhost:3000"
+      - "http://localhost:8080"        
+    allowheaders:
+      - "Authorization"
+      - "Content-Type"
+      - "X-Request-Id"
+    allowmethods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+      - "OPTIONS"  
+log:
+  level: "info"
+  format: "json"
+  output: "stdout"
+client: 
+  baseurl: "https://staging.cept.gov.in/bepis"
+
+# temporal:
+#   host: "temporaldev.cept.gov.in"
+#   port: "80"
+  # host: "localhost"
+  # port: "7233"
+
+minio:
+  url: 
+  accessKey: ""
+  secretKey: ""
+  bucketName: 
+keycloakURL : "https://staging.cept.gov.in/beitrolemgmt/rolemanagement/v1/auth/ChangeUserStatus"
+RoleMngmtURL: "https://staging.cept.gov.in/beitrolemgmt/rolemanagement/v1/auth/CreateUser"
+LeaveSubstituteurl: https://staging.cept.gov.in/belms/v1/leave-substitutes
+PayrollURL: https://staging.cept.gov.in/bepayroll/v1/employee-details
+SmsURL: https://staging.cept.gov.in/bemsggateway/v1/sms-request
+assignChargeAPIURL: "https://staging.cept.gov.in/beitrolemgmt/rolemanagement/v1/temp/temp-attach"
+
+#Aadhaar Authentication URL
+AADHAAR_OTP_GEN_URL: https://dopauth.cept.gov.in/aua/otp-gen
+AADHAAR_OTP_AUTHENTICATION_URL: https://dopauth.cept.gov.in/aua/otp-auth
+AADHAAR_CLIENT_ID: darpan
+AADHAAR_CLIENT_SECRET: DOPAUAUVeduks6i5sK05MfeIQzJ4fFigbpwe03T21NNzSYzZ4JJRlpAoVznshvFm

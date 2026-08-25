@@ -1,0 +1,14 @@
+{
+  "id": "validation-not-firing",
+  "symptom": "Invalid input is accepted, or valid input is rejected with a 422 naming a field that looks correct.",
+  "cause": "The generated validator is stale. It is produced from the validate tags on the request struct, so changing a tag without regenerating leaves the old rules in force \u2014 and hand-editing the generated file means the next regeneration silently reverts it.",
+  "steps": [
+    "Confirm the request struct lives in handler/request.go. Validators are generated only from there.",
+    "Run govalid_gen. It runs govalid ./request.go from the handler directory.",
+    "Run go_build: a regenerated validator referencing a renamed field fails to compile, which is the signal you want.",
+    "Never edit request_*_validator.go. The header says DO NOT EDIT and it means it."
+  ],
+  "tool": "govalid_gen",
+  "watch_out": "A struct with no validate tags generates no validator at all, so the endpoint accepts anything. An absent validator file is the symptom, not an omission.",
+  "citation": "@skill:request-dto"
+}

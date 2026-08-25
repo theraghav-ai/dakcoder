@@ -1,0 +1,12 @@
+{
+  "name": "Pension",
+  "plural": "Pensions",
+  "fields": [
+    {"go": "PpoNumber", "type": "string", "validate": "required", "sql": "varchar(20) NOT NULL"},
+    {"go": "Amount", "type": "float64", "validate": "required", "sql": "numeric(12, 2) NOT NULL"},
+    {"go": "Status", "type": "string", "validate": "oneof=active suspended closed", "sql": "varchar(16) NOT NULL"},
+    {"go": "SanctionDate", "type": "time.Time", "validate": "required"}
+  ],
+  "operations": ["create", "list", "get", "update", "delete"],
+  "list_filters": [{"go": "Status"}]
+}

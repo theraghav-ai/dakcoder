@@ -1,0 +1,75 @@
+package response
+
+{{.Imports}}
+
+// {{.R.ItemResp}} is the wire representation of a {{.R.Name}}.
+//
+// Timestamps are strings, formatted "{{.Layout}}", so every service in the
+// estate renders them identically regardless of the client's timezone handling
+// (skill.md §Response DTO Pattern).
+type {{.R.ItemResp}} struct {
+	ID int64 `json:"id"`
+{{- range .R.Fields}}
+	{{.Go}} {{.RespType}} `json:"{{.JSON}}"`
+{{- end}}
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// {{.R.NewItemResp}} converts the domain model to its wire form. Conversion
+// lives here rather than in the handler so the repository never has to know
+// that an HTTP layer exists.
+func {{.R.NewItemResp}}(d domain.{{.R.Name}}) {{.R.ItemResp}} {
+	return {{.R.ItemResp}}{
+		ID: d.ID,
+{{- range .R.Fields}}
+		{{.Go}}: d.{{.Go}}{{if .IsTime}}.Format("{{$.Layout}}"){{end}},
+{{- end}}
+		CreatedAt: d.CreatedAt.Format("{{.Layout}}"),
+		UpdatedAt: d.UpdatedAt.Format("{{.Layout}}"),
+	}
+}
+
+func {{.R.NewItemsResp}}(data []domain.{{.R.Name}}) []{{.R.ItemResp}} {
+	res := make([]{{.R.ItemResp}}, 0, len(data))
+	for _, d := range data {
+		res = append(res, {{.R.NewItemResp}}(d))
+	}
+	return res
+}
+
+// The operation envelopes.
+//
+// `json:",inline"` on the embedded status is load-bearing: without it the
+// embedded struct marshals as a nested object, so status_code and message end
+// up under a key instead of at the top level and every client breaks.
+{{if .R.Has "create"}}
+type {{.R.CreateResp}} struct {
+	port.StatusCodeAndMessage `json:",inline"`
+	Data                      {{.R.ItemResp}} `json:"data"`
+}
+{{end}}
+{{- if .R.Has "get"}}
+type {{.R.FetchResp}} struct {
+	port.StatusCodeAndMessage `json:",inline"`
+	Data                      {{.R.ItemResp}} `json:"data"`
+}
+{{end}}
+{{- if .R.Has "update"}}
+type {{.R.UpdateResp}} struct {
+	port.StatusCodeAndMessage `json:",inline"`
+	Data                      {{.R.ItemResp}} `json:"data"`
+}
+{{end}}
+{{- if .R.Has "delete"}}
+type {{.R.DeleteResp}} struct {
+	port.StatusCodeAndMessage `json:",inline"`
+}
+{{end}}
+{{- if .R.Has "list"}}
+type {{.R.ListResp}} struct {
+	port.StatusCodeAndMessage `json:",inline"`
+	port.MetaDataResponse     `json:",inline"`
+	Data                      []{{.R.ItemResp}} `json:"data"`
+}
+{{end}}

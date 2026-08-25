@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package proto.v1;
+
+option go_package = "gotemplate/gen/proto/v1;paocreation";
+
+import "buf/validate/validate.proto";
+
+message TransferEntryRequest {
+  string pao_code = 1 [(buf.validate.field).required=true];
+  string ddo_code = 2 [(buf.validate.field).required=true];
+  string hoa = 3;
+  double transfer_amount = 4;
+  string transfer_type = 5;
+  uint64 created_by = 6;
+  string created_date = 7;
+  string te_source_office_type = 8;
+  string remarks = 9;
+}
+
+message CreateTransferEntryGrpcHandlerRequest {
+  repeated TransferEntryRequest transfer_entries = 1;
+}
+
+message FetchTransferEntryCreationResponse {
+  string transfer_entry_id = 1;
+}
+
+message CreateTransferEntryGrpcHandlerResponse {
+    int32 status_code = 1 [json_name = "status_code"]; // Status code of the response
+    bool success = 2;      // Indicates if the operation was successful
+    string message = 3;    // Message describing the response
+    repeated FetchTransferEntryCreationResponse data = 4; // Data returned in the API response
+}
+message TransferEntryDirectRequest {
+  string pao_code = 1 [(buf.validate.field).required=true]; 
+  string ddo_code = 2 [(buf.validate.field).required=true];
+  string hoa = 3;
+  double transfer_amount = 4;
+  string transfer_type = 5;
+  uint64 created_by = 6;
+  uint64 verified_by = 7;
+  string te_source_office_type = 8;
+  string remarks = 9;
+}
+
+message CreateTransferEntryDirectGrpcHandlerRequest {
+  repeated TransferEntryDirectRequest transfer_entries = 1;
+}
+message FetchTransferEntryDirectCreationResponse {
+  string transfer_entry_id = 1;
+}
+
+message CreateTransferEntryDirectGrpcHandlerResponse {
+    int32 status_code = 1 [json_name = "status_code"]; // Status code of the response
+    bool success = 2;      // Indicates if the operation was successful
+    string message = 3;    // Message describing the response
+    repeated FetchTransferEntryDirectCreationResponse data = 4; // Data returned in the API response
+}
+service TransferEntryService{
+  rpc CreateTransferEntryGrpcHandler(CreateTransferEntryGrpcHandlerRequest) returns (CreateTransferEntryGrpcHandlerResponse){}
+  rpc CreateTransferEntryDirectGrpcHandler(CreateTransferEntryDirectGrpcHandlerRequest) returns (CreateTransferEntryDirectGrpcHandlerResponse){}
+}

@@ -1,0 +1,16 @@
+// Package port holds the shared request and response envelopes every handler
+// and every response DTO in this service builds on.
+//
+// Copied verbatim from the n-api-template reference so that a service
+// scaffolded here speaks exactly the same wire contract as every other IT 2.0
+// Go service. Keep it in step with the template rather than editing it locally:
+// response-dto and response-status in rules_lint check generated code against
+// the names declared here.
+package port
+
+type MetadataRequest struct {
+	Skip     uint64 `form:"skip,default=0" validate:"omitempty"`
+	Limit    uint64 `form:"limit,default=10" validate:"omitempty"`
+	OrderBy  string `form:"orderBy" validate:"omitempty"`
+	SortType string `form:"sortType" validate:"omitempty"`
+}

@@ -1,0 +1,14 @@
+# build output
+/gotools
+/gotools.exe
+/dist/
+/coverage.out
+*.bak
+
+# `make scaffold-demo` working directory
+/.demo/
+/.demo-spec.json
+
+# editor
+.idea/
+.vscode/

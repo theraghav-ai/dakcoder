@@ -1,0 +1,49 @@
+AppName: go-pao
+#appEnv: test
+AppEnv: production
+
+HttpUrl: 127.0.0.1
+HttpPort: 8080
+HttpAllowedOrigins: "*"
+Loglevel: info
+
+DBConnection: postgres
+DBHost: 10.20.84.23
+DBPort: 5432
+DBdatabase: paodb
+#DBdatabase: testdb
+DBUsername: pao_rw_user
+DBPassword: DoPrw@123
+
+
+RedisServer: localhost:6379
+RedisPassword: 
+
+ApiURL: test.cept.gov.in
+
+TokenSymmetricKey: 12345678901234567890123456789012
+TokenDuration: 15m
+ShutDownTime: 20s
+ShutDowntype: 
+
+MaxConns: 100
+MinConns: 5
+MaxConnLifetime: 20
+MaxConnIdleTime: 5
+HealthCheckPeriod: 1
+HealthCheckTimeout: 10
+
+minio:
+  url: s3.cept.gov.in
+  accessKey: iVvpBqz0aC4X5ANLn8X8
+  secretKey: p5p98Cef4AfkezdE9jtRsz1tWaX6nJ7H5qCnbpas
+  bucketName: pao
+
+AuthDefaultTimeout      : 10s
+AuthDefaultMaxRetries   : 3
+AuthDefaultRetryWait    : 1s
+AuthDefaultMaxRetryWait : 3s
+
+DBSchema: Pao
+DBQueryTimeoutLow : 2s
+DBQueryTimeoutMed : 5s

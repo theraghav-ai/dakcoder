@@ -1,0 +1,35 @@
+{
+  "_comment": "Pinned state of the template reference documents. Rules cite sections of these; changing a document without reviewing the rules that cite it is how the rule set drifts from the template it enforces (plan.md §14.4). Regenerate deliberately with `gotools doc-check --update` and review what moved.",
+  "docs": {
+    "SOP.md": {
+      "hash": "sha256:c7604ec40f5900a3544bf0ad92b7b47020b8a8f57ae03020853720a22e94da53",
+      "lines": 245,
+      "sections": 13,
+      "cited_sections": [
+        "Define the Routes",
+        "Running the application and Swagger Docs",
+        "Validation",
+        "[handler].go",
+        "bootstrap/bootstrapper.go",
+        "main.go"
+      ]
+    },
+    "skill.md": {
+      "hash": "sha256:a5bad15d64ff3ff805341cacf63df45a662c32e0e318f2c78048855e51dc0fd7",
+      "lines": 2340,
+      "sections": 50,
+      "cited_sections": [
+        "Bootstrap Configuration",
+        "Configuration Files",
+        "Domain Model Pattern",
+        "Error Handling",
+        "Handler Pattern",
+        "Naming Conventions",
+        "Repository Pattern",
+        "Request DTO Pattern",
+        "Response DTO Pattern",
+        "Routing Pattern"
+      ]
+    }
+  }
+}

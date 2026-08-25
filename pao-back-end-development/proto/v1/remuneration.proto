@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package proto.v1;
+
+option go_package = "gotemplate/gen/proto/v1;paocreation";
+
+import "buf/validate/validate.proto";
+
+message RemunerationCreationRequest {
+  string financial_year = 1 [(buf.validate.field).required=true];
+  string remuneration_item = 2 [(buf.validate.field).required=true];
+  string remuneration_type = 3 [(buf.validate.field).required=true];
+  float remuneration_item_count = 4 [(buf.validate.field).required=true];
+}
+
+message CreateRemunerationGrpcHandlerRequest {
+  repeated RemunerationCreationRequest remuneration_creation = 1;
+}
+
+message RemunerationCreationResponse {
+  string financial_year = 1;
+  string remuneration_item = 2;
+  string remuneration_type = 3;
+  float remuneration_rate = 4;
+  float remuneration_item_count = 5;
+  float item_remuneration = 6;
+}
+
+message CreateRemunerationGrpcHandlerResponse {
+  int32 status_code = 1 [json_name = "status_code"]; // Status code of the response
+  bool success = 2;      // Indicates if the operation was successful
+  string message = 3;    // Message describing the response
+  repeated RemunerationCreationResponse data = 4; // Data returned in the API response
+}
+service RemunerationService{
+  rpc CreateRemunerationGrpcHandler(CreateRemunerationGrpcHandlerRequest) returns (CreateRemunerationGrpcHandlerResponse){}
+}

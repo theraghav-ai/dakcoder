@@ -1,0 +1,1058 @@
+{
+  "component": "gotools",
+  "version": "dev",
+  "contract": "C1",
+  "tools": [
+    {
+      "name": "fx_wire",
+      "description": "Register a repository or handler in bootstrap/bootstrapper.go with the correct annotation. Never hand-edit it: an unannotated handler serves no routes.",
+      "mutates": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "ctor": {
+            "description": "the constructor's bare name, e.g. NewPensionHandler",
+            "type": "string"
+          },
+          "dry_run": {
+            "description": "true to return the patched file without writing it",
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "repo for a repository constructor, handler for a handler constructor",
+            "type": "string"
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "ctor"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "added": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "already_registered": {
+            "description": "constructors that were already wired; this is success, not a failure",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "changed": {
+            "type": "boolean"
+          },
+          "content": {
+            "description": "the patched file; present only on a dry run",
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "written": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "path",
+          "changed",
+          "written"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "legacy_audit",
+      "description": "Detect pre-template (api-*) patterns in an existing service: routes.go, gin handlers, manual validation, swaggo docs, handleSuccess helpers. Use when planning a migration, not during ordinary edits.",
+      "mutates": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "only": {
+            "description": "subset of rule ids to run; omit to run all",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "paths": {
+            "description": "workspace-relative files you just changed. Pass these so the check is scoped to your edits. Omit ONLY for a full audit the user explicitly asked for",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "description": "number of blocking violations",
+            "type": "integer"
+          },
+          "duration_ms": {
+            "type": "integer"
+          },
+          "files_scanned": {
+            "type": "integer"
+          },
+          "ok": {
+            "description": "true when there are no blocking violations in scope",
+            "type": "boolean"
+          },
+          "out_of_scope_count": {
+            "description": "pre-existing violations in files you did not touch; these do not block and you should not fix them unless asked",
+            "type": "integer"
+          },
+          "violations": {
+            "description": "blocking violations, each with a fix and a citation",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "citation": {
+                  "type": "string"
+                },
+                "col": {
+                  "type": "integer"
+                },
+                "fix": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "rule": {
+                  "type": "string"
+                },
+                "severity": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "rule",
+                "severity",
+                "path",
+                "line",
+                "message"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "warnings": {
+            "description": "non-blocking advice",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "citation": {
+                  "type": "string"
+                },
+                "col": {
+                  "type": "integer"
+                },
+                "fix": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "rule": {
+                  "type": "string"
+                },
+                "severity": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "rule",
+                "severity",
+                "path",
+                "line",
+                "message"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "count",
+          "violations",
+          "out_of_scope_count",
+          "files_scanned",
+          "duration_ms"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_rules",
+      "description": "List the rule ids, severities and citations. Call this before explaining a violation so you quote the real rule id and its source.",
+      "mutates": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "legacy": {
+            "description": "true to list legacy-detection rules instead of compliance rules",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "rules": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "citation": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "severity": {
+                  "type": "string"
+                },
+                "summary": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "severity",
+                "summary"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "rules"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "project_scaffold",
+      "description": "Create a new n-api-template service in an empty directory, seeded with one working resource. Greenfield only; to add to an existing service use resource_scaffold.",
+      "mutates": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "description": "true to return the files without writing them",
+            "type": "boolean"
+          },
+          "project": {
+            "additionalProperties": false,
+            "description": "the service to create",
+            "properties": {
+              "addr": {
+                "description": "listen address, e.g. :8080",
+                "type": "string"
+              },
+              "app_name": {
+                "description": "short service name; derived from the module when omitted",
+                "type": "string"
+              },
+              "description": {
+                "description": "one-line description for the swagger document",
+                "type": "string"
+              },
+              "go_version": {
+                "description": "go directive, e.g. 1.25.0",
+                "type": "string"
+              },
+              "module": {
+                "description": "go module path, e.g. gitlab.cept.gov.in/it-2.0/pension-api",
+                "type": "string"
+              },
+              "title": {
+                "description": "human title for the swagger document",
+                "type": "string"
+              }
+            },
+            "required": [
+              "module"
+            ],
+            "type": "object"
+          },
+          "resource": {
+            "additionalProperties": false,
+            "description": "one working resource to seed the service with",
+            "properties": {
+              "fields": {
+                "description": "the resource's own columns; do NOT include id, created_at or updated_at",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "db": {
+                      "description": "db column; inferred as snake_case when omitted",
+                      "type": "string"
+                    },
+                    "go": {
+                      "description": "Go field name in PascalCase, e.g. PPONumber",
+                      "type": "string"
+                    },
+                    "json": {
+                      "description": "json tag; inferred as snake_case when omitted",
+                      "type": "string"
+                    },
+                    "sql": {
+                      "description": "postgres column type; inferred from the Go type when omitted",
+                      "type": "string"
+                    },
+                    "type": {
+                      "description": "one of string, int, int64, float64, bool, time.Time",
+                      "type": "string"
+                    },
+                    "validate": {
+                      "description": "go-playground validate tag, e.g. required or oneof=active closed",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "go",
+                    "type"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "list_filters": {
+                "description": "optional query-string filters on the list route; each must name a declared field",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "form": {
+                      "description": "query-string parameter name; inferred as snake_case when omitted",
+                      "type": "string"
+                    },
+                    "go": {
+                      "description": "the declared field to filter on",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "go"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "name": {
+                "description": "singular resource name in PascalCase, e.g. Pension",
+                "type": "string"
+              },
+              "operations": {
+                "description": "subset of create, list, get, update, delete; omit for all five",
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "paginate": {
+                "description": "true to accept skip/limit on the list route",
+                "type": "boolean"
+              },
+              "plural": {
+                "description": "plural form; inferred from name when omitted",
+                "type": "string"
+              },
+              "route_base": {
+                "description": "route base under /v1, e.g. /pensions; inferred when omitted",
+                "type": "string"
+              },
+              "table": {
+                "description": "postgres table name; inferred from the plural when omitted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "fields"
+            ],
+            "type": "object"
+          },
+          "root": {
+            "description": "target directory; omit to use the server's default",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project",
+          "resource"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "description": "create or modify",
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "content": {
+                  "description": "the file's full content; present only on a dry run",
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "action",
+                "bytes"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "module": {
+            "type": "string"
+          },
+          "notes": {
+            "description": "steps the scaffolder deliberately left for a human; relay these",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "written": {
+            "description": "false on a dry run, when nothing was written",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "written",
+          "files"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "repo_map",
+      "description": "Module path, library generation, package tree with exported symbols, and the FX composition root. Call once to orient; pass `package` for one package in full.",
+      "mutates": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_tokens": {
+            "description": "size cap; omit for the default of 4000",
+            "type": "integer"
+          },
+          "package": {
+            "description": "a package directory such as repo/postgres, for that package in full detail",
+            "type": "string"
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "duration_ms": {
+            "type": "integer"
+          },
+          "elided": {
+            "additionalProperties": false,
+            "properties": {
+              "dropped": {
+                "description": "packages omitted entirely",
+                "type": "integer"
+              },
+              "hint": {
+                "type": "string"
+              },
+              "summarised": {
+                "description": "packages whose symbol lists were dropped",
+                "type": "integer"
+              },
+              "truncated": {
+                "description": "packages whose symbol lists were shortened; see more_types and more_funcs",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "hint"
+            ],
+            "type": [
+              "null",
+              "object"
+            ]
+          },
+          "est_tokens": {
+            "type": "integer"
+          },
+          "files": {
+            "type": "integer"
+          },
+          "fx": {
+            "additionalProperties": false,
+            "properties": {
+              "handlers": {
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "misregistered": {
+                "description": "handlers registered without their group tag; they start but serve no routes",
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "repos": {
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "unwired": {
+                "description": "constructors declared but absent from bootstrap/; these fail at startup",
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              }
+            },
+            "type": [
+              "null",
+              "object"
+            ]
+          },
+          "generation": {
+            "description": "n-api for the current template generation, api for the legacy one",
+            "type": "string"
+          },
+          "go_version": {
+            "type": "string"
+          },
+          "module": {
+            "type": "string"
+          },
+          "packages": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "dir": {
+                  "type": "string"
+                },
+                "files": {
+                  "type": "integer"
+                },
+                "funcs": {
+                  "description": "exported functions; methods appear as (*Type).Method",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "layer": {
+                  "type": "string"
+                },
+                "more_funcs": {
+                  "type": "integer"
+                },
+                "more_types": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "summarised": {
+                  "type": "boolean"
+                },
+                "types": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                }
+              },
+              "required": [
+                "dir",
+                "name",
+                "files"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "requires": {
+            "description": "direct dependencies as path@version",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "packages",
+          "files",
+          "est_tokens",
+          "duration_ms"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "resource_scaffold",
+      "description": "Write a whole CRUD resource — domain, DDL, repository, DTOs, handler, FX registration — from a field spec. Use this instead of writing the files yourself.",
+      "mutates": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "description": "true to return the files without writing them",
+            "type": "boolean"
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          },
+          "spec": {
+            "additionalProperties": false,
+            "description": "the resource to scaffold",
+            "properties": {
+              "fields": {
+                "description": "the resource's own columns; do NOT include id, created_at or updated_at",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "db": {
+                      "description": "db column; inferred as snake_case when omitted",
+                      "type": "string"
+                    },
+                    "go": {
+                      "description": "Go field name in PascalCase, e.g. PPONumber",
+                      "type": "string"
+                    },
+                    "json": {
+                      "description": "json tag; inferred as snake_case when omitted",
+                      "type": "string"
+                    },
+                    "sql": {
+                      "description": "postgres column type; inferred from the Go type when omitted",
+                      "type": "string"
+                    },
+                    "type": {
+                      "description": "one of string, int, int64, float64, bool, time.Time",
+                      "type": "string"
+                    },
+                    "validate": {
+                      "description": "go-playground validate tag, e.g. required or oneof=active closed",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "go",
+                    "type"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "list_filters": {
+                "description": "optional query-string filters on the list route; each must name a declared field",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "form": {
+                      "description": "query-string parameter name; inferred as snake_case when omitted",
+                      "type": "string"
+                    },
+                    "go": {
+                      "description": "the declared field to filter on",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "go"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "name": {
+                "description": "singular resource name in PascalCase, e.g. Pension",
+                "type": "string"
+              },
+              "operations": {
+                "description": "subset of create, list, get, update, delete; omit for all five",
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "paginate": {
+                "description": "true to accept skip/limit on the list route",
+                "type": "boolean"
+              },
+              "plural": {
+                "description": "plural form; inferred from name when omitted",
+                "type": "string"
+              },
+              "route_base": {
+                "description": "route base under /v1, e.g. /pensions; inferred when omitted",
+                "type": "string"
+              },
+              "table": {
+                "description": "postgres table name; inferred from the plural when omitted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "fields"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "spec"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "description": "create or modify",
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "content": {
+                  "description": "the file's full content; present only on a dry run",
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "action",
+                "bytes"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "module": {
+            "type": "string"
+          },
+          "notes": {
+            "description": "steps the scaffolder deliberately left for a human; relay these",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "written": {
+            "description": "false on a dry run, when nothing was written",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "written",
+          "files"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "rules_lint",
+      "description": "Check Go against the n-api-template contract: layer boundaries, handler signature, repository contract, DTO envelopes, FX wiring. Run after each edit batch, passing `paths` with the files you changed.",
+      "mutates": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "only": {
+            "description": "subset of rule ids to run; omit to run all",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "paths": {
+            "description": "workspace-relative files you just changed. Pass these so the check is scoped to your edits. Omit ONLY for a full audit the user explicitly asked for",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "description": "number of blocking violations",
+            "type": "integer"
+          },
+          "duration_ms": {
+            "type": "integer"
+          },
+          "files_scanned": {
+            "type": "integer"
+          },
+          "ok": {
+            "description": "true when there are no blocking violations in scope",
+            "type": "boolean"
+          },
+          "out_of_scope_count": {
+            "description": "pre-existing violations in files you did not touch; these do not block and you should not fix them unless asked",
+            "type": "integer"
+          },
+          "violations": {
+            "description": "blocking violations, each with a fix and a citation",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "citation": {
+                  "type": "string"
+                },
+                "col": {
+                  "type": "integer"
+                },
+                "fix": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "rule": {
+                  "type": "string"
+                },
+                "severity": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "rule",
+                "severity",
+                "path",
+                "line",
+                "message"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "warnings": {
+            "description": "non-blocking advice",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "citation": {
+                  "type": "string"
+                },
+                "col": {
+                  "type": "integer"
+                },
+                "fix": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "rule": {
+                  "type": "string"
+                },
+                "severity": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "rule",
+                "severity",
+                "path",
+                "line",
+                "message"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "count",
+          "violations",
+          "out_of_scope_count",
+          "files_scanned",
+          "duration_ms"
+        ],
+        "type": "object"
+      }
+    }
+  ]
+}

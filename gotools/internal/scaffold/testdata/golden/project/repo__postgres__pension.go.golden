@@ -1,0 +1,142 @@
+package repo
+
+import (
+	"context"
+	"time"
+
+	"gitlab.cept.gov.in/it-2.0/pension-api/core/domain"
+
+	sq "github.com/Masterminds/squirrel"
+	"github.com/jackc/pgx/v5"
+	config "gitlab.cept.gov.in/it-2.0-common/api-config"
+	dblib "gitlab.cept.gov.in/it-2.0-common/n-api-db"
+)
+
+// PensionRepository is the pensions repository.
+//
+// Three properties hold for every method here and are enforced by rules_lint:
+// the query is built with dblib.Psql (a Squirrel builder pre-configured with
+// $N placeholders — a bare sq.Insert would emit `?` and Postgres would reject
+// it at runtime), the deadline comes from config rather than a literal, and
+// rows are mapped by name so the db tags stay authoritative.
+type PensionRepository struct {
+	db  *dblib.DB
+	cfg *config.Config
+}
+
+func NewPensionRepository(db *dblib.DB, cfg *config.Config) *PensionRepository {
+	return &PensionRepository{db: db, cfg: cfg}
+}
+
+const pensionTable = "pensions"
+
+// CreatePension inserts one row and returns it as stored.
+//
+// RETURNING is what makes the response correct: without it the caller would be
+// handed back the values it just sent, with id 0 and zero timestamps.
+func (r *PensionRepository) CreatePension(ctx context.Context, ppoNumber string, amount float64, status string, sanctionDate time.Time) (domain.Pension, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	ins := dblib.Psql.Insert(pensionTable).
+		Columns("ppo_number", "amount", "status", "sanction_date").
+		Values(ppoNumber, amount, status, sanctionDate).
+		Suffix("RETURNING id, ppo_number, amount, status, sanction_date, created_at, updated_at")
+
+	return dblib.InsertReturning(ctx, r.db, ins, pgx.RowToStructByName[domain.Pension])
+}
+
+// GetAllPensions reads the collection. A nil filter pointer means the
+// caller did not supply that filter, so the column is not constrained.
+//
+// QueryTimeoutMed rather than Low: a collection read legitimately takes longer
+// than a single-row fetch, and using the tighter budget here is the most common
+// cause of a spurious `context deadline exceeded`.
+func (r *PensionRepository) GetAllPensions(ctx context.Context, skip, limit uint64, status *string) ([]domain.Pension, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutMed"))
+	defer cancel()
+
+	q := dblib.Psql.Select("id", "ppo_number", "amount", "status", "sanction_date", "created_at", "updated_at").
+		From(pensionTable)
+	if status != nil {
+		q = q.Where(sq.Eq{"status": *status})
+	}
+	q = q.OrderBy("id ASC")
+
+	// limit 0 means "unbounded"; the framework defaults it to 10 from the
+	// form:"limit,default=10" tag on port.MetadataRequest.
+	if limit > 0 {
+		q = q.Limit(limit).Offset(skip)
+	}
+
+	return dblib.SelectRows(ctx, r.db, q, pgx.RowToStructByName[domain.Pension])
+}
+
+// GetPensionByID reads one row. A missing row surfaces as pgx.ErrNoRows, which
+// the framework renders as a 404.
+func (r *PensionRepository) GetPensionByID(ctx context.Context, id int64) (domain.Pension, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	q := dblib.Psql.Select("id", "ppo_number", "amount", "status", "sanction_date", "created_at", "updated_at").
+		From(pensionTable).
+		Where(sq.Eq{"id": id})
+
+	return dblib.SelectOne(ctx, r.db, q, pgx.RowToStructByName[domain.Pension])
+}
+
+// UpdatePensionByID applies a partial update.
+//
+// Every optional parameter is a pointer because only a pointer distinguishes
+// "set this column to its zero value" from "do not touch this column"; a
+// value-typed parameter collapses the two and silently blanks fields the caller
+// never mentioned.
+//
+// RETURNING again: rebuilding the domain value from the parameters would report
+// the untouched columns as zero, and dereferencing a nil optional to do so
+// would panic outright.
+func (r *PensionRepository) UpdatePensionByID(ctx context.Context, id int64, ppoNumber *string, amount *float64, status *string, sanctionDate *time.Time) (domain.Pension, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	b := dblib.Psql.Update(pensionTable)
+	if ppoNumber != nil {
+		b = b.Set("ppo_number", *ppoNumber)
+	}
+	if amount != nil {
+		b = b.Set("amount", *amount)
+	}
+	if status != nil {
+		b = b.Set("status", *status)
+	}
+	if sanctionDate != nil {
+		b = b.Set("sanction_date", *sanctionDate)
+	}
+	b = b.Set("updated_at", sq.Expr("NOW()"))
+	b = b.Where(sq.Eq{"id": id}).
+		Suffix("RETURNING id, ppo_number, amount, status, sanction_date, created_at, updated_at")
+
+	return dblib.UpdateReturning(ctx, r.db, b, pgx.RowToStructByName[domain.Pension])
+}
+
+// DeletePensionByID removes one row.
+//
+// A delete that matched nothing must not look like success: without the
+// RowsAffected check the caller gets a 200 for a record that was never there.
+func (r *PensionRepository) DeletePensionByID(ctx context.Context, id int64) error {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	del := dblib.Psql.Delete(pensionTable).Where(sq.Eq{"id": id})
+
+	commandTag, err := dblib.Delete(ctx, r.db, del)
+	if err != nil {
+		return err
+	}
+
+	if commandTag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+
+	return nil
+}

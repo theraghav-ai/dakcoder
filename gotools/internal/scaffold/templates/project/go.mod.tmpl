@@ -1,0 +1,15 @@
+module {{.P.Module}}
+
+go {{.P.GoVersion}}
+
+require (
+	github.com/Masterminds/squirrel {{.P.Ver.Squirrel}}
+	github.com/jackc/pgx/v5 {{.P.Ver.Pgx}}
+	gitlab.cept.gov.in/it-2.0-common/api-config {{.P.Ver.Config}}
+	gitlab.cept.gov.in/it-2.0-common/n-api-bootstrapper {{.P.Ver.Bootstrapper}}
+	gitlab.cept.gov.in/it-2.0-common/n-api-db {{.P.Ver.DBLib}}
+	gitlab.cept.gov.in/it-2.0-common/n-api-log {{.P.Ver.Log}}
+	gitlab.cept.gov.in/it-2.0-common/n-api-server {{.P.Ver.Server}}
+	gitlab.cept.gov.in/it-2.0-common/n-api-validation {{.P.Ver.Validation}}
+	go.uber.org/fx {{.P.Ver.Fx}}
+)

@@ -1,0 +1,75 @@
+package response
+
+import (
+	"gitlab.cept.gov.in/it-2.0/pension-api/core/domain"
+	"gitlab.cept.gov.in/it-2.0/pension-api/core/port"
+)
+
+// PensionResponse is the wire representation of a Pension.
+//
+// Timestamps are strings, formatted "2006-01-02 15:04:05", so every service in the
+// estate renders them identically regardless of the client's timezone handling
+// (skill.md §Response DTO Pattern).
+type PensionResponse struct {
+	ID           int64   `json:"id"`
+	PPONumber    string  `json:"ppo_number"`
+	Amount       float64 `json:"amount"`
+	Status       string  `json:"status"`
+	SanctionDate string  `json:"sanction_date"`
+	CreatedAt    string  `json:"created_at"`
+	UpdatedAt    string  `json:"updated_at"`
+}
+
+// NewPensionResponse converts the domain model to its wire form. Conversion
+// lives here rather than in the handler so the repository never has to know
+// that an HTTP layer exists.
+func NewPensionResponse(d domain.Pension) PensionResponse {
+	return PensionResponse{
+		ID:           d.ID,
+		PPONumber:    d.PPONumber,
+		Amount:       d.Amount,
+		Status:       d.Status,
+		SanctionDate: d.SanctionDate.Format("2006-01-02 15:04:05"),
+		CreatedAt:    d.CreatedAt.Format("2006-01-02 15:04:05"),
+		UpdatedAt:    d.UpdatedAt.Format("2006-01-02 15:04:05"),
+	}
+}
+
+func NewPensionsResponse(data []domain.Pension) []PensionResponse {
+	res := make([]PensionResponse, 0, len(data))
+	for _, d := range data {
+		res = append(res, NewPensionResponse(d))
+	}
+	return res
+}
+
+// The operation envelopes.
+//
+// `json:",inline"` on the embedded status is load-bearing: without it the
+// embedded struct marshals as a nested object, so status_code and message end
+// up under a key instead of at the top level and every client breaks.
+
+type PensionCreateResponse struct {
+	port.StatusCodeAndMessage `json:",inline"`
+	Data                      PensionResponse `json:"data"`
+}
+
+type PensionFetchResponse struct {
+	port.StatusCodeAndMessage `json:",inline"`
+	Data                      PensionResponse `json:"data"`
+}
+
+type PensionUpdateResponse struct {
+	port.StatusCodeAndMessage `json:",inline"`
+	Data                      PensionResponse `json:"data"`
+}
+
+type PensionDeleteResponse struct {
+	port.StatusCodeAndMessage `json:",inline"`
+}
+
+type PensionsListResponse struct {
+	port.StatusCodeAndMessage `json:",inline"`
+	port.MetaDataResponse     `json:",inline"`
+	Data                      []PensionResponse `json:"data"`
+}

@@ -1,0 +1,316 @@
+pipeline {
+    agent any
+    environment {
+
+        MAIL_TO = "davis.m@indiapost.gov.in"
+       // CC_RECIPIENTS = "suryanarayana@indiapost.gov.in"
+       // BCC_RECIPIENTS = "directorcept@indiapost.gov.in,gmcept@indiapost.gov.in"
+		
+        APP_NAME = "pao-backend"   
+        
+        CI_BUILD_VERSION = "${BUILD_NUMBER}"
+        CI_BUILD_BRANCH = "${BRANCH_NAME}"
+        CI_GIT_HASH = "${GIT_COMMIT}"
+        CI_BUILD_TIMESTAMP = "${new java.text.SimpleDateFormat('yyyy-MM-dd HH:mm:ss').format(new Date())}"
+
+        HARBOR_PROJECT_NAME = "it2"
+        HARBOR_REPO_URL = "10.20.30.25:8082/${HARBOR_PROJECT_NAME}"
+
+        HARBOR_PROJECT_NAME_TEST = "it2-test"
+        HARBOR_REPO_URL_TEST = "10.20.30.25:8082/${HARBOR_PROJECT_NAME_TEST}"
+
+        HARBOR_PROJECT_NAME_TRAINING = "it2-training"
+        HARBOR_REPO_URL_TRAINING = "10.20.30.25:8082/${HARBOR_PROJECT_NAME_TRAINING}"
+
+	HARBOR_PROJECT_NAME_PREPROD = "it2-preprod"
+        HARBOR_REPO_URL_PREPROD = "10.20.30.25:8082/${HARBOR_PROJECT_NAME_PREPROD}"
+
+        HARBOR_IMAGE_NAME = "${APP_NAME}"
+        HARBOR_IMAGE_TAG  = "${BUILD_NUMBER}"
+
+        DOCKER_IMAGE_NAME = "${APP_NAME}"
+        DOCKER_IMAGE_TAG = "${BUILD_NUMBER}"
+	SONAR_PROJECT_KEY = "${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+        SONAR_TKN = "sqa_d09ed18a37f64cc5617515e1740537711a7b03f3"
+        SONAR_HOST_URL = "https://sonarqube.cept.gov.in"
+	
+	K8S_CONTEXT_PATH="/label"
+        K8S_SERVER="https://devrancher.cept.gov.in"
+        K8SserverWithoutProtocol = K8S_SERVER.replaceAll("https://", "")
+        K8S_NAMESPACE="accounts-api"
+        K8S_SERVICE_PORT="8080"
+        K8S_CONTAINER_PORT="8080"
+        K8S_CONTEXT="c-xpjbh:p-vzl5l"
+
+        TEST_K8S_CONTEXT_PATH="/label"
+        TEST_K8S_SERVER="https://testrancher.cept.gov.in"
+        TEST_K8SserverWithoutProtocol = K8S_SERVER.replaceAll("https://", "")
+        TEST_K8S_NAMESPACE="accounts-api"
+        TEST_K8S_SERVICE_PORT="8080"
+        TEST_K8S_CONTAINER_PORT="8080"
+        TEST_K8S_CONTEXT="c-sbtsd:p-8mj7b"
+
+        TRAINING_K8S_CONTEXT_PATH="/label"
+        TRAINING_K8S_SERVER="https://trgrancher.cept.gov.in"
+        TRAINING_K8SserverWithoutProtocol = K8S_SERVER.replaceAll("https://", "")
+        TRAINING_K8S_NAMESPACE="accounts-hr"
+        TRAINING_K8S_SERVICE_PORT="8080"
+        TRAINING_K8S_CONTAINER_PORT="8080"
+        TRAINING_K8S_CONTEXT="c-m-87cdnfdr:p-j5255"
+
+        PREPROD_K8S_CONTEXT_PATH="/label"
+        PREPROD_K8S_SERVER="https://ltrancher.cept.gov.in"
+        PREPROD_K8SserverWithoutProtocol = K8S_SERVER.replaceAll("https://", "")
+        PREPROD_K8S_NAMESPACE="accounts"
+        PREPROD_K8S_SERVICE_PORT="8080"
+        PREPROD_K8S_CONTAINER_PORT="8080"
+        PREPROD_K8S_CONTEXT="c-xbwdl:p-lbncm"
+
+    }
+   
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+       
+   stage('OWASP Dependency-Check Vulnerabilities') {
+            steps {
+                dependencyCheck additionalArguments: '''
+                --noupdate 
+                -o './'
+                -s './'
+                -f 'ALL' 
+                --prettyPrint''', odcInstallation: 'ODC_Latest'
+                
+                dependencyCheckPublisher pattern: 'dependency-check-report.xml'
+      }
+    }
+
+        stage('SonarQube analysis') {
+            steps {
+                withSonarQubeEnv('SonarQubeServer') { 
+                    script {
+                        def scannerHome = tool 'sonar'
+                        withEnv(["PATH+SONAR=${scannerHome}/bin"]) {
+                            sh "sonar-scanner -Dsonar.projectKey=${SONAR_PROJECT_KEY} -Dsonar.sources=. -Dsonar.host.url=${SONAR_HOST_URL} -Dsonar.login=${SONAR_TKN} -Dsonar.exclusions=trivy-report.html,dependency-check-report.xml,dependency-check-report.html,dependency-check-jenkins.html"
+                        }
+                    }
+                }
+            }
+        }
+stage('Create and Tag Docker Image') {
+    parallel {
+        stage('DEV Docker Image') {
+            steps {
+                script {
+                    try {
+                        if (env.BRANCH_NAME == 'dev_cluster') {
+                            sh "cp dev.yaml config.yaml"
+                            sh "cat config.yaml"
+                            sh "docker build  --no-cache -t ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} ."
+                            sh "docker tag ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} ${HARBOR_REPO_URL}/${HARBOR_IMAGE_NAME}:${HARBOR_IMAGE_TAG}"
+                        } else if (env.BRANCH_NAME == 'test_cluster') {
+                            sh "cp test.yaml config.yaml"
+                            sh "cat config.yaml"
+                            sh "docker build  --no-cache -t ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} ."
+                            sh "docker tag ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} ${HARBOR_REPO_URL_TEST}/${HARBOR_IMAGE_NAME}:${HARBOR_IMAGE_TAG}"
+                        } else if (env.BRANCH_NAME == 'training_cluster') {
+                            sh "cp training.yaml config.yaml"
+                            sh "cat config.yaml"
+                            sh "docker build  --no-cache -t ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} ."
+                            sh "docker tag ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} ${HARBOR_REPO_URL_TRAINING}/${HARBOR_IMAGE_NAME}:${HARBOR_IMAGE_TAG}"
+                        } else {
+                            echo "Branch not recognized."
+                            currentBuild.result = 'FAILURE'
+                        }
+                    } catch (Exception e) {
+                        echo "Error in building Docker Image: ${e.message}"
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+            }
+        }
+    }
+}
+        
+        stage('Scan Docker Image for Vulnerabilities') {
+  steps {
+    script {
+      // Generate Trivy report in JSON format
+       def formatOption = "--format template --template \"@/usr/local/share/trivy/templates/html.tpl\""
+                    sh "trivy image --exit-code 0 --no-progress --severity HIGH,CRITICAL  $formatOption -o trivy-report.html ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+                    // Publish HTML report for Trivy scan
+                    
+                    echo 'Trivy scan completed. Please check the report for vulnerabilities.'
+
+    /*  sh "trivy image --exit-code 0 --no-progress --severity HIGH,CRITICAL --format json -o trivy-report.json ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+
+      echo 'Trivy scan completed. Trivy report generated in trivy-report.json'*/
+    }
+  }
+}
+
+
+            
+stage('Push Docker Image to HARBOR Repository') {
+    steps {
+        script {
+            withCredentials([usernamePassword(credentialsId: 'harbor_credentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                try {
+                    if (env.BRANCH_NAME == 'dev_cluster') {
+                        
+                        sh "docker login -u ${USERNAME} -p ${PASSWORD} ${HARBOR_REPO_URL}"
+                        sh "docker push ${HARBOR_REPO_URL}/${HARBOR_IMAGE_NAME}:${HARBOR_IMAGE_TAG}"
+                    } else if (env.BRANCH_NAME == 'test_cluster') {
+                        
+                        sh "docker login -u ${USERNAME} -p ${PASSWORD} ${HARBOR_REPO_URL_TEST}"
+                        sh "docker push ${HARBOR_REPO_URL_TEST}/${HARBOR_IMAGE_NAME}:${HARBOR_IMAGE_TAG}"
+
+                     } else if (env.BRANCH_NAME == 'training_cluster') {
+
+                        sh "docker login -u ${USERNAME} -p ${PASSWORD} ${HARBOR_REPO_URL_TRAINING}"
+                        sh "docker push ${HARBOR_REPO_URL_TRAINING}/${HARBOR_IMAGE_NAME}:${HARBOR_IMAGE_TAG}"
+                    
+                    } else if (env.BRANCH_NAME == 'preprod_cluster') {
+
+                        sh "docker login -u ${USERNAME} -p ${PASSWORD} ${HARBOR_REPO_URL_PREPROD}"
+                        sh "docker push ${HARBOR_REPO_URL_PREPROD}/${HARBOR_IMAGE_NAME}:${HARBOR_IMAGE_TAG}"
+
+                    } else {
+                        echo "Branch not recognized."
+                        currentBuild.result = 'FAILURE'
+                    }
+                } catch (Exception e) {
+                    echo "Error in pushing Docker Images to Harbor Repository: ${e.message}"
+                    currentBuild.result = 'FAILURE'
+                }
+            }
+        }
+    }
+}
+
+         stage('Deploy to rancher') {
+    steps {
+        script {
+            try {
+                def rancherCredentialsId
+                def k8sServer
+                def k8sContext
+                def k8sNamespace
+                def harborRepoUrl
+                def harborImageName
+                def harborImageTag
+                def k8sServicePort
+
+                if (env.BRANCH_NAME == 'dev_cluster') {
+                    rancherCredentialsId = 'rancher_token'
+                    k8sServer = env.K8S_SERVER
+                    k8sContext = env.K8S_CONTEXT
+                    k8sNamespace = env.K8S_NAMESPACE
+                    harborRepoUrl = env.HARBOR_REPO_URL
+                    harborImageName = env.HARBOR_IMAGE_NAME
+                    harborImageTag = env.HARBOR_IMAGE_TAG
+                    k8sServicePort = env.K8S_SERVICE_PORT
+                } else if (env.BRANCH_NAME == 'test_cluster') {
+                    rancherCredentialsId = 'test_rancher_token'
+                    k8sServer = env.TEST_K8S_SERVER
+                    k8sContext = env.TEST_K8S_CONTEXT
+                    k8sNamespace = env.TEST_K8S_NAMESPACE
+                    harborRepoUrl = env.HARBOR_REPO_URL_TEST
+                    harborImageName = env.HARBOR_IMAGE_NAME
+                    harborImageTag = env.HARBOR_IMAGE_TAG
+                    k8sServicePort = env.TEST_K8S_SERVICE_PORT
+                 } else if (env.BRANCH_NAME == 'training_cluster') {
+                    rancherCredentialsId = 'trg_rancher_token'
+                    k8sServer = env.TRAINING_K8S_SERVER
+                    k8sContext = env.TRAINING_K8S_CONTEXT
+                    k8sNamespace = env.TRAINING_K8S_NAMESPACE
+                    harborRepoUrl = env.HARBOR_REPO_URL_TRAINING
+                    harborImageName = env.HARBOR_IMAGE_NAME
+                    harborImageTag = env.HARBOR_IMAGE_TAG
+                    k8sServicePort = env.TRAINING_K8S_SERVICE_PORT
+                } else if (env.BRANCH_NAME == 'preprod_cluster') {
+                    rancherCredentialsId = 'livetesting_rancher_token'
+                    k8sServer = env.PREPROD_K8S_SERVER
+                    k8sContext = env.PREPROD_K8S_CONTEXT
+                    k8sNamespace = env.PREPROD_K8S_NAMESPACE
+                    harborRepoUrl = env.HARBOR_REPO_URL_PREPROD
+                    harborImageName = env.HARBOR_IMAGE_NAME
+                    harborImageTag = env.HARBOR_IMAGE_TAG
+                    k8sServicePort = env.PREPROD_K8S_SERVICE_PORT
+                } else {
+                    echo "Branch not recognized."
+                    currentBuild.result = 'FAILURE'
+                    return
+                }
+
+                withCredentials([string(credentialsId: rancherCredentialsId, variable: 'RANCHER_TOKEN')]) {
+                    // Log in to Rancher
+                    sh "rancher login -t ${RANCHER_TOKEN} ${k8sServer} --context ${k8sContext}"
+                    
+                    // Check if the deployment exists
+                    def deploymentExists = sh(script: "rancher kubectl get deployment ${APP_NAME} --namespace=${k8sNamespace}", returnStatus: true)
+                    
+                    // If the deployment exists, perform an upgrade; otherwise, install it
+                    if (deploymentExists == 0) {
+                        sh "rancher kubectl set image deployment/${APP_NAME} ${APP_NAME}=${harborRepoUrl}/${harborImageName}:${harborImageTag} --namespace=${k8sNamespace}"
+                    } else {
+                        sh "rancher kubectl create deployment ${APP_NAME} --image=${harborRepoUrl}/${harborImageName}:${harborImageTag} --namespace=${k8sNamespace}"
+                        // Expose the deployment as a service
+                        sh "rancher kubectl expose deployment ${APP_NAME} --type=ClusterIP --port=${k8sServicePort} --namespace=${k8sNamespace}"
+                    }
+                }
+            } catch (Exception e) {
+                echo "Error in pushing Docker Images to Harbor Repository: ${e.message}"
+                currentBuild.result = 'FAILURE'
+            }
+        }
+    }
+}
+
+stage('Delete Files and Directories Except Trivy and Dependency Check Report') {
+            steps {
+                script {
+                    // Get the current workspace directory
+                    def workspace = pwd()
+
+                    // Define the script to delete all files and directories except c.pit and g.bo
+                    def script = """
+                        cd ${workspace}
+                        for item in *; do
+                          if [ "\$item" != "trivy-report.html" ] && [ "\$item" != "dependency-check-report.xml" ]; then
+                            rm -rf "\$item"
+                          fi
+                        done
+                    """
+
+                    // Execute the script
+                    sh script
+                }
+            }
+        }
+            
+    }
+    post {
+    always {
+        script {            
+            // Send email with the reports attached
+            emailext(
+                subject: "${currentBuild.result} CI: Project name -> ${env.JOB_NAME}",
+                body: """Project: ${env.JOB_NAME}
+                Build Number: ${env.BUILD_NUMBER}
+                Please find the attached OWASP Dependency-Check report & Trivy Image Scan Report.""",
+                attachLog: true,
+                attachmentsPattern: 'dependency-check-report.xml,trivy-report.html',
+                to: "${MAIL_TO}"
+            )
+        }
+        // Publish HTML reports
+        echo 'The pipeline has completed!'
+        publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: '.', reportFiles: 'dependency-check-report.xml', reportName: 'Dependency Check Report'])
+        publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: '.', reportFiles: 'trivy-report.html', reportName: 'Trivy Report'])
+    }
+}
+}

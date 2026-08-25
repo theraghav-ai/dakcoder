@@ -1,0 +1,860 @@
+{
+  "component": "dakcoder-agent",
+  "version": "dev",
+  "contract": "C1",
+  "limits": {
+    "max_params": 6,
+    "max_description": 200
+  },
+  "visible_per_mode": {
+    "planner": [
+      "repo_map",
+      "read_file",
+      "search_repo",
+      "search_docs",
+      "rules_lint",
+      "legacy_audit",
+      "git_status",
+      "git_diff",
+      "git_blame"
+    ],
+    "scaffolder": [
+      "repo_map",
+      "read_file",
+      "search_docs",
+      "write_file",
+      "resource_scaffold",
+      "project_scaffold",
+      "fx_wire",
+      "govalid_gen",
+      "git_status",
+      "git_diff",
+      "git_ops"
+    ],
+    "coder": [
+      "repo_map",
+      "read_file",
+      "search_repo",
+      "search_docs",
+      "rules_lint",
+      "playbook",
+      "write_file",
+      "patch_file",
+      "delete_file",
+      "fx_wire",
+      "govalid_gen",
+      "go_build",
+      "go_mod",
+      "git_status",
+      "git_diff",
+      "git_ops"
+    ],
+    "verifier": [
+      "repo_map",
+      "read_file",
+      "search_repo",
+      "rules_lint",
+      "legacy_audit",
+      "playbook",
+      "go_build",
+      "git_status",
+      "git_diff"
+    ],
+    "debugger": [
+      "repo_map",
+      "read_file",
+      "search_repo",
+      "search_docs",
+      "rules_lint",
+      "playbook",
+      "write_file",
+      "patch_file",
+      "delete_file",
+      "fx_wire",
+      "govalid_gen",
+      "go_build",
+      "go_vet",
+      "go_test",
+      "go_mod",
+      "git_status",
+      "git_diff",
+      "git_blame",
+      "run_terminal"
+    ]
+  },
+  "tools": [
+    {
+      "name": "repo_map",
+      "description": "Get the module path, package tree, exported symbols and FX providers. Call this first in an unfamiliar repository. Pass package to see one directory in full.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "package": {
+            "type": "string",
+            "description": "Directory to expand in full, e.g. 'handler'. Omit for the whole tree."
+          },
+          "max_tokens": {
+            "type": "integer",
+            "description": "Budget for the map. Defaults to 4000.",
+            "minimum": 500,
+            "maximum": 20000
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "planner",
+        "scaffolder",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
+      "name": "read_file",
+      "description": "Read a slice of one file. Always pass start and end when you know roughly where to look; whole-file reads crowd out everything else in context.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative path, e.g. 'handler/user.go'."
+          },
+          "start": {
+            "type": "integer",
+            "description": "First line, 1-based.",
+            "minimum": 1
+          },
+          "end": {
+            "type": "integer",
+            "description": "Last line, inclusive.",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "planner",
+        "scaffolder",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "search_repo",
+      "description": "Search file contents by regular expression. Use this instead of grep, and prefer it over reading files to find something.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Regular expression, e.g. 'func .*Handler.*Routes'."
+          },
+          "glob": {
+            "type": "string",
+            "description": "Restrict to matching paths, e.g. 'handler/**/*.go'."
+          },
+          "max": {
+            "type": "integer",
+            "description": "Maximum matches to return. Defaults to 40.",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "planner",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "search_docs",
+      "description": "Search the n-api-template knowledge base for the contract rule behind a pattern. Use it before inventing an approach, not after.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What you need to know, e.g. 'repository timeout constants'."
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "planner",
+        "scaffolder"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "go_symbols",
+      "description": "Find a symbol's definition, references or package API through gopls. Use this rather than searching for a name textually.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Symbol or package, e.g. 'serverHandler.Handler'."
+          },
+          "kind": {
+            "type": "string",
+            "description": "One of: search, references, package_api.",
+            "enum": [
+              "search",
+              "references",
+              "package_api"
+            ]
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "planner",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gopls",
+      "unavailable": "gopls is not yet wired (Part A section 8.3). Use search_repo, or go_build for type errors.",
+      "instead": "use search_repo for a textual search"
+    },
+    {
+      "name": "go_diagnostics",
+      "description": "Type-check the workspace incrementally and report errors. This is the fast inner-loop signal; run it after every edit batch.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Narrow to one file. Omit for the whole workspace."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gopls",
+      "unavailable": "gopls is not yet wired (Part A section 8.3). Use go_build, which is authoritative but takes about four seconds.",
+      "instead": "use go_build, which is authoritative but slower"
+    },
+    {
+      "name": "rules_lint",
+      "description": "Check Go against the n-api-template contract: layer boundaries, handler signatures, repository idiom, FX registration. Pass paths to scope it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Comma-separated paths to lint. Omit for the whole workspace."
+          },
+          "only": {
+            "type": "string",
+            "description": "Comma-separated rule ids, e.g. 'layer-sql-boundary,handler-signature'."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "planner",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
+      "name": "legacy_audit",
+      "description": "Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Comma-separated paths to audit. Omit for the whole workspace."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "planner",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
+      "name": "playbook",
+      "description": "Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "rule": {
+            "type": "string",
+            "description": "Rule id or failure class, e.g. 'fx-registration' or 'pgx-no-rows'."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "write_file",
+      "description": "Create a new file. Refuses to overwrite an existing one — use patch_file for that. Write complete, compiling Go, not a sketch.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative path for the new file."
+          },
+          "content": {
+            "type": "string",
+            "description": "Full file content."
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "scaffolder"
+      ],
+      "mutates": true,
+      "approval": "conditional",
+      "provider": "python",
+      "instead": "use patch_file to change a file that already exists"
+    },
+    {
+      "name": "patch_file",
+      "description": "Replace an exact unique string in a file. Include enough surrounding lines to make old unique; the call fails rather than guessing.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative path of the file to change."
+          },
+          "old": {
+            "type": "string",
+            "description": "Exact text to replace, unique within the file."
+          },
+          "new": {
+            "type": "string",
+            "description": "Replacement text."
+          }
+        },
+        "required": [
+          "path",
+          "old",
+          "new"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger"
+      ],
+      "mutates": true,
+      "approval": "conditional",
+      "provider": "python",
+      "instead": "use write_file to create a file that does not exist yet"
+    },
+    {
+      "name": "delete_file",
+      "description": "Delete a file. Always needs the developer's approval; say why in reason.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative path to delete."
+          },
+          "reason": {
+            "type": "string",
+            "description": "One sentence on why it should go."
+          }
+        },
+        "required": [
+          "path",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger"
+      ],
+      "mutates": true,
+      "approval": "always",
+      "provider": "python"
+    },
+    {
+      "name": "gofmt",
+      "description": "Format Go files and fix their imports. Runs automatically after edits; call it directly only to clean up a file you did not just touch.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Comma-separated paths. Omit for files changed this session."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [],
+      "mutates": true,
+      "approval": "none",
+      "provider": "python",
+      "gate_only": true
+    },
+    {
+      "name": "resource_scaffold",
+      "description": "Write a whole CRUD resource — domain, DDL, repository, DTOs, handler — from a field spec. Produce the spec; the templates produce the code.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "spec": {
+            "type": "string",
+            "description": "Resource as JSON: {\"name\",\"table\",\"route_base\",\"fields\",\"operations\"}."
+          }
+        },
+        "required": [
+          "spec"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "scaffolder"
+      ],
+      "mutates": true,
+      "approval": "always",
+      "provider": "gotools"
+    },
+    {
+      "name": "project_scaffold",
+      "description": "Create a new n-api-template service in an empty directory, with configs, bootstrap and one working resource. Credential fields are left empty.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "project": {
+            "type": "string",
+            "description": "Service as JSON: {\"module\": \"gitlab.cept.gov.in/it-2.0/x-api\"}."
+          },
+          "resource": {
+            "type": "string",
+            "description": "One resource to seed the service with, same shape as resource_scaffold."
+          }
+        },
+        "required": [
+          "project",
+          "resource"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "scaffolder"
+      ],
+      "mutates": true,
+      "approval": "always",
+      "provider": "gotools"
+    },
+    {
+      "name": "fx_wire",
+      "description": "Register a repository or handler in bootstrap/bootstrapper.go with the right annotations. Run this after adding either, or FX fails at startup.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Either 'repo' or 'handler'.",
+            "enum": [
+              "repo",
+              "handler"
+            ]
+          },
+          "ctor": {
+            "type": "string",
+            "description": "The constructor's bare name, e.g. 'NewPensionHandler'."
+          }
+        },
+        "required": [
+          "kind",
+          "ctor"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "scaffolder"
+      ],
+      "mutates": true,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
+      "name": "govalid_gen",
+      "description": "Regenerate handler/request_*_validator.go from the request structs. Run it whenever a validate tag changes; never hand-edit the generated files.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "scaffolder"
+      ],
+      "mutates": true,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "go_build",
+      "description": "Build every package. This is the authoritative signal: nothing is done until it is clean, whatever the other tools say.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "go_vet",
+      "description": "Run go vet over the workspace. Gate only — it takes about thirty seconds, so never run it in the edit loop.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "debugger"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "go_test",
+      "description": "Run tests. Pass pattern to scope to one package when output is large.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Package pattern, e.g. './handler/...'. Omit for './...'."
+          },
+          "run": {
+            "type": "string",
+            "description": "Regular expression for -run, e.g. 'TestCreatePension'."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "debugger"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "golangci_lint",
+      "description": "Run golangci-lint if the repository configures it. Advisory: its findings never block, so do not spend turns on them.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python",
+      "gate_only": true
+    },
+    {
+      "name": "govulncheck",
+      "description": "Scan dependencies for known vulnerabilities. Run it on a new service and after any dependency change, not routinely.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python",
+      "gate_only": true
+    },
+    {
+      "name": "swagger_check",
+      "description": "Check that routes are named and swagger generation is enabled, so endpoints reach /docs/v3Doc.json. This checks; it does not generate.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python",
+      "gate_only": true
+    },
+    {
+      "name": "go_mod",
+      "description": "Run tidy, or add a dependency. Tidy is free and must be a no-op at the gate; adding a direct dependency needs approval.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "op": {
+            "type": "string",
+            "description": "One of: tidy, get, why.",
+            "enum": [
+              "tidy",
+              "get",
+              "why"
+            ]
+          },
+          "pkg": {
+            "type": "string",
+            "description": "Module path, for get and why."
+          },
+          "version": {
+            "type": "string",
+            "description": "Version for get, e.g. 'v1.4.0'. Omit for latest."
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger"
+      ],
+      "mutates": true,
+      "approval": "conditional",
+      "provider": "python"
+    },
+    {
+      "name": "git_status",
+      "description": "List changed, staged and untracked files. Cheap; use it to confirm what you changed.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "planner",
+        "scaffolder",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "git_diff",
+      "description": "Show the diff of the working tree, or of one path. Read this before claiming a change is done.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Limit the diff to one path."
+          },
+          "staged": {
+            "type": "string",
+            "description": "Pass 'true' to diff the index instead of the working tree."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "debugger",
+        "planner",
+        "scaffolder",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "git_blame",
+      "description": "Show who last changed each line of a file, and when. Use it to date a legacy pattern.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative path."
+          },
+          "start": {
+            "type": "integer",
+            "description": "First line.",
+            "minimum": 1
+          },
+          "end": {
+            "type": "integer",
+            "description": "Last line.",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "debugger",
+        "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "git_ops",
+      "description": "Stage, commit, or switch to the session branch. Never pushes and never rewrites history, so nothing here can lose committed work.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "op": {
+            "type": "string",
+            "description": "One of: branch, add, commit.",
+            "enum": [
+              "branch",
+              "add",
+              "commit"
+            ]
+          },
+          "paths": {
+            "type": "string",
+            "description": "Comma-separated paths for add. Omit to stage tracked changes."
+          },
+          "message": {
+            "type": "string",
+            "description": "Commit message, for commit."
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "scaffolder"
+      ],
+      "mutates": true,
+      "approval": "conditional",
+      "provider": "python"
+    },
+    {
+      "name": "run_terminal",
+      "description": "Run one allow-listed binary with explicit arguments. There is no shell, so no pipes, globs or redirection. Prefer a purpose-built tool.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "argv": {
+            "type": "string",
+            "description": "Command and arguments, JSON array, e.g. '[\"go\",\"env\",\"GOPRIVATE\"]'."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Seconds before it is killed. Defaults to 60.",
+            "minimum": 1,
+            "maximum": 600
+          }
+        },
+        "required": [
+          "argv"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "debugger"
+      ],
+      "mutates": false,
+      "approval": "conditional",
+      "provider": "python"
+    }
+  ]
+}

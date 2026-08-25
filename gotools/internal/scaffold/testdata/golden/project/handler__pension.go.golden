@@ -1,0 +1,134 @@
+package handler
+
+import (
+	"time"
+
+	"gitlab.cept.gov.in/it-2.0/pension-api/core/port"
+	resp "gitlab.cept.gov.in/it-2.0/pension-api/handler/response"
+	repo "gitlab.cept.gov.in/it-2.0/pension-api/repo/postgres"
+
+	log "gitlab.cept.gov.in/it-2.0-common/n-api-log"
+	serverHandler "gitlab.cept.gov.in/it-2.0-common/n-api-server/handler"
+	serverRoute "gitlab.cept.gov.in/it-2.0-common/n-api-server/route"
+)
+
+// PensionHandler serves the /pensions routes.
+//
+// The embedded *serverHandler.Base is what makes this type satisfy
+// serverHandler.Handler. Omitting it compiles cleanly and then fails at start-up
+// as an Uber-FX graph error naming a type rather than a file, which is a
+// materially harder thing to debug than a compile error.
+type PensionHandler struct {
+	*serverHandler.Base
+	svc *repo.PensionRepository
+}
+
+func NewPensionHandler(svc *repo.PensionRepository) *PensionHandler {
+	base := serverHandler.New("Pensions").SetPrefix("/v1").AddPrefix("")
+	return &PensionHandler{Base: base, svc: svc}
+}
+
+// Routes declares this handler's routes.
+//
+// Every route carries .Name(...) because the generated OpenAPI document takes
+// its operation names from it — an unnamed route is missing from
+// /docs/v3Doc.json even though it serves correctly.
+func (h *PensionHandler) Routes() []serverRoute.Route {
+	return []serverRoute.Route{
+		serverRoute.POST("/pensions", h.CreatePension).Name("Create Pension"),
+		serverRoute.GET("/pensions", h.ListPensions).Name("List Pensions"),
+		serverRoute.GET("/pensions/:id", h.GetPensionByID).Name("Get Pension By ID"),
+		serverRoute.PUT("/pensions/:id", h.UpdatePensionByID).Name("Update Pension By ID"),
+		serverRoute.DELETE("/pensions/:id", h.DeletePensionByID).Name("Delete Pension By ID"),
+	}
+}
+
+func (h *PensionHandler) CreatePension(sctx *serverRoute.Context, req CreatePensionRequest) (*resp.PensionCreateResponse, error) {
+	pension, err := h.svc.CreatePension(sctx.Ctx, req.PPONumber, req.Amount, req.Status, req.SanctionDate)
+	if err != nil {
+		log.Error(sctx.Ctx, "Error creating pension: %v", err)
+		return nil, err
+	}
+	log.Info(sctx.Ctx, "Pension created with ID: %d", pension.ID)
+	r := &resp.PensionCreateResponse{
+		StatusCodeAndMessage: port.CreateSuccess,
+		Data:                 resp.NewPensionResponse(pension),
+	}
+	return r, nil
+}
+
+func (h *PensionHandler) ListPensions(sctx *serverRoute.Context, req ListPensionsParams) (*resp.PensionsListResponse, error) {
+	var statusFilter *string
+	if req.Status != "" {
+		statusFilter = &req.Status
+	}
+
+	pensions, err := h.svc.GetAllPensions(sctx.Ctx, req.Skip, req.Limit, statusFilter)
+	if err != nil {
+		log.Error(sctx.Ctx, "Error fetching pensions: %v", err)
+		return nil, err
+	}
+	data := resp.NewPensionsResponse(pensions)
+	md := port.NewMetaDataResponse(req.Skip, req.Limit, uint64(len(data)))
+	r := &resp.PensionsListResponse{
+		StatusCodeAndMessage: port.ListSuccess,
+		MetaDataResponse:     md,
+		Data:                 data,
+	}
+	return r, nil
+}
+
+func (h *PensionHandler) GetPensionByID(sctx *serverRoute.Context, req PensionIDUri) (*resp.PensionFetchResponse, error) {
+	pension, err := h.svc.GetPensionByID(sctx.Ctx, req.ID)
+	if err != nil {
+		log.Error(sctx.Ctx, "Error fetching pension by ID: %v", err)
+		return nil, err
+	}
+	r := &resp.PensionFetchResponse{
+		StatusCodeAndMessage: port.FetchSuccess,
+		Data:                 resp.NewPensionResponse(pension),
+	}
+	return r, nil
+}
+
+func (h *PensionHandler) UpdatePensionByID(sctx *serverRoute.Context, req UpdatePensionRequest) (*resp.PensionUpdateResponse, error) {
+	var ppoNumber *string
+	if req.PPONumber != "" {
+		ppoNumber = &req.PPONumber
+	}
+	var amount *float64
+	if req.Amount != 0 {
+		amount = &req.Amount
+	}
+	var status *string
+	if req.Status != "" {
+		status = &req.Status
+	}
+	var sanctionDate *time.Time
+	if !req.SanctionDate.IsZero() {
+		sanctionDate = &req.SanctionDate
+	}
+
+	pension, err := h.svc.UpdatePensionByID(sctx.Ctx, req.ID, ppoNumber, amount, status, sanctionDate)
+	if err != nil {
+		log.Error(sctx.Ctx, "Error updating pension by ID: %v", err)
+		return nil, err
+	}
+	r := &resp.PensionUpdateResponse{
+		StatusCodeAndMessage: port.UpdateSuccess,
+		Data:                 resp.NewPensionResponse(pension),
+	}
+	return r, nil
+}
+
+func (h *PensionHandler) DeletePensionByID(sctx *serverRoute.Context, req PensionIDUri) (*resp.PensionDeleteResponse, error) {
+	err := h.svc.DeletePensionByID(sctx.Ctx, req.ID)
+	if err != nil {
+		log.Error(sctx.Ctx, "Error deleting pension by ID: %v", err)
+		return nil, err
+	}
+	r := &resp.PensionDeleteResponse{
+		StatusCodeAndMessage: port.DeleteSuccess,
+	}
+	return r, nil
+}

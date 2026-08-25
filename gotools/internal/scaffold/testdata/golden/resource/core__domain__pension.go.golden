@@ -1,0 +1,19 @@
+package domain
+
+import "time"
+
+// Pension is the domain model for the pensions table.
+//
+// Every field carries both a json and a db tag. The db tag is not decoration:
+// pgx.RowToStructByName matches result columns to fields through it, so a
+// missing or misspelt db tag is a silent scan failure at runtime rather than a
+// compile error.
+type Pension struct {
+	ID           int64     `json:"id" db:"id"`
+	PPONumber    string    `json:"ppo_number" db:"ppo_number"`
+	Amount       float64   `json:"amount" db:"amount"`
+	Status       string    `json:"status" db:"status"`
+	SanctionDate time.Time `json:"sanction_date" db:"sanction_date"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+}

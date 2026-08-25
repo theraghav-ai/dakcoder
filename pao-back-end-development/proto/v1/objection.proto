@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package proto.v1;
+
+option go_package = "gotemplate/gen/proto/v1;paocreation";
+
+import "buf/validate/validate.proto";
+
+import "google/protobuf/timestamp.proto";
+
+message CreateObjectionGrpcHandlerRequest {
+  string pao_code = 1 [(buf.validate.field).required=true];        // Required, validates as validatePaocode
+  string ddo_code = 2 [(buf.validate.field).required=true];        // Required, validates as validateDdocode
+  string description = 3;     // Required, max length = 255
+  string objection_id = 4;    // Optional, max length = 25
+  uint64 created_by = 5;      // Required, validates as employee_id
+  google.protobuf.Timestamp created_date = 6; // Optional, validates as validateDateTime
+  repeated ObjectionRemarkcreate remarks = 7; // Validates as dive
+  string status_flag = 8;     // Required, allowed values: created, paoupdated, rejected, ddoupdated, closed
+}
+
+message ObjectionRemarkcreate {
+  string data = 1;            // Optional, max length = 255
+  uint64 commented_by = 2;    // Optional, validates as employee_id
+  google.protobuf.Timestamp commented_date = 3; // Optional
+  uint64 commented_office_id = 4; // Optional, validates as office_id
+  string filepath = 5;        // Optional, max length = 255
+  string sender = 6;          // Optional, max length = 255
+}
+message CreateObjectionGrpcResponse {
+  string pao_code = 1;              // Nullable string
+  string ddo_code = 2;              // Nullable string
+  string description = 3;           // Nullable string
+  string objection_id = 4;          // Nullable string
+  uint64 created_by = 5;            // Nullable uint64
+  google.protobuf.Timestamp created_date = 6; // Nullable timestamp
+  repeated ObjectionRemark remarks = 7;       // List of remarks
+  string status_flag = 8;           // Nullable string
+  uint64 last_updated_by = 9;       // Nullable uint64
+  google.protobuf.Timestamp last_updated_date = 10; // Nullable timestamp
+}
+
+message CreateObjectionGrpcHandlerResponse {
+  int32 status_code = 1 [json_name = "status_code"]; // Status code of the response
+  bool success = 2;      // Indicates if the operation was successful
+  string message = 3;    // Message describing the response
+  repeated CreateObjectionGrpcResponse data = 4; // Data returned in the API response
+}
+
+message ObjectionRemark {
+  string data = 1;                  // Nullable string
+  uint64 commented_by = 2;          // Nullable uint64
+  google.protobuf.Timestamp commented_date = 3; // Nullable timestamp
+  uint64 commented_office_id = 4;  // Nullable uint64
+  string filepath = 5;             // Nullable string
+  string sender = 6;               // Nullable string
+}
+
+message CreateObjectionPraoGrpcHandlerRequest {
+    string prao_code = 1 [(buf.validate.field).required=true];
+    string pao_code = 2 [(buf.validate.field).required=true];
+    string description = 3;
+    string objection_id = 4;
+    uint64 created_by = 5;
+    google.protobuf.Timestamp created_date = 6;
+    repeated ObjectionRemarkcreate remarks = 7;
+    string status_flag = 8;
+}
+message CreateObjectionPraoGrpcResponse {
+    string prao_code = 1;
+    string pao_code = 2;
+    string description = 3;
+    string objection_id = 4;
+    uint64 created_by = 5;
+    google.protobuf.Timestamp created_date = 6;
+    repeated ObjectionRemark remarks = 7;
+    string status_flag = 8;
+    uint64 last_updated_by = 9;
+    google.protobuf.Timestamp last_updated_date = 10;
+}
+message CreateObjectionPraoGrpcHandlerResponse {
+  int32 status_code = 1 [json_name = "status_code"]; // Status code of the response
+  bool success = 2;      // Indicates if the operation was successful
+  string message = 3;    // Message describing the response
+  repeated CreateObjectionPraoGrpcResponse data = 4; // Data returned in the API response
+}
+
+service PaoService{
+	rpc CreateObjectionGrpcHandler(CreateObjectionGrpcHandlerRequest) returns (CreateObjectionGrpcHandlerResponse){}
+  rpc CreateObjectionPraoGrpcHandler(CreateObjectionPraoGrpcHandlerRequest) returns (CreateObjectionPraoGrpcHandlerResponse){}
+	}

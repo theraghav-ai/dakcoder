@@ -1,0 +1,134 @@
+package repo
+
+{{.Imports}}
+
+// {{.R.RepoType}} is the {{.R.Table}} repository.
+//
+// Three properties hold for every method here and are enforced by rules_lint:
+// the query is built with dblib.Psql (a Squirrel builder pre-configured with
+// $N placeholders — a bare sq.Insert would emit `?` and Postgres would reject
+// it at runtime), the deadline comes from config rather than a literal, and
+// rows are mapped by name so the db tags stay authoritative.
+type {{.R.RepoType}} struct {
+	db  *dblib.DB
+	cfg *config.Config
+}
+
+func New{{.R.RepoType}}(db *dblib.DB, cfg *config.Config) *{{.R.RepoType}} {
+	return &{{.R.RepoType}}{db: db, cfg: cfg}
+}
+
+const {{.R.TableConst}} = "{{.R.Table}}"
+{{if .R.Has "create"}}
+// {{.R.RepoCreate}} inserts one row and returns it as stored.
+//
+// RETURNING is what makes the response correct: without it the caller would be
+// handed back the values it just sent, with id 0 and zero timestamps.
+func (r *{{.R.RepoType}}) {{.R.RepoCreate}}(ctx context.Context, {{sig .R.CreateParams}}) (domain.{{.R.Name}}, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	ins := dblib.Psql.Insert({{.R.TableConst}}).
+		Columns({{.R.QuotedInsertColumns}}).
+		Values({{args .R.CreateParams}}).
+		Suffix("RETURNING {{.R.ReturningColumns}}")
+
+	return dblib.InsertReturning(ctx, r.db, ins, pgx.RowToStructByName[domain.{{.R.Name}}])
+}
+{{end}}
+{{- if .R.Has "list"}}
+// {{.R.RepoList}} reads the collection.{{if .R.ListFilters}} A nil filter pointer means the
+// caller did not supply that filter, so the column is not constrained.{{end}}
+//
+// QueryTimeoutMed rather than Low: a collection read legitimately takes longer
+// than a single-row fetch, and using the tighter budget here is the most common
+// cause of a spurious `context deadline exceeded`.
+func (r *{{.R.RepoType}}) {{.R.RepoList}}(ctx context.Context{{if .R.UseListParams}}, skip, limit uint64{{end}}{{range .R.ListFilters}}, {{.Var}} *{{.GoType}}{{end}}) ([]domain.{{.R.Name}}, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutMed"))
+	defer cancel()
+
+	q := dblib.Psql.Select({{.R.QuotedSelectColumns}}).
+		From({{.R.TableConst}})
+{{- range .R.ListFilters}}
+	if {{.Var}} != nil {
+		q = q.Where(sq.Eq{"{{.DB}}": *{{.Var}}})
+	}
+{{- end}}
+	q = q.OrderBy("id ASC")
+{{- if .R.UseListParams}}
+
+	// limit 0 means "unbounded"; the framework defaults it to 10 from the
+	// form:"limit,default=10" tag on port.MetadataRequest.
+	if limit > 0 {
+		q = q.Limit(limit).Offset(skip)
+	}
+{{- end}}
+
+	return dblib.SelectRows(ctx, r.db, q, pgx.RowToStructByName[domain.{{.R.Name}}])
+}
+{{end}}
+{{- if .R.Has "get"}}
+// {{.R.RepoGet}} reads one row. A missing row surfaces as pgx.ErrNoRows, which
+// the framework renders as a 404.
+func (r *{{.R.RepoType}}) {{.R.RepoGet}}(ctx context.Context, id int64) (domain.{{.R.Name}}, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	q := dblib.Psql.Select({{.R.QuotedSelectColumns}}).
+		From({{.R.TableConst}}).
+		Where(sq.Eq{"id": id})
+
+	return dblib.SelectOne(ctx, r.db, q, pgx.RowToStructByName[domain.{{.R.Name}}])
+}
+{{end}}
+{{- if .R.Has "update"}}
+// {{.R.RepoUpdate}} applies a partial update.
+//
+// Every optional parameter is a pointer because only a pointer distinguishes
+// "set this column to its zero value" from "do not touch this column"; a
+// value-typed parameter collapses the two and silently blanks fields the caller
+// never mentioned.
+//
+// RETURNING again: rebuilding the domain value from the parameters would report
+// the untouched columns as zero, and dereferencing a nil optional to do so
+// would panic outright.
+func (r *{{.R.RepoType}}) {{.R.RepoUpdate}}(ctx context.Context, id int64, {{sig .R.UpdateParams}}) (domain.{{.R.Name}}, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	b := dblib.Psql.Update({{.R.TableConst}})
+{{- range .R.UpdateParams}}
+	if {{.Name}} != nil {
+		b = b.Set("{{.Field.DB}}", *{{.Name}})
+	}
+{{- end}}
+	b = b.Set("updated_at", sq.Expr("NOW()"))
+	b = b.Where(sq.Eq{"id": id}).
+		Suffix("RETURNING {{.R.ReturningColumns}}")
+
+	return dblib.UpdateReturning(ctx, r.db, b, pgx.RowToStructByName[domain.{{.R.Name}}])
+}
+{{end}}
+{{- if .R.Has "delete"}}
+// {{.R.RepoDelete}} removes one row.
+//
+// A delete that matched nothing must not look like success: without the
+// RowsAffected check the caller gets a 200 for a record that was never there.
+func (r *{{.R.RepoType}}) {{.R.RepoDelete}}(ctx context.Context, id int64) error {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	del := dblib.Psql.Delete({{.R.TableConst}}).Where(sq.Eq{"id": id})
+
+	commandTag, err := dblib.Delete(ctx, r.db, del)
+	if err != nil {
+		return err
+	}
+
+	if commandTag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+
+	return nil
+}
+{{end}}

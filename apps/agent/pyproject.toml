@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dakcoder-agent"
+version = "0.1.0"
+description = "The dakcoder agent loop, tool router and context manager"
+requires-python = ">=3.11"
+dependencies = ["dakcoder-shared"]
+
+[project.optional-dependencies]
+# swagger_check parses configs/*.yaml. Without PyYAML the check reports
+# "inconclusive" rather than a false negative, so it stays optional — but a
+# runtime that installs it gets a real answer.
+yaml = ["pyyaml>=6"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The prompts and playbooks are data the agent reads at runtime, not modules.
+# Without this they are absent from the wheel and every run fails on the first
+# turn — in the .vsix, where nobody has a source checkout to fall back to.
+dakcoder_agent = ["prompts/*.md", "prompts/modes/*.md", "playbooks/*.json"]

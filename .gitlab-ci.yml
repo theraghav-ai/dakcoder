@@ -1,0 +1,161 @@
+# dakcoder pipeline.
+#
+# At the repository root, which is where GitLab looks. It lived under gotools/
+# until the Python spine arrived and made the mistake visible: the jobs already
+# began with `cd gotools`, which only makes sense from the root, so the file was
+# never being picked up where it sat.
+#
+# The gotools jobs mirror `make ci` exactly, so a green local run means a green
+# pipeline.
+#
+# The baseline job is the one that matters: it asserts the reference template is
+# clean and the legacy corpus still trips its rules. Those two facts are what
+# keep the rule set honest, and they need the sibling corpora checked out, so
+# they run as a separate job that can be skipped when only gotools/ changed.
+
+stages: [verify, baseline, release]
+
+default:
+  image: golang:1.25
+  tags: [docker]
+  before_script:
+    # The it-2.0-common modules are private; GOPRIVATE keeps them off the public
+    # proxy and the checksum database. CI_JOB_TOKEN authenticates the fetch.
+    - export GOPRIVATE=gitlab.cept.gov.in
+    - export GOFLAGS=-mod=mod
+    - git config --global url."https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.cept.gov.in/".insteadOf "https://gitlab.cept.gov.in/"
+  cache:
+    key:
+      files: [gotools/go.sum]
+    paths: [.gocache, .gomodcache]
+
+variables:
+  GOCACHE: ${CI_PROJECT_DIR}/.gocache
+  GOMODCACHE: ${CI_PROJECT_DIR}/.gomodcache
+
+.in-gotools: &in-gotools
+  - cd gotools
+
+verify:
+  stage: verify
+  script:
+    - *in-gotools
+    - make fmt-check
+    - make vet
+    - make tidy-check
+    - make test-race
+  coverage: '/total:\s+\(statements\)\s+(\d+\.\d+)%/'
+  after_script:
+    - cd gotools && go test -coverprofile=coverage.out ./... >/dev/null 2>&1 || true
+    - cd gotools && go tool cover -func=coverage.out | tail -1 || true
+
+agent:
+  stage: verify
+  image: python:3.12
+  before_script: []
+  cache: {}
+  script:
+    # No install step: pytest.ini puts both packages on the path directly. A
+    # first run that needs the network is a first run that can fail behind the
+    # corporate proxy (Part B §4.2), and that applies to CI as much as to a
+    # developer's laptop.
+    - pip install --quiet pytest httpx pyyaml
+    - python -m pytest apps -q
+  # httpx is the only runtime dependency; pyyaml is optional and swagger_check
+  # reports "inconclusive" without it rather than a false negative. Both are
+  # installed here so the suite exercises the same closure the .vsix vendors.
+
+  # The budget gate is the one that matters here: P95 prompt tokens and
+  # effective prefill against the §5.3 targets. §21's first risk is that the
+  # context work gets deferred as "optimisation", and this is its mitigation.
+  rules:
+    - exists: [apps/agent/src/dakcoder_agent/context.py]
+
+integration:
+  # The gotools bridge and the section 11.1 happy path need BOTH toolchains, and
+  # neither the golang image nor the python image has both. Without this job the
+  # most valuable test in the repository skips silently in CI — which is worse
+  # than not having it, because the pipeline stays green while nothing runs.
+  stage: verify
+  script:
+    - apt-get update -qq && apt-get install -y -qq python3 python3-pip >/dev/null
+    - cd gotools && go build -o gotools.exe ./cmd/gotools && cd ..
+    - export PATH="$CI_PROJECT_DIR/gotools:$PATH"
+    - pip3 install --quiet --break-system-packages pytest httpx pyyaml
+    - python3 -m pytest apps/agent/tests/test_gotools_bridge.py apps/agent/tests/test_happy_path.py -q
+  # Fails loudly rather than skipping: a skip here means the toolchain is missing,
+  # and a missing toolchain in CI is a broken pipeline, not an absent capability.
+  variables:
+    DAKCODER_REQUIRE_INTEGRATION: "1"
+  rules:
+    - exists: [apps/agent/tests/test_happy_path.py]
+
+lint:
+  stage: verify
+  script:
+    - *in-gotools
+    - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+    - golangci-lint run --timeout 5m
+  allow_failure: true # advisory until the codebase settles; flip to false at Phase 1
+
+baseline:
+  stage: baseline
+  needs: [verify]
+  script:
+    - *in-gotools
+    - make build
+    # The reference resource must satisfy every rule. A failure here means a
+    # rule is wrong, not that the template is.
+    - ./gotools lint --root ../new-template
+    # And the scaffolder's own output must satisfy every rule too. The two
+    # halves of this binary have to agree; if they do not, the agent's inner
+    # loop opens with a violation the agent did not cause and cannot fix.
+    - cp -r ../new-template /tmp/scaffolded && rm -rf /tmp/scaffolded/.git
+    - ./gotools resource-scaffold --root /tmp/scaffolded --spec testdata/ci-spec.json
+    - ./gotools lint --root /tmp/scaffolded
+    # repo_map is sent at turn one and re-sent every turn after, so its size is
+    # a budget, not a preference. The frontend agent's equivalent was 20-30k
+    # tokens (Part A section 5, finding S4).
+    - ./gotools repo-map --root ../new-template --format json > /tmp/map.json
+    - >
+      python3 -c "import json,sys; m=json.load(open('/tmp/map.json'));
+      t=m['est_tokens'];
+      print(f'repo_map: {t} tokens, {len(m[\"packages\"])} packages, generation={m.get(\"generation\")}');
+      sys.exit(0 if t <= 4000 and m.get('generation') == 'n-api' else 1)"
+    # Every rule cites a section of skill.md or SOP.md, and those citations are
+    # rendered with every violation. This fails when a document changed without
+    # anyone reviewing the rules that cite it (plan.md section 14.4) — re-pin
+    # with `make doc-pin` once the review is done.
+    - ./gotools doc-check --docs ../new-template
+    # Contract C1 is what the gateway and the extension bind against. Generated
+    # from the live MCP schemas, so a stale catalogue is a stale build rather
+    # than a support ticket in three weeks.
+    - ./gotools tool-catalog --check
+    # The knowledge base is assembled from skill.md and SOP.md, so it goes stale
+    # the moment they change. Regenerating is `make knowledge`; this is the check
+    # that says when it is due.
+    - ./gotools knowledge --docs ../new-template --check
+    # The legacy corpus must still trip its rules; an empty result would mean
+    # legacy detection has silently stopped working.
+    - ./gotools legacy-audit --root ../pao-back-end-development --format json > /tmp/legacy.json || true
+    - >
+      python3 -c "import json,sys; d=json.load(open('/tmp/legacy.json'));
+      n=d['count']+len(d.get('warnings') or []);
+      print(f'legacy findings: {n}');
+      sys.exit(0 if n > 50 else 1)"
+  rules:
+    - exists: [new-template/go.mod]
+
+dist:
+  stage: release
+  needs: [verify, baseline]
+  script:
+    - *in-gotools
+    - make dist VERSION=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
+  artifacts:
+    name: gotools-${CI_COMMIT_REF_SLUG}
+    paths: [gotools/dist/]
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

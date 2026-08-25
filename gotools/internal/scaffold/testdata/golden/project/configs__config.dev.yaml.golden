@@ -1,0 +1,112 @@
+appname: "pension-api"
+
+trace:
+  enabled: true # OpenTelemetry tracing
+  processor:
+    type: "otlp-grpc"
+    options:
+      host: "localhost:4317"
+  sampler:
+    type: always-on
+    options:
+      ratio: 0.1
+
+swagger:
+  generation:
+    # "build" generates the OpenAPI document at build/run time and serves it
+    # from /docs/v3Doc.json. There is no generator CLI in this template.
+    mode: "build"
+
+cache:
+  redisserver:
+  redispassword: # supply at deploy time — never commit a credential
+  redisdbindex: 0
+  redisexpirationtime: 20m
+  lccapacity: 10000
+  lcnumshards: 20
+  lcttl: 2m
+  lcevictionpercentage: 10
+  lcminrefreshdelay: 15m
+  lcmaxrefreshdelay: 30m
+  lcretrybasedelay: 1s
+  lcbatchsize: 10
+  lcbatchbuffertimeout: 30s
+  isredisenabled: false
+  islocalcacheenabled: true
+
+db:
+  username: # supply at deploy time — never commit a credential
+  password: # supply at deploy time — never commit a credential
+  host:
+  port:
+  database:
+  schema: "public"
+  maxconns: 10
+  minconns: 1
+  maxconnlifetime: 30
+  maxconnidletime: 10
+  healthcheckperiod: 5
+  # Repositories read these two keys by name. Single-row work uses Low; a
+  # collection read uses Med. Casing matters — the keys are read verbatim.
+  QueryTimeoutLow: 2s
+  QueryTimeoutMed: 5s
+
+info: # surfaced in the generated swagger document
+  name: "pension-api"
+  version: "1.0.0"
+  description: "Pension disbursement API."
+  title: "Pension API"
+  terms: "https://example.com/terms"
+  email: ""
+
+metrics:
+  expose: true
+  buckets:
+  collect:
+    build: false
+    go: false
+    process: false
+    routes: true
+
+server:
+  debug:
+    stats:
+      expose: true
+      path: "/debug/statsviz"
+    pprof:
+      expose: true
+      path: "/debug/pprof"
+  dashboard:
+    Enabled: true
+  healthcheck:
+    # The framework serves the health endpoint. Do not hand-write one — a
+    # hand-rolled /healthz is a legacy pattern the linter flags.
+    expose: true
+    path: "/healthzz"
+  bodylimit: 2097152
+  readbuffersize: 16384
+  addr: ":8080"
+  readtimeout: 10s
+  writetimeout: 60s
+  timeout: 40 # overall request timeout, seconds
+  cors:
+    alloworigins:
+      - "http://localhost:3000"
+    allowheaders:
+      - "Authorization"
+      - "Content-Type"
+      - "X-Request-Id"
+    allowmethods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+      - "OPTIONS"
+
+log:
+  level: "debug"
+  format: "json"
+  output: "stdout"
+
+client:
+  baseurl: "http://localhost:8080"

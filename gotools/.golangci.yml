@@ -1,0 +1,62 @@
+# golangci-lint v2 configuration.
+#
+# The enabled set is deliberately conservative: a linter that fires on style
+# preferences trains people to add nolint directives, which then hide the
+# findings that matter.
+version: "2"
+
+run:
+  timeout: 3m
+
+linters:
+  default: standard          # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint              # %w vs %v, errors.Is/As correctness
+    - gocritic
+    - misspell
+    - nilerr                 # returning nil after checking err != nil
+    - noctx
+    - prealloc
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    gocritic:
+      enabled-tags: [diagnostic, performance, style]
+      disabled-checks:
+        - ifElseChain        # rule dispatch reads better as if/else than switch
+        - hugeParam
+    revive:
+      rules:
+        - name: exported
+          arguments: [checkPrivateReceivers]
+        - name: package-comments
+        - name: error-strings
+        - name: context-as-argument
+
+  exclusions:
+    paths:
+      # Golden snapshots are byte-exact fixtures, not source. Two of them are
+      # deliberately CRLF because the reference template is; linting or
+      # reformatting them would invalidate the property they pin.
+      - internal/scaffold/testdata/
+    rules:
+      # Tests build deliberately malformed workspaces and assert on them; the
+      # style rules that apply to production code are noise there.
+      - path: _test\.go
+        linters: [gocritic, revive, unparam, prealloc]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    paths:
+      - internal/scaffold/testdata/
