@@ -63,6 +63,8 @@ def deny_all(_request: ApprovalRequest) -> bool:
 
 class Outcome:
     DONE = "done"
+    #: The developer stopped it.
+    ABORTED = "aborted"
     #: The gate never came clean within the attempt budget.
     UNVERIFIED = "unverified"
     #: The same call three turns running.
@@ -126,12 +128,18 @@ class AgentLoop:
         router: Router,
         *,
         approve: Approver = deny_all,
+        cancelled: Callable[[], bool] = lambda: False,
         max_turns: int = 40,
     ) -> None:
         self.context = context
         self.client = client
         self.router = router
         self.approve = approve
+        #: Checked at two points, not one. Part B §12 keeps both because they
+        #: exist for real "stopped but kept moving" reports: a turn can be
+        #: several minutes long, and a tool batch can contain five writes after
+        #: the developer pressed stop.
+        self.cancelled = cancelled
         self.max_turns = max_turns
         self.state = _State()
         self.result: RunResult | None = None
@@ -151,6 +159,9 @@ class AgentLoop:
 
         for _ in range(self.max_turns):
             if self.result is not None:
+                break
+            if self.cancelled():
+                self.result = self._abort()
                 break
             yield from self._turn()
 
@@ -245,6 +256,13 @@ class AgentLoop:
         mutated = False
 
         for call in calls:
+            if self.cancelled():
+                # Before the call, not after. A batch can hold five writes, and
+                # "it stopped but three more files changed" is the report this
+                # check exists to prevent.
+                self.result = self._abort()
+                return
+
             # Fingerprinted from the raw string, not the parsed object. Parsing
             # can raise on malformed arguments, and a model that sends the same
             # malformed arguments three turns running is precisely the case the
@@ -270,10 +288,18 @@ class AgentLoop:
             outcome = self.router.dispatch(call.name, call.arguments, mode=self.state.mode)
 
             if isinstance(outcome, ApprovalRequest):
-                yield Event(EventType.TOOL_PENDING, outcome.as_dict())
-                if self.approve(outcome):
+                request = outcome
+                yield Event(EventType.TOOL_PENDING, request.as_dict())
+                if self.approve(request):
+                    # Re-dispatched with the *request's* arguments, not the
+                    # model's original string. An approver may have corrected
+                    # them — Part B §9's `edit` decision, where fixing a path
+                    # beats rejecting and re-prompting because the model
+                    # usually makes the same mistake again. Using call.arguments
+                    # here would apply the approval and discard the correction,
+                    # which is the worst of the three possible outcomes.
                     outcome = self.router.dispatch(
-                        call.name, call.arguments, mode=self.state.mode, approved=True
+                        call.name, request.arguments, mode=self.state.mode, approved=True
                     )
                 else:
                     outcome = ToolResult.failure(
@@ -393,6 +419,17 @@ class AgentLoop:
             report,
         )
         yield Event(EventType.ERROR, {"message": self.result.summary})
+
+    def _abort(self) -> RunResult:
+        return RunResult(
+            Outcome.ABORTED,
+            "stopped by the developer"
+            + (f"; {len(self.router.touched)} file(s) had already changed"
+               if self.router.touched else " before anything changed"),
+            self.context.turn,
+            tuple(self.router.touched),
+            self.state.last_gate,
+        )
 
     def _switch(self, mode: Mode) -> None:
         if mode is self.state.mode and self.context.turn > 0:

@@ -17,7 +17,6 @@ import pytest
 from dakcoder_gateway.auth import (
     AuthError,
     AuthService,
-    IdentityError,
     Profile,
     RoleMap,
     TokenError,
@@ -25,53 +24,7 @@ from dakcoder_gateway.auth import (
     verifier_challenge,
 )
 
-SECRET = "a" * 48
-REDIRECT = "vscode://dop.dakcoder-go/auth/callback"
-VERIFIER = "v" * 43
-
-
-class FakeGitLab:
-    """A GitLab that does what it is told, so the tests can say what it did."""
-
-    def __init__(self, profile: Profile | None = None) -> None:
-        self.profile_data = profile or Profile(
-            sub="gitlab:7",
-            username="asha",
-            name="Asha R",
-            email="asha@indiapost.gov.in",
-            groups=("it-2.0/pension-api",),
-        )
-        self.codes: dict[str, str] = {"good-code": "gitlab-access-token"}
-        self.exchanges: list[tuple[str, str, str]] = []
-        self.unreachable = False
-        self.rechecks = 0
-
-    def authorize_url(self, redirect_uri: str, challenge: str, state: str) -> str:
-        return f"https://gitlab.cept.gov.in/oauth/authorize?state={state}&code_challenge={challenge}"
-
-    async def exchange(self, code: str, code_verifier: str, redirect_uri: str) -> str:
-        if self.unreachable:
-            raise IdentityError("connection refused", retryable=True)
-        self.exchanges.append((code, code_verifier, redirect_uri))
-        token = self.codes.pop(code, None)  # authorization codes are single use
-        if token is None:
-            raise IdentityError("that authorization code is not valid")
-        return token
-
-    async def profile(self, access_token: str) -> Profile:
-        return self.profile_data
-
-    async def recheck(self, sub: str) -> Profile:
-        self.rechecks += 1
-        if self.unreachable:
-            raise IdentityError("connection refused", retryable=True)
-        return self.profile_data
-
-
-@pytest.fixture
-def gitlab() -> FakeGitLab:
-    return FakeGitLab()
-
+from fakes import REDIRECT, SECRET, VERIFIER, FakeGitLab
 
 @pytest.fixture
 def auth(gitlab: FakeGitLab) -> AuthService:
@@ -214,6 +167,9 @@ def test_the_role_mapping_is_configuration(gitlab: FakeGitLab) -> None:
 # ── the token ───────────────────────────────────────────────────────────────
 
 
+# The short key is the point: this is a forgery attempt, and PyJWT's
+# advice about key length is aimed at people minting real tokens.
+@pytest.mark.filterwarnings("ignore::UserWarning")
 def test_a_forged_token_is_refused() -> None:
     minter = TokenMinter(SECRET)
     forged = jwt.encode(

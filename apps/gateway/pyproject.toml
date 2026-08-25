@@ -5,9 +5,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dakcoder-gateway"
 version = "0.1.0"
-description = "Auth, quota, ledger and the model proxy. Server only — never in the .vsix."
+description = "The dakcoder gateway: identity, quota, ledger and the model proxy"
 requires-python = ">=3.11"
-dependencies = ["dakcoder-shared", "httpx"]
+# SERVER ONLY. Never packaged into the .vsix — this is the process that holds
+# the model API key, and §15.4's whole argument is that it exists in exactly one
+# place. A dependency list that could be installed on a laptop is a step toward
+# a laptop that could hold the key.
+dependencies = [
+    "dakcoder-shared",
+    "fastapi>=0.110",
+    "httpx>=0.27",
+    "pyjwt>=2.8",
+    "redis>=5",
+    "asyncpg>=0.29",
+    "uvicorn>=0.30",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

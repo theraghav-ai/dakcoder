@@ -59,7 +59,7 @@ agent:
     # first run that needs the network is a first run that can fail behind the
     # corporate proxy (Part B §4.2), and that applies to CI as much as to a
     # developer's laptop.
-    - pip install --quiet pytest httpx pyyaml
+    - pip install --quiet pytest pytest-asyncio httpx pyyaml fastapi uvicorn pyjwt
     - python -m pytest apps -q
   # httpx is the only runtime dependency; pyyaml is optional and swagger_check
   # reports "inconclusive" without it rather than a false negative. Both are
@@ -71,6 +71,32 @@ agent:
   rules:
     - exists: [apps/agent/src/dakcoder_agent/context.py]
 
+stores:
+  # The quota store's Lua script and the ledger's SQL are the two things whose
+  # correctness cannot be established without the real server. The conformance
+  # suites skip silently without one, so this job provides them — otherwise the
+  # only implementations ever exercised are the in-memory references, and the
+  # ones that ship are the ones nobody ran.
+  stage: verify
+  image: python:3.12
+  before_script: []
+  cache: {}
+  services:
+    - name: redis:7-alpine
+      alias: redis
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    POSTGRES_PASSWORD: dakcoder
+    POSTGRES_DB: dakcoder
+    DAKCODER_REDIS_URL: redis://redis:6379/0
+    DAKCODER_POSTGRES_DSN: postgres://postgres:dakcoder@postgres:5432/dakcoder
+  script:
+    - pip install --quiet pytest pytest-asyncio httpx redis asyncpg pyjwt fastapi
+    - python -m pytest apps/gateway -q
+  rules:
+    - exists: [apps/gateway/src/dakcoder_gateway/quota/store.py]
+
 integration:
   # The gotools bridge and the section 11.1 happy path need BOTH toolchains, and
   # neither the golang image nor the python image has both. Without this job the
@@ -81,7 +107,7 @@ integration:
     - apt-get update -qq && apt-get install -y -qq python3 python3-pip >/dev/null
     - cd gotools && go build -o gotools.exe ./cmd/gotools && cd ..
     - export PATH="$CI_PROJECT_DIR/gotools:$PATH"
-    - pip3 install --quiet --break-system-packages pytest httpx pyyaml
+    - pip3 install --quiet --break-system-packages pytest pytest-asyncio httpx pyyaml fastapi uvicorn pyjwt
     - python3 -m pytest apps/agent/tests/test_gotools_bridge.py apps/agent/tests/test_happy_path.py -q
   # Fails loudly rather than skipping: a skip here means the toolchain is missing,
   # and a missing toolchain in CI is a broken pipeline, not an absent capability.

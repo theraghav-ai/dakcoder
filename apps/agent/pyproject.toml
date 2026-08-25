@@ -7,7 +7,12 @@ name = "dakcoder-agent"
 version = "0.1.0"
 description = "The dakcoder agent loop, tool router and context manager"
 requires-python = ">=3.11"
-dependencies = ["dakcoder-shared"]
+dependencies = ["dakcoder-shared", "fastapi>=0.110", "uvicorn>=0.30"]
+
+[project.scripts]
+# What the extension spawns. A console script rather than `python -m`, so the
+# venv's bin directory is the whole discovery story on every platform.
+dakcoderd = "dakcoder_agent.serve:main"
 
 [project.optional-dependencies]
 # swagger_check parses configs/*.yaml. Without PyYAML the check reports

@@ -34,9 +34,27 @@ numbered entry below with its justification — not a silent deviation.
 | `apps/agent` — the verification gate | **built** |
 | `apps/agent` — the loop | **built**, five modes, C2 event stream |
 | `docs/TOOL-CATALOG.md` — contract C1, model-facing half | **built**, generated |
-| `apps/agent/prompts` — the shared system prompt | not started |
-| `apps/gateway` — auth, quota, ledger, model proxy | not started |
-| VS Code extension (Part B) | not started |
+| `apps/agent/prompts` — one system prompt, five overlays | **built**, 791/1,200 tokens |
+| `apps/gateway/auth` — PKCE, JWT, roles, refresh rotation | **built** |
+| `apps/gateway/quota` — rolling windows, reserve/reconcile | **built**, two stores |
+| `apps/gateway/ledger` — append-only usage events | **built** |
+| `apps/gateway/proxy` — `/v1/llm/*`, SSE tee | **built** |
+| `apps/gateway/app` — the HTTP surface (C1, C3, C4) | **built** |
+| `apps/agent/session` — event log, resumption, abort, revert | **built** |
+| `apps/agent/loopback` — the endpoint the extension talks to | **built**, API v1.0 |
+| `apps/agent/serve` — `dakcoderd`, the spawnable runtime | **built** |
+| VS Code extension (Part B) | **unblocked** — see §7 |
+
+**Part A is complete.** Every backend surface Part B binds against exists,
+is tested, and is documented: the tool catalogue (C1), the event stream (C2),
+sign-in (C3), quota (C4), and the context budget the server owns (C5). The
+handover is §7.
+
+**Phase 0 is complete, Phase 1's happy path runs end to end, and the gateway
+is built.** Identity, quota, the ledger and the model proxy are done, with the
+one control everything else rests on in place: the model API key exists in
+exactly one process, and every model call is metered, attributed and recorded
+before it reaches the GPU.
 
 **Phase 0 is complete, and Phase 1's happy path runs end to end.** The section
 11.1 recipe — plan, scaffold a resource, wire it, verify — completes against a
@@ -793,6 +811,344 @@ C1's limits are enforced when the registry is imported — a violation is an
 from something that does not share its code path.
 
 ---
+**D-52 · The prompts are files, and the budget is a test**
+
+`prompts/system.md` plus five `prompts/modes/*.md`, loaded through
+`importlib.resources`. 791 tokens against §6.1's 1,200; overlays 134–199.
+
+**Why files**: prompt review is the highest-leverage review there is, and a
+`.md` diff is readable in a way a Python string literal is not. It also makes
+the byte content hashable and pinnable, so a change to a prompt becomes a
+deliberate act rather than a side effect of editing whatever module happened to
+contain it.
+
+**Why the budget is a test**: a prompt is the easiest thing in a codebase to
+grow by accident. Every addition looks individually reasonable and nothing fails
+when it gets too long — the working set just quietly shrinks. `test_prompts.py`
+asserts the ceiling, and asserts the whole prefix leaves ≥26,000 tokens for code.
+
+Newlines are normalised on read. A prefix whose bytes depend on the reader's git
+configuration is not a stable prefix: it would produce a different cache key on a
+colleague's machine for a file neither of them edited.
+
+---
+**D-53 · The gateway is async; the agent stays synchronous**
+
+**Why not one or the other**: they are different shapes of program. A gateway
+serves many concurrent requests each mostly waiting on I/O, which is what an
+event loop is for. An agent loop is strictly sequential — one turn, then the
+next — and making it async would add an event loop, colour every function, and
+buy nothing, because there is never a second thing to do while a turn is in
+flight.
+
+The seam is the HTTP boundary, which is a process boundary anyway. The one place
+it could have leaked is the `gotools` bridge, and D-44's hand-written client is
+what keeps it synchronous.
+
+---
+**D-54 · The quota store's contract is one atomic method**
+
+`apply(sub, checks, now) -> Applied`, all-or-nothing. Not `check()` then
+`consume()`.
+
+**Why**: two turns arriving together must not both read "599,000 used" and both
+proceed. And a request refused by the weekly cap must not have already consumed
+from the hourly one, or a client retrying into a wall drains a budget it never
+spent. Check-then-consume as two calls has both bugs; a port that does not offer
+them separately cannot be implemented with either.
+
+The conformance suite includes a **deliberately wrong store** that checks, yields,
+then writes — and requires it to fail the atomicity assertion. Without that, a
+passing suite proves nothing: it might be asserting things true of any code at
+all. `NaiveStore` is not a strawman; it is what most rate limiters look like
+before someone notices the counters do not add up.
+
+`RedisStore` carries the Lua translation and is honestly labelled untested here:
+the suite runs against it only when `DAKCODER_REDIS_URL` reaches a server. A mock
+of Redis would execute the script exactly as correctly as the mock was written.
+
+---
+**D-55 · Reserve high, settle true — and settle in both directions**
+
+The frontend agent reserves a flat 4,096 tokens per call and never refunds, so a
+turn that used 300 is billed 4,096 and the error compounds across forty turns
+(finding S18). Here the reservation is provisional and the endpoint's own usage
+figure replaces it.
+
+The direction that is easy to leave out is the other one. An *under*-reservation
+is **charged**, not refused: the tokens are already spent by the time we know, so
+refusing would only make the counters wrong, and the overshoot correctly bites on
+the next reservation. Both directions are one signed `adjust()`. The first draft
+had `refund()` with an early return on non-positive amounts, which silently made
+under-reservations free — caught by writing the test for it.
+
+---
+**D-56 · Fail closed everywhere, with one deliberate exception**
+
+If the quota store is unreachable, requests are refused. There is exactly one
+`_guarded` wrapper so there is exactly one place where infrastructure trouble
+becomes an answer — scattering try/except is how one path ends up defaulting to
+"allow" and nobody notices until the audit.
+
+**The ledger is the exception, and it is reasoned rather than convenient.** A
+failed ledger write is logged and swallowed. The quota decision has already been
+made and enforced by the time a row is written, so losing a row costs reporting
+accuracy; refusing the turn would cost a developer their work over a bookkeeping
+problem. The counters stay correct and the hole is logged.
+
+`StoreUnavailable` maps to 503 with `Retry-After`, not 500: the request is
+refused because it cannot be *metered*, which is a temporary condition of ours
+rather than a fault in what was sent — and that distinction tells the client to
+retry later rather than to change the request.
+
+---
+**D-57 · `/v1/auth/start` is added to §15.2's flow, for a security reason**
+
+In the plan's diagram the extension generates `state` itself. That means the
+gateway receives a value it has never seen and cannot check — so the CSRF
+protection `state` exists to provide is unenforceable on the only side that could
+enforce it.
+
+Having the gateway issue and store it closes an authorization-code injection: an
+attacker who gets a victim's browser to complete a flow cannot then post that
+code, because they hold no state the gateway issued. The state is single-use, ten
+minutes, and **bound to the redirect URI** — otherwise a flow started for the
+`vscode://` handler could be completed against a loopback port an attacker owns.
+
+An unknown state is refused unconditionally. There is no fallback for the plan's
+original shape: accepting a state we did not issue makes the check decorative,
+and a control that can be satisfied by guessing is worse than none because it
+reads as protection in a design review.
+
+**Cost**: one extra round trip at sign-in, once.
+
+---
+**D-58 · Refresh rotates, reuse kills the family, and access tokens die with it**
+
+OAuth 2.0 BCP. A refresh token is a thirty-day credential in a keychain; the one
+thing that makes theft survivable is noticing when both the thief and the owner
+use it.
+
+We cannot tell which party is which, and the safe reading of "cannot tell" is to
+end the family. A legitimate user signs in again; a thief loses everything.
+
+The part that is easy to omit: **revoking a family invalidates its access tokens
+immediately**, checked at verify. Without it a stolen access token stays good for
+its full fifteen minutes after the theft was detected — exactly the window the
+detection was meant to close. Access tokens carry a `fam` claim for this.
+
+Every refresh re-reads the account from the IdP, which is what makes revocation
+real: a blocked GitLab account loses access within one token lifetime and nobody
+runs a deprovisioning step.
+
+---
+**D-59 · The client names a role; the gateway names the model**
+
+`model: "coder"` in, `model: "Qwen3.8-27B"` out.
+
+**Why**: forwarding the client's `model` would let a developer route to a model
+nobody has budgeted for, on a shared GPU, with our key attached. Only two paths
+are proxied — `chat/completions` and `embeddings` — so a new upstream capability
+cannot become reachable by accident.
+
+`stream_options.include_usage` is forced on every stream rather than trusted from
+the client. Without the usage chunk there is no accounting and quota could only
+be enforced from reservations, which is exactly S18.
+
+`user` is set to the subject, so LiteLLM's own spend tables attribute correctly
+even before per-user virtual keys exist (§16.6 phase 1). It costs nothing and
+makes the cross-check meaningful from day one.
+
+---
+**D-60 · The stream is primed before the response starts**
+
+The first chunk is pulled inside the route, before `StreamingResponse` is
+returned.
+
+**Why**: everything that can fail before the model produces a byte — quota
+refused, unknown role, unreachable upstream — happens inside the generator. Once
+the response is returned the status line is on the wire, and an exception raised
+then cannot change it: Starlette says "Caught handled exception, but response
+already started" and the client sees a 200 that stops mid-stream. This was a real
+bug, found by the HTTP tests and not by any unit test.
+
+After that point the status code is spent, so a mid-flight failure becomes a C2
+`error` event. Dropping the connection instead would be indistinguishable from a
+network fault — which clients retry, doubling the cost of whatever went wrong.
+
+Related, and measured rather than assumed: httpx strips the blank line that
+frames an SSE event, so the relay re-terminates every line. A relay that forgets
+produces a stream parsing as one enormous event, which looks exactly like the
+model hanging.
+
+---
+**D-61 · A missing usage chunk does not refund the reservation**
+
+If the stream produced output but reported no usage, the reservation stands.
+
+**Why**: a turn that produced output certainly cost something, and refunding what
+we cannot measure would make a broken endpoint the cheapest way to use the
+service. The capability probe's `usage_chunk` check exists so this surfaces as an
+endpoint fault rather than being absorbed silently.
+
+Same reasoning for a client that disconnects mid-stream: the model produced those
+tokens, so settlement runs in a `finally`. Otherwise abandoning turns would be
+the cheapest way to work.
+
+---
+**D-62 · The cached-prefill discount is wired, dormant, and read anyway**
+
+`cached_discount` defaults to 1.0 — no discount — because
+`prompt_tokens_details.cached_tokens` is absent from this endpoint (plan.md §9
+Q1). The proxy reads the field regardless, so the day it appears the discount has
+data rather than needing a code change.
+
+**Why keep it visible while dormant**: discounting cached prefill makes a session
+with good context discipline go further than one without, which points the quota
+model at the same behaviour the latency work rewards. Defaulting to a discount we
+cannot verify would under-bill; deleting the mechanism would mean rediscovering
+the intent later.
+
+---
+**D-63 · A refusal says what was requested, and whether waiting will help**
+
+A 429 carries used, limit, *requested*, and a one-sentence human reason.
+
+**Why the third**: "you have used 920 of 5,000" is true and useless when the ask
+was 9,000. And a request larger than the limit itself is flagged separately —
+every other refusal is answered by waiting, and telling someone to wait for
+something that will never happen is the worst possible answer, because they wait.
+
+The reset time is when the *oldest* event ages out, not a fixed period boundary.
+That is the whole difference between a rolling window and a bucket, and it is the
+number a developer needs in order to decide whether to wait.
+
+---
+**D-64 · Every event carries an id, and the log is the source of truth**
+
+Part B §14 names the one real gap in the current client: the SSE parser handles
+a clean stream well but has no resumption path, so a dropped connection loses the
+live view of a run that is still executing — and the developer cannot tell that
+from the run having died.
+
+Events are persisted **before** they are sent. The order is the whole point:
+sending first would let a crash between the two produce an event the client saw
+and the log does not have, and resumption would then silently skip it. A hole
+that looks like nothing is wrong is worse than a dropped connection.
+
+`Last-Event-ID` is honoured alongside an explicit `since_id`, because that is
+what a browser's `EventSource` sends automatically on reconnect — a client that
+does nothing special still resumes correctly.
+
+Transient events (`assistant_delta`, `heartbeat`) are relayed but not stored.
+They are superseded by the `assistant` message that follows, so replaying them
+would re-type an answer the client already has in full.
+
+---
+**D-65 · The run is on a worker thread, and that is load-bearing twice**
+
+Not a performance choice. Two things become impossible if the loop runs on the
+event loop:
+
+* **Abort.** The endpoint has to answer *while* a run is in flight, and a turn
+  can be minutes long. An inline loop blocks exactly the request that has to get
+  through.
+* **Approval.** The loop blocks on a `threading.Event` that an HTTP handler sets.
+  On the event loop that is a deadlock: the run waits for a decision the server
+  cannot deliver because the run is holding it.
+
+The bridge back is `call_soon_threadsafe`, guarded. A server shutting down while
+a run is in flight closes the loop, and an unguarded call then raises *inside the
+worker thread*, killing it and leaving the session stuck at "running" for ever.
+Found by the tests, not by reasoning.
+
+---
+**D-66 · Abort is checked at two points, not one**
+
+At the top of each turn, and before each tool call in a batch.
+
+**Why both**: Part B §12 keeps both checks because they exist for real "stopped
+but kept moving" reports. A turn can run for minutes, and a single tool batch can
+contain five writes — so checking only at the turn boundary produces exactly the
+complaint "it stopped, and then three more files changed".
+
+---
+**D-67 · The `edit` decision re-dispatches the request's arguments**
+
+Part B §9 calls `edit` the standout of the approval card, and the reason is
+arithmetic: correcting a path costs nothing, while rejecting costs a turn and the
+model usually makes the same mistake again.
+
+The first version re-dispatched `call.arguments` — the model's original string —
+so an approved edit applied the approval and silently discarded the correction.
+That is the worst of the three possible outcomes: the developer believes they
+fixed it, and the wrong thing happens anyway. It now re-dispatches the
+`ApprovalRequest`'s arguments, which the approver may have replaced.
+
+A timeout is a **refusal**. Nobody looked, so nobody agreed — and the failure
+mode of the opposite default is a write that happened while the developer was at
+lunch.
+
+---
+**D-68 · Revert reads git at revert time rather than snapshotting at write time**
+
+§12: restore every path the session touched to HEAD, deleting files with no
+baseline.
+
+**Why not snapshots**: no memory is held for a revert that will probably never
+happen, and the restored content is exactly what git would give a developer
+typing the command themselves — which is what they will compare it against.
+
+The plan is a separate call from the apply, because §12 asks for the
+confirmation to list the exact paths: "revert my last task" is easy to fire by
+accident.
+
+**A bug worth recording.** The first version inferred "not a git repository" from
+the exit code of `cat-file`, which conflates it with "the file is not in HEAD" —
+and those lead to opposite actions. The first means the session created the file,
+so revert **deletes** it; the second means revert cannot run at all. Deleting a
+developer's file because git happened to be absent is a mistake with no undo. The
+repository check is now its own explicit question.
+
+---
+**D-69 · The loopback token defends against the local machine, not the network**
+
+Bound to 127.0.0.1, so there is no network to defend against. What there is, on a
+developer laptop, is every npm postinstall script and browser extension that can
+reach localhost — and an unauthenticated port there is an agent anyone can drive.
+
+`secrets.compare_digest`, because a timing side channel on a local socket is
+entirely practical.
+
+`/v1/health` is deliberately exempt. It is what the extension polls for up to
+sixty seconds while deciding whether the runtime came up, and a health check that
+needs a credential cannot tell it whether the credential path is the broken
+thing.
+
+---
+**D-70 · `dakcoderd` announces its port on stdout, before serving**
+
+Port 0, then print what the OS gave us.
+
+**Why**: a fixed port turns a second VS Code window into a confusing failure.
+Announcing before serving means the parent has the number even if startup then
+fails — and `listen()` happens before the announcement, so a parent that connects
+the instant it reads the line does not hit a bound-but-not-accepting socket. That
+race only appears on a fast machine, which is the worst kind to only appear on.
+
+`Server.run(sockets=[...])` rather than `uvicorn.run(fd=...)`: passing a file
+descriptor works on POSIX and fails silently on Windows, where socket handles are
+not file descriptors. The primary platform here is Windows 11. Found by running
+it, not by reading about it.
+
+Prewarm is on by default, reversing Part B §3.3's current `--no-prewarm`. A
+four-token probe in a background thread costs nothing a developer can perceive
+and moves cold start off the first request — the one they are watching. Its
+failure is recorded in `/v1/health`, never raised: a runtime that refuses to
+start because the gateway was briefly unreachable is worse than one that starts
+and says so.
+
+---
 
 ## 4. Verification strategy
 
@@ -825,6 +1181,28 @@ The load-bearing assertions, and what each is guarding against:
 | A tool that raises becomes a result, not a crash | One bad tool ending a session the model could have recovered |
 | No committed credential reaches the event stream | The stream is logged, traced, and screenshotted |
 | The published C1 catalogue matches the registry | A contract document drifting from the code, silently |
+| The system prompt fits 1,200 tokens and the prefix leaves ≥26k | A prompt growing by accident, one reasonable addition at a time |
+| A mode switch does not change the pinned head | Finding S6 — three cold prefills per task |
+| Five concurrent reservations of 3,000 against a 5,000 ceiling admit one | Two callers reading the same "used" figure and both acting on it |
+| A deliberately non-atomic store *fails* that assertion | A conformance suite that asserts things true of any code at all |
+| A refused reservation consumes nothing | A client retrying into a wall draining a budget it never spent |
+| An over-reservation is refunded and an under-reservation is charged | Finding S18, in both directions |
+| An unreachable quota store refuses rather than allows | The unmetered bypass §15.4 exists to close |
+| A state the gateway never issued is refused | A CSRF check that can be satisfied by guessing |
+| Reusing a refresh token ends the family, access tokens included | A stolen token staying good for 15 minutes after detection |
+| A blocked account loses access at the next refresh | Revocation that needs a separate deprovisioning step |
+| The model key never appears in a response, a request body or a log | The one secret whose leak makes every limit decorative |
+| A failure before the first byte is a status code; after it, a C2 error event | A 200 that stops mid-stream, indistinguishable from a network fault |
+| A stream that drops midway is still billed and ledgered | Abandoning turns becoming the cheapest way to use the service |
+| `since_id` and `Last-Event-ID` replay only what was missed | Part B §14's gap: a dropped connection indistinguishable from a dead run |
+| A finished session's stream replays and then closes | An endless stream reading to the extension as a run still in progress |
+| Abort answers while a run is in flight, and releases its approval | A card nothing will ever answer, and "it stopped but kept moving" |
+| An `edit` decision's corrected arguments are the ones that run | An approval that silently discards the correction |
+| An approval timeout refuses | A write that happened while nobody was looking |
+| Revert deletes what a session created and restores what it changed | A revert that reports success and changes nothing |
+| Revert outside a git repository is blocked, not attempted | Deleting a developer's file because git was absent |
+| A running session cannot be reverted or deleted | A tree matching neither the before nor the after |
+| `dakcoderd` refuses to start holding a model key, or without a gateway | The unmetered bypass, at the one place a laptop could open it |
 
 ---
 
@@ -843,6 +1221,58 @@ The load-bearing assertions, and what each is guarding against:
   **`config.prod.yaml` has no `cache:` block at all**, so 15 keys return zero
   values in production.
 - `make ci` gained `doc-check`, `tool-catalog-check`, `knowledge-check`.
+
+### 2026-08-26 — Phase 3: sessions, the loopback, and `dakcoderd`
+
+Part A is finished. The extension has a runtime to spawn and a contract to bind
+against.
+
+- `agent/session.py`: the event log with monotonic ids, resumption, abort, and
+  a git-based revert (D-64, D-68).
+- `agent/loopback.py`: the HTTP+SSE surface — tasks, sessions, events,
+  approvals, abort, revert (D-65, D-66, D-69).
+- `agent/serve.py`: `dakcoderd`, spawnable exactly as Part B §4 describes
+  (D-70).
+- `agent/loop.py`: cancellation at two checkpoints (D-66).
+
+**Bugs this phase produced**, each caught by a test rather than by review:
+
+- The `edit` approval decision re-dispatched the model's original arguments, so
+  a correction was silently discarded while the approval went through (D-67).
+- `call_soon_threadsafe` was unguarded, so a shutdown mid-run killed the worker
+  thread and left the session "running" for ever (D-65).
+- Revert inferred "not a git repository" from the wrong exit code, which would
+  have **deleted** files it could not restore (D-68).
+- `uvicorn.run(fd=...)` binds silently and never serves on Windows (D-70).
+
+### 2026-08-25 — Phase 2: prompts and the gateway
+
+The gateway is built: identity, quota, the ledger and the model proxy, with the
+HTTP surface that carries contracts C1, C3 and C4.
+
+- `agent/prompts/`: one system prompt, five overlays, budget asserted (D-52).
+- `gateway/auth/`: PKCE with a server-issued state, our own JWT, roles from
+  GitLab groups, refresh rotation with family revocation (D-57, D-58).
+- `gateway/quota/`: rolling windows over an atomic store, reserve-and-reconcile,
+  priority lanes, idempotency (D-54, D-55, D-63).
+- `gateway/ledger.py`: append-only usage events, reasoning tokens in their own
+  column so §4.4's choices stay measurable.
+- `gateway/proxy.py`: `/v1/llm/*` with SSE passthrough and a usage tee (D-59,
+  D-61, D-62).
+- `gateway/app.py`: the routes, and one place where each domain error becomes a
+  status code (D-56, D-60).
+
+**Bugs this phase produced and the tests that caught them**, all before any of
+it ran against a server:
+
+- `refund()` with a non-positive early return made under-reservations free.
+- The idempotency claim stored `None`, so a replay could never be recognised.
+- `Reservation.settled` was set on a frozen dataclass by a no-op expression, so
+  double reconciliation was never detected.
+- `StreamingResponse` was returned before the generator's first chunk, so a
+  quota refusal arrived as a 200 that stopped mid-stream.
+- `_guarded` turned a 409 idempotency conflict into a 503, telling the caller to
+  retry the one request that must not be retried.
 
 ### 2026-08-25 — Phase 1: the tool router, the gate, and the loop
 
@@ -966,3 +1396,84 @@ These came out of building the analysis and are independent of this programme:
   deliberately deferred.
 - **`swagger_check`'s boot-and-diff half** and **`govalid_gen`** are command
   runners, which belong to the Python tool router rather than to `gotools`.
+
+---
+
+## 7. Handover to Part B
+
+Everything the extension binds against, and where it lives.
+
+### What to spawn
+
+```
+dakcoderd --workspace <repo> [--port 0] [--no-prewarm]
+
+env: DAKCODER_GATEWAY_URL    the gateway base, e.g. https://aiops.cept.gov.in/coder/backend
+     DAKCODER_GATEWAY_TOKEN  a random per-session loopback token you generate
+     DAKCODER_JWT            the dakcoder JWT from sign-in
+```
+
+It prints one line of JSON on stdout before serving — `{"port", "pid",
+"version"}` — and refuses to start if any model credential is in its
+environment, or if the gateway URL or loopback token is missing. Strip
+`OPENAI_API_KEY` and friends before spawn (Part B §4.6); the runtime will
+otherwise stop with a message naming the variable.
+
+### The loopback (`http://127.0.0.1:<port>`, `Authorization: Bearer <token>`)
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/health` | **No token.** `api_version`, `version`, prewarm result. Poll this after spawn. |
+| `GET /v1/tools` | Contract C1, 29 tools, same shape as `docs/tool-catalog.json` |
+| `POST /v1/tasks` | `{task, mode?, acceptance?}` → the session |
+| `GET /v1/sessions/{id}/events` | SSE. `?since_id=` or `Last-Event-ID:` to resume |
+| `GET /v1/sessions` | the tree; `?status=` filters |
+| `GET /v1/sessions/{id}` | detail; `?transcript=true` for the full event log |
+| `DELETE /v1/sessions/{id}` | 409 while running |
+| `POST /v1/sessions/{id}/abort` | honoured mid-turn and before each tool call |
+| `GET  /v1/sessions/{id}/revert` | the plan: `{restore, delete, blocked}` |
+| `POST /v1/sessions/{id}/revert` | apply it; 409 while running |
+| `GET  /v1/approvals` | what is waiting |
+| `POST /v1/approvals/{id}` | `{decision: accept\|reject\|edit, arguments?}`; 410 once gone |
+
+`api_version` is `1.0`. Pin it: Part B §15 is right that silent version skew
+across this seam is the failure that costs the most support time.
+
+### The gateway (`https://<gateway>`, `Authorization: Bearer <jwt>`)
+
+| Route | Purpose |
+|---|---|
+| `POST /v1/auth/start` | `{redirect_uri, code_challenge}` → `{state, authorize_url}` |
+| `POST /v1/auth/exchange` | `{code, code_verifier, state, redirect_uri}` → session + quota |
+| `POST /v1/auth/refresh` | rotates; reuse ends the family |
+| `GET  /v1/quota` | contract C4's snapshot, including `tightest` for the status bar |
+| `POST /v1/quota/preflight` | would a run of this size be admitted? |
+| `POST /v1/runs` | opens a session window |
+| `GET  /v1/health` | **no token**; capabilities and the limits in force |
+| `POST /v1/llm/*` | the model proxy; the runtime uses this, not the extension |
+
+**`/v1/auth/start` is new** relative to Part A §15.2's diagram, and it is not
+optional — see D-57. The extension must call it and use the `state` it returns,
+because a state the gateway did not issue is refused.
+
+### Event types on the stream (contract C2)
+
+`turn_start`, `assistant`, `assistant_delta`, `tool_call`, `tool_pending`,
+`tool_result`, `plan`, `gate`, `usage`, `quota`, `finish`, `error`,
+`heartbeat`, `end`.
+
+Additive only: **ignore unknown types and unknown fields.** That rule is what
+lets the `.vsix` and the wheel version independently, which they will, because
+one ships through a marketplace and the other through GitLab.
+
+`assistant_delta` is coalesced server-side and never persisted (fix S11); do not
+build a transcript from it. `gate` carries `kind: inner|full|compaction`.
+`tool_pending` is an approval — its `id` is what `POST /v1/approvals/{id}` takes.
+
+### What Part B still owns
+
+- The extension itself, all of Part B.
+- `gopls` integration. `go_symbols` and `go_diagnostics` are specified, in the
+  catalogue, and marked `unavailable` with a substitute named — see §6.3.
+- The `swagger_check` boot-and-diff half: it needs a database and a free port,
+  and a check that fails when Postgres is down gets disabled within a week.
