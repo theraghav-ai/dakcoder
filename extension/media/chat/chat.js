@@ -34,6 +34,10 @@
   const offlineEl = document.getElementById('offline');
   const queuedEl = document.getElementById('queued');
   const workingEl = document.getElementById('working');
+  const composerEl = document.getElementById('composer');
+  const consoleEl = document.getElementById('console');
+  const modePill = document.getElementById('mode-pill');
+  const keysEl = document.getElementById('keys');
 
   /** Strings arrive from the host; `vscode.l10n` does not exist in here. */
   let S = {};
@@ -159,6 +163,9 @@
       rows.push(row);
       byKey.set(row.key, row);
     }
+    // Before paint, not after: the empty state is a sibling in the same flow,
+    // and removing it afterwards would land the first row below it.
+    syncEmpty();
     paint(row);
     trim();
     save();
@@ -193,8 +200,133 @@
     pendingApprovals.clear();
     openAssistant = null;
     transcript.textContent = '';
+    syncEmpty();
     updateSkip();
     save();
+  }
+
+  // ── icons ─────────────────────────────────────────────────────────────────
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  /**
+   * Inline SVG, built through the DOM rather than through `innerHTML`.
+   *
+   * The panel's CSP has no `unsafe-inline`, but that is not the reason: an
+   * `innerHTML` sink anywhere in a renderer that also draws tool output is one
+   * refactor away from being an injection point, and there is no version of
+   * that trade worth making for four decorative glyphs.
+   *
+   * Everything drawn here is `aria-hidden`. The state it depicts is always also
+   * a word in the same row, which is what the announcements read.
+   */
+  function icon(shapes, size, stroke) {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', String(size || 12));
+    svg.setAttribute('height', String(size || 12));
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', String(stroke || 1.8));
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('focusable', 'false');
+    shapes.forEach(function (shape) {
+      if (typeof shape === 'string') {
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('d', shape);
+        svg.appendChild(path);
+        return;
+      }
+      const circle = document.createElementNS(SVG_NS, 'circle');
+      circle.setAttribute('cx', String(shape[0]));
+      circle.setAttribute('cy', String(shape[1]));
+      circle.setAttribute('r', String(shape[2]));
+      svg.appendChild(circle);
+    });
+    return svg;
+  }
+
+  const GLYPHS = {
+    cube: ['M3 7.5 12 3l9 4.5v9L12 21l-9-4.5z', 'M3 7.5 12 12l9-4.5M12 12v9'],
+    check: ['m5 13 4 4 10-10'],
+    cross: ['M6 6l12 12M18 6 6 18'],
+    pencil: ['M4 20h4l10-10-4-4L4 16z'],
+    released: [[12, 12, 8], 'M7 17 17 7'],
+    clock: [[12, 12, 8.5], 'M12 7.5V12l3 2'],
+    warn: ['M12 3 2 20h20z', 'M12 9v5M12 17v.5'],
+    offline: [
+      'M4 4l16 16M9 17h6M6.5 13.5a8 8 0 0 1 4-2.2M17.5 13.5a8 8 0 0 0-2.4-1.7' +
+        'M3.5 10a13 13 0 0 1 4-2.6M20.5 10a13 13 0 0 0-9-3.4',
+    ],
+  };
+
+  // ── the idle empty state ──────────────────────────────────────────────────
+
+  /**
+   * What an empty panel says.
+   *
+   * It is bottom-aligned so the sentence telling you to type sits directly
+   * above the box you type into, and the four suggestions are real buttons that
+   * fill the composer rather than send — the developer still has to say what
+   * they want scaffolded, and sending `/scaffold` alone would start a run with
+   * no subject.
+   *
+   * Kept out of `rows` entirely. It is not an event, it must not be persisted
+   * into `vs.setState`, and it must not survive the first thing that happens.
+   */
+  const SUGGESTIONS = [
+    ['/scaffold', 'cmdScaffold'],
+    ['/audit', 'cmdAudit'],
+    ['/migrate', 'cmdMigrate'],
+    ['/debug', 'cmdDebug'],
+  ];
+
+  let emptyNode = null;
+
+  function syncEmpty() {
+    const wanted = rows.length === 0;
+    if (wanted === Boolean(emptyNode && emptyNode.isConnected)) return;
+    if (!wanted) {
+      if (emptyNode && emptyNode.isConnected) emptyNode.remove();
+      emptyNode = null;
+      return;
+    }
+    emptyNode = renderEmpty();
+    transcript.appendChild(emptyNode);
+  }
+
+  function renderEmpty() {
+    const wrap = el('div', 'empty');
+
+    const lede = el('div', 'lede');
+    const mark = el('div', 'mark');
+    mark.appendChild(icon(GLYPHS.cube, 26, 1.4));
+    lede.appendChild(mark);
+    lede.appendChild(el('h2', null, S.emptyTitle || ''));
+    lede.appendChild(el('p', null, S.emptySubtitle || ''));
+    wrap.appendChild(lede);
+
+    const list = el('ul', 'suggestions');
+    list.appendChild(el('li', 'eyebrow', S.suggestions || ''));
+    SUGGESTIONS.forEach(function (pair) {
+      const item = el('li');
+      const button = el('button', 'suggestion');
+      button.type = 'button';
+      button.appendChild(el('span', 'cmd', pair[0]));
+      button.appendChild(el('span', 'what', S[pair[1]] || ''));
+      button.addEventListener('click', function () {
+        input.value = pair[0] + ' ';
+        autosize();
+        input.focus();
+        refresh();
+      });
+      item.appendChild(button);
+      list.appendChild(item);
+    });
+    wrap.appendChild(list);
+    return wrap;
   }
 
   // ── disclosure ────────────────────────────────────────────────────────────
@@ -291,6 +423,10 @@
    */
   function changeset(mutations) {
     const wrap = el('div', 'changeset');
+    const head = el('div', 'changeset-head');
+    head.appendChild(el('span', null, S.changeset || ''));
+    head.appendChild(el('span', 'count', plural('files', mutations.length)));
+    wrap.appendChild(head);
     mutations.forEach(function (m) {
       const row = el('div', 'changeset-row');
       const kind = el('span', 'kind', S['kind.' + m.kind] || m.kind);
@@ -457,7 +593,7 @@
       case 'steer':
         return shell({ state: '' }, '↩', S.steerApplied, '');
       case 'quota':
-        return shell({ state: '' }, '◷', row.text, '');
+        return renderQuota(row);
       case 'error':
         return shell({ state: 'fail' }, '✗', S.error, '', bodyFor(row.message, 'plaintext'));
       case 'notice':
@@ -617,9 +753,15 @@
     thead.appendChild(head);
     table.appendChild(thead);
 
+    // The stage that is holding the gate up. Named so the row can carry the
+    // amber, matching the console cell that says the same thing — one fact, one
+    // colour, in both places it appears.
+    const lastAttempt = row.attempts[row.attempts.length - 1];
+    const blocking = lastAttempt && !lastAttempt.ok ? lastAttempt.blocked_by : '';
+
     const tbody = el('tbody');
     names.forEach(function (name) {
-      const tr = el('tr');
+      const tr = el('tr', name && name === blocking ? 'blocking' : '');
       const th = el('th', null, name);
       th.scope = 'row';
       tr.appendChild(th);
@@ -631,24 +773,69 @@
     table.appendChild(tbody);
     wrap.appendChild(table);
 
-    const last = row.attempts[row.attempts.length - 1];
+    const last = lastAttempt;
     if (last) {
       wrap.appendChild(
         el('p', 'footnote', last.ok ? fmt(S.gateConverged, last.attempt) : S.gateOpen),
       );
+
+      /*
+       * Why a cell is a dash, spelled out under the grid.
+       *
+       * The cell itself is one character wide by necessity, so without this the
+       * reason exists only in a tooltip — which is unreachable by keyboard and
+       * invisible in the screenshot someone pastes into a support chat. Skipped
+       * and not-run keep separate lines because they call for different things:
+       * one is a missing tool, the other is a stage the gate never got to.
+       */
+      const reasons = [];
+      (last.stages || []).forEach(function (stage) {
+        if (stage.skipped) reasons.push(stage.name + ' ' + fmt(S.gateSkipped, stage.skipped));
+      });
+      (last.not_run || []).forEach(function (name) {
+        reasons.push(name + ' ' + S.gateNotRun);
+      });
+      reasons.forEach(function (line) {
+        wrap.appendChild(el('p', 'footnote', line));
+      });
+
+      /*
+       * The blocked gate gets the design's one raised surface, the same as an
+       * approval card — because it is the same kind of moment. The run has
+       * stopped and it is waiting for a person, and a footnote saying so reads
+       * like commentary on a grid rather than like something addressed to the
+       * reader.
+       *
+       * No buttons. `diagnostics.offerGateRerun` already offers "Run {stage}
+       * locally" as an action, and putting a second copy here would need a new
+       * webview-to-host message for no behaviour the developer does not
+       * already have.
+       */
       if (!last.ok && last.blocked_by) {
-        wrap.appendChild(el('p', 'footnote', fmt(S.gateBlocked, last.blocked_by)));
+        const card = el('section', 'notice-card gated');
+        const head = el('div', 'head');
+        const mark = el('span', 'mark');
+        mark.appendChild(icon(GLYPHS.warn, 13, 1.9));
+        head.appendChild(mark);
+        head.appendChild(el('span', null, fmt(S.gateBlocked, last.blocked_by)));
+        card.appendChild(head);
+        card.appendChild(el('p', null, fmt(S.gateBlockedWhy, last.blocked_by)));
+        wrap.appendChild(card);
       }
       // Failure output belongs behind a disclosure, one per failing stage, so a
       // grid stays a grid rather than becoming a wall of compiler errors.
       (last.stages || []).forEach(function (stage) {
         if (stage.ok || !stage.content) return;
+        // The word as well as the seconds. In the grid above, a failure is a
+        // glyph in its own cell; down here the row is a stage name and a
+        // duration, and without the word the only failure signal left would be
+        // the colour.
         wrap.appendChild(
           shell(
             { state: 'fail' },
             '✗',
             stage.name,
-            fmt(S.gateSeconds, stage.seconds),
+            S.toolFailed + ' · ' + fmt(S.gateSeconds, stage.seconds),
             bodyFor(stage.content, 'go'),
           ),
         );
@@ -657,6 +844,21 @@
     return wrap;
   }
 
+  /**
+   * One cell: a glyph, and the sentence behind it.
+   *
+   * The visible mark is punctuation — the attempt columns are 52px, and a cell
+   * reading "— skipped: govulncheck is not installed" would either wrap the
+   * grid into unreadability or be clipped to nothing. The whole sentence lives
+   * in `aria-label` and `title`, so a screen reader and a hover both get it,
+   * and the reasons repeat as footnotes under the grid where they can be read
+   * without pointing at anything.
+   *
+   * Four marks, not three. `·` is "this stage never ran in this attempt" and
+   * `—` is "this stage was deliberately skipped, and there is a reason below".
+   * Collapsing them would hide the distinction that decides whether the
+   * developer has anything to fix.
+   */
   function cellFor(a, name) {
     let stage = null;
     (a.stages || []).forEach(function (s) {
@@ -664,15 +866,77 @@
     });
     if (!stage) {
       const missing = (a.not_run || []).indexOf(name) !== -1;
-      return el('td', missing ? 'skip' : 'absent', missing ? S.gateNotRun : S.gateAbsent);
+      return gateCell(missing ? 'skip' : 'absent', missing ? '—' : '·', missing ? S.gateNotRun : S.gateAbsent);
     }
-    if (stage.skipped) return el('td', 'skip', fmt(S.gateSkipped, stage.skipped));
+    if (stage.skipped) return gateCell('skip', '—', fmt(S.gateSkipped, stage.skipped));
     const word = stage.ok ? S.gatePassed : S.gateFailed;
-    return el(
-      'td',
+    return gateCell(
       stage.ok ? 'pass' : 'failcell',
-      word + ' ' + fmt(S.gateSeconds, stage.seconds),
+      stage.ok ? '✓' : '✗',
+      word + ' · ' + fmt(S.gateSeconds, stage.seconds),
     );
+  }
+
+  function gateCell(cls, glyph, label) {
+    const td = el('td', cls, glyph);
+    td.setAttribute('aria-label', label);
+    td.title = label;
+    return td;
+  }
+
+  /**
+   * The quota card.
+   *
+   * Only what the gateway sent. `pct` is the server's own figure rather than
+   * `used / cap` recomputed here — the two can legitimately differ, because the
+   * tightest limit may be a weighted one, and a client that recomputes shows a
+   * number the server would not agree with.
+   *
+   * The bar is decorative and `aria-hidden`; the percentage beside it is the
+   * accessible value, so nothing here depends on seeing a coloured strip.
+   */
+  function renderQuota(row) {
+    const card = el('section', 'notice-card plain');
+
+    const head = el('div', 'head');
+    const mark = el('span', 'mark');
+    mark.appendChild(icon(GLYPHS.clock, 12, 1.8));
+    head.appendChild(mark);
+    head.appendChild(el('span', null, row.text));
+    if (typeof row.pct === 'number') {
+      head.appendChild(el('span', 'spacer'));
+      head.appendChild(el('span', 'pct', Math.round(row.pct) + '%'));
+    }
+    card.appendChild(head);
+
+    if (typeof row.pct === 'number') {
+      const bar = el('div', 'bar');
+      bar.setAttribute('aria-hidden', 'true');
+      const fill = el('i');
+      fill.style.width = Math.max(0, Math.min(100, Math.round(row.pct))) + '%';
+      bar.appendChild(fill);
+      card.appendChild(bar);
+    }
+
+    const caption = [];
+    if (typeof row.pct === 'number' && row.name) {
+      caption.push(fmt(S.quotaClosest, row.name, Math.round(row.pct)));
+    }
+    if (typeof row.resets === 'number') {
+      caption.push(fmt(S.quotaResets, duration(row.resets)));
+    }
+    if (caption.length) card.appendChild(el('span', 'caption', caption.join(' ')));
+    return card;
+  }
+
+  /** Coarse on purpose: a window that resets in "2h 41m" does not need seconds. */
+  function duration(seconds) {
+    if (seconds < 60) return plural('seconds', Math.max(0, Math.round(seconds)));
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return plural('minutes', minutes);
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest ? fmt(S.hoursMinutes, hours, rest) : plural('hours', hours);
   }
 
   function renderCompaction(row) {
@@ -691,9 +955,46 @@
     card.id = 'approval-' + row.id;
     card.tabIndex = -1;
 
-    const title = el('h2', null, fmt(S.approvalTitle, row.tool));
+    // Tool above, subject below. The tool name is what the policy is about and
+    // the path is what the decision is about, and putting them on one line made
+    // the line that mattered wrap first at a 340px width.
+    const subject = (row.paths && row.paths[0]) || row.tool;
+
+    /*
+     * A decided approval is a receipt, not a request.
+     *
+     * Built here rather than by appending an outcome to the live card, because
+     * almost nothing on the live card still applies: "Approval needed" is no
+     * longer true, and the reason it gives is an argument for a decision that
+     * has already been made. What survives is what happened, to what, and — in
+     * the three cases where the word alone is not the whole story — why.
+     */
+    if (row.decision) {
+      const spec = DECIDED[row.decision] || DECIDED.accept;
+      card.classList.add('decided');
+
+      const outcome = el('p', 'outcome ' + spec[0]);
+      const mark = el('span', 'mark');
+      mark.appendChild(icon(GLYPHS[spec[1]], 13, spec[1] === 'check' ? 2.4 : 1.9));
+      outcome.appendChild(mark);
+      outcome.appendChild(el('span', null, S[spec[2]] || ''));
+      outcome.appendChild(el('span', 'tool', row.tool));
+      card.setAttribute('aria-labelledby', nextId('ap'));
+      outcome.id = card.getAttribute('aria-labelledby');
+      card.appendChild(outcome);
+
+      card.appendChild(el('span', 'subject', subject));
+      if (row.receipt) card.appendChild(el('span', 'receipt', row.receipt));
+      return card;
+    }
+
+    const kicker = el('span', 'kicker', fmt(S.approvalTitle, row.tool));
+    const title = el('h2', null, subject);
     card.setAttribute('aria-labelledby', nextId('ap'));
     title.id = card.getAttribute('aria-labelledby');
+    // The heading is the path alone, so the accessible name restores the tool.
+    title.setAttribute('aria-label', fmt(S.approvalTitle, row.tool) + ' — ' + subject);
+    card.appendChild(kicker);
     card.appendChild(title);
 
     const dl = el('dl');
@@ -714,20 +1015,8 @@
       card.appendChild(el('p', 'warn', '⚠ ' + S.approvalUnconditional));
     }
 
-    if (row.decision) {
-      const word =
-        row.decision === 'accept'
-          ? S.decidedAccept
-          : row.decision === 'reject'
-            ? S.decidedReject
-            : S.decidedEdit;
-      card.appendChild(el('p', 'decided', word));
-      return card;
-    }
-
     const buttons = el('div', 'buttons');
     buttons.appendChild(decisionButton(row.id, 'accept', S.accept, 'primary'));
-    buttons.appendChild(decisionButton(row.id, 'reject', S.reject, 'secondary'));
 
     const diff = el('button', 'secondary', S.showDiff);
     diff.type = 'button';
@@ -736,8 +1025,36 @@
     });
     buttons.appendChild(diff);
     buttons.appendChild(decisionButton(row.id, 'edit', S.editArgs, 'secondary'));
+    // Reject sits after the spacer, away from Accept. Two decisions of opposite
+    // consequence should not be adjacent targets.
+    buttons.appendChild(el('span', 'spacer'));
+    buttons.appendChild(decisionButton(row.id, 'reject', S.reject, 'danger'));
     card.appendChild(buttons);
+
+    if (typeof row.secondsLeft === 'number') {
+      card.appendChild(el('span', 'countdown', fmt(S.approvalCountdown, row.secondsLeft)));
+    }
     return card;
+  }
+
+  /** decision → [css class, glyph, string key]. `released` is the timeout. */
+  const DECIDED = {
+    accept: ['accepted', 'check', 'decidedAccept'],
+    reject: ['rejected', 'cross', 'decidedReject'],
+    edit: ['edited', 'pencil', 'decidedEdit'],
+    released: ['released', 'released', 'decidedReleased'],
+  };
+
+  /**
+   * The sentence under the outcome, for the three cases where the word alone
+   * does not say what happened. "Accepted" needs no gloss; "released" does,
+   * because the developer did not do it and it was recorded as a rejection.
+   */
+  function receiptFor(decision, tool, auto) {
+    if (decision === 'released') return fmt(S.receiptReleased, tool);
+    if (decision === 'edit') return fmt(S.receiptEdited, tool);
+    if (auto) return S.receiptAuto || '';
+    return '';
   }
 
   function decisionButton(id, decision, label, cls) {
@@ -871,6 +1188,28 @@
         return;
       }
 
+      /*
+       * Synthesised host-side (extension.ts, from ApprovalCentre.onDidResolve),
+       * because the wire carries no "resolved" event — whichever surface
+       * answered the approval is the only thing that knows.
+       *
+       * `timeout` and `gone` are folded into one `released` outcome. They differ
+       * in why the runtime took the approval back, but not in what happened to
+       * the developer's change, and the receipt says what happened.
+       */
+      case 'approval_resolved': {
+        const row = byKey.get('ap:' + String(d.id || ''));
+        if (!row) return;
+        const raw = String(d.decision || '');
+        row.decision = raw === 'timeout' || raw === 'gone' ? 'released' : raw;
+        row.receipt = receiptFor(row.decision, String(d.tool || row.tool), d.auto === true);
+        paint(row);
+        pendingApprovals.delete(row.id);
+        updateSkip();
+        save();
+        return;
+      }
+
       case 'plan': {
         put({
           key: 'plan:' + event.id,
@@ -930,14 +1269,19 @@
         return;
 
       case 'quota': {
-        // Only the one line the server already computed. The status bar owns
-        // quota; a row here exists so the transcript records when it moved.
+        // Only figures the server already computed. The status bar owns quota;
+        // a card here exists so the transcript records when it moved, and so a
+        // run that is about to be refused says so before it is.
         const tightest = d.tightest;
         if (!tightest) return;
+        const window = d.window || {};
         put({
           key: 'quota:' + event.id,
           kind: 'quota',
           text: fmt(S.quota, tightest.name, tightest.used, tightest.cap),
+          name: String(tightest.name || ''),
+          pct: typeof tightest.pct === 'number' ? tightest.pct : null,
+          resets: typeof window.resets_in === 'number' ? window.resets_in : null,
         });
         return;
       }
@@ -998,8 +1342,30 @@
 
   function renderMeter(usage) {
     meterEl.textContent = '';
+
+    /*
+     * The bar takes the width the sentence does not need, so the meter reads as
+     * one object rather than as a strip above a caption. It is `aria-hidden`
+     * and carries no value of its own: every figure it depicts is already a
+     * word in the segments beside it, which is what a screen reader gets.
+     *
+     * `budget_used_pct` is the server's figure. Recomputing it from
+     * prompt_tokens/budget would disagree with the status bar the moment the
+     * gateway starts weighting anything.
+     */
+    if (typeof usage.budget_used_pct === 'number') {
+      const bar = el('div', 'bar');
+      bar.setAttribute('aria-hidden', 'true');
+      const fill = el('i');
+      fill.style.width = Math.max(0, Math.min(100, Math.round(usage.budget_used_pct))) + '%';
+      bar.appendChild(fill);
+      meterEl.appendChild(bar);
+    }
+
+    const segs = el('span', 'segs');
+    meterEl.appendChild(segs);
     const add = function (text, cls) {
-      meterEl.appendChild(el('span', cls ? 'seg ' + cls : 'seg', text));
+      segs.appendChild(el('span', cls ? 'seg ' + cls : 'seg', text));
     };
 
     add(fmt(S.meterContext, compact(usage.prompt_tokens), compact(usage.budget)));
@@ -1029,6 +1395,10 @@
     const pending = pendingApprovals.size > 0;
     skipBtn.hidden = !pending;
     skipBtn.textContent = S.skipToApproval || '';
+    // The header band and the composer both read "waiting on a decision" off
+    // this set, and this is the one place it changes.
+    applyConsole();
+    applyComposerState();
   }
 
   skipBtn.addEventListener('click', function () {
@@ -1155,6 +1525,9 @@
 
   function repaintAll() {
     transcript.textContent = '';
+    // The node is gone with the rest of the subtree; drop the handle too, or
+    // syncEmpty sees a detached node and decides it has nothing to do.
+    emptyNode = null;
     nodes.clear();
     byKey.clear();
     rows.forEach(function (row) {
@@ -1162,6 +1535,7 @@
       paint(row);
       if (row.kind === 'approval' && !row.decision) pendingApprovals.add(row.id);
     });
+    syncEmpty();
     updateSkip();
     transcript.scrollTop = transcript.scrollHeight;
   }
@@ -1180,12 +1554,17 @@
     applyRunState();
     applyOffline();
     updateSkip();
+    // The empty state is drawn at boot, before `init` has delivered a single
+    // string — so it comes back blank unless it is rebuilt once they arrive.
+    if (emptyNode && emptyNode.isConnected) {
+      emptyNode.remove();
+      emptyNode = null;
+      syncEmpty();
+    }
     if (!meterEl.firstChild) meterEl.textContent = S.meterIdle || '';
   }
 
   let tick = null;
-
-  const consoleEl = document.getElementById('console');
 
   /**
    * The console row: mode · turn/attempt · blocking gate stage · context.
@@ -1201,11 +1580,24 @@
     if (run.phase === 'idle') {
       consoleEl.hidden = true;
       consoleEl.textContent = '';
+      // Cleared, not just hidden. The band comes back on the next run, and it
+      // must not come back still wearing the state the last one ended in.
+      consoleEl.classList.remove('running', 'blocked-state');
       return;
     }
 
+    /*
+     * Waiting on a decision replaces the mode cell rather than adding to it.
+     *
+     * "coding" is true but useless while the run is blocked on a person — the
+     * question the band answers is "where is it, and is it going to pass?", and
+     * the answer right now is "it is waiting for you". The turn and attempt
+     * stay, because they are what the reviewer needs to place the request.
+     */
+    const waiting = pendingApprovals.size > 0;
     const cells = [];
-    if (run.mode) cells.push({ text: S['mode.' + run.mode] || run.mode });
+    if (waiting) cells.push({ text: S.consoleNeedsApproval, cls: 'waiting' });
+    else if (run.mode) cells.push({ text: S['mode.' + run.mode] || run.mode });
     if (run.turn) {
       // The attempt is shown only when there has been one, because "attempt 1"
       // on every turn is noise that hides the retry it exists to announce.
@@ -1225,15 +1617,32 @@
       consoleEl.appendChild(node);
     });
     consoleEl.hidden = cells.length === 0;
+
+    /*
+     * The band's own state, in two classes.
+     *
+     * `running` earns the pulsing amber dot; `blocked-state` tints the whole
+     * band, and is the only persistent chrome in the panel that ever changes
+     * colour. Both are decoration on top of cells that already say the same
+     * thing in words — the class is never the only carrier.
+     */
+    consoleEl.classList.toggle('running', run.phase !== 'idle' && !waiting);
+    // "Waiting on you" is the panel's own knowledge, not the host's: `RunState`
+    // has no approval phase, because from the runtime's side a blocked approval
+    // is still a running turn.
+    consoleEl.classList.toggle('blocked-state', waiting);
   }
 
   function applyRunState() {
     applyConsole();
     const running = run.phase !== 'idle';
     stopBtn.hidden = !running;
-    windBtn.hidden = run.phase !== 'running';
+    // Winding down already means "stop after this turn"; offering it again
+    // would be a button whose only effect is to say what is already true.
+    windBtn.hidden = run.phase !== 'running' || pendingApprovals.size > 0;
     input.placeholder = running ? S.placeholderRunning || '' : S.placeholder || '';
     workingEl.hidden = !running;
+    applyComposerState();
     if (tick) {
       clearInterval(tick);
       tick = null;
@@ -1242,29 +1651,115 @@
       workingEl.textContent = '';
       return;
     }
-    const showWorking = function () {
-      const base = run.tool ? fmt(S.workingTool, run.tool) : S.working;
-      const seconds = run.startedAt ? Math.round((Date.now() - run.startedAt) / 1000) : null;
-      workingEl.textContent = seconds === null ? base : base + ' · ' + fmt(S.elapsed, seconds);
-    };
-    showWorking();
+    paintWorking();
     // One text write a second, and no animation: `prefers-reduced-motion` has
     // nothing to suppress if the indicator never moves in the first place.
-    tick = setInterval(showWorking, 1000);
+    tick = setInterval(paintWorking, 1000);
+  }
+
+  /*
+   * One writer for the composer's status line, called both by the ticker and
+   * the instant an approval arrives or resolves. If only the ticker wrote it,
+   * the line would be up to a second out of date at exactly the moment it
+   * changes meaning — which is the moment someone is reading it.
+   *
+   * While an approval is up, the elapsed time is not the useful fact: the run
+   * is not spending it on the model, it is spending it on the reviewer, and
+   * counting it up reads as the agent being slow.
+   */
+  function paintWorking() {
+    if (run.phase === 'idle') {
+      workingEl.textContent = '';
+      return;
+    }
+    if (pendingApprovals.size > 0) {
+      workingEl.textContent = S.waitingDecision || '';
+      return;
+    }
+    const base = run.tool ? fmt(S.workingTool, run.tool) : S.working;
+    const seconds = run.startedAt ? Math.round((Date.now() - run.startedAt) / 1000) : null;
+    workingEl.textContent = seconds === null ? base : base + ' · ' + fmt(S.elapsed, seconds);
+  }
+
+  /**
+   * Which of the five composers this is.
+   *
+   * The design gives the composer a different border and a different footer per
+   * state — idle, running, waiting on a decision, offline, and completing a
+   * slash command. All five are the same DOM; only the classes and the footer
+   * text change, because a composer that is rebuilt loses the caret and
+   * whatever half-typed correction was in it.
+   */
+  function applyComposerState() {
+    const off = offlineReason !== null;
+    const waiting = pendingApprovals.size > 0;
+    const running = run.phase !== 'idle';
+    const completing = !popup.hidden;
+
+    composerEl.classList.toggle('offline', off);
+    composerEl.classList.toggle('running', !off && running && !waiting);
+    composerEl.classList.toggle('waiting', !off && waiting);
+    composerEl.classList.toggle('completing', !off && completing);
+
+    // The mode chip is an idle-only affordance: while a run is in flight the
+    // console band above already says the mode, and saying it twice in one
+    // 340px column is the kind of duplication that pushed the old four-row
+    // header out of the design in the first place.
+    /*
+     * The mode *name*, not the activity. `S['mode.coder']` is "coding", which
+     * the console band is right to use while a turn is in flight and which is
+     * simply false on an idle panel — nothing is coding. The chip says which
+     * mode the next task will start in, so it names it the way
+     * `dakcoder.defaultMode` does.
+     */
+    const showMode = !off && !running && Boolean(run.mode);
+    modePill.hidden = !showMode;
+    modePill.textContent = showMode ? run.mode : '';
+
+    keysEl.hidden = !completing;
+    keysEl.textContent = completing ? S.popupKeys || '' : '';
+    paintWorking();
   }
 
   let wasOffline = false;
 
+  /**
+   * The offline card.
+   *
+   * Two sentences, and the second one is the point. "The stream dropped" and
+   * "the run died" have the same symptom — a panel that stopped moving — and
+   * only the second is a reason to do anything. Saying that the run continues
+   * on the runtime is what stops someone re-running work that is still in
+   * flight.
+   */
   function applyOffline() {
     const off = offlineReason !== null;
+    const what = offlineReason || S.offlineDefault || '';
     offlineEl.hidden = !off;
-    offlineEl.textContent = off ? offlineReason || S.offlineDefault : '';
+    offlineEl.textContent = '';
+
+    if (off) {
+      const head = el('div', 'head');
+      const mark = el('span', 'mark');
+      mark.appendChild(icon(GLYPHS.offline, 13, 1.8));
+      head.appendChild(mark);
+      head.appendChild(el('span', null, S.offlineTitle || ''));
+      head.appendChild(el('span', 'spacer'));
+      const spin = el('span', 'spinner');
+      spin.setAttribute('aria-hidden', 'true');
+      head.appendChild(spin);
+      offlineEl.appendChild(head);
+      offlineEl.appendChild(el('p', 'what', what));
+      offlineEl.appendChild(el('p', 'aside', S.offlineAside || ''));
+    }
+
     // Disabled, not left accepting input that is going to fail: the agent cannot
     // reach the model without the gateway, by design, and a queued message that
     // silently dies is worse than a composer that says why it is closed.
     input.disabled = off;
     sendBtn.disabled = off;
-    if (off && !wasOffline) say(fmt(S.sayOffline, offlineEl.textContent), true);
+    applyComposerState();
+    if (off && !wasOffline) say(fmt(S.sayOffline, what), true);
     if (!off && wasOffline) say(S.sayOnline, true);
     wasOffline = off;
   }
@@ -1438,6 +1933,7 @@
     });
     popup.hidden = false;
     input.setAttribute('aria-expanded', 'true');
+    applyComposerState();
     setActive(0);
   }
 
@@ -1460,6 +1956,7 @@
     active = -1;
     input.setAttribute('aria-expanded', 'false');
     input.removeAttribute('aria-activedescendant');
+    applyComposerState();
   }
 
   function accept(i) {

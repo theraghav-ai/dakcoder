@@ -6,6 +6,10 @@
       default-src 'none' and a per-load nonce. Nothing here fetches: no CDN, no
       font host, no image host beyond the extension's own resource origin. A
       webview that cannot reach the network cannot leak a transcript to one.
+
+      font-src is what lets media/fonts/*.woff2 load. It is the extension's own
+      origin and nothing else, which is why the design's two faces are vendored
+      rather than linked from Google.
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -24,11 +28,16 @@
     <button id="skip" class="skip" type="button" hidden></button>
 
     <!--
-      The console row: mode · turn/attempt · blocking gate stage · context.
-      Hidden while idle, so an idle panel pays nothing for it.
+      The header band: the console row, then the context meter directly beneath
+      it with no rule between them. They are one block because the status and
+      the number it is spending are one fact, and two hairlines at a 340px
+      sidebar width is a border for every eleven rows of content.
+
+      The console row is hidden while idle, so an idle panel pays for nothing
+      but the meter's own line.
 
       Only fixed-height, non-list state earns persistent chrome here — that rule
-      is what keeps this to one row at a sidebar width of 340px. Everything
+      is what keeps this to two rows at a sidebar width of 340px. Everything
       list-shaped (the plan, sessions, quota, the context breakdown) is a
       sibling view the workbench already lets the user resize.
     -->
@@ -49,35 +58,50 @@
 
     <div id="announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 
-    <footer class="composer">
-      <p id="offline" class="offline" hidden></p>
+    <footer id="composer" class="composer">
+      <!--
+        Offline is a card rather than a line, because the distinction that
+        matters — "the panel lost the stream" versus "the run died" — takes two
+        sentences and the second one is the reassuring half.
+      -->
+      <div id="offline" class="offline" hidden></div>
 
       <div id="queued" class="queued" hidden></div>
 
-      <!--
-        A textarea as combobox: ARIA 1.2 allows it, and it keeps multi-line
-        input working while the slash/mention popup is open.
-      -->
-      <label class="sr-only" for="input" id="input-label"></label>
-      <textarea
-        id="input"
-        class="input"
-        rows="1"
-        role="combobox"
-        aria-expanded="false"
-        aria-controls="popup"
-        aria-autocomplete="list"
-        aria-labelledby="input-label"
-      ></textarea>
-
+      <!-- Anchored to .composer, not to .field, so it clears the border. -->
       <ul id="popup" class="popup" role="listbox" hidden></ul>
 
-      <div class="actions">
-        <div id="working" class="working" hidden></div>
-        <span class="spacer"></span>
-        <button id="wind-down" class="secondary" type="button" hidden></button>
-        <button id="stop" class="secondary" type="button" hidden></button>
-        <button id="send" class="primary" type="button"></button>
+      <!--
+        The field and its actions are one bordered block, so the send button
+        reads as part of the thing being typed rather than as a toolbar under
+        it. The border is what carries composer state.
+      -->
+      <div class="field">
+        <!--
+          A textarea as combobox: ARIA 1.2 allows it, and it keeps multi-line
+          input working while the slash/mention popup is open.
+        -->
+        <label class="sr-only" for="input" id="input-label"></label>
+        <textarea
+          id="input"
+          class="input"
+          rows="1"
+          role="combobox"
+          aria-expanded="false"
+          aria-controls="popup"
+          aria-autocomplete="list"
+          aria-labelledby="input-label"
+        ></textarea>
+
+        <div class="actions">
+          <span id="mode-pill" class="mode-pill" hidden></span>
+          <div id="working" class="working" hidden></div>
+          <span id="keys" class="hint-keys" hidden></span>
+          <span class="spacer"></span>
+          <button id="wind-down" class="secondary" type="button" hidden></button>
+          <button id="stop" class="danger" type="button" hidden></button>
+          <button id="send" class="primary" type="button"></button>
+        </div>
       </div>
     </footer>
 

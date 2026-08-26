@@ -114,12 +114,44 @@ Two things it does deliberately:
 
 ## Pointing the VS Code extension at it
 
+**Off the host**, over the published URL, nothing needs configuring: since
+v0.1.0 the extension's `dakcoder.serverGatewayUrl` already defaults to
+`https://ai.cept.gov.in/dakcoder`.
+
+What *is* needed is a credential, because this host does not publish sign-in.
+Mint one and hand it over:
+
+```bash
+deploy/gateway_main.py --mint dev:<user> --mint-hours 12
+```
+
+The developer runs **dakcoder: Enter Gateway Token** and pastes it. The
+extension checks it against `/v1/quota` before storing it in the OS keychain, so
+a token that will not work is refused at the prompt rather than at the first
+turn. **dakcoder: Sign In** reaches the same place — it catches the 403 from
+`/v1/auth/start`, shows the reason, and offers the token box.
+
+Two consequences of a minted token, both by design:
+
+- **It does not refresh.** There is no `/v1/auth/refresh` to call here, so the
+  extension does not schedule one. When the twelve hours are up the developer is
+  asked for another, at the moment the old one actually stops working.
+- **Doctor says so.** `/v1/health` reports `identity: "dev"`, and the
+  *Identity provider* row turns that into a warning with an "Enter a token"
+  button. Once GitLab OAuth is configured and health reports `identity:
+  "gitlab"`, that row goes green on its own and sign-in works normally — delete
+  the 403 block from `nginx-dakcoder.conf` at the same time.
+
+**On the host**, driving the loopback API directly:
+
 ```jsonc
 "dakcoder.gatewayUrl": "http://127.0.0.1:8790",
 "dakcoder.pythonPath": "/mnt/data/raghav/dakcoder/.venv/bin/python",
 "dakcoder.goPath":     "~/.local/share/dakcoder/go/bin/go",
 "dakcoder.gotoolsPath":"/mnt/data/raghav/dakcoder/gotools/gotools"
 ```
+
+`dakcoder.gatewayUrl` is the override and wins over `serverGatewayUrl`.
 
 The extension spawns its own `dakcoderd`; the `runtime` window here is a
 standing one for driving the loopback API by hand.

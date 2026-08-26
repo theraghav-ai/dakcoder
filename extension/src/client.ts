@@ -270,6 +270,37 @@ export class GatewayClient extends Rest {
     return this.get<QuotaSnapshot>('/v1/quota');
   }
 
+  /**
+   * Read quota with an explicit bearer, bypassing the stored one.
+   *
+   * This is how a pasted token is checked before it is written to
+   * `SecretStorage`. It has to bypass `Rest.request` entirely: that path reads
+   * the token from the provider's closure — which is exactly the value we do
+   * not have yet — and its 401 arm would fire `onUnauthorized`, refreshing the
+   * *existing* session as a side effect of validating a different credential.
+   *
+   * `/v1/quota` rather than `/v1/health`, because health is unauthenticated on
+   * the published host: it answers 200 for a token that is complete nonsense,
+   * which would make this check say yes to anything.
+   */
+  async quotaWith(token: string, signal?: AbortSignal): Promise<QuotaSnapshot> {
+    const response = await this.fetcher(`${this.base}/v1/quota`, {
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      ...(signal ? { signal } : {}),
+    });
+    if (!response.ok) {
+      let detail = `the gateway refused the token with ${response.status}`;
+      try {
+        const parsed = (await response.json()) as { error?: string; reason?: string; detail?: string };
+        detail = parsed.reason ?? parsed.error ?? parsed.detail ?? detail;
+      } catch {
+        // A non-JSON body is still a refusal; the status carries the meaning.
+      }
+      throw new HttpError(response.status, detail);
+    }
+    return (await response.json()) as QuotaSnapshot;
+  }
+
   preflight(estimatedTokens: number): Promise<{ ok: boolean; quota: QuotaSnapshot }> {
     return this.post('/v1/quota/preflight', { estimated_tokens: estimatedTokens });
   }

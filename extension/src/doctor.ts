@@ -968,13 +968,46 @@ export class Doctor implements vscode.Disposable {
 
     let reachable = false;
     try {
-      await this.deps.gateway.health();
+      const health = await this.deps.gateway.health();
       reachable = true;
       checks.push({
         name: gatewayName,
         state: 'pass',
         detail: vscode.l10n.t('{0} answered', this.deps.gateway.baseUrl),
       });
+
+      /*
+       * Which identity provider the gateway is actually running.
+       *
+       * `dev` is a local stand-in that accepts any authorization code. A host
+       * running it does not publish `/v1/auth/`, because published that is an
+       * open door onto the shared model budget — so sign-in cannot complete and
+       * credentials are minted by an administrator instead.
+       *
+       * This is a warning rather than a failure: the deployment is working as
+       * designed, and the developer's job is to know it, not to fix it. Without
+       * the row, "Sign in" failing looks like a bug in the extension.
+       */
+      const identity = identityOf(health);
+      if (identity === 'dev') {
+        checks.push({
+          name: vscode.l10n.t('Identity provider'),
+          state: 'warn',
+          detail: vscode.l10n.t(
+            'the gateway is using a local development identity provider, so sign-in is not published on this host. Ask an administrator for a token and run "dakcoder: Enter Gateway Token".',
+          ),
+          fix: {
+            label: vscode.l10n.t('Enter a token'),
+            run: () => runCommandIfPresent('dakcoder.enterToken'),
+          },
+        });
+      } else if (identity) {
+        checks.push({
+          name: vscode.l10n.t('Identity provider'),
+          state: 'pass',
+          detail: vscode.l10n.t('{0}', identity),
+        });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       checks.push({
@@ -1384,6 +1417,27 @@ interface ProbeResult {
   error?: string;
   /** The binary itself was not found, as opposed to running and failing. */
   missing: boolean;
+}
+
+/**
+ * Which identity provider the gateway reports, or `undefined` if it says
+ * nothing.
+ *
+ * Read from two places because the field has lived in both: nested under
+ * `capabilities` on the deployment at `ai.cept.gov.in/dakcoder`, and top-level
+ * on older builds. `/v1/health` is additive-only (C2), so a gateway that
+ * reports neither is a gateway that has not been taught to — which is silence,
+ * not "no identity provider", and the caller draws no row for it.
+ */
+function identityOf(health: Record<string, unknown>): string | undefined {
+  const top = health.identity;
+  if (typeof top === 'string' && top) return top;
+  const caps = health.capabilities;
+  if (caps && typeof caps === 'object') {
+    const nested = (caps as Record<string, unknown>).identity;
+    if (typeof nested === 'string' && nested) return nested;
+  }
+  return undefined;
 }
 
 function skipped(name: string, detail: string): Check {

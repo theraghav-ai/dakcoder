@@ -2,5 +2,5 @@ node_modules/
 dist/
 dist-test/
 .vscode-test/
-*.vsix
+# *.vsix
 runtime/*.whl

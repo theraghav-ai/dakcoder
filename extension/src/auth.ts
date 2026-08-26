@@ -79,6 +79,15 @@ interface StoredAccount {
   label: string;
   /** From the exchange. Displayed by Doctor; never used to gate anything locally. */
   roles: string[];
+  /**
+   * The credential was pasted, not exchanged — see `acceptMintedToken`.
+   *
+   * It has no refresh token and no rotation, so every path that would reach for
+   * `/v1/auth/refresh` has to stop here instead. Marked on the record rather
+   * than inferred from "no refresh token in storage", because that is also what
+   * a half-written sign-in looks like, and the two need different recoveries.
+   */
+  minted?: boolean;
 }
 
 interface PendingFlow {
@@ -90,6 +99,21 @@ interface PendingFlow {
 }
 
 type CallbackOutcome = 'ok' | 'denied' | 'failed' | 'ignored';
+
+/**
+ * `/v1/auth/start` answered 403: this deployment has not published sign-in.
+ *
+ * A distinct type rather than a status check at the call site, because it has to
+ * travel out through `withProgress` before anything may prompt — see `signIn`.
+ * `reason` is the gateway's own sentence, kept intact because it names the file
+ * an administrator has to change.
+ */
+class SignInNotPublished extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = 'SignInNotPublished';
+  }
+}
 
 type RotateResult =
   | { kind: 'ok'; token: string }
@@ -180,11 +204,13 @@ export class DakcoderAuthProvider
     label?: string;
     roles: readonly string[];
     expiresInSeconds?: number;
+    minted?: boolean;
   } {
     return {
       signedIn: !!this.account,
       label: this.account?.label,
       roles: this.account?.roles ?? [],
+      minted: this.account?.minted === true,
       expiresInSeconds: this.access
         ? Math.max(0, Math.round((this.access.expiresAt - Date.now()) / 1000))
         : undefined,
@@ -253,6 +279,93 @@ export class DakcoderAuthProvider
     }
   }
 
+  /**
+   * The second way in: a token an administrator minted on the gateway host.
+   *
+   * This exists because a deployment can legitimately publish everything except
+   * sign-in. `https://ai.cept.gov.in/dakcoder` does exactly that — the gateway
+   * is running a local development identity provider that accepts *any*
+   * authorization code, so nginx returns 403 for `/v1/auth/`, because published
+   * that would be an open door onto the shared GPU budget. Until a real GitLab
+   * OAuth application is configured there, `gateway_main.py --mint` is how a
+   * developer gets a credential, and this is where they put it.
+   *
+   * It is not a back door. The token is signed with a secret only the gateway
+   * holds, and the gateway is the only thing that ever validates it: this
+   * command's own check is a live `/v1/quota` call, not a local inspection.
+   */
+  async enterTokenCommand(): Promise<void> {
+    await this.ensureLoaded();
+    const token = await vscode.window.showInputBox({
+      title: vscode.l10n.t('Enter a dakcoder gateway token'),
+      prompt: vscode.l10n.t(
+        'Paste a token issued by your administrator for {0}. It is checked against the gateway before it is stored.',
+        this.gateway.baseUrl,
+      ),
+      placeHolder: vscode.l10n.t('eyJhbGciOi…'),
+      password: true,
+      ignoreFocusOut: true,
+      validateInput: (value) =>
+        value.trim().split('.').length === 3
+          ? undefined
+          : vscode.l10n.t('That does not look like a token. Expected three dot-separated parts.'),
+    });
+    if (token === undefined) return;
+
+    try {
+      const session = await this.acceptMintedToken(token.trim());
+      void vscode.window.showInformationMessage(
+        vscode.l10n.t('dakcoder is using a token issued for {0}.', session.account.label),
+      );
+    } catch (err) {
+      void vscode.window.showErrorMessage(
+        vscode.l10n.t('That token was not accepted: {0}', describe(err)),
+      );
+    }
+  }
+
+  /**
+   * Check a pasted token, then adopt it.
+   *
+   * Checked *before* it is stored, and checked by asking the gateway rather
+   * than by reading the token: a credential this window cannot use produces a
+   * panel that looks signed in and 401s on everything, which is a worse failure
+   * than being told no here. `/v1/quota` is the probe because it is the
+   * cheapest authenticated endpoint that the deployment publishes.
+   */
+  private async acceptMintedToken(token: string): Promise<vscode.AuthenticationSession> {
+    await this.gateway.quotaWith(token);
+
+    // Read only after the gateway has vouched for it. These claims decide what
+    // the account row says, never what it is allowed to do — the gateway
+    // re-derives that from the same token on every request.
+    const claims = readClaims(token);
+    const account: StoredAccount = {
+      sessionId: randomUUID(),
+      sub: claims.sub ?? 'dakcoder',
+      label: claims.name ?? claims.email ?? claims.sub ?? vscode.l10n.t('gateway token'),
+      roles: claims.roles ?? [],
+      minted: true,
+    };
+
+    // No refresh token to store, and any inherited one would be a credential
+    // from a different account that the next 401 would happily try to rotate.
+    await this.secrets.delete(SECRET_REFRESH);
+    this.account = account;
+    // Its real expiry when the token carries one, so the panel stops trusting
+    // it at the same moment the gateway does. One hour is the fallback and is
+    // deliberately short: a guess that outlives the credential is worse than a
+    // guess that expires early, because only one of them fails silently.
+    const remaining = claims.exp ? claims.exp - Math.floor(Date.now() / 1000) : 3600;
+    this.setAccess(token, Math.max(60, remaining));
+    await this.secrets.store(SECRET_ACCOUNT, JSON.stringify(account));
+
+    const session = sessionOf(account, token);
+    this.changed.fire({ added: [session], removed: [], changed: [] });
+    this.log.info(`using a minted gateway token for ${account.label}`);
+    return session;
+  }
+
   async signOutCommand(): Promise<void> {
     await this.ensureLoaded();
     if (!this.account) {
@@ -276,6 +389,54 @@ export class DakcoderAuthProvider
   // ── the flow ──────────────────────────────────────────────────────────────
 
   private async signIn(requested: readonly string[]): Promise<vscode.AuthenticationSession> {
+    try {
+      return await this.oauthSignIn(requested);
+    } catch (err) {
+      if (!(err instanceof SignInNotPublished)) throw err;
+      return this.offerToken(err.reason);
+    }
+  }
+
+  /**
+   * The fallback offered when the host does not publish sign-in.
+   *
+   * Deliberately a choice rather than an automatic prompt: the developer is
+   * being told their editor cannot complete a sign-in, and the next thing they
+   * see should explain why before it asks them for a credential.
+   */
+  private async offerToken(reason: string): Promise<vscode.AuthenticationSession> {
+    const enter = vscode.l10n.t('Enter a token');
+    const choice = await vscode.window.showWarningMessage(
+      vscode.l10n.t('{0} does not publish sign-in.', this.gateway.baseUrl),
+      {
+        modal: true,
+        detail: vscode.l10n.t(
+          '{0}\n\nAn administrator can mint a token for you on the gateway host. dakcoder still runs as you: the token carries your identity, and quota and the audit trail stay yours.',
+          reason,
+        ),
+      },
+      enter,
+    );
+    if (choice !== enter) throw new vscode.CancellationError();
+
+    const token = await vscode.window.showInputBox({
+      title: vscode.l10n.t('Enter a dakcoder gateway token'),
+      prompt: vscode.l10n.t(
+        'Paste a token issued by your administrator for {0}. It is checked against the gateway before it is stored.',
+        this.gateway.baseUrl,
+      ),
+      password: true,
+      ignoreFocusOut: true,
+      validateInput: (value) =>
+        value.trim().split('.').length === 3
+          ? undefined
+          : vscode.l10n.t('That does not look like a token. Expected three dot-separated parts.'),
+    });
+    if (token === undefined) throw new vscode.CancellationError();
+    return this.acceptMintedToken(token.trim());
+  }
+
+  private async oauthSignIn(requested: readonly string[]): Promise<vscode.AuthenticationSession> {
     if (requested.length) this.log.debug(`sign-in requested scopes: ${requested.join(' ')}`);
     return vscode.window.withProgress(
       {
@@ -294,7 +455,28 @@ export class DakcoderAuthProvider
           const redirectUri = loopback ? loopback.redirectUri : await this.uriHandlerRedirect();
 
           // The gateway mints and stores `state`; we only carry it (D-57).
-          const started = await this.gateway.authStart(redirectUri, challenge);
+          const started = await this.gateway.authStart(redirectUri, challenge).catch(
+            (err: unknown) => {
+              /*
+               * 403 is not a failure here — it is the deployment answering.
+               *
+               * A gateway running a development identity provider publishes
+               * everything except `/v1/auth/`, because that provider accepts any
+               * authorization code and publishing it would let anyone mint a
+               * session against the shared model budget. The reason string it
+               * returns says so and names the file that decides it, so it is
+               * shown verbatim rather than reworded into something vaguer.
+               *
+               * Thrown as a typed marker and unwrapped outside the progress
+               * notification: an input box behind a spinner is a dialog the
+               * developer cannot see.
+               */
+              if (err instanceof HttpError && err.status === 403) {
+                throw new SignInNotPublished(err.detail);
+              }
+              throw err;
+            },
+          );
           state = started.state;
           await this.rememberFlow(state, verifier, redirectUri);
 
@@ -540,6 +722,18 @@ export class DakcoderAuthProvider
     const lifetime = Math.max(60, expiresIn) * 1000;
     this.access = { token, expiresAt: Date.now() + lifetime };
     if (this.proactive) clearTimeout(this.proactive);
+    /*
+     * A minted token has nothing to refresh *into*, so there is no timer.
+     *
+     * Firing one anyway would reach `refreshOnce`, find no refresh token, and
+     * ask for a new credential at 80% of a twelve-hour lifetime — hours before
+     * the one in hand stops working. The developer finds out when it actually
+     * expires instead, which is the only moment the answer is true.
+     */
+    if (this.account?.minted) {
+      this.proactive = undefined;
+      return;
+    }
     // Proactive at 80% of lifetime rather than on expiry: a token that dies
     // mid-turn turns a forty-minute run into a 401 the developer has to
     // interpret, and the runtime received its copy in an environment variable
@@ -565,6 +759,17 @@ export class DakcoderAuthProvider
   }
 
   private async refreshOnce(): Promise<string | undefined> {
+    // A pasted token expires; it does not rotate. Reaching the sign-out path
+    // below would be wrong twice over — there is no refresh token to have been
+    // rejected, and on this host there is no `/v1/auth/refresh` to ask.
+    if (this.account?.minted) {
+      this.log.info('the minted gateway token has expired; asking for another');
+      // Read before `forget` clears the record it lives on.
+      await this.forget(true);
+      this.promptReauth(true);
+      return undefined;
+    }
+
     const stored = await this.secrets.get(SECRET_REFRESH);
     if (!stored) {
       await this.forget(true);
@@ -616,24 +821,26 @@ export class DakcoderAuthProvider
     }
   }
 
-  private promptReauth(): void {
+  private promptReauth(minted = false): void {
     if (this.prompting) return;
     this.prompting = true;
-    const signIn = vscode.l10n.t('Sign In');
-    void vscode.window
-      .showWarningMessage(
-        vscode.l10n.t('Your dakcoder sign-in is no longer valid. Sign in again to continue.'),
-        signIn,
-      )
-      .then(
-        (choice) => {
-          this.prompting = false;
-          if (choice === signIn) void vscode.commands.executeCommand('dakcoder.signIn');
-        },
-        () => {
-          this.prompting = false;
-        },
-      );
+    // Two different recoveries, so two different offers. Sending someone whose
+    // token expired to a sign-in the host returns 403 for would be a dead end
+    // dressed as a remedy.
+    const action = minted ? vscode.l10n.t('Enter a token') : vscode.l10n.t('Sign In');
+    const message = minted
+      ? vscode.l10n.t('Your dakcoder gateway token has expired. Enter a new one to continue.')
+      : vscode.l10n.t('Your dakcoder sign-in is no longer valid. Sign in again to continue.');
+    void vscode.window.showWarningMessage(message, action).then(
+      (choice) => {
+        this.prompting = false;
+        if (choice !== action) return;
+        void vscode.commands.executeCommand(minted ? 'dakcoder.enterToken' : 'dakcoder.signIn');
+      },
+      () => {
+        this.prompting = false;
+      },
+    );
   }
 
   private async forget(notify: boolean): Promise<void> {
@@ -828,11 +1035,59 @@ function parseAccount(raw: string | undefined): StoredAccount | undefined {
       sub: parsed.sub,
       label: typeof parsed.label === 'string' ? parsed.label : parsed.sub,
       roles: Array.isArray(parsed.roles) ? parsed.roles.filter((r) => typeof r === 'string') : [],
+      minted: parsed.minted === true,
     };
   } catch {
     // A corrupt record is indistinguishable from no record, and the recovery
     // for both is the same sign-in.
     return undefined;
+  }
+}
+
+interface Claims {
+  sub?: string;
+  name?: string;
+  email?: string;
+  roles?: string[];
+  /** Seconds since the epoch, per RFC 7519. */
+  exp?: number;
+}
+
+/**
+ * Read a JWT's payload. **This is not validation, and must never be used as if
+ * it were.**
+ *
+ * The signature is not checked here and cannot be: the secret belongs to the
+ * gateway, which is the whole point of the gateway. Everything this returns is
+ * a *label* — what to write in the Accounts menu, and when to stop presenting
+ * the token — and every one of those is re-derived server-side from the same
+ * token on every request. A caller that used any of it to decide what the
+ * developer is allowed to do would be trusting a string the developer pasted.
+ *
+ * The only real check on a pasted token is `acceptMintedToken`'s live
+ * `/v1/quota` call, which asks the one party that can answer.
+ */
+function readClaims(token: string): Claims {
+  const parts = token.split('.');
+  if (parts.length !== 3) return {};
+  try {
+    const json = Buffer.from(parts[1], 'base64url').toString('utf8');
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    const roles = Array.isArray(parsed.roles)
+      ? parsed.roles.filter((r): r is string => typeof r === 'string')
+      : undefined;
+    return {
+      sub: typeof parsed.sub === 'string' ? parsed.sub : undefined,
+      name: typeof parsed.name === 'string' ? parsed.name : undefined,
+      email: typeof parsed.email === 'string' ? parsed.email : undefined,
+      exp: typeof parsed.exp === 'number' ? parsed.exp : undefined,
+      ...(roles ? { roles } : {}),
+    };
+  } catch {
+    // A payload that will not decode is not an error worth reporting: the
+    // gateway has already accepted the token, so the only thing lost is a
+    // nicer label. `acceptMintedToken` falls back to one that always works.
+    return {};
   }
 }
 
@@ -913,6 +1168,7 @@ export function register(
     vscode.window.registerUriHandler(provider),
     vscode.commands.registerCommand('dakcoder.signIn', () => provider.signInCommand()),
     vscode.commands.registerCommand('dakcoder.signOut', () => provider.signOutCommand()),
+    vscode.commands.registerCommand('dakcoder.enterToken', () => provider.enterTokenCommand()),
   );
   return provider;
 }

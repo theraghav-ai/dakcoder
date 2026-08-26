@@ -541,6 +541,14 @@ function strings(): Record<string, string> {
     offlineDefault: vscode.l10n.t('The agent needs the IT 2.0 gateway to reach the model. Reconnecting.'),
     working: vscode.l10n.t('Working'),
     workingTool: vscode.l10n.t('Working · {0}'),
+    waitingDecision: vscode.l10n.t('Waiting on your decision'),
+    popupKeys: vscode.l10n.t('↑↓ to choose · ⏎ to run'),
+
+    // The offline card. Two sentences, and the second one is the load-bearing
+    // half: "the stream dropped" and "the run died" look identical from here,
+    // and only one of them is a reason to start the work again.
+    offlineTitle: vscode.l10n.t('Offline'),
+    offlineAside: vscode.l10n.t('The event stream dropped and is being retried. The run keeps going on the runtime.'),
 
     // The console row. Every one of these is a whole phrase rather than a
     // fragment plus a number, because a translator handed "turn" and "{0}"
@@ -548,6 +556,9 @@ function strings(): Record<string, string> {
     consoleTurn: vscode.l10n.t('turn {0}'),
     consoleAttempt: vscode.l10n.t('attempt {0}'),
     consoleBlocked: vscode.l10n.t('blocked: {0}'),
+    // Replaces the mode cell while a decision is outstanding: "coding" is true
+    // but useless when the run is blocked on a person.
+    consoleNeedsApproval: vscode.l10n.t('needs approval'),
     'mode.planner': vscode.l10n.t('planning'),
     'mode.scaffolder': vscode.l10n.t('scaffolding'),
     'mode.coder': vscode.l10n.t('coding'),
@@ -570,6 +581,12 @@ function strings(): Record<string, string> {
     transcript: vscode.l10n.t('Conversation transcript'),
     skipToApproval: vscode.l10n.t('Skip to the approval request'),
     suggestions: vscode.l10n.t('Suggestions'),
+
+    // The idle panel. The title repeats the composer placeholder's first
+    // sentence deliberately: the placeholder disappears the moment anyone
+    // types, and this is the half that has to survive that.
+    emptyTitle: vscode.l10n.t('Ask dakcoder to build, audit or fix something.'),
+    emptySubtitle: vscode.l10n.t('Verified by the compiler and the template linter before you see the diff.'),
     you: vscode.l10n.t('You'),
     assistant: vscode.l10n.t('dakcoder'),
     show: vscode.l10n.t('Show detail'),
@@ -598,6 +615,7 @@ function strings(): Record<string, string> {
     lines_other: vscode.l10n.t('{0} lines'),
     files_one: vscode.l10n.t('1 file'),
     files_other: vscode.l10n.t('{0} files'),
+    changeset: vscode.l10n.t('Changeset'),
     protectedPath: vscode.l10n.t('protected'),
     fixHint: vscode.l10n.t('Suggested fix: {0}'),
 
@@ -622,6 +640,10 @@ function strings(): Record<string, string> {
     gateAbsent: vscode.l10n.t('·'),
     gateSeconds: vscode.l10n.t('{0}s'),
     gateBlocked: vscode.l10n.t('Blocked by {0}.'),
+    // Says what the runtime decided and why it stopped, so a stalled run does
+    // not read as a hung one. The turn count is not in the sentence because
+    // the console row above already carries it.
+    gateBlockedWhy: vscode.l10n.t('The gate blocked on {0}. The run is waiting rather than trying the same change again.'),
     gateConverged: vscode.l10n.t('Converged on attempt {0}.'),
     gateOpen: vscode.l10n.t('Not converged yet.'),
 
@@ -641,6 +663,21 @@ function strings(): Record<string, string> {
     decidedAccept: vscode.l10n.t('Accepted'),
     decidedReject: vscode.l10n.t('Rejected'),
     decidedEdit: vscode.l10n.t('Edited and accepted'),
+
+    /*
+     * `timeout` and `gone` both land here. They differ in why the runtime took
+     * the approval back, but not in what happened to the change, and the
+     * receipt says the part that matters: it was recorded as a rejection.
+     *
+     * The outcome word alone is enough for accept; the other three need the
+     * sentence, because in none of them did the developer see the result they
+     * would have predicted from the button they pressed.
+     */
+    decidedReleased: vscode.l10n.t('Released before it was answered'),
+    receiptReleased: vscode.l10n.t('{0} was released by the runtime before it was answered, and recorded as a rejection.'),
+    receiptEdited: vscode.l10n.t('Corrected arguments sent to {0}.'),
+    receiptAuto: vscode.l10n.t('Approved automatically by the approval policy.'),
+    approvalCountdown: vscode.l10n.t('{0} seconds left before the runtime releases it and records a rejection.'),
 
     // meter
     meterContext: vscode.l10n.t('{0} / {1} context'),
@@ -664,6 +701,18 @@ function strings(): Record<string, string> {
     // misc rows
     error: vscode.l10n.t('Error'),
     quota: vscode.l10n.t('Quota · {0} {1}/{2}'),
+    quotaClosest: vscode.l10n.t('Closest limit: {0} at {1}%.'),
+    quotaResets: vscode.l10n.t('{0} left in this window.'),
+
+    // Coarse by design: a window resetting in "2h 41m" does not need seconds,
+    // and a figure that changes every tick invites watching it.
+    hoursMinutes: vscode.l10n.t('{0}h {1}m'),
+    seconds_one: vscode.l10n.t('1 second'),
+    seconds_other: vscode.l10n.t('{0} seconds'),
+    minutes_one: vscode.l10n.t('1 minute'),
+    minutes_other: vscode.l10n.t('{0} minutes'),
+    hours_one: vscode.l10n.t('1 hour'),
+    hours_other: vscode.l10n.t('{0} hours'),
 
     // announcements (one composed sentence per event)
     sayTool: vscode.l10n.t('{0} {1}.'),

@@ -107,8 +107,8 @@
       "properties": {
         "dakcoder.serverGatewayUrl": {
           "type": "string",
-          "default": "https://aiops.cept.gov.in/coder/backend",
-          "description": "The IT 2.0 gateway: sign-in, quota, and the model proxy. The agent itself always runs on this machine — your repository, build output and git history never leave it. The prompt the agent builds does go to the India Post model endpoint, over internal infrastructure only."
+          "default": "https://ai.cept.gov.in/dakcoder",
+          "description": "The IT 2.0 gateway: sign-in, quota, and the model proxy. The agent itself always runs on this machine — your repository, build output and git history never leave it. The prompt the agent builds does go to the India Post model endpoint, over internal infrastructure only. This host publishes everything except sign-in: ask an administrator for a token and run \"dakcoder: Enter Gateway Token\"."
         },
         "dakcoder.gatewayUrl": {
           "type": "string",
@@ -285,6 +285,12 @@
         "title": "Sign Out",
         "category": "dakcoder",
         "icon": "$(sign-out)"
+      },
+      {
+        "command": "dakcoder.enterToken",
+        "title": "Enter Gateway Token",
+        "category": "dakcoder",
+        "icon": "$(key)"
       },
       {
         "command": "dakcoder.sessions.refresh",
