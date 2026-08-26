@@ -12,9 +12,10 @@ import json
 
 import pytest
 
-from dakcoder_agent.gate import GATE, full_gate, inner_loop
+from dakcoder_agent.gate import GATE, _NO_MODULE, full_gate, inner_loop
 from dakcoder_agent.tools.router import Router
 from dakcoder_shared.envelope import ToolResult
+from dakcoder_shared.paths import Workspace
 
 
 class Recorder:
@@ -231,3 +232,33 @@ def test_the_inner_loop_never_blocks(gate: Recorder, router: Router) -> None:
     report = inner_loop(router, ["repo/postgres/user.go"])
     assert report.ok
     assert report.warnings
+
+
+def test_the_go_stages_skip_without_a_module_at_the_root(tmp_path, sidecar) -> None:
+    """Every Go stage runs ``./...``, which needs a ``go.mod`` at the working
+    directory. Without one the toolchain refuses the pattern itself, and the
+    loop reads that as a defect in code it never compiled.
+
+    Guarding only ``go_build`` would promote ``swagger_check`` to first blocker
+    and replay the same unclearable ladder, so both scoped stages are asserted
+    here by name.
+    """
+    from dakcoder_agent.tools import commands, fs, gotools, knowledge
+
+    (tmp_path / "handler").mkdir()
+    (tmp_path / "handler" / "user.go").write_text("package handler\n", encoding="utf-8")
+    router = Router(
+        Workspace.at(tmp_path),
+        {**fs.HANDLERS, **knowledge.HANDLERS, **commands.HANDLERS, **gotools.handlers_for(sidecar)},
+    )
+    Recorder(router)
+
+    report = full_gate(router, ["handler/user.go"])
+
+    assert report.ok
+    assert report.not_run == ()
+    skipped = {r.name for r in report.results if r.skipped == _NO_MODULE}
+    assert {"go_build", "go_vet", "swagger_check", "rules_lint", "go_mod tidy"} <= skipped
+    # Nothing ran, so nothing may claim to have passed.
+    assert all(r.skipped for r in report.results)
+

@@ -20,6 +20,7 @@ from dakcoder_agent.modes import Mode
 from dakcoder_agent.tools.router import ApprovalRequest, Router
 from dakcoder_shared.envelope import EventType, ToolResult
 from dakcoder_shared.llm import ChatResult, ToolCall, Usage
+from dakcoder_shared.paths import Workspace
 
 
 class ScriptedClient:
@@ -34,7 +35,11 @@ class ScriptedClient:
         self.calls += 1
         self.seen_tools.append([t["function"]["name"] for t in (tools or [])])
         if not self.turns:
-            return say("nothing further")
+            # Numbered, so the filler stands for "the model said something" and
+            # not "it said the same thing twice". An identical filler trips the
+            # repeated-prose detector, which would make a script that simply ran
+            # out look like a model stuck in a loop.
+            return say(f"nothing further ({self.calls})")
         return self.turns.pop(0)
 
 
@@ -366,3 +371,95 @@ def test_usage_is_reported_every_turn(router: Router, gated) -> None:
     usage = of_type(events, EventType.USAGE)
     assert len(usage) == 2
     assert "budget_used_pct" in usage[0].data
+
+
+# ── triage: not every message is a task ─────────────────────────────────────
+
+
+def test_a_greeting_ends_the_run_without_a_plan(router: Router, gated) -> None:
+    """The seventeen-turn report, as a test.
+
+    A greeting reaches the Planner, which answers it. That answer carries no
+    numbered steps, so there is nothing for the Coder to execute — and handing
+    it on anyway is what ran the whole engineering ladder against a workspace
+    nothing had touched.
+    """
+    agent, events = loop_over(router, [say("Hello! How can I help?")])
+
+    assert agent.result.outcome == Outcome.DONE
+    assert agent.context.turn == 1
+    assert of_type(events, EventType.GATE) == []
+    assert of_type(events, EventType.PLAN) == []
+
+
+def test_a_numbered_plan_still_reaches_the_coder(router: Router, gated) -> None:
+    """The other side of the same branch, so triage cannot quietly widen."""
+    agent, events = loop_over(router, [say("1. Edit handler/user.go"), say("done")])
+
+    assert of_type(events, EventType.PLAN) != []
+    assert any(e.data.get("kind") == "full" for e in of_type(events, EventType.GATE))
+    assert agent.result.outcome == Outcome.DONE
+
+
+def test_repeated_prose_stops_the_run(router: Router, gated) -> None:
+    """`_stuck` reads tool arguments, so a turn that calls nothing is invisible
+    to it. Every rung of the reported ladder was such a turn."""
+    gated["fail"] = "go_build"
+    agent, _ = loop_over(
+        router,
+        [say("1. Edit handler/user.go")] + [say("I cannot proceed.")] * 4,
+    )
+    assert agent.result.outcome == Outcome.NO_PROGRESS
+
+
+def test_the_same_prose_before_different_calls_is_not_no_progress(
+    router: Router, gated
+) -> None:
+    """The reason the check sits after the tool-call branch and not before it.
+
+    A model that prefixes each edit with one stock sentence is working, not
+    stuck, and killing it mid-run would lose the third write.
+    """
+    agent, events = loop_over(
+        router,
+        [
+            say("1. Edit three files"),
+            calls(("write_file", '{"path": "a.go", "content": "package a"}')),
+            calls(("write_file", '{"path": "b.go", "content": "package b"}')),
+            calls(("write_file", '{"path": "c.go", "content": "package c"}')),
+            say("done"),
+        ],
+        approve=lambda _r: True,
+    )
+    assert agent.result.outcome is not Outcome.NO_PROGRESS
+    assert {"a.go", "b.go", "c.go"} <= set(router.touched)
+
+
+# ── a gate that did not run is not a gate that passed ───────────────────────
+
+
+def test_a_skipped_gate_is_not_reported_as_clean(tmp_path, sidecar) -> None:
+    """A checkout root has no ``go.mod``, so every Go stage sits out. Reporting
+    that as "the gate is clean" would ship unverified code quietly, which is
+    worse than the loud wall it replaces."""
+    from dakcoder_agent.tools import commands, fs, gotools, knowledge
+
+    (tmp_path / "notes.md").write_text("# notes\n", encoding="utf-8")
+    router = Router(
+        Workspace.at(tmp_path),
+        {**fs.HANDLERS, **knowledge.HANDLERS, **commands.HANDLERS, **gotools.handlers_for(sidecar)},
+    )
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Write handler/user.go"),
+            calls(("write_file", '{"path": "handler/user.go", "content": "package handler"}')),
+            say("done"),
+        ],
+        approve=lambda _r: True,
+    )
+
+    assert agent.result.outcome == Outcome.DONE
+    assert "did not run" in agent.result.summary
+    assert "the gate is clean" not in agent.result.summary
+

@@ -20,6 +20,7 @@
  */
 
 import type { ContextSnapshot, Health, QuotaSnapshot, RevertPlan, SessionSummary, WireEvent } from './protocol';
+import { normaliseQuota } from './protocol';
 
 export class HttpError extends Error {
   constructor(
@@ -266,8 +267,8 @@ export class GatewayClient extends Rest {
     return this.post('/v1/auth/revoke', { refresh_token: refreshToken });
   }
 
-  quota(): Promise<QuotaSnapshot> {
-    return this.get<QuotaSnapshot>('/v1/quota');
+  async quota(): Promise<QuotaSnapshot> {
+    return normaliseQuota(await this.get<unknown>('/v1/quota'));
   }
 
   /**
@@ -298,11 +299,14 @@ export class GatewayClient extends Rest {
       }
       throw new HttpError(response.status, detail);
     }
-    return (await response.json()) as QuotaSnapshot;
+    return normaliseQuota(await response.json());
   }
 
-  preflight(estimatedTokens: number): Promise<{ ok: boolean; quota: QuotaSnapshot }> {
-    return this.post('/v1/quota/preflight', { estimated_tokens: estimatedTokens });
+  async preflight(estimatedTokens: number): Promise<{ ok: boolean; quota: QuotaSnapshot }> {
+    const result = await this.post<{ ok?: boolean; quota?: unknown }>('/v1/quota/preflight', {
+      estimated_tokens: estimatedTokens,
+    });
+    return { ok: result.ok === true, quota: normaliseQuota(result.quota) };
   }
 }
 

@@ -433,7 +433,10 @@ export function quotaTooltip(snapshot: QuotaSnapshot, staleSince?: number): vsco
   }
 
   const tightest = snapshot.tightest;
-  if (tightest) {
+  // The wire is normalised before it gets here, but a tooltip is the wrong
+  // place to find out otherwise: a throw in this function fails the whole
+  // refresh, not just this line.
+  if (tightest && typeof tightest.name === 'string' && Number.isFinite(tightest.pct)) {
     lines.push(
       vscode.l10n.t(
         'Closest limit: {0} at {1}%',

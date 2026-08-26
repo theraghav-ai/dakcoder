@@ -12,7 +12,7 @@ import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
 import { parseSse } from '../client';
-import { isResumable, parsePlan, type WireEvent } from '../protocol';
+import { isResumable, normaliseQuota, parsePlan, type WireEvent } from '../protocol';
 
 /** A ReadableStream that hands out exactly the chunks given, in order. */
 function streamOf(...chunks: string[]): ReadableStream<Uint8Array> {
@@ -210,5 +210,73 @@ describe('isResumable', () => {
     // C2 is additive: a status this build has never heard of must not produce a
     // button that posts to a route the runtime will refuse.
     assert.equal(isResumable('quarantined'), false);
+  });
+});
+
+
+describe('normaliseQuota', () => {
+  /** What the gateway's `Snapshot.as_dict()` sent before it grew the nested view. */
+  const flat = {
+    sub: 'gitlab:7',
+    lane: 'interactive',
+    window_open: true,
+    window_expires_at: '2026-08-26T14:00:00+00:00',
+    used: { window_tokens: 1200, window_runs: 2, hour_tokens: 1200, week_tokens: 1200, week_sessions: 1 },
+    limits: { window_tokens: 10_000, window_runs: 3, hour_tokens: 5_000, week_tokens: 30_000, week_sessions: 2 },
+    tightest: { limit: 'window_runs', used_pct: 66.7 },
+  };
+  const now = Date.parse('2026-08-26T13:30:00+00:00');
+
+  it('builds the nested view from the flat counters', () => {
+    const q = normaliseQuota(flat, now);
+    assert.deepEqual(q.window, { used: 1200, cap: 10_000, expires_in: 1800, runs: { used: 2, cap: 3 } });
+    assert.deepEqual(q.week, { used: 1200, cap: 30_000, sessions: { used: 1, cap: 2 } });
+    assert.deepEqual(q.hour, { used: 1200, cap: 5_000 });
+    // `name` and `pct` are what the status bar and tooltip read; both must be set.
+    assert.deepEqual(q.tightest, { name: 'window_runs', used: 2, cap: 3, pct: 66.7 });
+  });
+
+  it('reports no window when none is open, and no tightest limit when nothing is used', () => {
+    const q = normaliseQuota(
+      { ...flat, window_open: false, window_expires_at: null, used: {}, tightest: { limit: '', used_pct: 0 } },
+      now,
+    );
+    assert.equal(q.window, undefined);
+    assert.equal(q.tightest, undefined);
+    assert.deepEqual(q.week, { used: 0, cap: 30_000, sessions: { used: 0, cap: 2 } });
+  });
+
+  it('prefers the nested view when the gateway sends both', () => {
+    const q = normaliseQuota(
+      {
+        ...flat,
+        window: {
+          used: 1300,
+          cap: 10_000,
+          expires_in: 42,
+          opened_at: '2026-08-26T09:00:00+00:00',
+          runs: { used: 2, cap: 3 },
+        },
+        tightest: { limit: 'window_runs', used_pct: 66.7, name: 'window_runs', used: 2, cap: 3, pct: 66.7 },
+        role: 'developer',
+      },
+      now,
+    );
+    assert.deepEqual(q.window, {
+      used: 1300,
+      cap: 10_000,
+      expires_in: 42,
+      opened_at: '2026-08-26T09:00:00+00:00',
+      runs: { used: 2, cap: 3 },
+    });
+    assert.equal(q.role, 'developer');
+    assert.equal(q.tightest?.name, 'window_runs');
+  });
+
+  it('never yields a tightest limit without a name, whatever arrives', () => {
+    assert.equal(normaliseQuota({ tightest: { used_pct: 12 } }).tightest, undefined);
+    assert.equal(normaliseQuota({ tightest: 'window_runs' }).tightest, undefined);
+    assert.deepEqual(normaliseQuota(null), {});
+    assert.deepEqual(normaliseQuota('nonsense'), {});
   });
 });

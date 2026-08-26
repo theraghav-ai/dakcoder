@@ -33,6 +33,7 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { chmodSync, statSync } from 'node:fs';
 import * as vscode from 'vscode';
 
 import type { GateEvent, Mode } from './protocol';
@@ -907,51 +908,8 @@ export class GoDiagnostics implements vscode.Disposable {
     });
   }
 
-  private async locateGotools(): Promise<string> {
-    const configured = vscode.workspace
-      .getConfiguration('dakcoder')
-      .get<string>('gotoolsPath')
-      ?.trim();
-    if (configured) return configured;
-
-    const name = `gotools-${process.platform}-${process.arch}${
-      process.platform === 'win32' ? '.exe' : ''
-    }`;
-    const bundled = vscode.Uri.joinPath(this.deps.extensionUri, 'bin', name);
-    if (await exists(bundled)) {
-      if (await this.checksumOk(bundled, name)) return bundled.fsPath;
-      // Refused, not warned past: a sidecar that does not match its manifest is
-      // either a corrupted download or a substituted binary, and this one writes
-      // files in the workspace.
-      throw new Error(`checksum mismatch for ${name}`);
-    }
-    return process.platform === 'win32' ? 'gotools.exe' : 'gotools';
-  }
-
-  private async checksumOk(binary: vscode.Uri, name: string): Promise<boolean> {
-    const manifest = vscode.Uri.joinPath(this.deps.extensionUri, 'bin', 'gotools.sha256');
-    let expected: string | undefined;
-    try {
-      const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(manifest));
-      for (const line of text.split(/\r?\n/)) {
-        const match = line.match(/^([0-9a-f]{64})\s+\*?(.+?)\s*$/i);
-        if (match && match[2].endsWith(name)) expected = match[1].toLowerCase();
-      }
-    } catch {
-      // No manifest is a packaging defect, not a mismatch. Refusing here would
-      // break every development build, which is the one place it would be seen.
-      this.deps.log.warn('bin/gotools.sha256 is missing; the sidecar checksum was not verified');
-      return true;
-    }
-    if (!expected) {
-      this.deps.log.warn(`bin/gotools.sha256 does not list ${name}; the checksum was not verified`);
-      return true;
-    }
-    const bytes = await vscode.workspace.fs.readFile(binary);
-    const actual = createHash('sha256').update(bytes).digest('hex');
-    if (actual === expected) return true;
-    this.deps.log.error(`${name}: expected sha256 ${expected}, got ${actual}`);
-    return false;
+  private locateGotools(): Promise<string> {
+    return resolveGotools(this.deps.extensionUri, this.deps.log);
   }
 
   private async reportMissingTool(): Promise<void> {
@@ -1803,6 +1761,99 @@ async function constructorAt(uri: vscode.Uri, line: number): Promise<string | un
     /* the file moved between the lint and the pick */
   }
   return undefined;
+}
+
+/**
+ * The sidecar the extension will actually launch: the setting, then the
+ * checksum-verified bundled build, then the bare name for a developer with one
+ * on PATH — the order `dakcoder.gotoolsPath` documents.
+ *
+ * Free rather than a method because `runtime.ts` must hand the same answer to
+ * the Python runtime, which can compose neither the filename (reproducing
+ * node's `process.arch` from Python would be the per-platform mapping table
+ * `scripts/build-gotools.mjs` exists to avoid, Part B §4.5) nor the trust
+ * decision behind it. Sharing the *resolution* rather than the *name* is the
+ * point: the runtime is the consumer that lets `gotools` write in the
+ * workspace, so it is the last one that should reach the binary around the
+ * manifest check.
+ */
+export async function resolveGotools(
+  extensionUri: vscode.Uri,
+  log: vscode.LogOutputChannel,
+): Promise<string> {
+  const configured = vscode.workspace
+    .getConfiguration('dakcoder')
+    .get<string>('gotoolsPath')
+    ?.trim();
+  if (configured) return configured;
+
+  const name = `gotools-${process.platform}-${process.arch}${
+    process.platform === 'win32' ? '.exe' : ''
+  }`;
+  const bundled = vscode.Uri.joinPath(extensionUri, 'bin', name);
+  if (await exists(bundled)) {
+    if (await checksumOk(extensionUri, log, bundled, name)) {
+      ensureExecutable(bundled.fsPath, log);
+      return bundled.fsPath;
+    }
+    // Refused, not warned past: a sidecar that does not match its manifest is
+    // either a corrupted download or a substituted binary, and this one writes
+    // files in the workspace.
+    throw new Error(`checksum mismatch for ${name}`);
+  }
+  return process.platform === 'win32' ? 'gotools.exe' : 'gotools';
+}
+
+/**
+ * Restore the execute bit the `.vsix` does not carry.
+ *
+ * A zip written on Windows stores 0666 for every entry, and VS Code extracts
+ * those modes verbatim. So on linux and macOS the sidecar arrives present,
+ * checksum-valid and unrunnable, and the only symptom is EACCES from a spawn.
+ *
+ * Best-effort: a read-only install directory is not a reason to refuse a binary
+ * that may already be executable.
+ */
+function ensureExecutable(file: string, log: vscode.LogOutputChannel): void {
+  if (process.platform === 'win32') return;
+  try {
+    if ((statSync(file).mode & 0o111) !== 0) return;
+    chmodSync(file, 0o755);
+    log.info(`marked ${file} executable; the .vsix does not carry the bit`);
+  } catch (err) {
+    log.warn(`could not mark ${file} executable: ${String(err)}`);
+  }
+}
+
+async function checksumOk(
+  extensionUri: vscode.Uri,
+  log: vscode.LogOutputChannel,
+  binary: vscode.Uri,
+  name: string,
+): Promise<boolean> {
+  const manifest = vscode.Uri.joinPath(extensionUri, 'bin', 'gotools.sha256');
+  let expected: string | undefined;
+  try {
+    const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(manifest));
+    for (const line of text.split(/\r?\n/)) {
+      const match = line.match(/^([0-9a-f]{64})\s+\*?(.+?)\s*$/i);
+      if (match && match[2].endsWith(name)) expected = match[1].toLowerCase();
+    }
+  } catch {
+    // No manifest is a packaging defect, not a mismatch. Refusing here would
+    // break every development build, which is the one place it would be seen.
+    log.warn('bin/gotools.sha256 is missing; the sidecar checksum was not verified');
+    return true;
+  }
+  if (!expected) {
+    log.warn(`bin/gotools.sha256 does not list ${name}; the checksum was not verified`);
+    return true;
+  }
+  const bytes = await vscode.workspace.fs.readFile(binary);
+  const actual = createHash('sha256').update(bytes).digest('hex');
+  if (actual === expected) return true;
+  log.error(`${name}: expected sha256 ${expected}, got ${actual}`);
+  return false;
 }
 
 async function exists(uri: vscode.Uri): Promise<boolean> {

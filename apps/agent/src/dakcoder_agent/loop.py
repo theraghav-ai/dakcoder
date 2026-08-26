@@ -109,6 +109,11 @@ class _State:
     cycles: int = 0
     #: Fingerprints of the last few tool calls, for the no-progress detector.
     recent: list[str] = field(default_factory=list)
+    #: The last few tool-call-free replies, for the same detector. A separate
+    #: ledger on purpose: `_switch` clears `recent` on every mode change, and a
+    #: run that repeats itself does so *while* advancing modes — planner, coder,
+    #: verifier, debugger, coder — so a shared ledger could never reach three.
+    said: list[str] = field(default_factory=list)
     plan: str = ""
     last_gate: GateReport | None = None
     dependencies_changed: bool = False
@@ -307,6 +312,16 @@ class AgentLoop:
             yield from self._tool_calls(result.chat.tool_calls)
             return
 
+        if result.chat.content and self._repeating(result.chat.content):
+            self.result = RunResult(
+                Outcome.NO_PROGRESS,
+                f"the same reply {NO_PROGRESS_REPEATS} turns running, with no tool call",
+                self.context.turn,
+                tuple(self.router.touched),
+                self.state.last_gate,
+            )
+            return
+
         # No tool calls: the model has said its piece, so the mode is over.
         yield from self._advance(result)
 
@@ -439,9 +454,26 @@ class AgentLoop:
         text = result.chat.content or ""
 
         if mode is Mode.PLANNER:
+            steps = _count_steps(text)
+            if steps == 0 and not _is_scaffold_plan(text):
+                # A reply with no steps is not a plan, and the Planner is the one
+                # mode positioned to say so: it has read the task and answered it.
+                # Greetings, typos and questions land here, and so does a
+                # clarifying question the developer has to answer before there is
+                # anything to plan. Handing that text to the Coder as if it were a
+                # plan is what turned "he how are you doijng" into seventeen turns
+                # — the Coder had no step to execute, so every mode below it fired
+                # in order against a workspace nothing had touched.
+                self.result = RunResult(
+                    Outcome.DONE,
+                    "answered; no plan was needed and nothing was changed",
+                    self.context.turn,
+                    tuple(self.router.touched),
+                )
+                return
             self.state.plan = text
             self.context.set_plan(text)
-            yield Event(EventType.PLAN, {"text": text, "steps": _count_steps(text)})
+            yield Event(EventType.PLAN, {"text": text, "steps": steps})
             self._switch(Mode.SCAFFOLDER if _is_scaffold_plan(text) else Mode.CODER)
             return
 
@@ -540,6 +572,23 @@ class AgentLoop:
             and len(set(self.state.recent)) == 1
         )
 
+    def _repeating(self, text: str) -> bool:
+        """The same reply, three turns running, with no tool call between them.
+
+        ``_stuck`` judges a turn by the arguments it dispatched, so a turn that
+        dispatches nothing is invisible to it. That is the hole a typo fell
+        through: the modes kept advancing, each one restated the same refusal,
+        and the loop had no way to notice because not one of those turns called
+        a tool. Whitespace is normalised because a model that re-wraps the same
+        paragraph has not made progress either.
+        """
+        self.state.said.append(" ".join(text.split()))
+        del self.state.said[:-NO_PROGRESS_REPEATS]
+        return (
+            len(self.state.said) == NO_PROGRESS_REPEATS
+            and len(set(self.state.said)) == 1
+        )
+
     def _compact(self) -> Iterator[Event]:
         before = self.context.usage().total
         recap = self.context.compact(self._summarise)
@@ -629,10 +678,26 @@ class AgentLoop:
         return (), tuple(ordered)
 
     def _done_summary(self, report: GateReport) -> str:
+        """What the developer reads when a run ends DONE.
+
+        Read off the report rather than off the outcome, because ``ok`` now
+        covers two different claims: the stages passed, and the stages did not
+        apply. Saying "the gate is clean" for the second is the same overclaim
+        D-42 refuses from the model, pointed at the developer instead — and on a
+        workspace with no root ``go.mod`` it is the ordinary case, not a corner.
+        """
         files = self.router.touched
+        verified = any(not r.skipped for r in report.results)
         if not files:
-            return "nothing needed changing; the gate is clean"
+            return (
+                "nothing needed changing; the gate is clean"
+                if verified
+                else "nothing needed changing, and the gate had nothing to verify"
+            )
         listed = "\n".join(f"  - {p}" for p in files)
+        if not verified:
+            reason = report.results[0].skipped if report.results else "no applicable stage"
+            return f"{len(files)} file(s) changed, but the gate did not run ({reason}):\n{listed}"
         return f"{len(files)} file(s) changed and the gate is clean:\n{listed}"
 
 
@@ -646,7 +711,11 @@ def _safe_args(call: ToolCall) -> Any:
     try:
         return call.parsed()
     except ValueError:
-        return {"_raw": call.arguments[:500]}
+        # Named for what it is. Rendered, ``git_status {"_raw":"{"}`` reads as
+        # though the router invented a parameter and passed it on — it did not,
+        # ``_coerce`` refused the call and told the model why. A pilot reported
+        # that line as the bug, which cost the report its actual evidence.
+        return {"_malformed_arguments": call.arguments[:500]}
 
 
 def _slice_path(call: ToolCall, result: ToolResult) -> str | None:

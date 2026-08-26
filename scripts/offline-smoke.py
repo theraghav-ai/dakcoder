@@ -47,6 +47,24 @@ def build_venv() -> None:
 
 build_venv()
 
+
+def _find_gotools() -> str:
+    """The binary `runtime.ts` would resolve for this platform.
+
+    Node composes the name from `process.platform`/`process.arch`; the two that
+    matter for a developer running this script are win32-x64 and linux-x64, and
+    an absent binary is not a failure here — the checks below report the sidecar
+    as unavailable rather than refusing to run at all.
+    """
+    suffix = {"win32": "win32-x64.exe", "linux": "linux-x64", "darwin": "darwin-arm64"}
+    name = "gotools-" + suffix.get(sys.platform, "linux-x64")
+    candidate = ROOT / "extension" / "bin" / name
+    return str(candidate) if candidate.is_file() else ""
+
+
+_gotools = _find_gotools()
+print("gotools for this platform:", _gotools or "(not built)")
+
 env = dict(os.environ)
 env.update(
     {
@@ -57,6 +75,12 @@ env.update(
         # goes through the gateway as the developer, and there is no local key.
         "DAKCODER_JWT": "test.jwt.value",
         "DAKCODER_VERSION": "0.1.0",
+        # What `runtime.ts::childEnv` now passes, resolved there against the
+        # platform-suffixed name and the sha256 manifest. Mirrored here because
+        # this script's whole claim is that it spawns the child the extension
+        # spawns — and a mirror that omits the one variable the sidecar needs is
+        # how a broken install passed this script and failed on a pilot's laptop.
+        **({"GOTOOLS_PATH": _gotools} if _gotools else {}),
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",
     }
@@ -160,6 +184,31 @@ try:
 
     status, body = call("POST", "/v1/approvals/x", {"decision": "banana"})
     check("a bad decision is refused", status in (400, 410))
+
+    # The sidecar bridge, which is the seam every other check here flies over.
+    # `repo_map` is the first tool a real run reaches, and the failure it used to
+    # produce ("the gotools binary is not on PATH") was invisible to this script.
+    if _gotools:
+        status, body = call("GET", "/v1/tools")
+        names = {t.get("name") for t in (body.get("tools") or [])}
+        check("repo_map is in the catalogue", "repo_map" in names)
+
+        code = (
+            "import os, sys;"
+            "sys.path.insert(0, r'" + str(VENV / "Lib" / "site-packages") + "');"
+            "from dakcoder_agent.tools.gotools import _find_binary;"
+            "print(_find_binary() or '')"
+        )
+        found = subprocess.run(
+            [PY, "-c", code], env=env, capture_output=True, text=True
+        ).stdout.strip()
+        check(
+            "the daemon resolves gotools from GOTOOLS_PATH",
+            found.lower() == _gotools.lower(),
+            found or "resolved nothing",
+        )
+    else:
+        print("  SKIP  sidecar checks — no gotools built for this platform")
 
 finally:
     child.terminate()

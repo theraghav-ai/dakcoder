@@ -193,6 +193,12 @@ class Snapshot:
     used: dict[str, int] = field(default_factory=dict)
     limits: dict[str, int] = field(default_factory=dict)
     lane: Lane = Lane.INTERACTIVE
+    #: When the open window began. ``None`` whenever ``window_open`` is false.
+    window_opened_at: datetime | None = None
+    #: The instant the counters were read. ``expires_in`` on the wire is derived
+    #: from it, so the client never has to compare a server timestamp with its
+    #: own clock — laptops behind the proxy are not reliably NTP-synced.
+    at: datetime | None = None
 
     @property
     def tightest(self) -> tuple[str, float]:
@@ -212,19 +218,63 @@ class Snapshot:
                 worst, ratio = name, share
         return worst, round(ratio, 4)
 
+    def _counter(self, series: Series) -> dict[str, int]:
+        return {"used": self.used.get(str(series), 0), "cap": self.limits.get(str(series), 0)}
+
     def as_dict(self) -> dict[str, Any]:
+        """The wire form, in both envelopes.
+
+        The flat counters (``used``/``limits`` keyed by series) are what the
+        ledger and the tests read. The nested view — ``window``, ``week``,
+        ``hour`` and a ``tightest`` carrying ``name``/``used``/``cap``/``pct`` —
+        is what the extension's status bar, quota tree and Doctor render
+        (Part B §7). Both are emitted because the first shipped alone and every
+        client read it as the second: ``tightest.name`` came back undefined and
+        the status bar failed on every refresh. Additive, per C2.
+        """
         name, ratio = self.tightest
-        return {
+        pct = round(ratio * 100, 1)
+        payload: dict[str, Any] = {
             "sub": self.sub,
             "lane": str(self.lane),
             "window_open": self.window_open,
             "window_expires_at": (
                 self.window_expires_at.isoformat() if self.window_expires_at else None
             ),
+            "window_opened_at": (
+                self.window_opened_at.isoformat() if self.window_opened_at else None
+            ),
             "used": dict(self.used),
             "limits": dict(self.limits),
-            "tightest": {"limit": name, "used_pct": round(ratio * 100, 1)},
+            "tightest": {
+                "limit": name,
+                "used_pct": pct,
+                "name": name,
+                "used": self.used.get(name, 0),
+                "cap": self.limits.get(name, 0),
+                "pct": pct,
+            },
+            "week": {
+                **self._counter(Series.WEEK_TOKENS),
+                "sessions": self._counter(Series.WEEK_SESSIONS),
+            },
+            "hour": self._counter(Series.HOUR_TOKENS),
         }
+        if self.window_open:
+            window: dict[str, Any] = {
+                **self._counter(Series.WINDOW_TOKENS),
+                "runs": self._counter(Series.WINDOW_RUNS),
+            }
+            if self.window_opened_at:
+                window["opened_at"] = self.window_opened_at.isoformat()
+            if self.window_expires_at and self.at:
+                window["expires_in"] = max(
+                    0, int((self.window_expires_at - self.at).total_seconds())
+                )
+            payload["window"] = window
+        else:
+            payload["window"] = None
+        return payload
 
 
 class QuotaExceeded(Exception):

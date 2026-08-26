@@ -254,6 +254,120 @@ export interface QuotaSnapshot {
   tightest?: { name: string; used: number; cap: number; pct: number };
 }
 
+/**
+ * Shape a `/v1/quota` body for the surfaces here, whichever envelope it came in.
+ *
+ * The gateway's `Snapshot.as_dict()` sends its counters flat — `used` and
+ * `limits` keyed by series (`window_tokens`, `week_sessions`, …), a boolean
+ * `window_open`, an ISO `window_expires_at`, and `tightest: {limit, used_pct}`.
+ * Every renderer here reads the nested view above. Casting one to the other
+ * left `tightest.name` undefined and the tooltip died on `escape(undefined)` —
+ * "quota refresh failed: Cannot read properties of undefined (reading
+ * 'replace')" on every refresh, for a payload that was perfectly good.
+ *
+ * Newer gateways emit both envelopes; older ones only the flat one. Nested
+ * fields win when present, the flat ones fill in when not, and the result is
+ * always a `QuotaSnapshot` with nothing undefined where a renderer will read a
+ * string or a number. `now` is injectable so the derived `expires_in` is
+ * testable.
+ */
+export function normaliseQuota(raw: unknown, now = Date.now()): QuotaSnapshot {
+  if (!isRecord(raw)) return {};
+  const used = isRecord(raw.used) ? raw.used : {};
+  const limits = isRecord(raw.limits) ? raw.limits : {};
+  const counter = (series: string): QuotaWindow | undefined =>
+    typeof limits[series] === 'number' ? { used: num(used[series]), cap: num(limits[series]) } : undefined;
+
+  const out: QuotaSnapshot = {};
+  if (typeof raw.role === 'string' && raw.role) out.role = raw.role;
+  if (typeof raw.tier === 'string' && raw.tier) out.tier = raw.tier;
+
+  const window = readWindow(raw.window);
+  if (window) {
+    out.window = window;
+  } else if (raw.window_open === true) {
+    const tokens = counter('window_tokens') ?? { used: 0, cap: 0 };
+    const runs = counter('window_runs');
+    const expiresIn = secondsUntil(raw.window_expires_at, now);
+    out.window = {
+      ...tokens,
+      ...(typeof raw.window_opened_at === 'string' ? { opened_at: raw.window_opened_at } : {}),
+      ...(expiresIn === undefined ? {} : { expires_in: expiresIn }),
+      ...(runs ? { runs } : {}),
+    };
+  }
+
+  const week = readWindow(raw.week);
+  if (week) {
+    out.week = week;
+  } else {
+    const tokens = counter('week_tokens');
+    const sessions = counter('week_sessions');
+    if (tokens || sessions) out.week = { ...(tokens ?? { used: 0, cap: 0 }), ...(sessions ? { sessions } : {}) };
+  }
+
+  const hour = readWindow(raw.hour);
+  if (hour) {
+    out.hour = hour;
+  } else {
+    const tokens = counter('hour_tokens');
+    if (tokens) out.hour = tokens;
+  }
+
+  if (isRecord(raw.tightest)) {
+    const t = raw.tightest;
+    // An empty name is the gateway saying "nothing has been used yet".
+    const name = typeof t.name === 'string' && t.name ? t.name : typeof t.limit === 'string' ? t.limit : '';
+    if (name) {
+      const usedN = typeof t.used === 'number' ? t.used : num(used[name]);
+      const cap = typeof t.cap === 'number' ? t.cap : num(limits[name]);
+      const pct =
+        typeof t.pct === 'number'
+          ? t.pct
+          : typeof t.used_pct === 'number'
+            ? t.used_pct
+            : cap > 0
+              ? (usedN / cap) * 100
+              : 0;
+      out.tightest = { name, used: usedN, cap, pct };
+    }
+  }
+  return out;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function num(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+/** A nested counter as a newer gateway already sends it; undefined unless it has a numeric cap. */
+function readWindow(
+  value: unknown,
+): (QuotaWindow & { opened_at?: string; expires_in?: number; runs?: QuotaWindow; sessions?: QuotaWindow }) | undefined {
+  if (!isRecord(value) || typeof value.cap !== 'number') return undefined;
+  const out: QuotaWindow & { opened_at?: string; expires_in?: number; runs?: QuotaWindow; sessions?: QuotaWindow } = {
+    used: num(value.used),
+    cap: num(value.cap),
+  };
+  if (typeof value.resets_in === 'number') out.resets_in = value.resets_in;
+  if (typeof value.expires_in === 'number') out.expires_in = value.expires_in;
+  if (typeof value.opened_at === 'string') out.opened_at = value.opened_at;
+  const runs = readWindow(value.runs);
+  if (runs) out.runs = { used: runs.used, cap: runs.cap };
+  const sessions = readWindow(value.sessions);
+  if (sessions) out.sessions = { used: sessions.used, cap: sessions.cap };
+  return out;
+}
+
+function secondsUntil(iso: unknown, now: number): number | undefined {
+  if (typeof iso !== 'string') return undefined;
+  const at = Date.parse(iso);
+  return Number.isFinite(at) ? Math.max(0, Math.round((at - now) / 1000)) : undefined;
+}
+
 // ── plan parsing ────────────────────────────────────────────────────────────
 
 export interface PlanStep {

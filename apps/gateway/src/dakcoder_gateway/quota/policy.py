@@ -317,6 +317,8 @@ class QuotaPolicy:
             used={str(k): v for k, v in used.items()},
             limits={str(s): self.limits.ceiling(s, lane) for s in Series},
             lane=lane,
+            window_opened_at=window.opened_at if window else None,
+            at=now,
         )
 
     async def preflight(self, sub: str, estimated: int, lane: Lane = Lane.INTERACTIVE) -> bool:

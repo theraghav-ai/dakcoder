@@ -28,6 +28,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 
 import { RuntimeClient } from './client';
+import { resolveGotools } from './diagnostics';
 import { API_VERSION, type Health } from './protocol';
 
 /** Variables that must never reach the child, whatever the developer's shell holds. */
@@ -98,7 +99,7 @@ export class Runtime implements vscode.Disposable {
 
   private async start(): Promise<Announcement> {
     const python = await this.venvPython();
-    const env = this.childEnv();
+    const env = this.childEnv(await this.gotools());
 
     const args = [
       '-m',
@@ -225,13 +226,47 @@ export class Runtime implements vscode.Disposable {
     );
   }
 
-  private childEnv(): NodeJS.ProcessEnv {
+  /**
+   * The verified sidecar path, or nothing.
+   *
+   * Resolved here rather than left to `diagnostics.ts`'s lazy locator, because
+   * that one fires on the first lint and `dakcoder.lintOnSave` defaults to
+   * false — the first thing a pilot does is send a chat message, which spawns
+   * this child. Only this call site has a happens-before against the daemon's
+   * first `repo_map`.
+   *
+   * A checksum mismatch must not stop the runtime: a daemon without `gotools`
+   * still answers, still streams, and reports one clear failure per
+   * gotools-backed tool, whereas a runtime that refuses to spawn leaves the
+   * developer with no agent and no explanation.
+   */
+  private async gotools(): Promise<string | undefined> {
+    try {
+      return await resolveGotools(vscode.Uri.file(this.opts.extensionPath), this.opts.log);
+    } catch (err) {
+      this.opts.log.error(`gotools was not passed to the runtime: ${String(err)}`);
+      return undefined;
+    }
+  }
+
+  private childEnv(gotools: string | undefined): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       DAKCODER_MODE: 'local',
       DAKCODER_GATEWAY_URL: this.opts.gatewayUrl,
       DAKCODER_GATEWAY_TOKEN: this.loopbackToken,
       DAKCODER_VERSION: extensionVersion(this.opts.extensionPath),
+      // The sidecar ships inside the `.vsix` under a platform-suffixed name
+      // (`bin/gotools-win32-x64.exe`, §4.5) and the runtime is a venv under
+      // globalStorage, so the child can reach it neither by PATH — which holds
+      // no entry and would be looking for the wrong name anyway — nor by walking
+      // up from its own file. §4.6 names this variable; without the hand-off
+      // every gotools-backed tool fails on a correct install, starting with the
+      // `repo_map` the Planner opens with, so the first thing a developer ever
+      // sees is a broken agent. The path is the one `resolveGotools` already
+      // verified, so the child honours `dakcoder.gotoolsPath` and never sees a
+      // binary the manifest refused.
+      ...(gotools ? { GOTOOLS_PATH: gotools } : {}),
       PYTHONUTF8: '1',
       PYTHONIOENCODING: 'utf-8',
     };

@@ -1,6 +1,10 @@
-Plan first, in Planner mode.
+Plan first, in Planner mode — when there is something to plan.
 
-Read the task and orient yourself with `repo_map`. Then emit at most eight
+Not every message is a task. A greeting, a typo, or a question you can answer
+from what you know gets the answer and nothing else: no `repo_map`, no steps,
+no files.
+
+For real work, orient yourself with `repo_map`, then emit at most eight
 numbered steps. Each step names a real file and carries an `Accepts:` line
 saying how you will know it worked.
 

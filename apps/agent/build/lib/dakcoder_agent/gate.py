@@ -76,8 +76,31 @@ class GateContext:
         return tuple(p for p in self.touched if p.endswith(".go"))
 
     @property
+    def is_go_module(self) -> bool:
+        """Whether the workspace root is itself a Go module.
+
+        Every Go stage runs ``./...``, which is a *module*-relative pattern: with
+        no ``go.mod`` at the working directory the toolchain answers ``pattern
+        ./...: directory prefix . does not contain main module or its selected
+        dependencies`` and exits non-zero — which ``_result`` turns into a failure
+        and the loop reads as a defect in code that was never compiled here at
+        all. Part A §9.3 was written against a workspace that *is* one service; a
+        developer who opens the checkout root instead gets a gate no edit can
+        ever clear.
+
+        Deliberately not "is there a ``go.mod`` somewhere below". The modules
+        under a checkout root are other people's services: building them — or
+        worse, tidying them — on a task that never touched them is this module's
+        own unscoped-gofmt mistake, one directory up.
+        """
+        return (self.router.workspace.root / "go.mod").is_file()
+
+    @property
     def has_tests(self) -> bool:
-        return any(self.router.workspace.root.rglob("*_test.go"))
+        # Scoped to the module, not to the tree. An rglob from a checkout root
+        # finds `*_test.go` inside a service `go test` will never reach from
+        # here, which schedules a stage that cannot run.
+        return self.is_go_module and any(self.router.workspace.root.rglob("*_test.go"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +224,16 @@ def _scoped(ctx: GateContext) -> dict[str, Any] | None:
     return {"paths": ",".join(files)} if files else None
 
 
+#: Why every Go stage sits out a workspace that is not itself a module, stated
+#: as the environment fact it is — and saying what to do about it, because a
+#: skip reason the developer cannot act on costs the same turn a failure does.
+_NO_MODULE = "workspace root has no go.mod; open the service directory to gate it"
+
+
+def _has_go(ctx: GateContext) -> bool:
+    return ctx.is_go_module
+
+
 INNER: tuple[Stage, ...] = (
     # An auto-fix, not a check. The model's formatting misses are trivial and
     # mechanical — a missing trailing newline, one struct-tag column — and
@@ -217,30 +250,66 @@ INNER: tuple[Stage, ...] = (
     Stage("rules_lint", "rules_lint", _scoped, blocking=False),
 )
 
+# Every Go stage is guarded on `_has_go`, not just the first. Guarding only
+# `go_build` would promote `swagger_check` to first blocker and replay the same
+# unclearable ladder under a different stage name.
 GATE: tuple[Stage, ...] = (
-    Stage("go_build", "go_build", lambda ctx: {}),
-    Stage("govalid_gen", "govalid_gen", lambda ctx: {}, blocking=False),
+    Stage("go_build", "go_build", lambda ctx: {}, when=_has_go, skip_reason=_NO_MODULE),
+    Stage(
+        "govalid_gen",
+        "govalid_gen",
+        lambda ctx: {},
+        blocking=False,
+        when=_has_go,
+        skip_reason=_NO_MODULE,
+    ),
     # Again, because regenerating a validator against a renamed field breaks the
     # build — and that break is the signal, not an accident.
-    Stage("go_build (after generate)", "go_build", lambda ctx: {}),
-    Stage("rules_lint", "rules_lint", _scoped),
-    Stage("swagger_check", "swagger_check", lambda ctx: {}),
-    Stage("go_vet", "go_vet", lambda ctx: {}),
+    Stage(
+        "go_build (after generate)",
+        "go_build",
+        lambda ctx: {},
+        when=_has_go,
+        skip_reason=_NO_MODULE,
+    ),
+    Stage("rules_lint", "rules_lint", _scoped, when=_has_go, skip_reason=_NO_MODULE),
+    Stage(
+        "swagger_check",
+        "swagger_check",
+        lambda ctx: {},
+        when=_has_go,
+        skip_reason=_NO_MODULE,
+    ),
+    Stage("go_vet", "go_vet", lambda ctx: {}, when=_has_go, skip_reason=_NO_MODULE),
     Stage(
         "go_test",
         "go_test",
         lambda ctx: {},
+        # `has_tests` already implies `is_go_module`, so this needs no _has_go.
         when=lambda ctx: ctx.has_tests,
         skip_reason="no test files",
     ),
-    Stage("go_mod tidy", "go_mod", lambda ctx: {"op": "tidy"}),
-    Stage("golangci_lint", "golangci_lint", lambda ctx: {}, blocking=False),
+    Stage(
+        "go_mod tidy",
+        "go_mod",
+        lambda ctx: {"op": "tidy"},
+        when=_has_go,
+        skip_reason=_NO_MODULE,
+    ),
+    Stage(
+        "golangci_lint",
+        "golangci_lint",
+        lambda ctx: {},
+        blocking=False,
+        when=_has_go,
+        skip_reason=_NO_MODULE,
+    ),
     Stage(
         "govulncheck",
         "govulncheck",
         lambda ctx: {},
         blocking=False,
-        when=lambda ctx: ctx.dependencies_changed,
+        when=lambda ctx: ctx.is_go_module and ctx.dependencies_changed,
         skip_reason="no dependency change this run",
     ),
 )

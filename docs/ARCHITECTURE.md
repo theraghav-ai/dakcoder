@@ -1332,6 +1332,89 @@ The load-bearing assertions, and what each is guarding against:
 
 ## 5. Changelog
 
+### 2026-08-26 — The greeting that burned seventeen turns
+
+A pilot typed a greeting and watched the full engineering ladder run against a
+workspace nothing had touched: planner to coder to verifier to debugger, two
+coder attempts and three debug cycles, ending `Unverified` at `go_build`. Six
+faults, each independently sufficient to ruin a first run.
+
+**Not every message is a task.** `planner.md` opened by ordering `repo_map`
+before the model had decided anything, and a Planner reply carrying no numbered
+steps was handed to the Coder as though it were a plan. `_advance` now ends the
+run when `_count_steps` is zero — the loop already computed that number and
+shipped it in the `PLAN` event, then discarded it. One turn instead of
+seventeen.
+
+**A gate that cannot pass is worse than no gate.** Every Go stage runs `./...`,
+a module-relative pattern, from `workspace.root`. Open a checkout root rather
+than a service and the toolchain refuses the pattern itself, which `_result`
+turned into a failure and the loop read as a defect in code it never compiled.
+Every Go stage is now guarded on a root `go.mod` — every stage, not just
+`go_build`, because guarding one only promotes the next to first blocker.
+Deliberately *not* a downward scan for modules: building or tidying other
+people's services on a task that never touched them is a worse bug than the one
+being fixed.
+
+**A skipped gate is not a clean gate.** With stages skipping, `ok` covers two
+different claims. `_done_summary` now reads the report rather than the outcome,
+because "3 file(s) changed and the gate is clean" for a gate that compiled
+nothing is the same overclaim D-42 refuses from the model, pointed at the
+developer instead.
+
+**The loop could not see a model repeating itself.** `_stuck` fingerprints tool
+arguments, so a turn that calls no tool was invisible to it — and every rung of
+that ladder was such a turn. `_repeating` mirrors it for prose, on its own
+ledger because `_switch` clears `recent` on each mode change and this run
+changed mode on every advancing turn. It sits *after* the tool-call branch: a
+model that prefixes three different edits with one stock sentence is working,
+not stuck.
+
+**The sidecar never reached the daemon.** The extension resolves
+`bin/gotools-win32-x64.exe`, checksum-verifies it and spawns it; `childEnv()`
+told the Python child nothing, so `_find_binary()` searched PATH for an
+unsuffixed name the build never emits and then walked `parents[5]` into
+site-packages. The extension now shares the *resolution* — not the name —
+through `GOTOOLS_PATH`, so the child honours `dakcoder.gotoolsPath` and never
+sees a binary the manifest refused. `resolveGotools` also restores the execute
+bit, which a `.vsix` written on Windows does not carry.
+
+**`_raw` was a rendering artefact that cost a bug report its evidence.** The
+router did refuse the malformed call and told the model why; only the display
+payload was misnamed. It is `_malformed_arguments` now.
+
+`scripts/offline-smoke.py` grew the check that would have caught the sidecar
+fault: every previous check stopped at an HTTP route, so nothing ever crossed
+the bridge. Its env block is a hand-maintained mirror of `childEnv` and drifted
+the moment `childEnv` learned something new — mirrors do that, and the check is
+what makes the drift visible.
+
+### 2026-08-26 — Two errors from the first pilot session, one root cause each
+
+**`quota refresh failed: Cannot read properties of undefined (reading 'replace')`.**
+The gateway's `Snapshot.as_dict()` sent its counters flat (`used`/`limits`
+keyed by series, `tightest: {limit, used_pct}`); every extension surface read
+the nested C4 view (`window`/`week`/`hour`, `tightest: {name, used, cap, pct}`)
+and the tooltip called `escape(tightest.name)` on `undefined`. Fixed on both
+sides, additively: the gateway now emits both envelopes (and `expires_in`,
+derived server-side so a laptop's clock never enters into it), and the
+extension routes every `/v1/quota` and preflight body through
+`normaliseQuota()` in `protocol.ts`, which accepts either envelope and never
+yields a `tightest` without a name. A gateway that has not been redeployed is
+therefore still rendered correctly.
+
+**`'str' object has no attribute 'get'` on every run.** Not a new bug: the
+source had already fixed both halves — `_error_for` assuming the OpenAI error
+envelope where the gateway sends `error: "<kind>"`, and a local runtime
+resolving the model *name* instead of passing the *role* (D-59), which is what
+made the gateway refuse in the first place — but the vendored
+`dakcoder_shared` wheel in `extension/runtime/` predated those commits by
+seven hours, and `runtime.ts` installs from the wheels, not the source. The
+wheels are rebuilt from the current tree. `wheelHash()` keys on content, so an
+installed runtime reinstalls itself on the next activation. Lesson recorded in
+§4.3's spirit: a wheel is a build artefact and goes stale like one; rebuild it
+whenever `apps/shared` or `apps/agent` change before packaging a `.vsix`.
+
 ### 2026-08-26 — Part B, completion: the wheels and the two real hosts
 
 The two gaps left open when the extension first went green, closed — and each

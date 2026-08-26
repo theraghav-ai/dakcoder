@@ -89,8 +89,10 @@ class GoTools:
     def _spawn(self) -> subprocess.Popen[str]:
         if self.binary is None:
             raise SidecarError(
-                "the gotools binary is not on PATH. It ships alongside the agent; "
-                "a missing one means a broken install, not a code problem."
+                "the gotools binary could not be located: GOTOOLS_PATH is unset "
+                "or points at nothing, and there is no gotools on PATH. It ships "
+                "inside the extension; a missing one means a broken install, not "
+                'a code problem. Reinstall the .vsix, or set "dakcoder.gotoolsPath".'
             )
         env = dict(os.environ)
         env["GIT_TERMINAL_PROMPT"] = "0"
@@ -260,6 +262,19 @@ class GoTools:
 
 
 def _find_binary() -> str | None:
+    # The extension resolves the platform-suffixed binary it shipped
+    # (`bin/gotools-win32-x64.exe`) and passes the full path, under the name
+    # Part B §4.6 assigns. That is the only answer that works for an installed
+    # runtime: the daemon lives in a venv under the extension's globalStorage,
+    # so PATH holds no entry for the sidecar and the checkout fallback below
+    # points into site-packages. Checked first because that path is
+    # checksum-verified and version-matched to this build, which is the order
+    # `dakcoder.gotoolsPath` documents. The name is composed on the Node side on
+    # purpose (§4.5) — a second copy of that platform table here is the mapping
+    # the build script exists to avoid.
+    packaged = os.environ.get("GOTOOLS_PATH", "").strip()
+    if packaged and Path(packaged).is_file():
+        return packaged
     for name in ("gotools", "gotools.exe"):
         found = shutil.which(name)
         if found:

@@ -469,6 +469,31 @@ async def test_the_snapshot_serialises_for_the_wire(clock: Clock) -> None:
     assert set(payload["limits"]) == {str(s) for s in Series}
 
 
+async def test_the_snapshot_carries_the_nested_view_the_extension_renders(clock: Clock) -> None:
+    """The status bar reads ``window``/``week``/``hour`` and ``tightest.name``;
+    a payload with only the flat counters rendered as a TypeError on every
+    refresh. Both envelopes are emitted, and they must agree."""
+    p = policy(clock)
+    await p.start_run("u")
+    clock.advance(minutes=10)
+    payload = (await p.snapshot("u")).as_dict()
+
+    window = payload["window"]
+    assert window["cap"] == 10_000 and window["runs"] == {"used": 1, "cap": 3}
+    assert window["opened_at"] == payload["window_opened_at"]
+    assert window["expires_in"] == int(timedelta(hours=5).total_seconds()) - 600
+    assert payload["week"] == {"used": 0, "cap": 30_000, "sessions": {"used": 1, "cap": 2}}
+    assert payload["hour"] == {"used": 0, "cap": 5_000}
+
+    tightest = payload["tightest"]
+    assert tightest["name"] == tightest["limit"] == str(Series.WEEK_SESSIONS)
+    assert tightest["pct"] == tightest["used_pct"] == 50.0
+    assert (tightest["used"], tightest["cap"]) == (1, 2)
+
+    clock.advance(hours=6)  # the window has lapsed
+    assert (await p.snapshot("u")).as_dict()["window"] is None
+
+
 async def test_limits_are_published_so_the_numbers_are_never_a_guess() -> None:
     """Every number is a placeholder until Qwen capacity is measured (§9 Q3).
     Publishing them at /v1/health is what makes tuning them a config change
