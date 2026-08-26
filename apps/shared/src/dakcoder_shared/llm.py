@@ -340,8 +340,17 @@ class LLMClient:
         detail = raw
         try:
             payload = response.json()
+            # Two error envelopes reach this method. Upstream (OpenAI-shaped)
+            # sends ``error: {message: ...}``; our own gateway sends
+            # ``error: "<kind>", reason: "<sentence>"``. Assuming the first
+            # shape turned every gateway refusal — a 429 on quota, a 401 on an
+            # expired token — into ``'str' object has no attribute 'get'``,
+            # which is the one message that says nothing about what happened.
+            error = payload.get("error")
             detail = (
-                payload.get("error", {}).get("message")
+                (error.get("message") if isinstance(error, dict) else None)
+                or payload.get("reason")
+                or (error if isinstance(error, str) else None)
                 or payload.get("detail")
                 or json.dumps(payload)[:300]
             )

@@ -71,12 +71,30 @@ def test_the_gateway_refuses_to_start_without_a_key():
 
 def test_the_two_deployments_differ_only_in_what_they_authenticate_to():
     """What makes the invariant cheap enough to hold permanently: the agent loop
-    is identical in both modes."""
+    is identical in both modes — same call, same role, same shaping."""
     gw = gateway_config(env={"DAKCODER_MODEL_API_KEY": "sk-real"})
     local = local_config("https://aiops.cept.gov.in/coder/backend", "jwt", env={})
-    assert gw.model_for("coder") == local.model_for("coder")
     assert gw.temperature_for("coder") == local.temperature_for("coder")
     assert gw.api_key != local.api_key
+
+
+def test_a_local_runtime_sends_the_role_and_lets_the_gateway_name_the_model():
+    """D-59, on the client side.
+
+    The gateway reads ``model`` as a *role* and refuses anything else — the
+    control that stops a developer routing to a model nobody budgeted for. A
+    local runtime that resolved the name here would have every call refused with
+    "'Qwen3.8-27B' is not a configured role", which is what happened the first
+    time the two halves were run against each other.
+    """
+    local = local_config("https://aiops.cept.gov.in/coder/backend", "jwt", env={})
+    assert local.model_for("coder") == "coder"
+    assert local.model_for("fast") == "fast"
+    with pytest.raises(ValueError, match="unknown model role"):
+        local.model_for("planner")
+
+    gw = gateway_config(env={"DAKCODER_MODEL_API_KEY": "sk-real"})
+    assert gw.model_for("coder") == "Qwen3.8-27B"
 
 
 def test_models_resolve_by_role_never_by_a_bare_name():

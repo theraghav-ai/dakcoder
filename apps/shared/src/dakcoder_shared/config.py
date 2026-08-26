@@ -81,7 +81,20 @@ class LLMConfig:
         `fast` to Phi-4-mini-instruct later should be an env change rather than
         a refactor. A hard-coded model name anywhere is the bug that makes the
         tiering unusable.
+
+        **A local runtime returns the role itself.** D-59: the client names a
+        role and the gateway names the model, precisely so a developer cannot
+        route to a model nobody budgeted for. Resolving the name here would send
+        ``model: "Qwen3.8-27B"`` to the proxy, which reads that field as a role
+        and refuses it — so every call from a local runtime failed with "is not
+        a configured role". The resolution belongs on the side that holds the
+        key, and this method is the seam that says which side that is.
         """
+        if self.deployment is Deployment.LOCAL:
+            if role not in ("coder", "fast", "embed"):
+                raise ValueError(f"unknown model role {role!r}; use coder, fast or embed")
+            return role
+
         match role:
             case "coder":
                 return self.model_coder

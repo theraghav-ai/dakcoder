@@ -6,3 +6,13 @@ __pycache__/
 .venv/
 
 # Go build output lives under gotools/ and is ignored there.
+
+# Local hosting (deploy/). The scripts are committed; what they generate is not.
+#
+# The Go toolchain and module cache are NOT listed here because they no longer
+# live in the tree at all — deploy/install-go.sh puts them in $DAKCODER_HOME
+# (~/.local/share/dakcoder). Twenty thousand generated files inside the working
+# tree slow every editor, watcher and search, and .gitignore hides them from
+# git alone. Ignoring is not the same as not being there.
+deploy/*.env
+deploy/logs/
