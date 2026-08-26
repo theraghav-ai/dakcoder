@@ -23,6 +23,17 @@
     -->
     <button id="skip" class="skip" type="button" hidden></button>
 
+    <!--
+      The console row: mode · turn/attempt · blocking gate stage · context.
+      Hidden while idle, so an idle panel pays nothing for it.
+
+      Only fixed-height, non-list state earns persistent chrome here — that rule
+      is what keeps this to one row at a sidebar width of 340px. Everything
+      list-shaped (the plan, sessions, quota, the context breakdown) is a
+      sibling view the workbench already lets the user resize.
+    -->
+    <header id="console" class="console" hidden></header>
+
     <header id="meter" class="meter"></header>
 
     <!--

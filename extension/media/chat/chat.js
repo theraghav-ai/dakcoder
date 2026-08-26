@@ -278,6 +278,39 @@
     return node;
   }
 
+  /**
+   * A list of files a tool wrote, as one reviewable changeset.
+   *
+   * `resource_scaffold` writes seven files in a single call: seven separate
+   * rows is the wrong ceremony for one logical action, and a bare list of paths
+   * loses the verb — whether a file was created or overwritten is the first
+   * thing anyone wants to know.
+   *
+   * A protected path says *why* it is protected rather than only that it is,
+   * because "generated" and "holds credentials" call for different responses.
+   */
+  function changeset(mutations) {
+    const wrap = el('div', 'changeset');
+    mutations.forEach(function (m) {
+      const row = el('div', 'changeset-row');
+      const kind = el('span', 'kind', S['kind.' + m.kind] || m.kind);
+      kind.setAttribute('data-kind', m.kind);
+      row.appendChild(kind);
+      row.appendChild(el('span', 'file', m.path));
+      if (m.protected) row.appendChild(el('span', 'why', protectedReason(m.path)));
+      wrap.appendChild(row);
+    });
+    return wrap;
+  }
+
+  /** Why this path is protected, in the words that suggest what to do instead. */
+  function protectedReason(path) {
+    if (/_validator\.go$/.test(path)) return S.protectedGenerated;
+    if (/(^|\/)configs\//.test(path)) return S.protectedCredentials;
+    if (/(^|\/)db\//.test(path)) return S.protectedSchema;
+    return S.protectedStructural;
+  }
+
   function pathList(paths, protectedPaths) {
     const wrap = el('div', 'paths');
     const guarded = protectedPaths || [];
@@ -473,20 +506,7 @@
       if (row.truncated) body.appendChild(el('p', 'footnote', S.truncated));
       if (row.fix) body.appendChild(el('p', 'footnote', fmt(S.fixHint, row.fix)));
       if (row.mutations && row.mutations.length) {
-        body.appendChild(
-          pathList(
-            row.mutations.map(function (m) {
-              return m.path;
-            }),
-            row.mutations
-              .filter(function (m) {
-                return m.protected;
-              })
-              .map(function (m) {
-                return m.path;
-              }),
-          ),
-        );
+        body.appendChild(changeset(row.mutations));
       }
     }
     return shell({ state: row.state === 'running' ? 'running' : row.state }, glyph, label, meta, body);
@@ -1165,7 +1185,50 @@
 
   let tick = null;
 
+  const consoleEl = document.getElementById('console');
+
+  /**
+   * The console row: mode · turn/attempt · blocking gate stage · context.
+   *
+   * Every cell is conditional on its data having arrived, so a read-only
+   * planner run pays two cells and an idle panel pays none. That is what makes
+   * one persistent row defensible at a 340px sidebar width where four were not.
+   *
+   * It answers "where is it, and is it going to pass?" without a scroll — which
+   * during a forty-turn gate loop is the only question anyone has.
+   */
+  function applyConsole() {
+    if (run.phase === 'idle') {
+      consoleEl.hidden = true;
+      consoleEl.textContent = '';
+      return;
+    }
+
+    const cells = [];
+    if (run.mode) cells.push({ text: S['mode.' + run.mode] || run.mode });
+    if (run.turn) {
+      // The attempt is shown only when there has been one, because "attempt 1"
+      // on every turn is noise that hides the retry it exists to announce.
+      const turn = fmt(S.consoleTurn, run.turn);
+      cells.push({ text: run.attempt > 1 ? turn + ' · ' + fmt(S.consoleAttempt, run.attempt) : turn });
+    }
+    if (run.blockedBy) {
+      cells.push({ text: fmt(S.consoleBlocked, run.blockedBy), cls: 'blocked' });
+    }
+    if (run.context) cells.push({ text: run.context });
+
+    consoleEl.textContent = '';
+    cells.forEach(function (cell, i) {
+      if (i > 0) consoleEl.appendChild(el('span', 'sep', '·'));
+      const node = el('span', 'cell ' + (cell.cls || ''));
+      node.appendChild(el('b', '', cell.text));
+      consoleEl.appendChild(node);
+    });
+    consoleEl.hidden = cells.length === 0;
+  }
+
   function applyRunState() {
+    applyConsole();
     const running = run.phase !== 'idle';
     stopBtn.hidden = !running;
     windBtn.hidden = run.phase !== 'running';

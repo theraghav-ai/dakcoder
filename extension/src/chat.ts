@@ -80,6 +80,12 @@ export interface RunState {
   tool?: string;
   /** Epoch ms. The webview owns the ticking clock so the host is not a timer. */
   startedAt?: number;
+  /** 1 or 2. Shown only when >1: "attempt 1" on every turn hides the retry. */
+  attempt?: number;
+  /** The gate stage blocking the run, if one is. The console's only colour. */
+  blockedBy?: string;
+  /** Pre-formatted by the host, so nothing here divides tokens by a budget. */
+  context?: string;
 }
 
 /**
@@ -535,6 +541,29 @@ function strings(): Record<string, string> {
     offlineDefault: vscode.l10n.t('The agent needs the IT 2.0 gateway to reach the model. Reconnecting.'),
     working: vscode.l10n.t('Working'),
     workingTool: vscode.l10n.t('Working · {0}'),
+
+    // The console row. Every one of these is a whole phrase rather than a
+    // fragment plus a number, because a translator handed "turn" and "{0}"
+    // separately cannot reorder them, and several languages need to.
+    consoleTurn: vscode.l10n.t('turn {0}'),
+    consoleAttempt: vscode.l10n.t('attempt {0}'),
+    consoleBlocked: vscode.l10n.t('blocked: {0}'),
+    'mode.planner': vscode.l10n.t('planning'),
+    'mode.scaffolder': vscode.l10n.t('scaffolding'),
+    'mode.coder': vscode.l10n.t('coding'),
+    'mode.verifier': vscode.l10n.t('verifying'),
+    'mode.debugger': vscode.l10n.t('debugging'),
+
+    // The changeset verb, and why a path is protected. The reason names the
+    // better tool where there is one: a developer who knows to run govalid_gen
+    // does not need the linter to tell them afterwards.
+    'kind.create': vscode.l10n.t('create'),
+    'kind.modify': vscode.l10n.t('modify'),
+    'kind.delete': vscode.l10n.t('delete'),
+    protectedGenerated: vscode.l10n.t('generated — run govalid_gen instead'),
+    protectedCredentials: vscode.l10n.t('holds credentials'),
+    protectedSchema: vscode.l10n.t('schema — apply the migration yourself'),
+    protectedStructural: vscode.l10n.t('structural'),
     elapsed: vscode.l10n.t('{0}s'),
 
     // structure

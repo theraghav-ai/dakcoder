@@ -278,6 +278,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         phase: state.running ? 'running' : 'idle',
         mode: state.modeId as never,
         turn: state.turn,
+        attempt: state.attempt,
+        // Read from the one state, never recomputed. Two surfaces deriving the
+        // same figure independently is how a panel shows two context readings
+        // that disagree.
+        blockedBy: state.gateLadder?.blockedBy,
+        context: state.contextMeter(),
         tool: state.currentTool,
         startedAt: state.running ? Date.now() - state.elapsedMs : undefined,
       });
