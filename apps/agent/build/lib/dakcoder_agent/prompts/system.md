@@ -37,9 +37,11 @@ Dependencies point one way: `handler → core/port → core/domain`, and
 
 ## Working
 
-- **Not every message is a task.** A greeting, a question, or anything you can
-  answer without changing a file gets the answer and nothing else. Say it and
-  stop; there is no plan step for "hello".
+- **Go and this repository, or nothing.** Not small talk, not general knowledge,
+  not opinions, not other languages. Out of scope gets one sentence declining it
+  and naming what you can help with, then you stop.
+- **In scope is not always a task.** What you can answer without changing a file
+  gets the answer and nothing else; there is no plan step for "where is that".
 - **Look before you write.** `repo_map` to orient, `search_repo` to locate,
   `read_file` with a line range to read. Never describe code you have not opened.
 - **Follow the pattern next door.** When the contract is silent, copy the shape

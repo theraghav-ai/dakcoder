@@ -48,16 +48,97 @@ async def test_an_empty_correction_is_refused(
     assert response.status_code == 400
 
 
-async def test_steering_a_finished_session_says_so_rather_than_silently_dropping_it(
+async def test_a_message_to_a_finished_session_continues_the_conversation(
     client: httpx.AsyncClient, scripted: Loopback
 ) -> None:
+    """The second question must be answered by something that heard the first.
+
+    Before this, a message to a finished session was a 409 and the extension's
+    only recourse was to start a new one — which is why two messages in one
+    conversation arrived as two sessions, neither of which knew about the other.
+    """
     session = await start(client)
     await settle(session["id"], scripted)
+
     response = await client.post(
-        f"/v1/sessions/{session['id']}/messages", json={"text": "too late"}
+        f"/v1/sessions/{session['id']}/messages", json={"text": "and now the handler"}
     )
-    assert response.status_code == 409
-    assert "resume" in response.json()["error"].lower()
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["id"] == session["id"], "a follow-up must not mint a new session"
+    assert body["status"] == "running"
+    assert body["turns"] == 2, "the opening message and the follow-up"
+
+
+async def test_a_follow_up_keeps_the_context_the_first_message_built(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """Contract C5: the server is authoritative on context, and a conversation
+    that resets it between messages has no memory at all."""
+    session = await start(client)
+    await settle(session["id"], scripted)
+    before = scripted.contexts[session["id"]]
+
+    await client.post(
+        f"/v1/sessions/{session['id']}/messages", json={"text": "and now the handler"}
+    )
+    await settle(session["id"], scripted)
+
+    assert scripted.contexts[session["id"]] is before, "the follow-up rebuilt the context"
+    assert any(
+        m.source == "user" and "and now the handler" in m.content for m in before.build()
+    ), "the follow-up never reached the model"
+
+
+async def test_a_follow_up_re_enters_its_mode_rather_than_inheriting_the_last_one(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """A conversation that ended in one mode must not answer the next message
+    under it.
+
+    ``_switch`` skips work when the loop is already in the mode asked for, and a
+    follow-up builds a *new* loop that defaults to Planner while the context is
+    still wherever the previous run left it. Guarding on the loop's copy alone
+    left the Debugger's overlay and prompt budget in force under a loop
+    dispatching the Planner's tools.
+    """
+    from dakcoder_agent.modes import Mode
+
+    session = await start(client)
+    await settle(session["id"], scripted)
+    context = scripted.contexts[session["id"]]
+    context.switch_mode(Mode.DEBUGGER, "debugging")
+    assert context.mode is Mode.DEBUGGER
+
+    await client.post(
+        f"/v1/sessions/{session['id']}/messages",
+        json={"text": "and now the handler", "mode": "planner"},
+    )
+    await settle(session["id"], scripted)
+
+    # Asserted on the overlays rather than on the mode the run ended in: this
+    # run advances Planner -> Coder like any other, and the question is whether
+    # it *entered* the Planner at all or carried on under the Debugger.
+    overlays = [m.source for m in context.build() if m.source.startswith("mode:")]
+    assert "mode:planner" in overlays[overlays.index("mode:debugger") :], (
+        f"the follow-up never left the previous run's mode: {overlays}"
+    )
+
+
+async def test_the_developers_own_messages_are_in_the_transcript(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """Otherwise re-opening a session shows the agent talking to itself."""
+    session = await start(client)
+    await settle(session["id"], scripted)
+    await client.post(
+        f"/v1/sessions/{session['id']}/messages", json={"text": "and now the handler"}
+    )
+    await settle(session["id"], scripted)
+
+    full = (await client.get(f"/v1/sessions/{session['id']}?transcript=true")).json()
+    said = [e["data"]["text"] for e in full["transcript"] if e["type"] == "user"]
+    assert said == [session["task"], "and now the handler"]
 
 
 async def test_the_loop_reads_a_queued_correction_at_the_top_of_a_turn() -> None:

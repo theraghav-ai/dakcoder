@@ -61,6 +61,14 @@ export interface RuntimeOptions {
   workspace: string;
   gatewayUrl: string;
   jwt: () => string | undefined;
+  /**
+   * The await-able form, which loads or refreshes rather than reporting what
+   * happens to be in memory. `jwt()` answers synchronously and is right for the
+   * places that cannot wait; a spawn can, and it is the one call whose answer
+   * the child cannot revisit — the token is handed over in an environment
+   * variable and the daemon refuses to start without it.
+   */
+  accessToken?: () => Promise<string | undefined>;
   storage: vscode.Uri;
   extensionPath: string;
   log: vscode.LogOutputChannel;
@@ -99,7 +107,7 @@ export class Runtime implements vscode.Disposable {
 
   private async start(): Promise<Announcement> {
     const python = await this.venvPython();
-    const env = this.childEnv(await this.gotools());
+    const env = this.childEnv(await this.gotools(), await this.token());
 
     const args = [
       '-m',
@@ -249,7 +257,26 @@ export class Runtime implements vscode.Disposable {
     }
   }
 
-  private childEnv(gotools: string | undefined): NodeJS.ProcessEnv {
+  /**
+   * The JWT for this spawn.
+   *
+   * Creating the venv takes tens of seconds on a fresh install, and any window
+   * can clear this one's in-memory copy while that runs. Asking the provider to
+   * produce a token — rather than reading the field — is what makes the spawn
+   * depend on the credential's real state instead of on what survived the wait.
+   */
+  private async token(): Promise<string | undefined> {
+    const held = this.opts.jwt();
+    if (held) return held;
+    try {
+      return await this.opts.accessToken?.();
+    } catch (err) {
+      this.opts.log.warn(`the runtime's token could not be refreshed: ${String(err)}`);
+      return undefined;
+    }
+  }
+
+  private childEnv(gotools: string | undefined, jwt: string | undefined): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       DAKCODER_MODE: 'local',
@@ -270,7 +297,6 @@ export class Runtime implements vscode.Disposable {
       PYTHONUTF8: '1',
       PYTHONIOENCODING: 'utf-8',
     };
-    const jwt = this.opts.jwt();
     if (jwt) env.DAKCODER_JWT = jwt;
 
     for (const name of FORBIDDEN_IN_CHILD) {
@@ -295,18 +321,48 @@ export class Runtime implements vscode.Disposable {
 
   // ── the venv ──────────────────────────────────────────────────────────────
 
+  /**
+   * The interpreter for this build's wheels, creating its venv if needed.
+   *
+   * **The directory is named for the wheels it holds.** The obvious design —
+   * one `runtime/` rebuilt in place whenever the wheel hash moves — cannot work
+   * on Windows, where a running process holds an exclusive lock on the `.exe`
+   * it was launched from. `python -m venv` over a live venv fails with
+   * `[Errno 13] Permission denied` on `Scripts/python.exe`, and the extension
+   * host reports it as a sign-in failure because spawning the runtime is what
+   * sign-in does first.
+   *
+   * Stopping our own child before rebuilding does not fix it. `globalStorage`
+   * is per *extension*, not per window, so every open window shares this venv:
+   * one window tears down its daemon, a sibling respawns into the same
+   * directory a moment later, and the rebuild fails on the sibling's lock
+   * instead. There is no ordering that makes in-place mutation safe.
+   *
+   * Naming the directory after the hash removes the question. A new build
+   * writes somewhere no live process is executing from, the old venv keeps
+   * serving the windows still using it, and each window moves across when it
+   * next restarts its runtime. The directory name *is* the stamp, so there is
+   * no separate `.wheel-hash` to fall out of step with its contents.
+   */
   private async venvPython(): Promise<string> {
-    const root = path.join(this.opts.storage.fsPath, 'runtime');
+    const wheels = path.join(this.opts.extensionPath, 'runtime');
+    const wanted = wheelHash(wheels);
+    const root = path.join(this.opts.storage.fsPath, `runtime-${wanted}`);
     const python =
       process.platform === 'win32'
         ? path.join(root, 'Scripts', 'python.exe')
         : path.join(root, 'bin', 'python');
-
-    const wheels = path.join(this.opts.extensionPath, 'runtime');
-    const stamp = path.join(root, '.wheel-hash');
-    const wanted = wheelHash(wheels);
+    // Written last, so a venv interrupted half-installed is not mistaken for a
+    // complete one on the next activation.
+    const stamp = path.join(root, '.installed');
 
     if (fs.existsSync(python) && readIfExists(stamp) === wanted) return python;
+    // A previous attempt that died between `venv` and `pip install` leaves a
+    // directory that is present, unlocked and useless. It is ours and nothing
+    // is running from it, so it can go.
+    if (fs.existsSync(root)) {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
 
     const base = await this.findPython();
     this.opts.log.info(`creating the runtime venv with ${base}`);
@@ -340,7 +396,47 @@ export class Runtime implements vscode.Disposable {
       this.opts.log,
     );
     fs.writeFileSync(stamp, wanted, 'utf8');
+    // Only now, with a working replacement on disk. Reclaiming first would
+    // trade a locked directory for no directory at all if the install failed.
+    this.sweepOldVenvs(wanted);
     return python;
+  }
+
+  /**
+   * Delete venvs from earlier builds, best effort.
+   *
+   * Each is ~34 MB, so they are worth reclaiming, but never at the cost of an
+   * activation: one still in use by another window is locked, and that is an
+   * ordinary state rather than a fault. The next activation tries again, and
+   * the last window to close leaves it collectable.
+   *
+   * `runtime` without a suffix is the pre-versioning layout. It is swept on the
+   * same terms — an upgraded extension has no further use for it.
+   *
+   * Windows refuses to unlink a locked `.exe`, which is what makes this safe
+   * there. POSIX allows it: a daemon still running from a swept venv keeps its
+   * open inodes and carries on, but cannot respawn from that path. It does not
+   * need to — the next `venvPython` rebuilds — so the window self-heals on its
+   * next runtime restart.
+   */
+  private sweepOldVenvs(keep: string): void {
+    const storage = this.opts.storage.fsPath;
+    let names: string[];
+    try {
+      names = fs.readdirSync(storage);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (name !== 'runtime' && !name.startsWith('runtime-')) continue;
+      if (name === `runtime-${keep}`) continue;
+      try {
+        fs.rmSync(path.join(storage, name), { recursive: true, force: true });
+        this.opts.log.info(`removed the superseded runtime venv ${name}`);
+      } catch {
+        // Locked by another window's daemon. Not an error: it is still in use.
+      }
+    }
   }
 
   /**

@@ -17,8 +17,10 @@ from dakcoder_shared.llm import (
     BACKOFF_SECONDS,
     EmptyCompletionError,
     LLMClient,
+    Metering,
     UnsupportedParameterError,
     UpstreamError,
+    _consume_stream,
     strip_html,
 )
 
@@ -362,3 +364,93 @@ def test_the_context_ceiling_is_reported_as_a_plain_error(endpoint):
     with client(endpoint) as c, pytest.raises(UpstreamError) as exc:
         c.chat([{"role": "user", "content": "hi"}], max_tokens=300_000, enable_thinking=False)
     assert "262144" in exc.value.detail
+
+
+# ── metering ────────────────────────────────────────────────────────────────
+
+
+def test_the_call_carries_what_the_gateway_meters_it_by(endpoint):
+    """Defect D-1's other half.
+
+    Without ``X-Estimated-Tokens`` the gateway reserves against a deliberately
+    generous fallback and — since the reservation is what the reconcile replaces
+    — a run is charged a figure with no relationship to what it spent. Without
+    the session, turn and mode the ledger holds rows that cannot answer "what did
+    this team spend on migrations last month", which is the question it exists
+    for.
+    """
+    client(endpoint).chat(
+        [{"role": "user", "content": "hi"}],
+        metering=Metering(session_id="s-1", turn=4, mode="coder", estimated_tokens=9_120),
+    )
+
+    sent = endpoint.headers[0]
+    assert sent["x-session-id"] == "s-1"
+    assert sent["x-turn"] == "4"
+    assert sent["x-mode"] == "coder"
+    assert sent["x-estimated-tokens"] == "9120"
+    assert sent["x-lane"] == "interactive"
+
+
+def test_metering_omits_what_it_does_not_know_rather_than_sending_zero(endpoint):
+    """A zero turn is not turn zero, and an empty session id is not a session.
+
+    The gateway falls back when a header is absent; a header present and wrong
+    is one it would believe.
+    """
+    client(endpoint).chat([{"role": "user", "content": "hi"}], metering=Metering())
+
+    sent = endpoint.headers[0]
+    assert "x-turn" not in sent
+    assert "x-session-id" not in sent
+    assert "x-estimated-tokens" not in sent
+
+
+def test_a_call_with_no_metering_still_goes(endpoint):
+    """The probe and the prewarm have nothing meaningful to attribute."""
+    client(endpoint).chat([{"role": "user", "content": "hi"}])
+    assert "x-session-id" not in endpoint.headers[0]
+
+
+def test_the_stream_is_read_to_the_end_rather_than_abandoned_at_done():
+    """Defect D-1, at the line that caused it.
+
+    Breaking out of the loop on ``[DONE]`` closes the response while the gateway
+    is still inside the block that reconciles quota and writes the ledger row.
+    Starlette reads that as a disconnect, cancels the response task, and the
+    settlement is lost — so the turn is charged at its estimate for ever and
+    never reaches the ledger at all. Reading to the end costs one more iteration,
+    because ``[DONE]`` is the last frame.
+
+    Asserted here rather than through the client, because `httpx.MockTransport`
+    hands back a whole response and has no socket to leave hanging: the
+    behaviour that matters is that the iterator is exhausted.
+    """
+    frames = [
+        'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}',
+        'data: {"usage":{"prompt_tokens":10,"completion_tokens":2}}',
+        "data: [DONE]",
+    ]
+    pulled: list[str] = []
+
+    def lines():
+        for frame in frames:
+            pulled.append(frame)
+            yield frame
+
+    result = _consume_stream(lines())
+
+    assert pulled == frames, "the client hung up before the response ended"
+    assert result.content == "ok"
+    assert result.usage.prompt_tokens == 10
+
+
+def test_frames_after_done_belong_to_nobody_and_are_ignored():
+    """Draining must not mean *believing* whatever arrives after the end."""
+    frames = [
+        'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}',
+        "data: [DONE]",
+        'data: {"choices":[{"index":0,"delta":{"content":" and more"}}]}',
+    ]
+    result = _consume_stream(iter(frames))
+    assert result.content == "ok"

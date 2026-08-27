@@ -91,7 +91,7 @@ interface EntryBase {
 }
 
 export type TranscriptEntry =
-  | (EntryBase & { kind: 'assistant' | 'error' | 'steer'; text: string })
+  | (EntryBase & { kind: 'user' | 'assistant' | 'error' | 'steer'; text: string })
   | (EntryBase & { kind: 'plan'; text: string; plan: ParsedPlan; steps: number })
   | (EntryBase & {
       kind: 'tool';
@@ -474,7 +474,13 @@ export class RunState implements vscode.Disposable {
     this._status = summary.status;
     this._summary = summary.summary;
     this._startedAt ??= Date.parse(summary.created_at) || Date.now();
-    if (summary.finished_at) this._finishedAt = Date.parse(summary.finished_at) || Date.now();
+    // Cleared, not merely overwritten. A follow-up puts a finished session back
+    // to running and sends `finished_at: null`; keeping the old value would
+    // leave the elapsed timer frozen at whatever the last run took, which reads
+    // as a run that has stalled.
+    this._finishedAt = summary.finished_at
+      ? Date.parse(summary.finished_at) || Date.now()
+      : undefined;
 
     for (const event of summary.transcript ?? []) this.ingest(event);
     for (const path of summary.mutations) this.notePath(path);
@@ -646,15 +652,41 @@ export class RunState implements vscode.Disposable {
     // Re-emitted first, so a consumer that renders raw events sees them in
     // exactly the order the server sent them, before any derived state moves.
     this.receiveEmitter.fire(event);
+
+    const d = event.data ?? {};
+    const at = Date.now();
+
+    // Transient events are handled above the cursor, because they do not have
+    // one. The server does not persist `assistant_delta` or `heartbeat`, so it
+    // does not spend an id on them either — it stamps them with the id the
+    // *next* stored event will get. Running them through the monotonic guard
+    // therefore drops every delta after the first and then drops the authoritative
+    // `assistant` message that shares their id, and advancing `lastId` from one
+    // makes the next reconnect resume past an answer that was never delivered.
+    if (event.type === 'assistant_delta') {
+      this.setStreaming(this.streaming + str(d.text));
+      return; // never a row: S11 says do not build a transcript from deltas
+    }
+    if (event.type === 'heartbeat') {
+      // Liveness only. It proves the link, which `follow` already recorded.
+      return;
+    }
+
     // A server that resumed inclusively rather than exclusively would double
     // every row at each reconnect. Ids are monotonic; trust nothing else.
     if (this.lastId && event.id <= this.lastId) return;
     if (event.id) this.lastId = event.id;
 
-    const d = event.data ?? {};
-    const at = Date.now();
-
     switch (event.type) {
+      case 'user': {
+        // The developer's own message, recorded by the runtime rather than only
+        // echoed by whichever panel was open when they typed it. Without it a
+        // re-opened conversation is the agent talking to itself.
+        this.release();
+        this.append({ id: event.id, turn: this._turn, at, kind: 'user', text: str(d.text) });
+        break;
+      }
+
       case 'turn_start': {
         this.release();
         this._turn = num(d.turn, this._turn + 1);
@@ -665,11 +697,6 @@ export class RunState implements vscode.Disposable {
         this.setStreaming('');
         this._startedAt ??= at;
         break;
-      }
-
-      case 'assistant_delta': {
-        this.setStreaming(this.streaming + str(d.text));
-        return; // never a row: S11 says do not build a transcript from deltas
       }
 
       case 'assistant': {
@@ -848,10 +875,6 @@ export class RunState implements vscode.Disposable {
         this.settleActivity();
         break;
       }
-
-      case 'heartbeat':
-        // Liveness only. It proves the link, which `follow` already recorded.
-        return;
 
       case 'end':
         return;

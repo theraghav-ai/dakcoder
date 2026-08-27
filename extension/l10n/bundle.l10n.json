@@ -440,7 +440,7 @@
   "The text this patch replaces is not in {0} on disk. The runtime will refuse this call rather than guess.": "The text this patch replaces is not in {0} on disk. The runtime will refuse this call rather than guess.",
   "The window refills when it expires; a queued task can simply wait.": "The window refills when it expires; a queued task can simply wait.",
   "There are no Go errors in this file to debug.": "There are no Go errors in this file to debug.",
-  "There is no session to compact yet.": "There is no session to compact yet.",
+  "There is no run in progress to compact.": "There is no run in progress to compact.",
   "There is no {0} yet. Run \"dakcoder: Audit Legacy Patterns\" to produce one.": "There is no {0} yet. Run \"dakcoder: Audit Legacy Patterns\" to produce one.",
   "There is nothing to revert: this session left no file changes.": "There is nothing to revert: this session left no file changes.",
   "This approval is no longer waiting for a decision.": "This approval is no longer waiting for a decision.",

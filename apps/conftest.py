@@ -153,12 +153,17 @@ class FakeEndpoint:
     html_errors: bool = False
 
     requests: list[dict[str, Any]] = field(default_factory=list)
+    #: The headers of each request, so the metering the gateway bills on can be
+    #: asserted. They are not in the body on purpose — the body is forwarded to
+    #: the model, and none of this is the model's business.
+    headers: list[dict[str, str]] = field(default_factory=list)
     attempts: int = 0
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.attempts += 1
         body = json.loads(request.content or b"{}")
         self.requests.append(body)
+        self.headers.append(dict(request.headers))
 
         if self.attempts <= self.transient_failures:
             if self.html_errors:

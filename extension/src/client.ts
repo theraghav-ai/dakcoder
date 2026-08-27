@@ -167,9 +167,25 @@ export class RuntimeClient extends Rest {
     return this.post(`/v1/sessions/${id}/wind-down`);
   }
 
-  /** Queue a correction the run reads before its next turn. */
-  steer(id: string, text: string): Promise<{ queued: number }> {
-    return this.post(`/v1/sessions/${id}/messages`, { text });
+  /**
+   * Send this session another message, whatever state it is in.
+   *
+   * The runtime decides what the message means from the state it finds the
+   * session in: a correction queued for the next turn while it is running, the
+   * next message of the conversation once it has finished. The client must not
+   * make that decision, because it cannot: a run can end between reading the
+   * status and posting the message, and a client that guessed would hand back a
+   * 409 for something the developer had already typed.
+   *
+   * Either way the answer is the session as it now stands — `queued` says how
+   * many corrections are waiting, `status` says whether it started running
+   * again.
+   */
+  message(id: string, text: string, mode?: string): Promise<SessionSummary> {
+    return this.post<SessionSummary>(`/v1/sessions/${id}/messages`, {
+      text,
+      ...(mode ? { mode } : {}),
+    });
   }
 
   resume(id: string, note = ''): Promise<SessionSummary> {

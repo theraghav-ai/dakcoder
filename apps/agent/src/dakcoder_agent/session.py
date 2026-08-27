@@ -231,6 +231,17 @@ class Session:
         return len(self._steer)
 
     @property
+    def turns(self) -> int:
+        """How many messages the developer has sent in this conversation.
+
+        Counted off the transcript rather than kept as a second field, because a
+        counter and a log that are supposed to agree are two things that can
+        disagree — and the log is the one clients read.
+        """
+        with self._lock:
+            return sum(1 for e in self.events if e.type is EventType.USER)
+
+    @property
     def running(self) -> bool:
         return self.status is Status.RUNNING
 
@@ -247,6 +258,7 @@ class Session:
             "events": len(self.events),
             "resumable": self.status.resumable,
             "queued": self.queued,
+            "turns": self.turns,
             "winding_down": self.winding_down.is_set(),
         }
         if transcript:

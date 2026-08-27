@@ -34,7 +34,9 @@ this section exists to close.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -44,6 +46,8 @@ from .ledger import Ledger, MemoryLedger, UsageEvent
 from .quota import Lane, QuotaExceeded, QuotaPolicy, Reservation
 
 __all__ = ["ModelProxy", "ProxyError", "RoleModels", "TeedUsage"]
+
+log = logging.getLogger(__name__)
 
 #: Paths the proxy exposes. Not a general-purpose LiteLLM passthrough: anything
 #: not listed here is refused, so a new upstream capability cannot become
@@ -148,6 +152,10 @@ class ModelProxy:
         self.roles = roles or RoleModels()
         self.timeout = timeout
         self._http = http
+        #: Settlements still in flight. Held as strong references because a task
+        #: nobody is holding can be garbage-collected mid-await, and because
+        #: ``drain`` needs something to wait on at shutdown.
+        self._settling: set[asyncio.Task] = set()
 
     # -- the request --------------------------------------------------------
 
@@ -204,10 +212,12 @@ class ModelProxy:
         """Reserve, relay, tee, settle.
 
         The reservation is taken before a byte is sent and released if the call
-        never happens. Settlement runs in a ``finally``: a client that
-        disconnects mid-stream has still spent whatever the model produced, and
-        losing that would make abandoning turns the cheapest way to use the
-        service.
+        never happens. Settlement is *scheduled* — on the usage chunk, with the
+        ``finally`` as a fallback — and never awaited here: a client that stops
+        reading has still spent whatever the model produced, and losing that
+        would make abandoning turns the cheapest way to use the service. See
+        ``_schedule_settlement`` for why awaiting it in the ``finally`` looks
+        right and is not.
         """
         role = str(body.get("model", "coder"))
         outgoing = self.prepare(path, body, sub)
@@ -218,11 +228,25 @@ class ModelProxy:
         teed = TeedUsage()
         started = time.monotonic()
         opened = False
+        scheduled = False
 
         try:
             async for chunk in self._relay(path, outgoing):
                 opened = True
                 _observe(chunk, teed)
+                if teed.saw_usage and not scheduled:
+                    # Settled the moment the numbers exist, not at the end of the
+                    # stream. The last thing a client does is stop reading, and a
+                    # generator suspended at its final ``yield`` is never resumed:
+                    # its ``finally`` runs whenever the object is finalised, which
+                    # may be under cancellation, at loop shutdown, or not at all.
+                    # The usage chunk arrives one frame before ``[DONE]``, while
+                    # this code is still live and being driven — so that is where
+                    # the accounting is owed and where it is taken.
+                    scheduled = True
+                    self._schedule_settlement(
+                        reservation, teed, sub, session_id, turn, mode, role, lane, started
+                    )
                 yield chunk
         except QuotaExceeded:
             raise
@@ -233,10 +257,72 @@ class ModelProxy:
                 raise ProxyError(f"the model endpoint is unavailable: {exc}", status=502) from exc
             raise
         finally:
-            if opened:
-                await self._settle(
+            # The fallback, for the ways a stream ends without a usage chunk: an
+            # upstream that dropped mid-answer, or one that has stopped reporting
+            # usage at all. Both produced tokens, so both are owed a settlement.
+            if opened and not scheduled:
+                self._schedule_settlement(
                     reservation, teed, sub, session_id, turn, mode, role, lane, started
                 )
+
+    # -- settlement ---------------------------------------------------------
+
+    def _schedule_settlement(self, *args: Any) -> None:
+        """Hand settlement to a task of the app's own, not this request's.
+
+        This is defect D-1, and the shape of the fix is the whole point. The
+        obvious version — ``await self._settle(...)`` right here — reads
+        correctly and does not work: a client that closes the response the
+        moment it sees ``[DONE]`` makes Starlette cancel the response task, the
+        generator's ``finally`` then runs *under cancellation*, and the first
+        ``await`` inside it raises ``CancelledError`` immediately. Neither the
+        reconcile nor the ledger write completed, so every turn the agent made
+        was charged at its estimate for ever and never reached the ledger at
+        all. Every proxy test drained the stream to EOF, which is why it passed
+        CI for as long as it did.
+
+        A task created here is a sibling, not a child: cancelling the request
+        does not touch it. ``drain`` closes the remaining hole, which is the
+        process stopping while a settlement is still in flight.
+        """
+        try:
+            task = asyncio.get_running_loop().create_task(self._settle_quietly(*args))
+        except RuntimeError:
+            # No loop, which means the server is already gone. Nothing can be
+            # awaited from here; losing the row is the only option left, and it
+            # is one worth a log line rather than a silent drop.
+            log.warning("settlement skipped: the event loop is closed")
+            return
+        self._settling.add(task)
+        task.add_done_callback(self._settling.discard)
+
+    async def _settle_quietly(self, *args: Any) -> None:
+        """Settle, and never let the failure escape into a bare task.
+
+        An exception in a task nobody awaits surfaces as "Task exception was
+        never retrieved" at garbage-collection time, attached to no request and
+        with no context. Metering that has stopped working is worth a log line
+        that says so.
+        """
+        try:
+            await self._settle(*args)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a lost row must still be legible
+            log.warning("settlement failed: %s", exc)
+
+    async def drain(self, timeout: float = 10.0) -> None:
+        """Wait for outstanding settlements. Called at shutdown.
+
+        Without it a process that stops between the last chunk and the ledger
+        write loses that turn — the same hole as D-1, just narrower.
+        """
+        pending = list(self._settling)
+        if not pending:
+            return
+        done, still_running = await asyncio.wait(pending, timeout=timeout)
+        if still_running:
+            log.warning("%d settlement(s) did not finish before shutdown", len(still_running))
 
     async def _relay(self, path: str, body: dict[str, Any]) -> AsyncIterator[bytes]:
         client = self._http

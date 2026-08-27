@@ -8,8 +8,10 @@
  * at, so a hidden view is torn down and rebuilt. The transcript therefore lives
  * in two places instead: the webview's own `setState` (capped at 500 rows) and
  * the ring of recent wire events below. On re-create the webview reports the
- * highest event id it still holds and only what came after is replayed — the
- * same `since_id` idea `RuntimeClient.events` uses, for the same reason.
+ * furthest point in that ring it still holds and only what came after is
+ * replayed — the same `since_id` idea `RuntimeClient.events` uses, for the same
+ * reason. The cursor is the host's own counter and not the wire event id,
+ * because event ids restart at 1 for every session and a ring spans several.
  *
  * **Outbound messages are rate-capped.** The budget is ~25 messages/second, and
  * a run that emits a tool result per 20 ms would blow past it. Messages are
@@ -41,6 +43,14 @@ const FLUSH_MS = 40;
 const RING = 500;
 
 export type ApprovalDecision = 'accept' | 'reject' | 'edit';
+
+/** One event as the ring holds it: the event, whose session it was, and where
+ *  it sits in the host's own ordering. */
+interface RingEntry {
+  seq: number;
+  session: string;
+  event: WireEvent;
+}
 
 /**
  * `symbol` and `package` deliberately carry a reference and not content: a
@@ -95,9 +105,12 @@ export interface RunState {
  */
 export interface ChatHost {
   /** `steering` is true when the developer typed during a run — see the note on
-   *  the queued chip in `chat.js`. The host decides what that means; the panel
-   *  only reports which one the developer meant. */
+   *  the queued chip in `chat.js`. */
   submit(text: string, steering: boolean): Promise<void> | void;
+  // `steering` is what the *composer* believed when the developer pressed
+  // send, and the host is right not to act on it: a run can end between the
+  // last event and the keystroke. It is reported because the panel draws the
+  // row differently, not because it decides anything.
   /** Abort now. Discards the turn in flight. */
   stop(): void;
   /** Stop after the current turn, so work in flight completes coherently. */
@@ -149,7 +162,7 @@ type HostMessage =
       mentions: MentionSpec[];
     }
   | { type: 'batch'; messages: HostMessage[] }
-  | { type: 'event'; event: WireEvent }
+  | { type: 'event'; event: WireEvent; session: string; seq: number }
   | { type: 'user'; text: string; steering: boolean }
   | { type: 'run'; state: RunState }
   | { type: 'offline'; reason?: string }
@@ -166,7 +179,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   static readonly viewType = 'dakcoder.chat';
 
   private view?: vscode.WebviewView;
-  private readonly ring: WireEvent[] = [];
+  private readonly ring: RingEntry[] = [];
+  /**
+   * A host-side cursor over the ring, independent of any session.
+   *
+   * Wire event ids restart at 1 for every session, so they cannot order a ring
+   * that spans several — a replay filtered on `event.id > lastEventId` silently
+   * dropped a new session's opening events because an older session had reached
+   * higher ids. This counter only ever goes up.
+   */
+  private seq = 0;
   private readonly queue: HostMessage[] = [];
   private timer?: NodeJS.Timeout;
   private run: RunState = { phase: 'idle' };
@@ -184,13 +206,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   // ── what the extension calls ──────────────────────────────────────────────
 
-  /** Feed one C2 event to the transcript. Unknown types are the webview's problem
-   *  to ignore, not this method's to filter — filtering here would make the
-   *  additive-only guarantee depend on a list kept in two files. */
-  push(event: WireEvent): void {
-    this.ring.push(event);
+  /**
+   * Feed one C2 event to the transcript. Unknown types are the webview's problem
+   * to ignore, not this method's to filter — filtering here would make the
+   * additive-only guarantee depend on a list kept in two files.
+   *
+   * `session` travels with the event because the renderer keys its rows by it.
+   * Event ids are only unique *within* a session, so without this a second
+   * conversation's `assistant:1` lands on the first one's row and replaces the
+   * answer that was already on screen.
+   */
+  push(event: WireEvent, session = ''): void {
+    this.seq += 1;
+    const entry: RingEntry = { seq: this.seq, session, event };
+    this.ring.push(entry);
     if (this.ring.length > RING) this.ring.splice(0, this.ring.length - RING);
-    this.post({ type: 'event', event });
+    this.post({ type: 'event', event, session, seq: entry.seq });
   }
 
   /** Echo a message the developer did not type into the composer — a command,
@@ -201,8 +232,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   setRunState(state: RunState): void {
     this.run = state;
-    if (state.phase === 'idle') this.queued = 0;
     this.post({ type: 'run', state });
+    // A run that has ended has nothing queued against it. Posted rather than
+    // only recorded, because the chip is drawn in the webview and a count kept
+    // solely on this side leaves "2 queued" on screen after the run they were
+    // queued for is over.
+    if (state.phase === 'idle' && this.queued) {
+      this.queued = 0;
+      this.post({ type: 'queued', count: 0 });
+    }
   }
 
   /**
@@ -233,6 +271,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   clear(): void {
     this.ring.length = 0;
     this.post({ type: 'clear' });
+  }
+
+  /** Whether anything at all has been pushed. Used to decide whether a rebuilt
+   *  panel has a transcript to catch up on. */
+  get hasHistory(): boolean {
+    return this.ring.length > 0;
   }
 
   /** Only ever from an explicit command. A stream starting must not move focus
@@ -350,7 +394,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     try {
       switch (message.type) {
         case 'ready':
-          this.replay(numberOr(message['lastEventId'], 0));
+          this.replay(numberOr(message['lastSeq'], 0));
           return;
 
         case 'submit': {
@@ -435,13 +479,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * not its run state would show a Stop button for a run that finished while it
    * was hidden.
    */
-  private replay(lastEventId: number): void {
+  private replay(lastSeq: number): void {
     this.post(initMessage());
     this.post({ type: 'run', state: this.run });
     this.post({ type: 'offline', ...(this.offline === undefined ? {} : { reason: this.offline }) });
     if (this.queued) this.post({ type: 'queued', count: this.queued });
-    for (const event of this.ring) {
-      if (event.id > lastEventId) this.post({ type: 'event', event });
+    for (const entry of this.ring) {
+      if (entry.seq > lastSeq) {
+        this.post({ type: 'event', event: entry.event, session: entry.session, seq: entry.seq });
+      }
     }
   }
 

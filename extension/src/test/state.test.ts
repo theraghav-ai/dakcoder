@@ -283,3 +283,77 @@ describe('RunState — status', () => {
     }
   });
 });
+
+describe('RunState — the conversation', () => {
+  it('keeps what the developer said, not just what the agent replied', () => {
+    const { state } = stateWith([]);
+    feed(state, [
+      event(1, 'user', { text: 'add a Pension resource' }),
+      event(2, 'turn_start', { turn: 1, mode: 'planner' }),
+      event(3, 'assistant', { text: 'here is the plan' }),
+      event(4, 'finish', { outcome: 'done', summary: 'done', turns: 1, mutations: [] }),
+      event(5, 'user', { text: 'and now the handler' }),
+    ]);
+    const said = state.transcript.filter((e) => e.kind === 'user').map((e) => (e as { text: string }).text);
+    assert.deepEqual(said, ['add a Pension resource', 'and now the handler']);
+  });
+
+  it('clears finished_at when a follow-up puts the session back to running', () => {
+    const { state } = stateWith([]);
+    const base = {
+      id: 's1',
+      task: 't',
+      workspace: 'w',
+      created_at: new Date().toISOString(),
+      summary: '',
+      mutations: [],
+      events: 0,
+      resumable: false,
+      queued: 0,
+      winding_down: false,
+    };
+    state.hydrate({ ...base, status: 'done', finished_at: new Date().toISOString() } as never);
+    const stopped = state.elapsedMs;
+    state.hydrate({ ...base, status: 'running', finished_at: null } as never);
+    assert.equal(state.status, 'running');
+    assert.ok(
+      state.elapsedMs >= stopped,
+      'a frozen elapsed clock reads as a run that has stalled',
+    );
+  });
+});
+
+describe('RunState — transient events', () => {
+  /*
+   * The server does not persist `assistant_delta` or `heartbeat`, so it does not
+   * spend an id on them either: it stamps them with the id the *next* stored
+   * event will get. Running them through the monotonic guard therefore drops
+   * every delta after the first, then drops the authoritative `assistant`
+   * message that shares their id — and leaves `lastId` pointing past an answer
+   * that was never delivered, so the next reconnect skips it too.
+   */
+  it('does not let a delta consume the id of the message it precedes', () => {
+    const { state } = stateWith([]);
+    feed(state, [
+      event(4, 'assistant_delta', { text: 'pack' }),
+      event(4, 'assistant_delta', { text: 'age handler' }),
+      event(4, 'assistant', { text: 'package handler' }),
+      // An `assistant` is held for one event, in case a `plan` repeats it. The
+      // finish releases it; the hold is not what this test is about.
+      event(5, 'finish', { outcome: 'done', summary: 'shipped', turns: 1, mutations: [] }),
+    ]);
+    const said = state.transcript.filter((e) => e.kind === 'assistant');
+    assert.equal(said.length, 1, 'the assistant message was swallowed by its own deltas');
+    assert.equal((said[0] as { text: string }).text, 'package handler');
+  });
+
+  it('does not advance the resume cursor past an unpersisted event', async () => {
+    const script = [event(1, 'assistant', { text: 'first' })];
+    const { state, client } = stateWith(script);
+    feed(state, [event(2, 'heartbeat'), event(2, 'assistant_delta', { text: 'x' })]);
+    state.attach('s1');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(client.lastSinceId, 0, 'a heartbeat is not a place to resume from');
+    state.dispose();
+  });
+});
