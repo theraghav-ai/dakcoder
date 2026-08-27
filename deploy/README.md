@@ -1,5 +1,11 @@
 # Hosting dakcoder on this machine
 
+to mint the gateway token
+
+cd /mnt/data/raghav/dakcoder && . deploy/shellenv.sh
+.venv/bin/python deploy/gateway_main.py --mint dev:localdev --mint-hours 168
+
+
 Everything the server side needs, and one command that brings it up.
 
 ```bash

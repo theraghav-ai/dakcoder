@@ -13,7 +13,19 @@ export no_proxy="localhost,127.0.0.1,::1,${no_proxy:-}"
 export NO_PROXY="$no_proxy"
 
 # The Go sidecar the agent spawns over MCP.
+#
+# GOTOOLS_PATH is checked before PATH by `_find_binary`, and it is the name the
+# extension hands the child (§4.6): inside a real install the sidecar ships under
+# a platform-suffixed name in the .vsix and PATH holds no entry for it at all.
+# Setting it here makes this standing runtime resolve the sidecar exactly the
+# way a spawned one does, rather than through a fallback that only works because
+# this happens to be a source checkout.
 export PATH="$_dak_root/gotools:$PATH"
+[ -x "$_dak_root/gotools/gotools" ] && export GOTOOLS_PATH="$_dak_root/gotools/gotools"
+
+# What the extension stamps on the child. Nothing in the runtime reads it today;
+# it is set so this process and a spawned one differ in nothing that matters.
+export DAKCODER_MODE=local
 
 # The Go toolchain. The agent's verification gates are `go build`, `go vet`,
 # `go test` and `gofmt` — without these on PATH the agent can still write code
