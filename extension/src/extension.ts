@@ -406,6 +406,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const session = await runtime.client.startTask(task, {
       mode: modeFor(config().get<string>('defaultMode') ?? 'multi'),
     });
+    chatView.showSession(session.id);
     state.hydrate(session);
     state.attach(session.id);
     treeSet.sessions.refresh();
@@ -413,13 +414,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   async function openSession(session: SessionSummary): Promise<void> {
+    // Before the hydrate, not after: hydrating replays the transcript through
+    // the same `onDidReceive` the live stream uses, so a clear that arrived
+    // afterwards would wipe the rows it had just drawn.
+    chatView.showSession(session.id);
     state.hydrate(session);
     if (session.status === 'running') state.attach(session.id);
     else {
       const full = await runtime.client.session(session.id, true);
       state.hydrate(full);
     }
-    await vscode.commands.executeCommand('dakcoder.chat.focus');
+    await focusPanel();
+  }
+
+  /**
+   * Reveal the panel, best effort.
+   *
+   * `dakcoder.chat.focus` is VS Code's, minted for the contributed view, and it
+   * is not registered here — see the note by the command registrations. Reaching
+   * it is a nicety on top of opening a session, so a failure to reveal must not
+   * become the error the developer is shown instead of their conversation.
+   */
+  async function focusPanel(): Promise<void> {
+    try {
+      await vscode.commands.executeCommand('dakcoder.chat.focus');
+    } catch (err) {
+      log.warn(`the chat panel could not be revealed: ${String(err)}`);
+    }
   }
 
   async function followUp(session: SessionSummary, note: string): Promise<void> {
@@ -437,10 +458,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const next = isResumable(session.status)
         ? await runtime.client.resume(session.id, note)
         : await runtime.client.message(session.id, note);
+      // The row the developer clicked need not be the conversation on screen.
+      chatView.showSession(next.id);
       state.hydrate(next);
       state.attach(next.id);
       treeSet.sessions.refresh();
-      await vscode.commands.executeCommand('dakcoder.chat.focus');
+      await focusPanel();
     } catch (err) {
       reportRunError(err, log);
     }
@@ -555,7 +578,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   command('dakcoder.focusComposer', () => chatView.focusComposer());
   command('dakcoder.doctor', () => doctorService.run({ reveal: true }));
-  command('dakcoder.chat.focus', () => vscode.commands.executeCommand('dakcoder.chat.focus'));
+  // `dakcoder.chat.focus` is deliberately NOT registered here. VS Code mints
+  // `<viewId>.focus` for every contributed view, and `dakcoder.chat` is one — so
+  // registering it shadowed the built-in with a handler whose whole body was
+  // `executeCommand('dakcoder.chat.focus')`. A command that calls itself: every
+  // call recursed until the extension host tried to marshal a non-cloneable
+  // argument to the main thread and gave up with "An object could not be
+  // cloned", 165 times in one session's log. Opening a session from the tree
+  // awaits this command, which is why it presented as navigation being broken.
 
   // ── activation is over; everything below is lazy ─────────────────────────
   disposeAll = context.subscriptions as vscode.Disposable[];

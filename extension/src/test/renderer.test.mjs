@@ -216,6 +216,73 @@ const wire = (session, id, type, data = {}) => ({
 
 const saying = (rows, text) => rows.filter((r) => r.text.indexOf(text) !== -1);
 
+// -- opening a different conversation ---------------------------------------
+
+describe('the transcript, when a different session is opened', () => {
+  it('shows the conversation that was opened, and only that one', () => {
+    // Clicking through the Sessions tree used to accumulate every conversation
+    // looked at into one transcript, because nothing told the panel the session
+    // had changed: `RunState.reset()` cleared the host's copy and the rows on
+    // screen stayed. `showSession` posts the clear before the transcript of the
+    // newly-opened session is replayed through it.
+    const p = panel();
+    p.send(
+      wire('a1', 1, 'user', { text: 'the first conversation' }),
+      wire('a1', 2, 'assistant', { text: 'answer to the first' }),
+    );
+    assert.equal(p.rows().length, 2);
+
+    // What `ChatViewProvider.showSession` posts on the switch, ahead of the
+    // replayed transcript.
+    p.send(
+      { type: 'session', id: 'a2' },
+      wire('a2', 1, 'user', { text: 'the second conversation' }),
+      wire('a2', 2, 'assistant', { text: 'answer to the second' }),
+    );
+
+    const rows = p.rows();
+    assert.equal(saying(rows, 'the first conversation').length, 0, 'the old conversation stayed');
+    assert.equal(saying(rows, 'answer to the first').length, 0, 'the old answers stayed');
+    assert.equal(saying(rows, 'the second conversation').length, 1);
+    assert.equal(saying(rows, 'answer to the second').length, 1);
+  });
+
+  it('accepts the reopened conversation despite its ids starting over', () => {
+    // The clear resets the panel's cursor. If it did not, every event of the
+    // session just opened would look like one already applied and the panel
+    // would come back empty.
+    const p = panel();
+    p.send(wire('b1', 1, 'assistant', { text: 'first' }), { type: 'session', id: 'b2' });
+    p.send(wire('b2', 1, 'assistant', { text: 'reopened' }));
+    assert.equal(saying(p.rows(), 'reopened').length, 1, 'the reopened session rendered nothing');
+  });
+
+  it('keeps the echo of the message that starts a conversation', () => {
+    // The switch is announced *before* the session has produced anything, and
+    // on the first message of a new conversation the only thing on screen is the
+    // composer's own echo of it. An unconditional clear here deleted the
+    // sentence the developer had just typed, a beat after they typed it.
+    const p = panel();
+    p.send({ type: 'user', text: 'add a Pension resource', steering: false });
+    p.send({ type: 'session', id: 'c1' });
+    assert.equal(
+      saying(p.rows(), 'add a Pension resource').length,
+      1,
+      'the echo was cleared by the switch that its own message caused',
+    );
+  });
+
+  it('says nothing about a session it is already showing', () => {
+    const p = panel();
+    p.send(
+      wire('d1', 1, 'user', { text: 'keep me' }),
+      wire('d1', 2, 'assistant', { text: 'and me' }),
+      { type: 'session', id: 'd1' },
+    );
+    assert.equal(p.rows().length, 2, 're-announcing the current session cleared it');
+  });
+});
+
 // -- the two-conversation fault ---------------------------------------------
 
 describe('the transcript, across two conversations', () => {

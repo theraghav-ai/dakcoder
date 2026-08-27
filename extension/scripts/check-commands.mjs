@@ -51,4 +51,38 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-console.log(`all ${declared.size} declared commands are registered`);
+const EOL = String.fromCharCode(10);
+
+/** The ids VS Code mints for every contributed view. Ours to call, never ours
+ *  to register. */
+const VIEW_SUFFIXES = ['focus', 'resetViewLocation', 'removeView', 'toggleVisibility'];
+const reserved = new Set();
+for (const views of Object.values(manifest.contributes?.views ?? {})) {
+  for (const view of views) {
+    for (const suffix of VIEW_SUFFIXES) reserved.add(`${view.id}.${suffix}`);
+  }
+}
+
+const shadowed = [...registered].filter((c) => reserved.has(c)).sort();
+
+if (shadowed.length > 0) {
+  console.error(`
+${shadowed.length} command(s) registered over an id VS Code owns:
+`);
+  for (const c of shadowed) console.error(`  ${c}`);
+  console.error(
+    [
+      '',
+      'VS Code mints these for every contributed view. Registering one shadows',
+      'the built-in, and a handler that then calls the same id is a command that',
+      'calls itself: it recurses until the extension host fails with',
+      '"An object could not be cloned". Call them; do not register them.',
+      '',
+    ].join(EOL),
+  );
+  process.exit(1);
+}
+
+console.log(
+  `all ${declared.size} declared commands are registered, none over a view's own id`,
+);

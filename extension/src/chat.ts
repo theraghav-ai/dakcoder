@@ -170,6 +170,7 @@ type HostMessage =
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; text: string }
   | { type: 'mentions'; token: number; items: MentionItem[] }
   | { type: 'approval-resolved'; id: string; decision: ApprovalDecision }
+  | { type: 'session'; id: string }
   | { type: 'clear' }
   | { type: 'focus' };
 
@@ -179,6 +180,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   static readonly viewType = 'dakcoder.chat';
 
   private view?: vscode.WebviewView;
+  /**
+   * The conversation the panel is showing.
+   *
+   * The panel shows one at a time. Opening a different session used to leave the
+   * previous one's rows on screen and append the new one's underneath, so a
+   * developer clicking through the Sessions tree accumulated every conversation
+   * they had looked at in one transcript.
+   */
+  private session = '';
   private readonly ring: RingEntry[] = [];
   /**
    * A host-side cursor over the ring, independent of any session.
@@ -217,6 +227,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * answer that was already on screen.
    */
   push(event: WireEvent, session = ''): void {
+    // Defensive rather than the main path: `showSession` is called on every
+    // deliberate switch, and gets the panel cleared before the first event
+    // rather than on it. This catches a switch nothing announced.
+    if (session) this.showSession(session);
     this.seq += 1;
     const entry: RingEntry = { seq: this.seq, session, event };
     this.ring.push(entry);
@@ -268,7 +282,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.post({ type: 'approval-resolved', id, decision });
   }
 
+  /**
+   * Show this conversation, clearing whatever was on screen if it is a different
+   * one.
+   *
+   * Called before the transcript is replayed, so the panel is empty from the
+   * moment of the switch — waiting for the first event would leave the previous
+   * conversation on screen for a session that has no events yet, and would leave
+   * it there for ever for one that never produces any.
+   *
+   * `seq` deliberately does not reset. It is the cursor a rebuilt webview
+   * resumes from, and restarting it would make every event after a switch look
+   * like one the panel had already applied.
+   */
+  showSession(id: string): void {
+    if (id === this.session) return;
+    this.session = id;
+    // Dropped so a rebuilt webview is not replayed a conversation it is no
+    // longer showing.
+    this.ring.length = 0;
+    // `session`, not `clear`. The webview decides whether anything needs
+    // removing, because it is the side that knows what is on screen: a panel
+    // showing nothing but the optimistic echo of the message that *started*
+    // this conversation must keep it, and an unconditional clear from here
+    // would wipe the sentence the developer had just typed.
+    this.post({ type: 'session', id });
+  }
+
   clear(): void {
+    this.session = '';
     this.ring.length = 0;
     this.post({ type: 'clear' });
   }

@@ -1630,6 +1630,27 @@
         return;
       }
 
+      /*
+       * The panel shows one conversation at a time, and this says which.
+       *
+       * The clear is conditional and the condition matters. Opening a different
+       * session must remove what is on screen — clicking through the Sessions
+       * tree used to accumulate every conversation looked at into one
+       * transcript. But the *first* message of a new conversation arrives with
+       * nothing on screen except its own optimistic echo, and clearing there
+       * would delete the sentence the developer had just typed.
+       *
+       * `session` is empty on a panel that has never shown one, and restored
+       * alongside the rows on a panel that has, so it is the honest test for
+       * "there is another conversation here".
+       */
+      case 'session': {
+        const next = String(message.id || '');
+        if (session && next !== session) clearAll();
+        session = next;
+        return;
+      }
+
       case 'clear':
         clearAll();
         return;

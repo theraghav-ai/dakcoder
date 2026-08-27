@@ -1440,6 +1440,61 @@ ceiling was available and was not taken: the ceiling is what stops prompts
 growing by accident, and spending it on the first thing that asks is how it stops
 meaning anything.
 
+---
+**D-86 · `<viewId>.focus` is VS Code's to mint and ours to call**
+
+`dakcoder.chat.focus` was registered here, with a handler whose entire body was
+`vscode.commands.executeCommand('dakcoder.chat.focus')`. VS Code mints
+`<viewId>.focus` for every contributed view, so that registration shadowed the
+built-in and left a command that called itself.
+
+It recursed until the extension host tried to marshal a non-cloneable argument
+across the RPC boundary and gave up with **"An object could not be cloned"** —
+165 of them in one session's `exthost.log`. It presented as *navigation being
+broken*, because opening a session from the Sessions tree awaits this command as
+its last step; nothing about the message points at a focus call, and the two
+faults reported together (see D-87) looked like one.
+
+The registration is gone. Focus is now best effort — revealing the panel is a
+nicety on top of opening a session, and a failure to reveal must not become the
+error shown instead of the conversation.
+
+`scripts/check-commands.mjs` gained the reverse of the check it already made. It
+verified that every declared command has a registration; it now also verifies
+that no registration takes an id VS Code owns — `.focus`, `.resetViewLocation`,
+`.removeView`, `.toggleVisibility` for each contributed view. That direction is
+the more valuable one, because the failure is silent: it typechecks, it bundles,
+it packages, and it activates.
+
+---
+**D-87 · The panel shows one conversation, and the host says which**
+
+Opening a session from the tree hydrated its whole transcript through the same
+`onDidReceive` the live stream uses, and nothing told the panel the session had
+changed. `RunState.reset()` cleared the *host's* copy; the rows on screen stayed.
+So clicking through the Sessions tree accumulated every conversation the
+developer had looked at into one transcript, all of it filed under the first.
+
+`ChatViewProvider.showSession(id)` is called by every path that switches — open,
+follow-up, and the first message of a new conversation — before the transcript is
+replayed, because a clear that arrived afterwards would wipe the rows it had just
+drawn. It also drops the ring, so a rebuilt webview is not replayed a
+conversation it is no longer showing.
+
+What crosses the seam is `session`, not `clear`, and the difference is the whole
+decision. The webview is the side that knows what is on screen. An unconditional
+clear from the host is correct when another conversation is being replaced and
+wrong on the first message of a new one, where the only thing on screen is the
+composer's optimistic echo of the message that *caused* the switch — clearing
+there deletes the sentence the developer typed, a beat after they typed it. So
+the host names the session and the webview clears only if it is already showing a
+different one. `session` is empty on a panel that has never shown one and is
+restored alongside the rows on a panel that has, which makes it the honest test.
+
+`seq` deliberately survives the switch. It is the cursor a rebuilt webview
+resumes from; restarting it would make every event after a switch look like one
+the panel had already applied.
+
 ## 4. Verification strategy
 
 The load-bearing assertions, and what each is guarding against:
