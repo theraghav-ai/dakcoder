@@ -463,3 +463,172 @@ def test_a_skipped_gate_is_not_reported_as_clean(tmp_path, sidecar) -> None:
     assert "did not run" in agent.result.summary
     assert "the gate is clean" not in agent.result.summary
 
+
+# ── streaming ───────────────────────────────────────────────────────────────
+
+
+class StreamingClient(ScriptedClient):
+    """A scripted model that also emits its answer a fragment at a time."""
+
+    def chat(self, messages, *, tools=None, on_delta=None, **kwargs) -> ChatResult:
+        result = super().chat(messages, tools=tools, **kwargs)
+        if on_delta is not None and result.content:
+            for word in result.content.split(" "):
+                on_delta(word + " ")
+        return result
+
+
+def streaming_loop(router: Router, turns, **kw):
+    """A loop whose transient events are collected rather than dropped."""
+    relayed = []
+    context = ContextManager(mode=Mode.PLANNER, system_prompt="You are dakcoder.")
+    agent = AgentLoop(
+        context, StreamingClient(turns), router, on_event=relayed.append, **kw
+    )
+    events = list(agent.run("Add a Pension resource", start=Mode.PLANNER))
+    return agent, events, relayed
+
+
+def test_the_answer_arrives_while_it_is_being_written(router: Router, gated) -> None:
+    """The point of the whole path.
+
+    The loop is a generator and its events reach a client by being yielded, which
+    works for everything that happens *between* calls and not at all for
+    something that happens *during* one. Streamed text takes the other road the
+    runtime already had: the same relay the caller uses for yielded events.
+    """
+    _agent, events, relayed = streaming_loop(router, [say("1. Edit handler/user.go")])
+
+    deltas = [e for e in relayed if e.type is EventType.ASSISTANT_DELTA]
+    assert deltas, "nothing streamed"
+    # Everything the model said, and nothing it did not. Compared as words
+    # because the fragmenting is the scripted client's, not the loop's.
+    streamed = "".join(e.data["text"] for e in deltas)
+    said = " ".join(e.data["text"] for e in of_type(events, EventType.ASSISTANT))
+    assert streamed.split() == said.split()
+
+
+def test_the_stream_is_coalesced_rather_than_one_frame_per_token(
+    router: Router, gated
+) -> None:
+    """Fix S11. One frame per token is an SSE frame, an IPC message and a repaint
+    each, and the frontend agent shipped that and fell measurably behind."""
+    sentence = " ".join(f"word{i}" for i in range(60))
+    _agent, _events, relayed = streaming_loop(router, [say(sentence)])
+
+    deltas = [e for e in relayed if e.type is EventType.ASSISTANT_DELTA]
+    assert 0 < len(deltas) < 60, f"{len(deltas)} frames for 60 words is not coalescing"
+
+
+def test_the_tail_is_flushed(router: Router, gated) -> None:
+    """The classic bug in code shaped like this: everything works except that the
+    last sentence never arrives."""
+    _agent, _events, relayed = streaming_loop(router, [say("short")])
+
+    deltas = [e for e in relayed if e.type is EventType.ASSISTANT_DELTA]
+    assert "".join(e.data["text"] for e in deltas).strip() == "short"
+
+
+def test_the_authoritative_message_still_arrives_by_yield(router: Router, gated) -> None:
+    """Deltas are a view of a turn. The transcript is the `assistant` event, and
+    a client that built one from deltas would have no transcript at all after a
+    reconnect — they are never stored."""
+    _agent, events, relayed = streaming_loop(router, [say("1. Edit handler/user.go")])
+
+    said = of_type(events, EventType.ASSISTANT)
+    assert said[0].data["text"] == "1. Edit handler/user.go"
+    assert not any(e.type is EventType.ASSISTANT_DELTA for e in events), (
+        "a transient event must not travel by yield: it would interleave with "
+        "the stored ones and the log would stop being the run"
+    )
+
+
+def test_a_sink_that_breaks_does_not_take_the_run_with_it(router: Router, gated) -> None:
+    """Streaming is a view of a turn, never the turn itself. A panel that was
+    torn down mid-answer, or an event loop that has closed, must cost the
+    developer their live view and nothing else."""
+    context = ContextManager(mode=Mode.PLANNER, system_prompt="You are dakcoder.")
+
+    def explode(_event):
+        raise RuntimeError("the event loop is closed")
+
+    agent = AgentLoop(
+        context,
+        StreamingClient([say("1. Edit handler/user.go")]),
+        router,
+        on_event=explode,
+    )
+    events = list(agent.run("Add a Pension resource", start=Mode.PLANNER))
+
+    assert agent.result is not None
+    assert agent.result.outcome != Outcome.ERROR
+    assert of_type(events, EventType.ASSISTANT)[0].data["text"] == "1. Edit handler/user.go"
+
+
+def test_a_loop_with_no_sink_runs_exactly_as_before(router: Router, gated) -> None:
+    """The default is a no-op, so the CLI and every existing test drive the loop
+    without knowing streaming exists."""
+    _agent, events = loop_over(router, [say("1. Edit handler/user.go")])
+    assert of_type(events, EventType.ASSISTANT)
+
+
+# ── a numbered answer is not a plan ─────────────────────────────────────────
+
+
+SUMMARY = (
+    "So far in this conversation:\n"
+    "1. You said hi and I introduced myself.\n"
+    "2. You asked how I was and I declined the small talk.\n"
+    "3. You asked what this is and I explained the contract.\n"
+    "4. Now you are asking what we have discussed."
+)
+
+
+def test_a_coder_that_restates_its_plan_ends_the_run(router: Router, gated) -> None:
+    """The reported fault, reduced.
+
+    `_count_steps` is a regex over prose and cannot tell a plan from a numbered
+    answer: a reply that happened to enumerate what had been said was read as
+    four steps, handed to the Coder, and restated by it. The developer saw the
+    same paragraph three times — as the answer, as the plan card, and again from
+    the Coder — and then watched a full gate run against a workspace nothing had
+    touched.
+
+    No regex over prose reliably separates the two. What the loop can see is the
+    mode below finding nothing to do with what it was given.
+    """
+    agent, events = loop_over(router, [say(SUMMARY), say(SUMMARY)])
+
+    said = [e.data["text"] for e in of_type(events, EventType.ASSISTANT)]
+    assert said == [SUMMARY], f"the paragraph was emitted {len(said)} times"
+    assert of_type(events, EventType.GATE) == [], "a gate ran on work nobody did"
+    assert agent.result.outcome == Outcome.DONE
+    assert "not a plan" in agent.result.summary
+
+
+def test_a_coder_that_actually_works_is_left_alone(router: Router, gated) -> None:
+    """The guard must not fire on a Coder that had something to say about the
+    plan rather than merely saying it back."""
+    agent, events = loop_over(
+        router,
+        [say("1. Edit handler/user.go\n   Accepts: builds"), say("Edited handler/user.go.")],
+    )
+
+    assert [e.data["text"] for e in of_type(events, EventType.ASSISTANT)] == [
+        "1. Edit handler/user.go\n   Accepts: builds",
+        "Edited handler/user.go.",
+    ]
+    assert of_type(events, EventType.GATE), "the gate must still run on real work"
+
+
+def test_a_coder_that_calls_a_tool_is_left_alone(router: Router, gated) -> None:
+    """A tool call is work, whatever the prose alongside it says."""
+    plan = "1. Read handler/user.go"
+    agent, events = loop_over(
+        router,
+        [say(plan), calls(("read_file", '{"path": "handler/user.go"}')), say("done")],
+    )
+
+    assert of_type(events, EventType.TOOL_CALL), "the call never happened"
+    assert agent.result.outcome == Outcome.DONE
+    assert "not a plan" not in agent.result.summary

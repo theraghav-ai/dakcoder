@@ -454,3 +454,120 @@ def test_frames_after_done_belong_to_nobody_and_are_ignored():
     ]
     result = _consume_stream(iter(frames))
     assert result.content == "ok"
+
+
+# -- streaming ---------------------------------------------------------------
+
+
+def test_content_is_offered_as_it_arrives_rather_than_only_at_the_end(endpoint):
+    """The seam the whole streaming path was missing.
+
+    The request has always been made with ``stream: True`` and the gateway has
+    always relayed chunk by chunk. This client folded the stream into one value
+    and returned at EOF, so nothing downstream could see a turn until it was
+    over — while every layer above, right up to the panel's ``assistant_delta``
+    renderer, sat built and idle.
+    """
+    endpoint.content_fragments = ("package ", "handler", " // pension")
+    seen = []
+
+    result = client(endpoint).chat([{"role": "user", "content": "hi"}], on_delta=seen.append)
+
+    assert seen == ["package ", "handler", " // pension"]
+    assert result.content == "package handler // pension", "streaming disturbed the fold"
+
+
+def test_a_turn_with_no_sink_still_works(endpoint):
+    """The probe, the prewarm and the summariser all call without one."""
+    assert client(endpoint).chat([{"role": "user", "content": "hi"}]).content == "ready"
+
+
+def test_reasoning_is_not_offered_as_content(endpoint):
+    """Thinking is off in every mode, so a reasoning feed would be the symptom of
+    a fault rather than something to render — and it is already reported as a
+    number. A sink that received it would put the model's private deliberation on
+    screen as though it were the answer."""
+    endpoint.ignore_thinking_off = True
+    seen = []
+
+    client(endpoint).chat([{"role": "user", "content": "hi"}], on_delta=seen.append)
+
+    assert seen == ["ready"]
+    assert not any("Considering" in fragment for fragment in seen)
+
+
+def test_a_tool_call_turn_streams_nothing(endpoint):
+    """Arguments arrive as JSON split across chunks. Anything rendering them
+    would be rendering half-written JSON."""
+    seen = []
+    result = client(endpoint).chat(
+        [{"role": "user", "content": "hi"}],
+        tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+        on_delta=seen.append,
+    )
+
+    assert result.tool_calls
+    assert seen == []
+
+
+def test_a_retry_that_had_said_nothing_still_streams(endpoint, no_sleep):
+    """The ordinary retry. A 503 or a 429 is raised before a single line is read,
+    so nothing has been said and the replacement attempt is free to stream."""
+    endpoint.transient_failures = 1
+    seen = []
+
+    result = client(endpoint, sleep=no_sleep).chat(
+        [{"role": "user", "content": "hi"}], on_delta=seen.append
+    )
+
+    assert result.attempts == 2
+    assert seen == ["ready"], "an upstream hiccup should not cost the turn its streaming"
+
+
+def test_a_retry_that_had_already_spoken_stays_silent(no_sleep):
+    """The correctness case.
+
+    A failure part-way through a stream is the only way to reach a retry having
+    already handed text to the caller, and deltas are append-only: there is no
+    way to un-say them. The retry keeps quiet and the authoritative message at
+    the end of the turn replaces the partial answer on screen.
+    """
+    seen = []
+    attempts = []
+
+    class Dying(httpx.SyncByteStream):
+        """Streams two content frames and then drops, as a read timeout does."""
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"index":0,"delta":{"content":"half an "}}]}\n\n'
+            yield b'data: {"choices":[{"index":0,"delta":{"content":"answer"}}]}\n\n'
+            raise httpx.ReadTimeout("the stream dropped")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        if len(attempts) == 1:
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=Dying()
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'data: {"choices":[{"index":0,"delta":{"content":"the whole answer"}}]}\n\n'
+                b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                b"data: [DONE]\n\n"
+            ),
+        )
+
+    config = LLMConfig(
+        deployment=Deployment.GATEWAY,
+        base_url="https://ai.cept.gov.in/v1",
+        api_key="sk-test",
+    )
+    transport = httpx.MockTransport(handler)
+    with LLMClient(config, transport=transport, sleep=no_sleep, jitter=lambda: 0.0) as c:
+        result = c.chat([{"role": "user", "content": "hi"}], on_delta=seen.append)
+
+    assert len(attempts) == 2
+    assert seen == ["half an ", "answer"], f"the retry said it again: {seen}"
+    assert result.content == "the whole answer", "and the authoritative text is the whole one"

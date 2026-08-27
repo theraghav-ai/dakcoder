@@ -39,7 +39,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from dakcoder_shared.envelope import Event, EventType, ToolResult
+from dakcoder_shared.envelope import DeltaCoalescer, Event, EventType, ToolResult
 from dakcoder_shared.llm import LLMClient, Metering, ToolCall
 from dakcoder_shared.tokens import estimate_tokens
 
@@ -176,6 +176,7 @@ class AgentLoop:
         *,
         approve: Approver = deny_all,
         on_pending: Callable[[ApprovalRequest], None] = lambda _request: None,
+        on_event: Callable[[Event], None] = lambda _event: None,
         steer: Callable[[], list[str]] = list,
         cancelled: Callable[[], bool] = lambda: False,
         winding_down: Callable[[], bool] = lambda: False,
@@ -191,6 +192,25 @@ class AgentLoop:
         #: can possibly see that id. Default is a no-op: the CLI and the tests
         #: have nothing to register.
         self.on_pending = on_pending
+        #: Where transient events go — the ones that cannot travel by ``yield``.
+        #:
+        #: This loop is a generator, and its events reach a client by being
+        #: yielded. That works for everything that happens *between* calls, and
+        #: not at all for something that happens *during* one: the model streams
+        #: its answer while this thread is blocked inside the completion, and a
+        #: callback firing there cannot yield. So streamed text takes the other
+        #: road the runtime already had — the same ``emit`` the caller uses to
+        #: relay yielded events, called directly.
+        #:
+        #: Only transient events may go this way. They are defined as relayed
+        #: and never stored, so they carry no id and impose no order on the
+        #: transcript; a stored event sent out of band would interleave with the
+        #: yielded ones and the log would no longer be the run.
+        self.on_event = on_event
+        #: Cleared to False the first time the sink raises. Streaming is a view
+        #: of a turn, never the turn itself, so a sink that has broken must not
+        #: be allowed to take the run down with it.
+        self._relaying = True
         #: Drained at the top of every turn. This is the whole answer to "the
         #: agent is going the wrong way at turn 12": without it the only
         #: correction is Stop, which ends the run and throws away twelve turns
@@ -291,12 +311,17 @@ class AgentLoop:
         if self.context.should_compact():
             yield from self._compact()
 
+        # One coalescer per turn, and the tail flushed however the turn ends.
+        # Forgetting that flush is the classic bug in code shaped like this:
+        # everything works except that the last sentence never arrives.
+        deltas = DeltaCoalescer()
         try:
             result = complete(
                 self.context,
                 self.client,
                 tools=self.router.schemas_for(self.state.mode),
                 session_id=self.session_id,
+                on_delta=lambda fragment: self._relay(deltas.feed(fragment)),
             )
         except OverBudgetError as exc:
             # The context manager exists to prevent this, so reaching it means
@@ -310,6 +335,7 @@ class AgentLoop:
                     self.client,
                     tools=self.router.schemas_for(self.state.mode),
                     session_id=self.session_id,
+                    on_delta=lambda fragment: self._relay(deltas.feed(fragment)),
                 )
             except OverBudgetError:
                 self.result = RunResult(
@@ -323,8 +349,31 @@ class AgentLoop:
                 Outcome.ERROR, str(exc), self.context.turn, tuple(self.router.touched)
             )
             return
+        finally:
+            self._relay(deltas.flush())
 
         yield from self._usage(result)
+
+        if self._restated_the_plan(result):
+            # The handoff was wrong, and this turn is the proof of it.
+            #
+            # A Coder handed a plan restates it word for word only when there
+            # was nothing in it to execute — which means the Planner was
+            # answering rather than planning, and the numbered list it happened
+            # to use was read as steps. `_count_steps` cannot tell a plan from a
+            # numbered answer, and no regex over prose reliably can; what the
+            # loop *can* see is the mode below finding nothing to do with it.
+            #
+            # Caught before the reply is emitted, so the developer is not shown
+            # the same paragraph twice and then told it was a mistake. The turn
+            # is still accounted for above: it cost tokens whatever it said.
+            self.result = RunResult(
+                Outcome.DONE,
+                "answered; the reply was not a plan and nothing needed changing",
+                self.context.turn,
+                tuple(self.router.touched),
+            )
+            return
 
         if result.chat.content:
             self.context.append_assistant(result.chat.content)
@@ -576,6 +625,41 @@ class AgentLoop:
             tuple(self.router.touched),
             self.state.last_gate,
         )
+
+    def _restated_the_plan(self, result: TurnResult) -> bool:
+        """Whether this turn did nothing but repeat the plan it was given.
+
+        Deliberately narrower than ``_repeating``, which watches for a model
+        stuck in a loop and needs three replies before it is sure. This is a
+        different signal and one reply is conclusive: an executing mode was
+        handed a plan, called no tool, and said the plan back.
+        """
+        return (
+            self.state.mode in (Mode.CODER, Mode.SCAFFOLDER)
+            and not result.chat.tool_calls
+            and bool(self.state.plan.strip())
+            and (result.chat.content or "").strip() == self.state.plan.strip()
+        )
+
+    def _relay(self, event: Event | None) -> None:
+        """Send a transient event out of band, and never let it cost the run.
+
+        ``None`` is the ordinary case: the coalescer holds a fragment back until
+        it has enough text or enough time has passed, and says so by returning
+        nothing.
+
+        The sink is a client that may have gone — a closed event loop, a panel
+        that was torn down. Streaming is a view of a turn and never the turn
+        itself, so a broken sink is switched off rather than raised: the answer
+        still arrives in full as the ``assistant`` message at the end of the
+        turn, which is the message every client treats as authoritative anyway.
+        """
+        if event is None or not self._relaying:
+            return
+        try:
+            self.on_event(event)
+        except Exception:  # noqa: BLE001 - see the docstring
+            self._relaying = False
 
     def _switch(self, mode: Mode) -> None:
         """Enter a mode, unless we are already in it.

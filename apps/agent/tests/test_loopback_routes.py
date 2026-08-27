@@ -320,3 +320,89 @@ async def test_every_new_route_requires_the_loopback_token(
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as http:
         response = await http.request(method, path.format(id="whatever"), json={})
     assert response.status_code == 401, f"{method} {path} answered without a token"
+
+
+# ── streaming on the wire ───────────────────────────────────────────────────
+
+
+def _stored(session_id: str, runtime: Loopback):
+    return runtime.sessions.get(session_id)
+
+
+async def test_a_transient_event_does_not_advance_the_relay_cursor() -> None:
+    """The defect the first streamed turn produced, and it cost the `usage` frame.
+
+    A transient event is never stored, so it is never given an id of its own: it
+    carries the id the *next* stored event will get. The relay skipped anything
+    whose id it had already seen, so relaying a delta marked that id as seen and
+    the event it actually belonged to was dropped — silently, and only ever on a
+    turn that streamed.
+    """
+    import asyncio
+
+    from dakcoder_agent.session import Session
+    from dakcoder_shared.envelope import Event, EventType
+
+    from dakcoder_agent.loopback import _stream
+
+    session = Session(id="s1", task="t", workspace="w")
+    session.record(Event(EventType.TURN_START, {"turn": 1}))
+
+    class NeverDisconnected:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    frames: list[str] = []
+    stream = _stream(session, 0, NeverDisconnected())
+
+    async def pump() -> None:
+        async for chunk in stream:
+            frames.append(chunk.decode("utf-8"))
+
+    task = asyncio.create_task(pump())
+    await asyncio.sleep(0)
+
+    session.record(Event(EventType.ASSISTANT_DELTA, {"text": "half an "}))
+    session.record(Event(EventType.USAGE, {"prompt_tokens": 900}))
+    session.record(Event(EventType.END, {}))
+    await asyncio.wait_for(task, timeout=2.0)
+
+    body = "".join(frames)
+    assert "assistant_delta" in body, "the delta never reached the wire"
+    assert "usage" in body, "the delta swallowed the event whose id it borrowed"
+
+
+def test_a_transient_frame_is_not_a_place_to_resume_from() -> None:
+    """The SSE spec's rule, and the reason for it here.
+
+    A frame with no ``id:`` leaves the client's last event id where it was. A
+    delta must omit it: it carries the id of an event that has not been sent
+    yet, so a client that remembered it would resume *past* something it never
+    saw.
+    """
+    from datetime import datetime, timezone
+
+    from dakcoder_agent.session import StoredEvent
+    from dakcoder_shared.envelope import EventType
+
+    at = datetime.now(tz=timezone.utc)
+    delta = StoredEvent(id=7, type=EventType.ASSISTANT_DELTA, data={"text": "x"}, at=at)
+    message = StoredEvent(id=7, type=EventType.ASSISTANT, data={"text": "x"}, at=at)
+
+    assert "id:" not in delta.sse()
+    assert "id: 7" in message.sse()
+
+
+async def test_a_streamed_turn_leaves_the_transcript_alone(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """Deltas are relayed and never stored. A transcript built from them would be
+    empty after a reconnect, which is why the `assistant` message is the one
+    every client treats as authoritative."""
+    session = await start(client)
+    await settle(session["id"], scripted)
+
+    full = (await client.get(f"/v1/sessions/{session['id']}?transcript=true")).json()
+    kinds = [e["type"] for e in full["transcript"]]
+    assert "assistant_delta" not in kinds
+    assert "assistant" in kinds

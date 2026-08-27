@@ -11,7 +11,7 @@ one turn is dispatched.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -75,6 +75,7 @@ def complete(
     role: str = "coder",
     enforce_budget: bool = True,
     session_id: str = "",
+    on_delta: Callable[[str], None] | None = None,
 ) -> TurnResult:
     """Dispatch one turn from a context manager.
 
@@ -94,6 +95,10 @@ def complete(
     can send them. Without them the gateway reserves against a deliberately
     generous fallback that is never refunded, which is how quota comes to report
     a figure with no relationship to what was actually spent.
+
+    ``on_delta`` is handed straight through to the transport. Nothing is decided
+    about it here, because this module is the wiring between three components
+    that each own their own decisions and a sink is none of their business.
     """
     mode_config = config_for(context.mode)
     usage = context.usage()
@@ -112,6 +117,7 @@ def complete(
         enable_thinking=mode_config.enable_thinking,
         tools=tools,
         temperature=mode_config.temperature,
+        on_delta=on_delta,
         metering=Metering(
             session_id=session_id,
             turn=context.turn,

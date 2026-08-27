@@ -216,6 +216,152 @@ const wire = (session, id, type, data = {}) => ({
 
 const saying = (rows, text) => rows.filter((r) => r.text.indexOf(text) !== -1);
 
+// -- the two places the wire says a thing twice ------------------------------
+
+describe('the transcript, when the wire repeats itself', () => {
+  it('does not print the plan once as prose and again as a card', () => {
+    // The reported "double response". C2 emits the planner's text twice — as
+    // `assistant`, then as the `plan` it is parsed into — and that is a property
+    // of the wire, not a fault. `RunState` declares the rule and folds them; the
+    // panel draws straight from the wire and did not, so every plan appeared
+    // twice, the second time with a heading over it.
+    const p = panel();
+    p.send(
+      wire('f1', 1, 'turn_start', { turn: 1, mode: 'planner' }),
+      wire('f1', 2, 'assistant', { text: '1. Edit handler/user.go' }),
+      wire('f1', 2, 'plan', { text: '1. Edit handler/user.go', steps: 1 }),
+    );
+
+    const rows = p.rows();
+    assert.equal(saying(rows, 'Edit handler/user.go').length, 1, `printed twice: ${rows.length}`);
+    assert.ok(rows.some((r) => r.key.indexOf('/plan:') !== -1), 'the card is the richer one');
+    assert.ok(!rows.some((r) => r.key.indexOf('/assistant:') !== -1));
+  });
+
+  it('keeps a plan that is not what was just said', () => {
+    const p = panel();
+    p.send(
+      wire('f2', 1, 'turn_start', { turn: 1, mode: 'planner' }),
+      wire('f2', 2, 'assistant', { text: 'Let me look at the handler first.' }),
+      wire('f2', 2, 'plan', { text: '1. Edit handler/user.go', steps: 1 }),
+    );
+
+    assert.equal(p.rows().length, 3, 'a plan that adds something must add a row');
+  });
+
+  it('does not state a failure once as an error and again as the summary', () => {
+    // The other half of the same rule, and the more common one: a failing run
+    // usually finishes with the sentence it already reported.
+    const p = panel();
+    p.send(
+      wire('f3', 1, 'error', { message: 'the model endpoint is unavailable' }),
+      wire('f3', 2, 'finish', {
+        outcome: 'error',
+        summary: 'the model endpoint is unavailable',
+        turns: 1,
+        mutations: [],
+      }),
+    );
+
+    assert.equal(saying(p.rows(), 'endpoint is unavailable').length, 1);
+  });
+
+  it('keeps an error the finish does not repeat', () => {
+    const p = panel();
+    p.send(
+      wire('f4', 1, 'error', { message: 'go vet: composite literal uses unkeyed fields' }),
+      wire('f4', 2, 'finish', {
+        outcome: 'unverified',
+        summary: 'the gate never came clean',
+        turns: 3,
+        mutations: [],
+      }),
+    );
+
+    assert.equal(p.rows().length, 2, 'a distinct cause and outcome are two facts');
+  });
+
+  it('does not fold across a turn boundary', () => {
+    // `foldable` is only meaningful between two events that arrive together. A
+    // plan in turn 2 must not reclaim the row an assistant wrote in turn 1.
+    const p = panel();
+    p.send(
+      wire('f5', 1, 'turn_start', { turn: 1, mode: 'planner' }),
+      wire('f5', 2, 'assistant', { text: 'the same words' }),
+      wire('f5', 3, 'turn_start', { turn: 2, mode: 'coder' }),
+      wire('f5', 4, 'plan', { text: 'the same words', steps: 1 }),
+    );
+
+    assert.equal(saying(p.rows(), 'the same words').length, 2);
+  });
+});
+
+// -- streaming ---------------------------------------------------------------
+
+describe('the transcript, while an answer is being written', () => {
+  it('grows one row rather than adding a row per fragment', () => {
+    // Deltas share the id of the stored event they precede, so keying on the id
+    // alone would still be one row. What actually holds the row together is
+    // `openAssistant`, and this is the test that says so.
+    const p = panel();
+    p.send(
+      wire('e1', 3, 'turn_start', { turn: 1, mode: 'planner' }),
+      wire('e1', 4, 'assistant_delta', { text: 'The pension handler ' }),
+      wire('e1', 4, 'assistant_delta', { text: 'lives in handler/pension.go.' }),
+    );
+
+    const rows = p.rows();
+    assert.equal(rows.length, 2, `a row per fragment: ${rows.map((r) => r.key)}`);
+    assert.equal(rows[1].text, 'The pension handler lives in handler/pension.go.');
+  });
+
+  it('lets the authoritative message replace what streamed, not follow it', () => {
+    // The `assistant` event is the transcript; the deltas are a view of it being
+    // written. Appending would print the answer twice.
+    const p = panel();
+    p.send(
+      wire('e2', 3, 'turn_start', { turn: 1, mode: 'planner' }),
+      wire('e2', 4, 'assistant_delta', { text: 'half an ' }),
+      wire('e2', 4, 'assistant_delta', { text: 'answer' }),
+      wire('e2', 4, 'assistant', { text: 'the whole answer' }),
+    );
+
+    const said = p.rows().filter((r) => r.key.indexOf('/assistant:') !== -1);
+    assert.equal(said.length, 1, 'the streamed row and the real one are both on screen');
+    assert.equal(said[0].text, 'the whole answer');
+  });
+
+  it('starts a new row for the next turn rather than growing the last one', () => {
+    const p = panel();
+    p.send(
+      wire('e3', 1, 'turn_start', { turn: 1, mode: 'planner' }),
+      wire('e3', 2, 'assistant_delta', { text: 'first' }),
+      wire('e3', 2, 'assistant', { text: 'first' }),
+      wire('e3', 3, 'turn_start', { turn: 2, mode: 'coder' }),
+      wire('e3', 4, 'assistant_delta', { text: 'second' }),
+    );
+
+    const said = p.rows().filter((r) => r.key.indexOf('/assistant:') !== -1);
+    assert.deepEqual(
+      said.map((r) => r.text),
+      ['first', 'second'],
+      'the second turn was written into the first turn"s row',
+    );
+  });
+
+  it('does not treat a partial answer as a transcript row to restore', () => {
+    // Deltas are never persisted server-side, so a rebuilt panel must not have
+    // saved half an answer it will never be sent again.
+    const p = panel();
+    p.send(
+      wire('e4', 1, 'turn_start', { turn: 1, mode: 'planner' }),
+      wire('e4', 2, 'assistant_delta', { text: 'half an answer' }),
+    );
+    const ready = p.posted.filter((m) => m.type === 'ready');
+    assert.equal(ready.length, 1, 'the panel announces itself once');
+  });
+});
+
 // -- opening a different conversation ---------------------------------------
 
 describe('the transcript, when a different session is opened', () => {

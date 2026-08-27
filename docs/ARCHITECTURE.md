@@ -1495,6 +1495,164 @@ restored alongside the rows on a panel that has, which makes it the honest test.
 resumes from; restarting it would make every event after a switch look like one
 the panel had already applied.
 
+---
+**D-88 · Streamed text takes the other road, because a generator cannot yield
+from inside a call**
+
+Streaming was built at every layer and produced by none. The request had always
+carried `stream: True`, the gateway had always relayed chunk by chunk, the
+envelope had `ASSISTANT_DELTA` and a `TRANSIENT` set, the SSE relay had
+`_is_transient`, `RunState.ingest` had an `assistant_delta` arm, and `chat.js`
+had a per-fragment renderer. `DeltaCoalescer` — the fix-S11 batcher — was
+complete, exported, and had **zero importers and zero tests**. The one missing
+piece was the producer: `LLMClient._consume_stream` folded the whole stream into
+one value and returned at EOF, so nothing downstream could see a turn until it
+was over.
+
+The reason it stayed missing is a real design problem rather than an oversight.
+`AgentLoop._turn` is a generator and its events reach a client by being yielded,
+which works for everything that happens *between* calls and not at all for
+something that happens *during* one: the model streams while that thread is
+blocked inside the completion, and a callback firing there cannot yield.
+
+So streamed text takes the road the runtime already had. `Loopback._spawn` builds
+an `emit` closure to relay yielded events; the loop now also holds it as
+`on_event` and calls it directly. Same closure, same thread, so ordering is
+preserved by the queue rather than by hope.
+
+**Only transient events may go this way.** They are defined as relayed and never
+stored, so they carry no id of their own and impose no order on the transcript. A
+*stored* event sent out of band would interleave with the yielded ones and the
+log would stop being the run.
+
+A sink that raises is switched off, not raised. Streaming is a view of a turn and
+never the turn itself: a panel torn down mid-answer must cost the developer their
+live view and nothing else, and the answer still arrives in full as the
+`assistant` message every client already treats as authoritative.
+
+Two things deliberately do not stream. **Reasoning**, because thinking is off in
+every mode — a reasoning feed would be the symptom of a fault rather than
+something to render, and it is already reported as a number. And the
+**summariser**, because compaction is not part of the conversation.
+
+---
+**D-89 · A retry streams unless the attempt before it already spoke**
+
+Deltas are append-only on the wire: there is no way to un-say one. A retry
+re-generates text the caller has already been handed, so it would arrive twice.
+
+The obvious rule — only the first attempt streams — is wrong in the common case.
+A status-code failure is raised before a single line is read, so the ordinary
+retry (a 503, a 429) has said nothing, and silencing its replacement would cost
+streaming to an upstream hiccup that the developer never sees. The rule is
+therefore about what was *spoken*, not which attempt this is: `_send` tracks
+whether any fragment reached the caller and suppresses the sink only after one
+did.
+
+That leaves one case — a failure part-way through a stream — where the panel
+holds a partial answer that will not be completed. The authoritative `assistant`
+message at the end of the turn replaces it, which is what that message is for.
+The alternative, a `restart` flag on the delta, would put a correction protocol
+on the wire to fix a state that already corrects itself.
+
+---
+**D-90 · A transient frame is not a place to resume from**
+
+Two bugs, one cause, both only reachable once something actually streamed.
+
+A transient event is never stored, so `Session.record` never gives it an id: it
+carries the id the *next* stored event will get. The SSE relay skipped anything
+whose id it had already seen, so relaying a delta marked that id as seen and the
+event it belonged to was dropped. The first streamed turn lost its `usage` frame
+this way — silently, and only on turns that streamed, which is the worst
+combination to debug. `_stream` now relays transient events without touching the
+cursor.
+
+`StoredEvent.sse` had the same fault one layer up: it stamped every frame with
+`id:`, which is what a spec-conforming client stores as its resume point. A
+delta's id belongs to an event that has not been sent yet, so a client that
+remembered it would resume *past* something it never saw. Transient frames now
+omit the line, which is the spec's own way of saying "not a resume point".
+
+This is the third appearance of the same mistake — after `RunState.ingest`
+(D-81) and the panel's replay cursor — and the shape is always identical: a
+cursor advanced by an event that does not own a position.
+
+---
+**D-91 · Transient events are relayed but never ringed**
+
+`ChatViewProvider` keeps the last 500 wire events so a rebuilt webview can be
+replayed what it missed. A streamed reply is dozens of `assistant_delta` frames,
+and a ring that stored them would evict the tool calls and gate results behind
+them inside a single turn — a panel that came back from a rebuild having
+forgotten the run in order to remember a sentence it already had.
+
+They are still numbered. The sequence is what tells the webview a message is new,
+and an unnumbered delta would look like one it had already applied.
+
+---
+**D-92 · The panel folds the two places the wire says a thing twice**
+
+C2 states the same words twice in two situations, and both are properties of the
+protocol rather than faults. The Planner's prose arrives as `assistant` and then
+again as the `plan` it is parsed into. A failing run reports its cause as `error`
+and then again as the summary it finishes with.
+
+`RunState.ingest` has known this since it was written — it holds a row for one
+event and drops it if the next one repeats it, and the two rules are named in its
+comments. The problem is that **nothing renders from `RunState`**. The panel
+draws straight from the wire through `chat.js`, which had no such rule, so every
+plan was printed twice — once as prose and once as a card with a heading over
+it — and every failure stated itself twice.
+
+The rules are now where the drawing happens. A `plan` whose text matches the
+`assistant` row just written takes that row rather than adding one beneath it,
+because the card is the richer rendering of the same words; a `finish` whose
+summary matches the `error` just reported takes that row, because it carries the
+outcome as well. The fold is scoped to a turn: the marker is cleared on
+`turn_start`, so a later turn cannot reclaim an earlier turn's row.
+
+`RunState`'s copy stays. It is the derivation every other surface reads, and two
+implementations of one rule is the lesser problem — one surface that quietly
+ignores it is what this was.
+
+---
+**D-93 · A mode that restates its plan proves the plan was an answer**
+
+`_count_steps` is a regex for numbered lines, and it cannot tell a plan from a
+numbered answer. Asked what had been discussed, the Planner correctly answered
+rather than planning — and happened to enumerate the four exchanges. The loop
+read four steps, pinned them as the plan, handed them to the Coder, and the Coder
+restated them. The developer saw the paragraph three times, then watched a full
+gate run against a workspace nothing had touched.
+
+Tightening the regex was tried and abandoned. Requiring the `Accepts:` line the
+Planner prompt mandates is the only structural signal available, and it fails the
+other way round — a good plan that omits it would stop the run before any work
+was done, which is the worse failure and the harder one to notice. Every other
+discriminator considered (a path in the step, an imperative opener, a majority
+vote over items) either matched the conversational text — item three of it named
+`core/domain` and `repo/postgres` — or rejected plans the tests legitimately use.
+
+So the loop stops guessing about prose and reads the evidence instead. An
+executing mode that calls no tool and says its plan back word for word had
+nothing in it to execute. `_repeating` already watches for a model stuck in a
+loop, but it needs three replies before it is sure, because three identical
+answers is what "stuck" looks like; **one** verbatim restatement of the plan
+*itself* is a different and stronger signal, and it is conclusive.
+
+Caught before the reply is emitted, so the developer is not shown the same
+paragraph a third time and then told it was a mistake. The turn is still metered:
+it cost tokens whatever it said.
+
+What this does not do is stop the misclassification. The `plan` event still goes
+out for a numbered answer, and the panel still renders it as a card — folded into
+one row by D-92, but titled "Plan". The run now costs two turns instead of five
+and no gate, which is the part that was expensive. Fixing the classification
+properly means the Planner marking its own output, which is a prompt-contract
+change with a budget cost, and is worth doing deliberately rather than as part of
+a bug fix.
+
 ## 4. Verification strategy
 
 The load-bearing assertions, and what each is guarding against:
@@ -1973,7 +2131,9 @@ it through the full gate — `go build`, `go vet`, `rules_lint`, `swagger_check`
 
 - `shared/paths.py`: workspace confinement, three classes of escape (D-48).
 - `shared/envelope.py`: contract C1's result shape and C2's event stream, with
-  `assistant_delta` coalesced at the source (fix S11).
+  `assistant_delta` coalesced at the source (fix S11) — produced by the client
+  and relayed out of band since D-88; before that the coalescer was reachable
+  code with nothing to coalesce.
 - `agent/tools/registry.py`: 29 tools, C1 enforced at import (D-51).
 - `agent/tools/router.py`: six ordered checks between a model's call and a tool
   running, with every refusal naming an alternative (D-46, D-49).

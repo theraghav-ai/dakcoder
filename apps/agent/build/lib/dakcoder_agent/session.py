@@ -32,7 +32,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from dakcoder_shared.envelope import Event, EventType
+from dakcoder_shared.envelope import TRANSIENT, Event, EventType
 
 from .loop import Outcome, RunResult
 
@@ -86,11 +86,19 @@ class StoredEvent:
 
         Without the id the reconnect has nothing to resume from and the client
         is back to guessing whether the run died.
+
+        Transient events omit it, which is the spec's way of saying "this frame
+        is not a place to resume from": a frame with no ``id:`` leaves the last
+        event id where it was. They have to. A transient event is never stored,
+        so it is never given an id of its own and carries the one the *next*
+        stored event will get — and a client that remembered it would resume
+        past an event it had never been sent.
         """
         import json
 
         body = json.dumps(self.data, separators=(",", ":"), ensure_ascii=False)
-        return f"id: {self.id}\nevent: {self.type}\ndata: {body}\n\n"
+        head = "" if self.type in TRANSIENT else f"id: {self.id}\n"
+        return f"{head}event: {self.type}\ndata: {body}\n\n"
 
 
 @dataclass(frozen=True, slots=True)

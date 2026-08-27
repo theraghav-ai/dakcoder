@@ -42,6 +42,18 @@ const FLUSH_MS = 40;
 /** Matches the webview's own row cap, so a replay can never outrun what it keeps. */
 const RING = 500;
 
+/**
+ * Types that are relayed and never replayed.
+ *
+ * The same set the runtime calls transient, for the same reason: they are
+ * superseded by what follows them, so replaying them would re-type an answer the
+ * panel already holds in full. Keeping them out of the ring matters more than
+ * that, though — a streamed reply is dozens of `assistant_delta` frames, and a
+ * ring that stored them would evict the tool calls and gate results behind them
+ * within a single turn.
+ */
+const TRANSIENT = new Set(['assistant_delta', 'heartbeat']);
+
 export type ApprovalDecision = 'accept' | 'reject' | 'edit';
 
 /** One event as the ring holds it: the event, whose session it was, and where
@@ -231,11 +243,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // deliberate switch, and gets the panel cleared before the first event
     // rather than on it. This catches a switch nothing announced.
     if (session) this.showSession(session);
+    // Numbered even when it is not kept: the cursor is what tells the webview a
+    // message is new, and an unnumbered delta would look like one it had already
+    // applied.
     this.seq += 1;
-    const entry: RingEntry = { seq: this.seq, session, event };
-    this.ring.push(entry);
-    if (this.ring.length > RING) this.ring.splice(0, this.ring.length - RING);
-    this.post({ type: 'event', event, session, seq: entry.seq });
+    if (!TRANSIENT.has(event.type)) {
+      this.ring.push({ seq: this.seq, session, event });
+      if (this.ring.length > RING) this.ring.splice(0, this.ring.length - RING);
+    }
+    this.post({ type: 'event', event, session, seq: this.seq });
   }
 
   /** Echo a message the developer did not type into the composer — a command,

@@ -146,6 +146,10 @@ class FakeEndpoint:
     refuse_tool_calls: bool = False
     #: A tool-call id that does not match the documented shape.
     tool_call_id: str = "chatcmpl-tool-9f2c1ab4"
+    #: The answer, as the fragments it arrives in. A real endpoint emits one per
+    #: token or so; a fake that emits the whole answer in a single delta cannot
+    #: tell a client that streams from one that does not.
+    content_fragments: tuple[str, ...] = ("ready",)
     #: Fail this many times with `transient_status` before succeeding.
     transient_failures: int = 0
     transient_status: int = 503
@@ -234,7 +238,8 @@ class FakeEndpoint:
             ))
             return self._stream(*chunks)
 
-        chunks += [delta(content="ready"), finish("stop")]
+        chunks += [delta(content=fragment) for fragment in self.content_fragments]
+        chunks.append(finish("stop"))
         chunks.append(usage_chunk(
             completion=88 if reasoning_on else 20,
             reasoning=reasoning_tokens,

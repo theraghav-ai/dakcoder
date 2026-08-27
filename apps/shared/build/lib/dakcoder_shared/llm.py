@@ -317,6 +317,7 @@ class LLMClient:
         temperature: float | None = None,
         recover_empty: bool = True,
         metering: Metering | None = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> ChatResult:
         """Run one turn.
 
@@ -328,6 +329,17 @@ class LLMClient:
         ``metering`` is what the gateway bills and attributes this turn by. It
         is optional because a probe or a one-off script has nothing meaningful
         to put in it; a turn of an actual run always should.
+
+        ``on_delta`` is called with each fragment of *content* as it arrives.
+        This is the seam the streaming path was missing. The request has always
+        been made with ``stream: True`` and the gateway has always relayed chunk
+        by chunk, but this method folded the stream into one value and returned
+        at EOF, so nothing downstream could see a turn until it was over.
+
+        Reasoning fragments are deliberately not offered. Thinking is off in
+        every mode, so a reasoning feed here would be the symptom of a fault
+        rather than a thing to render, and it is already reported as a number by
+        ``usage.reasoning_tokens``.
         """
         body = self.build_request(
             messages,
@@ -339,24 +351,52 @@ class LLMClient:
         )
         headers = metering.headers() if metering else None
         try:
-            return self._send(body, headers)
+            return self._send(body, headers, on_delta)
         except EmptyCompletionError:
             if not recover_empty or not enable_thinking:
                 raise
             retry = dict(body)
             retry["chat_template_kwargs"] = {"enable_thinking": False}
-            result = self._send(retry, headers)
+            # Still streamed. An empty completion is by definition one that
+            # produced no content, so there is nothing already said that the
+            # recovered answer would be talking over.
+            result = self._send(retry, headers, on_delta)
             result.recovered_from_empty = True
             return result
 
     # ── transport ───────────────────────────────────────────────────────────
 
-    def _send(self, body: dict[str, Any], headers: dict[str, str] | None = None) -> ChatResult:
+    def _send(
+        self,
+        body: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> ChatResult:
         last: Exception | None = None
+        # Whether any fragment has actually reached the caller. Not "which
+        # attempt is this": a status-code failure is raised before a single line
+        # is read, so the ordinary retry — a 503 or a 429 — has said nothing and
+        # its replacement is free to stream normally.
+        spoken = False
+
+        def sink(fragment: str) -> None:
+            nonlocal spoken
+            spoken = True
+            on_delta(fragment)  # type: ignore[misc] - only built when on_delta exists
 
         for attempt in range(1, self._config.max_attempts + 1):
             try:
-                result = self._stream_once(body, headers)
+                # An attempt that follows one which already spoke stays silent.
+                #
+                # It would be re-generating text the caller has been handed, and
+                # deltas are append-only on the wire: there is no way to un-say
+                # them. Only a failure part-way through a stream can reach here
+                # having spoken. Staying silent leaves that partial answer on
+                # screen for a moment, and the authoritative message at the end
+                # of the turn replaces it, which is what that message is for.
+                result = self._stream_once(
+                    body, headers, None if (spoken or on_delta is None) else sink
+                )
                 result.attempts = attempt
                 return result
             except UnsupportedParameterError:
@@ -377,7 +417,10 @@ class LLMClient:
         raise last or RuntimeError("request failed with no recorded cause")
 
     def _stream_once(
-        self, body: dict[str, Any], headers: dict[str, str] | None = None
+        self,
+        body: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> ChatResult:
         with self._client.stream(
             "POST", "/chat/completions", json=body, headers=headers
@@ -385,7 +428,7 @@ class LLMClient:
             if response.status_code >= 400:
                 response.read()
                 raise self._error_for(response)
-            return _consume_stream(response.iter_lines())
+            return _consume_stream(response.iter_lines(), on_delta)
 
     @staticmethod
     def _error_for(response: httpx.Response) -> UpstreamError:
@@ -415,12 +458,21 @@ class LLMClient:
         return UpstreamError(response.status_code, detail)
 
 
-def _consume_stream(lines: Iterator[str]) -> ChatResult:
-    """Fold an SSE stream into one result.
+def _consume_stream(
+    lines: Iterator[str], on_delta: Callable[[str], None] | None = None
+) -> ChatResult:
+    """Fold an SSE stream into one result, offering content as it passes.
 
     Tool-call fragments arrive indexed and split across chunks, so they are
     accumulated by index and assembled at the end. Doing it any other way
-    produces arguments that are valid-looking JSON prefixes.
+    produces arguments that are valid-looking JSON prefixes. Content is
+    different: a fragment is complete the moment it arrives, so it is handed to
+    ``on_delta`` on the way past as well as accumulated.
+
+    The callback is not guarded here. The caller whose sink can fail is the one
+    that knows what a failure means, and swallowing it at this depth would hide
+    the symptom that is hardest to notice from outside: a panel that has quietly
+    stopped streaming.
     """
     result = ChatResult()
     content: list[str] = []
@@ -481,6 +533,8 @@ def _consume_stream(lines: Iterator[str]) -> ChatResult:
                 saw_content_key = True
                 if delta["content"]:
                     content.append(delta["content"])
+                    if on_delta is not None:
+                        on_delta(delta["content"])
             if delta.get("reasoning_content"):
                 reasoning.append(delta["reasoning_content"])
 

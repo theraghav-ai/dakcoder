@@ -97,6 +97,19 @@
    * gate would be drawn into the first message's grid and overwrite it.
    */
   let runIndex = typeof restored.runIndex === 'number' ? restored.runIndex : 0;
+  /**
+   * The last row this turn that something following it may turn out to repeat.
+   *
+   * Two pairs on the wire say the same thing twice, and both are properties of
+   * C2 rather than faults: the planner's prose arrives as `assistant` and then
+   * again as the `plan` it is parsed into, and a failing run usually repeats its
+   * error sentence as the finish summary. `RunState` declares both rules and
+   * folds them — but nothing renders from `RunState`, and the panel draws
+   * straight from the wire, so the panel printed the plan twice and every
+   * failure twice. Not persisted: it is only meaningful between two events that
+   * arrive together.
+   */
+  let foldable = null;
   let domId = 0;
 
   // ── small helpers ─────────────────────────────────────────────────────────
@@ -268,15 +281,28 @@
       // from deleting the earlier one.
       if (row.key.indexOf('/') !== -1) return false;
       if (row.kind === 'user' && row.pending && row.text === text) {
-        rows.splice(i, 1);
-        byKey.delete(row.key);
-        const node = nodes.get(row.key);
-        if (node && node.isConnected) node.remove();
-        nodes.delete(row.key);
+        removeRow(row.key);
         return true;
       }
     }
     return false;
+  }
+
+  function removeRow(key) {
+    const at = rows.findIndex(function (row) {
+      return row.key === key;
+    });
+    if (at !== -1) rows.splice(at, 1);
+    byKey.delete(key);
+    const node = nodes.get(key);
+    if (node && node.isConnected) node.remove();
+    nodes.delete(key);
+  }
+
+  /** Trim-equal and not empty. Two blank rows are not the same sentence. */
+  function sameText(a, b) {
+    const left = String(a || '').trim();
+    return left.length > 0 && left === String(b || '').trim();
   }
 
   function clearAll() {
@@ -1208,6 +1234,7 @@
       case 'turn_start': {
         attempt = typeof d.attempt === 'number' ? d.attempt : 1;
         openAssistant = null;
+        foldable = null;
         put({
           key: keyFor('turn', event.id),
           kind: 'turn',
@@ -1234,6 +1261,7 @@
         row.text = String(d.text || '');
         paint(row);
         openAssistant = null;
+        foldable = { key: row.key, kind: 'assistant', text: row.text };
         save();
         return;
       }
@@ -1316,6 +1344,13 @@
       }
 
       case 'plan': {
+        // The prose already arrived as an `assistant`. The plan card is the
+        // richer rendering of the same words, so it takes the row rather than
+        // adding one underneath it.
+        if (foldable && foldable.kind === 'assistant' && sameText(foldable.text, d.text)) {
+          removeRow(foldable.key);
+        }
+        foldable = null;
         put({
           key: keyFor('plan', event.id),
           kind: 'plan',
@@ -1397,6 +1432,13 @@
 
       case 'finish': {
         openAssistant = null;
+        // A failing run usually states its cause twice: once as `error`, and
+        // again as the summary it finishes with. The finish row carries the
+        // outcome as well, so it is the one that stays.
+        if (foldable && foldable.kind === 'error' && sameText(foldable.text, d.summary)) {
+          removeRow(foldable.key);
+        }
+        foldable = null;
         // The run is over; anything the next message starts belongs to a grid of
         // its own.
         runIndex += 1;
@@ -1415,7 +1457,9 @@
 
       case 'error': {
         const message = String(d.message || d.error || '');
-        put({ key: keyFor('error', event.id), kind: 'error', message: message });
+        const errorKey = keyFor('error', event.id);
+        put({ key: errorKey, kind: 'error', message: message });
+        foldable = { key: errorKey, kind: 'error', text: message };
         say(fmt(S.sayError, message.split('\n')[0]), true);
         return;
       }

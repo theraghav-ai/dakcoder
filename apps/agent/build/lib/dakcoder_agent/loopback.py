@@ -241,6 +241,12 @@ class Loopback:
             except RuntimeError:
                 session.record(event)
 
+        # The road transient events take. The loop is a generator and streamed
+        # text happens while it is blocked inside a completion, so deltas cannot
+        # travel by yield; they go straight to the same relay the yielded events
+        # use, from the same thread, which is what keeps them in order.
+        agent.on_event = emit
+
         def run() -> None:
             try:
                 for event in agent.run(
@@ -698,9 +704,18 @@ async def _stream(session: Session, since_id: int, request: Request) -> AsyncIte
                     return
                 continue
 
-            if event.id <= seen and not _is_transient(event):
+            if _is_transient(event):
+                # Relayed without touching the cursor. A transient event is not
+                # stored, so it is not given an id of its own: it carries the id
+                # the *next* stored event will get. Advancing `seen` past it
+                # therefore swallows that event — the first streamed turn cost
+                # the `usage` frame exactly this way, and the meter simply
+                # stopped moving.
+                yield event.sse().encode("utf-8")
                 continue
-            seen = max(seen, event.id)
+            if event.id <= seen:
+                continue
+            seen = event.id
             yield event.sse().encode("utf-8")
 
             if event.type is EventType.END:
