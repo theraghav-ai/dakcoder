@@ -165,6 +165,11 @@ class EventType(StrEnum):
     because one ships through GitLab and the other through a marketplace.
     """
 
+    #: A message the developer sent — the opening task, or a follow-up on a
+    #: session that had already finished. Recorded so that re-opening a
+    #: conversation shows both halves of it: without this the transcript is the
+    #: agent talking to itself, and a follow-up appears as an answer to nothing.
+    USER = "user"
     TURN_START = "turn_start"
     ASSISTANT = "assistant"
     ASSISTANT_DELTA = "assistant_delta"

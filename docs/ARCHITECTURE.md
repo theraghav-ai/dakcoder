@@ -1274,6 +1274,172 @@ to parse a prefix back out of a string it shares with the file listing, which
 breaks the first time a note contains a newline. The Go side already had
 `Notes []string`; only the bridge was lossy.
 
+---
+**D-80 · One conversation is one session; the context is the conversation**
+
+The first build started a session per message. `submit` steered only while a run
+was live and called `POST /v1/tasks` otherwise, and `build_loop` handed every run
+a fresh `ContextManager`. Three faults reported as separate bugs came out of that
+one decision:
+
+- the Sessions tree filled with one-row sessions, one per sentence typed;
+- the second question was answered by a model that had never seen the first,
+  because the second session's context began empty;
+- the second run's rows landed on top of the first run's in the panel and erased
+  them — see D-81.
+
+So: `POST /v1/sessions/{id}/messages` now means "say this to this session", and
+the *runtime* decides what that means from the state it finds the session in —
+queued as a correction while a run is going, the next message of the conversation
+once it has finished. The client cannot make that decision, because a run can end
+between reading the status and posting the message, and a client that guessed
+would return a 409 for something the developer had already typed.
+
+A follow-up reuses the session's `ContextManager`, so the working set — every
+file read, every answer given — carries forward, and compaction sees one growing
+conversation rather than a series of amnesiac ones. The new message is *appended*
+to the working set rather than re-pinned as the task: the pinned task layer sits
+above the working set, so re-pinning would put the newest message before the
+answers to the older ones and read as though the model replied before it was
+asked.
+
+`_switch` now guards on the context's mode as well as the loop's. They start out
+disagreeing on a follow-up — the loop is newly built and defaults to Planner
+while the context is wherever the last run left it — and guarding on the loop's
+copy alone let a conversation that ended in the Debugger answer its next message
+under the Debugger's overlay and prompt budget.
+
+**Cost to reverse**: the endpoint is additive and the client change is local.
+Reverting the *context* half would restore the amnesia.
+
+---
+**D-81 · Transcript rows are keyed by session, and the replay cursor is the host's own counter**
+
+Wire event ids are monotonic *within* a session and restart at 1 for the next
+one. The panel keyed its rows `assistant:<event.id>`, so a second conversation's
+first answer carried the same key as the first conversation's and was painted
+over it: the question changed and the answer already on screen changed with it.
+That is the "the second response erased the first" report, and it was a rendering
+fault rather than a runtime one — the runtime had both answers all along.
+
+Row keys are now `<session>/<kind>:<id>`. Two things are deliberately outside
+that scheme. Approval ids are minted by the runtime and unique across sessions
+(D-71), and the host synthesises `approval_resolved` with no session to name. And
+the gate grid is keyed by kind rather than by id, because its whole job is to put
+attempt 1 and attempt 2 of *one* run side by side — so it carries a run counter
+instead, bumped on every `finish`.
+
+The same mistake was in the replay path. A rebuilt webview reported the highest
+event id it held and the host replayed `event.id > lastEventId`, which silently
+dropped a new conversation's opening rows whenever an older one had reached
+higher ids. The cursor is now a host-side sequence over the ring, which only ever
+goes up.
+
+Two smaller instances of the same class, fixed with it: `localSeq` — which
+numbers the panel's own optimistic rows — reset to 0 on rebuild and collided with
+restored rows; and `RunState.ingest` ran transient events through the monotonic
+guard, when the server stamps `assistant_delta` and `heartbeat` with the id the
+*next* stored event will get. That guard dropped every delta after the first,
+then dropped the authoritative `assistant` that shared their id, and left
+`lastId` pointing past an answer that had never been delivered.
+
+---
+**D-82 · The developer's own messages are events, not panel state**
+
+`EventType.USER`, recorded by `start` and `follow_up` before the loop is spawned.
+
+Before this, what the developer typed existed only as an optimistic row in
+whichever panel was open when they typed it. Re-opening a session from the
+Sessions tree showed the agent talking to itself — and with several messages per
+session that is no longer a curiosity, it is half the conversation missing.
+
+The composer still draws the message immediately, because a round trip the
+developer can feel makes the panel look broken. The echo is dropped when the
+runtime's own copy arrives, rather than the other way round: the echo is keyed by
+a counter local to one window, so it is the copy a replay could not match and a
+second panel would never have. The search for it is bounded to the run of
+locally-keyed rows at the end of the transcript, so asking the same thing twice
+shows twice.
+
+---
+**D-83 · Settlement is scheduled on the usage chunk, not awaited in a `finally`**
+
+Defect D-1. `ModelProxy.stream` reserved quota and settled in a `finally`, and
+the docstring claimed a client disconnecting mid-stream had still spent what the
+model produced. It had not: `LLMClient` broke out of its loop on `[DONE]` and
+closed the response, Starlette read the disconnect and cancelled the response
+task, and the first `await` inside the `finally` raised `CancelledError`. Neither
+the reconcile nor the ledger write happened. Measured: a ~25-turn planner run
+produced 179 events, dozens of `200 OK` lines, and **zero** rows in
+`usage_events`. Every reservation stood at its estimate for ever, and `_estimate`
+is deliberately generous — so quota over-charged every user against every limit,
+and the calibration loop meant to close that gap had nothing to learn from.
+
+Moving the `await` behind `asyncio.shield` was the obvious fix and is not
+sufficient, because the `finally` may not run at a useful moment at all: a
+generator suspended at its last `yield` is finalised whenever the object is
+collected, which can be under cancellation, at loop shutdown, or never.
+
+So settlement is scheduled from *live* code — the moment the usage chunk goes
+past, one frame before `[DONE]`, while the generator is still being driven — onto
+a task of the app's own. A task created there is a sibling of the request, not a
+child, so cancelling the request does not touch it. The `finally` remains as the
+fallback for the ways a stream ends *without* a usage chunk: an upstream that
+dropped mid-answer, or one that has stopped reporting usage. `drain`, awaited in
+the app's lifespan, closes the last window — the process stopping while a
+reconcile is in flight.
+
+`LLMClient` reads to EOF now instead of breaking on `[DONE]`. That costs one more
+loop iteration, because `[DONE]` is the last frame, and it means a well-behaved
+client no longer looks like a disconnect.
+
+**Cost to reverse**: low, and the regression test is the point — every other
+proxy test drains the stream to EOF, which is exactly why this passed CI for as
+long as it did.
+
+---
+**D-84 · The client sends what the gateway meters by**
+
+`Metering` — session, turn, mode, estimated prompt tokens, lane — as headers, on
+every call. The gateway had read `X-Session-Id`, `X-Turn`, `X-Mode` and
+`X-Estimated-Tokens` since it was written; nothing ever sent them.
+
+Headers rather than body fields, because the body is forwarded upstream and none
+of this is the model's business — and because the gateway reads them before
+deciding whether the call may go at all.
+
+The consequence of the omission was not neutral. Without `X-Estimated-Tokens` the
+gateway reserved against `_estimate`'s deliberately generous fallback, and with
+D-1 unfixed that reservation was never replaced, so the two compounded. Without
+the session, turn and mode the ledger held rows that could not answer "what did
+this team spend on migrations last month", which is the question §16.6 says it
+exists for. Compaction is metered too: it is a real cost against the developer's
+quota, and an unmetered one grows with exactly the long runs the ledger most
+needs to explain.
+
+`agent/llm.py:complete` is the only place that knows all four facts, so it is the
+only place that can send them.
+
+---
+**D-85 · The agent declines what is not about Go or this repository**
+
+The system prompt used to say a greeting "gets the answer and nothing else",
+which it did — cheerfully, on a shared GPU, for a question nobody deployed it
+for. Every such answer is a turn of quota the developer waiting behind it does
+not get, and the failure is invisible: an agent answering "how are you" looks
+like it is working.
+
+The rule lives in the *system* prompt rather than in a mode overlay, so no mode
+can be entered without it, and it is asserted by a test, because prose that
+nothing checks is prose that drifts.
+
+It cost 44 tokens net, which is the interesting part. The prefix ceiling (3,100,
+D-43) left about 57 tokens of headroom, so the first three drafts — each of them
+clearer than the one that shipped — did not fit. Buying the room by raising the
+ceiling was available and was not taken: the ceiling is what stops prompts
+growing by accident, and spending it on the first thing that asks is how it stops
+meaning anything.
+
 ## 4. Verification strategy
 
 The load-bearing assertions, and what each is guarding against:
@@ -1331,6 +1497,101 @@ The load-bearing assertions, and what each is guarding against:
 ---
 
 ## 5. Changelog
+
+### 2026-08-26 — One window's empty pocket signed everybody out
+
+The runtime refused to start: `a local runtime needs a dakcoder JWT to reach the
+gateway`, moments after a successful sign-in. Three windows' logs, aligned,
+showed why in under a second:
+
+```
+13:41:58.440  window5  using a minted gateway token for dev:localdev
+13:41:58.665  window4  the minted gateway token has expired; asking for another
+13:41:58.666  window1  the minted gateway token has expired; asking for another
+13:42:27.120  window5  spawning dakcoderd ...
+13:42:27.946  window5  dakcoderd could not start: ... needs a dakcoder JWT
+```
+
+`forget()` deletes the shared record every window reads. `refreshOnce`'s minted
+branch called it whenever *this* window could not produce a token — which is the
+ordinary state of a window whose extension host has restarted, holding nothing
+in memory and having no refresh token to rotate. So each sign-in woke the idle
+windows through the `SECRET_ACCOUNT` watch, each failed to find a token it had
+never held, and each answered by signing everyone out 200ms later. The window
+that had just authenticated then spawned its runtime with nothing to hand it.
+
+The minted branch now loads the shared token and checks it before concluding
+anything. Expiry is a fact about the credential; not having a copy is a fact
+about the window, and only the first justifies a global delete.
+
+The spawn also stopped depending on what survived the wait. `venvPython` can run
+for tens of seconds on a fresh install, and the JWT reaches the child once, in
+an environment variable it cannot revisit. `Runtime` now takes the await-able
+`accessToken()` alongside the synchronous `jwt()`, and uses it when the fast
+path is empty — so a spawn asks what the credential's state *is* rather than
+what it was before the venv was built.
+
+### 2026-08-26 — A venv cannot be rebuilt while it is running
+
+Signing in failed with `[Errno 13] Permission denied` on
+`globalStorage/dop.dakcoder-go/runtime/Scripts/python.exe`. Sign-in spawns the
+runtime, and `venvPython` rebuilds the venv whenever the wheel hash moves — so
+an extension update that changes the Python side rebuilt a venv a daemon was
+still executing from. Windows holds an exclusive lock on a running `.exe` and
+refused, and the failure surfaced as a sign-in error because spawning the
+runtime is the first thing sign-in does.
+
+Stopping our own child first does not fix it. `globalStorage` is per extension,
+not per window, so every open window shares one venv: one window tears its
+daemon down, a sibling respawns into the same directory a moment later, and the
+rebuild fails on the sibling's lock instead. No ordering makes in-place mutation
+of that directory safe.
+
+The venv is now named for the wheels it holds — `runtime-<hash>`. A new build
+writes where nothing is executing, the old venv keeps serving the windows still
+on it, and each window moves across when it next restarts its runtime. The
+directory name is the stamp, so there is no `.wheel-hash` left to disagree with
+the contents; `.installed` is written last, so a venv interrupted between
+`python -m venv` and `pip install` is not mistaken for a finished one.
+
+`sweepOldVenvs` reclaims superseded venvs — 34 MB each — after the replacement
+is proven, never before, and treats a locked directory as in use rather than as
+a fault. Windows refuses to unlink a live `.exe`, which is what makes the sweep
+safe there. POSIX allows it: a daemon running from a swept venv keeps its open
+inodes and carries on, and rebuilds on its next restart.
+
+### 2026-08-26 — A minted token was never saved, only remembered
+
+A pilot on a minted gateway token was asked to paste it again on every reload,
+every new window, and after every extension update. The token had not expired;
+the gateway had accepted it minutes earlier and would have again.
+
+`this.access` is in-memory by design — a signed-in session keeps its access
+token there because `SECRET_REFRESH` is the durable half and a short-lived copy
+on disk buys nothing. A *minted* token has no refresh token: `acceptMintedToken`
+deletes that record precisely because a pasted credential does not rotate. So
+the in-memory copy was the only copy, `load()` restored the account without it,
+and the first authenticated request 401'd into `refreshOnce`'s minted branch —
+whose message, "the minted gateway token has expired; asking for another", named
+the one thing that was not true.
+
+The access token is now stored under `SECRET_ACCESS`, but only when nothing else
+can rebuild it: a rotating session still keeps its copy in memory, because
+writing it would be a second copy of a secret with a shorter life and no
+additional use. `loadAccess` reads it back through `liveToken`'s own skew, so a
+token this window would refuse to send is never one it claims to hold, and
+`forget` deletes it alongside the other two — without that, signing out in one
+window left a credential the next window would happily restore.
+
+`reconcile` reads it too. Two open windows were taking turns: one minted, the
+other saw `SECRET_ACCOUNT` change, cleared its own token, found nothing to
+replace it with, and prompted — which minted again. Reading the stored token on
+the cross-window path is what ends the loop.
+
+Worth naming for the next person who bisects this: nothing here regressed. The
+bug shipped with the minted-token path and needed only an extension-host restart
+to surface, which is exactly what installing a rebuilt `.vsix` does — so a day
+of packaging fixes made a latent fault look like a new one.
 
 ### 2026-08-26 — The greeting that burned seventeen turns
 

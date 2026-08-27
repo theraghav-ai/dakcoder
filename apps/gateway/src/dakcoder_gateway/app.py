@@ -23,6 +23,8 @@ Scattering that decision through the routes is how one path ends up returning
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -66,7 +68,21 @@ class Gateway:
 
 
 def create_app(gateway: Gateway) -> FastAPI:
-    app = FastAPI(title="dakcoder gateway", version=gateway.version)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """Nothing to do on the way up; on the way down, let the accounting land.
+
+        Settlement is deliberately not awaited inside the request that caused it
+        — see ``ModelProxy._schedule_settlement`` for why awaiting it there looks
+        right and does not work — which leaves exactly one window where a turn
+        can still be lost: the server stopping while a reconcile is in flight.
+        This closes it.
+        """
+        yield
+        if gateway.proxy is not None:
+            await gateway.proxy.drain()
+
+    app = FastAPI(title="dakcoder gateway", version=gateway.version, lifespan=lifespan)
     app.state.gateway = gateway
 
     # -- error translation --------------------------------------------------

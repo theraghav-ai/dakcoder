@@ -144,7 +144,38 @@ class Loopback:
 
     def start(self, task: str, *, mode: Mode = Mode.PLANNER, acceptance=()) -> Session:
         session = self.sessions.create(task)
+        # Recorded before the loop is spawned, so the developer's own words are
+        # the first row of the transcript rather than something only the panel
+        # that happened to be open at the time remembers.
+        session.record(Event(EventType.USER, {"text": task, "turn": 0}))
         self._spawn(session, task, mode, tuple(acceptance))
+        return session
+
+    def follow_up(self, session: Session, text: str, *, mode: Mode = Mode.PLANNER) -> Session:
+        """Another message in the same conversation.
+
+        This is what a chat panel does when a run has finished and the developer
+        types again. It is deliberately *not* ``start``: a new session would give
+        the model a new context, so the second question would be answered by
+        something that had never seen the first one — and it is deliberately not
+        ``resume``, which re-seeds the original task to have another go at work
+        that did not land.
+
+        The session's context manager is reused, so the working set — every file
+        already read, every answer already given — carries forward, and the
+        budget and compaction machinery see one growing conversation rather than
+        a series of amnesiac ones.
+        """
+        if session.running:
+            raise RuntimeError("that session is still running")
+
+        session.status = Status.RUNNING
+        session.finished_at = None
+        session.summary = ""
+        session.cancel = threading.Event()
+        session.winding_down = threading.Event()
+        session.record(Event(EventType.USER, {"text": text, "turn": session.turns}))
+        self._spawn(session, text, mode, (), continued=True)
         return session
 
     def _spawn(
@@ -153,12 +184,14 @@ class Loopback:
         task: str,
         mode: Mode,
         acceptance: tuple[str, ...],
+        *,
+        continued: bool = False,
     ) -> None:
         """Build a loop for this session and run it on a worker thread.
 
-        Factored out of ``start`` so ``resume`` drives the identical path. Two
-        code paths that both "run a session" drift, and the one that drifts is
-        always the one nobody demos.
+        Factored out of ``start`` so ``resume`` and ``follow_up`` drive the
+        identical path. Two code paths that both "run a session" drift, and the
+        one that drifts is always the one nobody demos.
         """
         loop = asyncio.get_running_loop()
 
@@ -170,6 +203,19 @@ class Loopback:
             self.approvals[request.id] = PendingApproval(request.id, session.id, request)
 
         agent = self.build_loop(session, approve)
+        # Set here rather than asked of ``build_loop``, so a factory that knows
+        # nothing about sessions stays a factory. Without it every ledger row
+        # this run produces is attributed to no session at all.
+        agent.session_id = session.id
+        if continued:
+            # The conversation *is* the context manager. ``build_loop`` hands
+            # back a fresh one because most runs want one; a follow-up wants the
+            # one that already holds the exchange, and swapping it here keeps
+            # ``build_loop`` a factory rather than something that has to know
+            # about session lifecycles.
+            prior = self.contexts.get(session.id)
+            if prior is not None:
+                agent.context = prior
         agent.on_pending = register
         agent.cancelled = session.cancel.is_set
         agent.winding_down = session.winding_down.is_set
@@ -197,7 +243,9 @@ class Loopback:
 
         def run() -> None:
             try:
-                for event in agent.run(task, acceptance=acceptance, start=mode):
+                for event in agent.run(
+                    task, acceptance=acceptance, start=mode, continued=continued
+                ):
                     emit(event)
             except Exception as exc:  # noqa: BLE001 - a crashed run must still close
                 emit(Event(EventType.ERROR, {"message": f"the run failed: {exc}"}))
@@ -515,29 +563,40 @@ def create_app(runtime: Loopback) -> FastAPI:
         return runtime.resume(session, note=note).as_dict()
 
     @app.post("/v1/sessions/{session_id}/messages")
-    async def steer_session(
+    async def message_session(
         session_id: str,
         body: dict[str, Any],
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        """Queue a correction the run reads before its next turn.
+        """Send the session another message, whatever state it is in.
 
-        Without this the only way to disagree with a run in progress is Stop,
-        which ends it and discards every turn of context it had built. A
-        correction that arrives after the run is not a correction.
+        One endpoint rather than two, and the state decides what the message
+        means:
+
+        * **running** — it queues as a correction the run reads before its next
+          turn. Without that, the only way to disagree with a run in progress is
+          Stop, which ends it and discards every turn of context it had built,
+          and a correction that arrives after the run is not a correction.
+        * **finished** — it is the next message in the conversation, and the run
+          starts again on the same context.
+
+        The caller cannot make that decision without a race: a run can end
+        between reading the status and posting the message, and a client that
+        guessed wrong would get a 409 for a message the developer had already
+        typed. Here the branch is taken under the same view of the session that
+        acts on it.
         """
         authorise(authorization)
         session = runtime.sessions.get(session_id) or _missing()
         text = str(body.get("text", "")).strip()
         if not text:
             raise HTTPException(status_code=400, detail="text is required")
-        if not session.running:
-            raise HTTPException(
-                status_code=409,
-                detail="that session is not running; resume it or start a follow-up task",
-            )
-        session.steer(text)
-        return {"id": session.id, "queued": session.queued}
+
+        if session.running:
+            session.steer(text)
+        else:
+            runtime.follow_up(session, text, mode=Mode(str(body.get("mode", "planner"))))
+        return session.as_dict()
 
     @app.post("/v1/sessions/{session_id}/wind-down")
     async def wind_down(

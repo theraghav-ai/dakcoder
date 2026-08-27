@@ -295,7 +295,7 @@ export class ApprovalService implements vscode.Disposable {
     });
     if (!note) return;
     try {
-      await this.deps.client.steer(pending.sessionId, note);
+      await this.deps.client.message(pending.sessionId, note);
     } catch (err) {
       void vscode.window.showWarningMessage(
         vscode.l10n.t('The note could not be queued: {0}', message(err)),

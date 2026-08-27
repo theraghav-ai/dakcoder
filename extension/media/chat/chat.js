@@ -48,7 +48,22 @@
   const restored = vs.getState() || {};
   /** Ordered row descriptors. The render is a pure function of these. */
   let rows = Array.isArray(restored.rows) ? restored.rows : [];
-  let lastEventId = typeof restored.lastEventId === 'number' ? restored.lastEventId : 0;
+  /**
+   * How far through the host's ring this panel has read.
+   *
+   * The host's own counter, not a wire event id. Event ids restart at 1 for
+   * every session, so a cursor made of them cannot order a ring that spans two
+   * — and a replay filtered on one silently dropped a new conversation's
+   * opening rows because an older one had already reached higher ids.
+   */
+  let lastSeq = typeof restored.lastSeq === 'number' ? restored.lastSeq : 0;
+  /**
+   * Which session the events arriving now belong to. Row keys are namespaced by
+   * it: ids are unique only *within* a session, so without this the second
+   * conversation's `assistant:1` lands on the first one's row and replaces an
+   * answer that is already on screen.
+   */
+  let session = typeof restored.session === 'string' ? restored.session : '';
 
   const byKey = new Map();
   const nodes = new Map();
@@ -63,7 +78,25 @@
    *  persisted server-side either, and a restored webview waits for the real
    *  `assistant` event rather than inventing a partial one. */
   let openAssistant = null;
-  let localSeq = 0;
+  /**
+   * Numbers the rows this panel invents — the optimistic echo of a message the
+   * developer just typed, and host notices. Restored rather than reset, because
+   * a rebuilt panel starts again from 1 and its first echo then collides with a
+   * `user:local:1` already in the restored rows: `put` finds the key taken,
+   * keeps the old row and repaints the *new* text over it. That is the same
+   * overwrite the session namespace fixes for server events.
+   */
+  let localSeq = typeof restored.localSeq === 'number' ? restored.localSeq : 0;
+  /**
+   * Which run of this conversation is going.
+   *
+   * A session now holds every message of a conversation, so it holds several
+   * runs. Most rows are keyed by an event id and are distinct anyway; the gate
+   * grid is not - it is keyed by kind, because its whole job is to put attempt 1
+   * and attempt 2 of *one* run side by side. Without this the second message's
+   * gate would be drawn into the first message's grid and overwrite it.
+   */
+  let runIndex = typeof restored.runIndex === 'number' ? restored.runIndex : 0;
   let domId = 0;
 
   // ── small helpers ─────────────────────────────────────────────────────────
@@ -152,11 +185,34 @@
     if (saveTimer) return;
     saveTimer = setTimeout(function () {
       saveTimer = null;
-      vs.setState({ rows: rows.slice(-MAX_ROWS), lastEventId: lastEventId });
+      vs.setState({
+        rows: rows.slice(-MAX_ROWS),
+        lastSeq: lastSeq,
+        session: session,
+        localSeq: localSeq,
+        runIndex: runIndex,
+      });
     }, 400);
   }
 
   // ── the row table ─────────────────────────────────────────────────────────
+
+  /**
+   * A row key, namespaced by the session the event came from.
+   *
+   * Wire event ids are monotonic *within a session* and restart at 1 for the
+   * next one. Keying on the id alone meant a second conversation's first
+   * `assistant` event carried the same key as the first conversation's, so its
+   * text was painted over a row that already held an answer — the answer to the
+   * previous question simply became the answer to this one.
+   *
+   * Approvals are exempt: their ids are minted by the runtime and unique across
+   * sessions, and the host synthesises `approval_resolved` with no session of
+   * its own to name.
+   */
+  function keyFor(kind, id) {
+    return session + '/' + kind + ':' + id;
+  }
 
   function put(row) {
     if (!byKey.has(row.key)) {
@@ -192,9 +248,43 @@
     }
   }
 
+  /**
+   * Remove the optimistic echo of a message the runtime has now confirmed.
+   *
+   * The composer draws what was typed straight away, because a round trip the
+   * developer can feel makes the panel seem broken. The runtime then records the
+   * same message and it arrives as a `user` event. Only one of the two may stay,
+   * and it has to be the server's: the echo is keyed by a counter local to this
+   * window, so it would be the copy that a replay could not match and a second
+   * panel would never have.
+   */
+  function dropEcho(text) {
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const row = rows[i];
+      // Stop at the first row the server put there. A `user` event always
+      // arrives before the run it opens, so its echo can only be inside the run
+      // of locally-invented rows at the very end — and bounding the search there
+      // is what stops a follow-up that repeats an earlier sentence word for word
+      // from deleting the earlier one.
+      if (row.key.indexOf('/') !== -1) return false;
+      if (row.kind === 'user' && row.pending && row.text === text) {
+        rows.splice(i, 1);
+        byKey.delete(row.key);
+        const node = nodes.get(row.key);
+        if (node && node.isConnected) node.remove();
+        nodes.delete(row.key);
+        return true;
+      }
+    }
+    return false;
+  }
+
   function clearAll() {
     rows = [];
-    lastEventId = 0;
+    lastSeq = 0;
+    session = '';
+    localSeq = 0;
+    runIndex = 0;
     byKey.clear();
     nodes.clear();
     pendingApprovals.clear();
@@ -1097,15 +1187,29 @@
   // ── the event reducer ─────────────────────────────────────────────────────
 
   function applyEvent(event) {
-    if (typeof event.id === 'number' && event.id > lastEventId) lastEventId = event.id;
     const d = event.data || {};
 
     switch (event.type) {
+      /*
+       * The developer's own message, as the runtime recorded it. The composer
+       * has usually drawn it already — optimistically, so typing feels
+       * immediate — and that echo is dropped here rather than left to sit above
+       * an identical row. Adopting the server's copy is what makes the message
+       * survive a panel rebuild: the echo is this window's invention and the
+       * event is in the transcript.
+       */
+      case 'user': {
+        const text = String(d.text || '');
+        dropEcho(text);
+        put({ key: keyFor('user', event.id), kind: 'user', text: text, steering: false });
+        return;
+      }
+
       case 'turn_start': {
         attempt = typeof d.attempt === 'number' ? d.attempt : 1;
         openAssistant = null;
         put({
-          key: 'turn:' + event.id,
+          key: keyFor('turn', event.id),
           kind: 'turn',
           turn: d.turn,
           mode: d.mode,
@@ -1116,7 +1220,7 @@
 
       case 'assistant_delta': {
         if (!openAssistant) {
-          openAssistant = put({ key: 'assistant:' + event.id, kind: 'assistant', text: '' });
+          openAssistant = put({ key: keyFor('assistant', event.id), kind: 'assistant', text: '' });
         }
         openAssistant.text += String(d.text || '');
         paint(openAssistant);
@@ -1125,7 +1229,8 @@
 
       case 'assistant': {
         // The authoritative text replaces whatever the deltas folded together.
-        const row = openAssistant || put({ key: 'assistant:' + event.id, kind: 'assistant', text: '' });
+        const row =
+          openAssistant || put({ key: keyFor('assistant', event.id), kind: 'assistant', text: '' });
         row.text = String(d.text || '');
         paint(row);
         openAssistant = null;
@@ -1136,7 +1241,7 @@
       case 'tool_call': {
         openAssistant = null;
         put({
-          key: 'tool:' + d.id,
+          key: keyFor('tool', d.id),
           kind: 'tool',
           id: d.id,
           name: String(d.name || ''),
@@ -1147,8 +1252,8 @@
       }
 
       case 'tool_result': {
-        const row = byKey.get('tool:' + d.id) || put({
-          key: 'tool:' + d.id,
+        const row = byKey.get(keyFor('tool', d.id)) || put({
+          key: keyFor('tool', d.id),
           kind: 'tool',
           id: d.id,
           name: String(d.name || ''),
@@ -1212,7 +1317,7 @@
 
       case 'plan': {
         put({
-          key: 'plan:' + event.id,
+          key: keyFor('plan', event.id),
           kind: 'plan',
           text: String(d.text || ''),
           steps: typeof d.steps === 'number' ? d.steps : 0,
@@ -1224,7 +1329,7 @@
       case 'gate': {
         if (d.kind === 'compaction') {
           put({
-            key: 'compact:' + event.id,
+            key: keyFor('compact', event.id),
             kind: 'compaction',
             before: d.before,
             after: d.after,
@@ -1232,7 +1337,7 @@
           });
           return;
         }
-        const key = 'gate:' + (d.kind || 'full');
+        const key = keyFor('gate', runIndex + ':' + (d.kind || 'full'));
         let row = byKey.get(key);
         if (!row) {
           row = put({ key: key, kind: 'gate', gkind: d.kind || 'full', attempts: [] });
@@ -1276,7 +1381,7 @@
         if (!tightest) return;
         const window = d.window || {};
         put({
-          key: 'quota:' + event.id,
+          key: keyFor('quota', event.id),
           kind: 'quota',
           text: fmt(S.quota, tightest.name, tightest.used, tightest.cap),
           name: String(tightest.name || ''),
@@ -1287,13 +1392,16 @@
       }
 
       case 'steer':
-        put({ key: 'steer:' + event.id, kind: 'steer' });
+        put({ key: keyFor('steer', event.id), kind: 'steer' });
         return;
 
       case 'finish': {
         openAssistant = null;
+        // The run is over; anything the next message starts belongs to a grid of
+        // its own.
+        runIndex += 1;
         put({
-          key: 'finish:' + event.id,
+          key: keyFor('finish', event.id),
           kind: 'finish',
           outcome: String(d.outcome || 'done'),
           summary: String(d.summary || ''),
@@ -1307,7 +1415,7 @@
 
       case 'error': {
         const message = String(d.message || d.error || '');
-        put({ key: 'error:' + event.id, kind: 'error', message: message });
+        put({ key: keyFor('error', event.id), kind: 'error', message: message });
         say(fmt(S.sayError, message.split('\n')[0]), true);
         return;
       }
@@ -1454,9 +1562,19 @@
         repaintAll();
         return;
 
-      case 'event':
+      case 'event': {
+        if (typeof message.seq === 'number') {
+          if (message.seq <= lastSeq) return; // already applied; a replay overlap
+          lastSeq = message.seq;
+        }
+        // Set before the event is reduced, because every key the reducer mints
+        // is namespaced by it.
+        if (typeof message.session === 'string' && message.session) {
+          session = message.session;
+        }
         applyEvent(message.event || {});
         return;
+      }
 
       case 'user':
         localSeq += 1;
@@ -1465,6 +1583,9 @@
           kind: 'user',
           text: String(message.text || ''),
           steering: message.steering === true,
+          // Optimistic until the runtime's own `user` event arrives and
+          // replaces it. See `dropEcho`.
+          pending: true,
         });
         return;
 
@@ -1792,7 +1913,20 @@
      * `queued` message confirms the depth.
      */
     const steering = run.phase === 'running';
-    put({ key: 'user:local:' + localSeq, kind: 'user', text: text, steering: steering });
+    put({
+      key: 'user:local:' + localSeq,
+      kind: 'user',
+      text: text,
+      steering: steering,
+      // Optimistic until the runtime's own `user` event arrives and replaces it.
+      // Set whatever the composer believes about the run, because it may be
+      // wrong: a run that ended between the last event and this keystroke means
+      // the message the panel is calling a correction is the one the runtime
+      // will record as the next thing said. A steering message really does get
+      // no `user` event — the run records those as `steer` — so its echo simply
+      // stays, which is why this is a flag and not a promise.
+      pending: true,
+    });
 
     if (known) post({ type: 'slash', command: slash[1], argument: slash[2].trim() });
     else post({ type: 'submit', text: text, steering: steering });
@@ -2033,5 +2167,5 @@
   repaintAll();
   // The host answers with `init` and replays only events past this id, the same
   // resumption the SSE client does against the runtime.
-  post({ type: 'ready', lastEventId: lastEventId });
+  post({ type: 'ready', lastSeq: lastSeq });
 })();

@@ -62,6 +62,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     workspace: workspaceRoot()?.fsPath ?? process.cwd(),
     gatewayUrl: gatewayUrl(),
     jwt: authProvider.jwt,
+    accessToken: () => authProvider.accessToken(),
     storage: context.globalStorageUri,
     extensionPath: context.extensionUri.fsPath,
     log,
@@ -272,7 +273,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Every number the panel shows is read from `state`; nothing here recomputes
   // one. That is the rule that stops two surfaces disagreeing on screen.
   context.subscriptions.push(
-    state.onDidReceive((event) => chatView.push(event)),
+    // The session travels with the event: the renderer keys its rows by it, and
+    // wire event ids are unique only within one session.
+    state.onDidReceive((event) => chatView.push(event, state.sessionId ?? '')),
     state.onDidChange(() => {
       chatView.setRunState({
         phase: state.running ? 'running' : 'idle',
@@ -338,33 +341,75 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // ── running a task ───────────────────────────────────────────────────────
 
   /**
-   * Submit, or steer.
+   * Send the composer's message.
    *
-   * Steering is the whole answer to "the agent is going the wrong way at turn
-   * 12". Without it the only correction is Stop, which ends the run and discards
-   * every turn of context it had built — and a message that arrives after the
-   * run is not a correction.
+   * **One conversation is one session.** A message typed after a run has
+   * finished continues the session it finished on; only the first message of a
+   * conversation starts a new one. Starting a session per message is what the
+   * first build did, and it produced three separate faults from one cause: the
+   * Sessions tree filled with one-line rows, the model answered the second
+   * question having never seen the first, and — because event ids restart at 1
+   * for each session — the second run's rows landed on top of the first run's in
+   * the panel and erased them.
+   *
+   * The runtime decides what the message means from the state it finds the
+   * session in, so this does not check `running` first: a run can end between
+   * the check and the post, and the whole point of steering is that a correction
+   * typed at turn 12 arrives before turn 13 rather than after the run.
    */
-  async function submit(text: string, steering: boolean): Promise<void> {
+  async function submit(text: string, _steering: boolean): Promise<void> {
     if (!(await ready())) return;
     const trimmed = text.trim();
     if (!trimmed) return;
 
-    if (steering && state.sessionId && state.running) {
-      await runtime.client.steer(state.sessionId, trimmed);
-      return;
-    }
+    // Read before the round trip. The runtime decides what the message means
+    // from the state it finds, and this is only used to interpret the answer:
+    // `queued` on a session that was already idle is a leftover, not a depth.
+    const wasRunning = state.running;
     try {
-      const session = await runtime.client.startTask(trimmed, {
-        mode: modeFor(config().get<string>('defaultMode') ?? 'multi'),
-      });
-      state.hydrate(session);
-      state.attach(session.id);
-      treeSet.sessions.refresh();
-      void statusBar.refresh(true);
+      if (state.sessionId) {
+        const session = await runtime.client.message(state.sessionId, trimmed);
+        const queued = wasRunning ? session.queued : 0;
+        state.hydrate(session);
+        // Re-attached only when the message started a run. A correction queued
+        // against a live run leaves the existing stream doing the work.
+        if (!wasRunning && session.status === 'running') state.attach(session.id);
+        // The depth, from the server that holds the queue. The panel has shown a
+        // "queued" chip since it was written and nothing ever filled it, so a
+        // correction typed at turn 12 gave no sign it had been received.
+        chatView.setQueued(queued);
+        treeSet.sessions.refresh();
+        void statusBar.refresh(true);
+        return;
+      }
+      await startConversation(trimmed);
     } catch (err) {
+      // The session may have been deleted, or trimmed off the end of the
+      // runtime's 200-session table, or belong to a runtime that has since
+      // restarted. None of those are the developer's problem: their message is
+      // the start of a new conversation instead of a lost one.
+      if (err instanceof HttpError && err.status === 404 && state.sessionId) {
+        state.reset();
+        try {
+          await startConversation(trimmed);
+          return;
+        } catch (retry) {
+          reportRunError(retry, log);
+          return;
+        }
+      }
       reportRunError(err, log);
     }
+  }
+
+  async function startConversation(task: string): Promise<void> {
+    const session = await runtime.client.startTask(task, {
+      mode: modeFor(config().get<string>('defaultMode') ?? 'multi'),
+    });
+    state.hydrate(session);
+    state.attach(session.id);
+    treeSet.sessions.refresh();
+    void statusBar.refresh(true);
   }
 
   async function openSession(session: SessionSummary): Promise<void> {
@@ -379,19 +424,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   async function followUp(session: SessionSummary, note: string): Promise<void> {
     if (!(await ready())) return;
-    // A finished run takes a follow-up, not a resume: re-running a successful
-    // change would re-enter the gate loop on something that already passed.
-    const seeded = isResumable(session.status)
-      ? undefined
-      : `${session.task}\n\nFollow-up: ${note}`;
-    if (seeded) {
-      await submit(seeded, false);
-      return;
+    try {
+      // A finished run takes a follow-up, not a resume: re-running a successful
+      // change would re-enter the gate loop on something that already passed.
+      // Either way it continues *this* session — the row the developer clicked —
+      // rather than whichever conversation the panel happens to be showing.
+      //
+      // The note used to travel as the old task re-typed with the follow-up
+      // appended, because starting a new session was the only way to say
+      // anything to a finished one and a new session remembered nothing. The
+      // runtime keeps the conversation now, so the note is just the note.
+      const next = isResumable(session.status)
+        ? await runtime.client.resume(session.id, note)
+        : await runtime.client.message(session.id, note);
+      state.hydrate(next);
+      state.attach(next.id);
+      treeSet.sessions.refresh();
+      await vscode.commands.executeCommand('dakcoder.chat.focus');
+    } catch (err) {
+      reportRunError(err, log);
     }
-    const resumed = await runtime.client.resume(session.id, note);
-    state.hydrate(resumed);
-    state.attach(resumed.id);
-    treeSet.sessions.refresh();
   }
 
   function slash(command: string, argument: string): void {
@@ -459,13 +511,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   command('dakcoder.compactContext', async () => {
-    if (!state.sessionId) {
+    // Guarded on `running`, not just on having a session. `/compact` reaches the
+    // runtime as an ordinary message, and a message to a session that has
+    // finished is the next thing the developer wants said — so on an idle
+    // session this would start a run whose task was the literal word "/compact".
+    if (!state.sessionId || !state.running) {
       void vscode.window.showInformationMessage(
-        vscode.l10n.t('There is no session to compact yet.'),
+        vscode.l10n.t('There is no run in progress to compact.'),
       );
       return;
     }
-    await runtime.client.steer(state.sessionId, '/compact').catch(() => undefined);
+    await runtime.client.message(state.sessionId, '/compact').catch(() => undefined);
   });
 
   command('dakcoder.restartRuntime', async () => {
@@ -482,7 +538,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Declared in the manifest by the chat module, which owns the behaviour but
   // not the activation. A command in the palette with no registration throws
   // when invoked, and the palette is exactly where someone finds it.
-  command('dakcoder.clearChat', () => chatView.clear());
+  /**
+   * Clear the panel *and* end the conversation.
+   *
+   * Both halves, because the transcript on screen and the session the next
+   * message would continue are one thing to a developer. Clearing only the view
+   * would leave the next message appended to a conversation they had just
+   * watched disappear; clearing only the session would leave rows on screen that
+   * nothing can be said to.
+   */
+  command('dakcoder.clearChat', () => {
+    state.detach();
+    state.reset();
+    chatView.clear();
+    void statusBar.refresh(true);
+  });
   command('dakcoder.focusComposer', () => chatView.focusComposer());
   command('dakcoder.doctor', () => doctorService.run({ reveal: true }));
   command('dakcoder.chat.focus', () => vscode.commands.executeCommand('dakcoder.chat.focus'));

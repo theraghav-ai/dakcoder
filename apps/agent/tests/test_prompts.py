@@ -44,6 +44,20 @@ def test_every_mode_has_an_overlay(mode: Mode) -> None:
     assert str(mode) in text.lower() or mode.name.lower() in text.lower()
 
 
+def test_the_system_prompt_states_what_is_out_of_scope() -> None:
+    """The agent is a Go backend engineer, not an assistant.
+
+    Asserted because the failure is invisible: an agent that cheerfully answers
+    "how are you" looks like it is working. It is spending a shared GPU budget on
+    a question nobody deployed it for, and every such answer is a turn of quota
+    the developer waiting behind it does not get. The rule lives in the *system*
+    prompt rather than a mode overlay so that no mode can be entered without it.
+    """
+    prompt = system_prompt().lower()
+    assert "out of scope" in prompt
+    assert "one sentence" in prompt, "a decline that rambles is an answer"
+
+
 # ── the stable prefix ───────────────────────────────────────────────────────
 
 

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from dakcoder_shared.config import Deployment, LLMConfig
-from dakcoder_shared.llm import ChatResult, LLMClient
+from dakcoder_shared.llm import ChatResult, LLMClient, Metering
 
 from .context import ContextManager, OverBudgetError
 from .modes import Mode, config_for
@@ -74,6 +74,7 @@ def complete(
     tools: Sequence[dict[str, Any]] | None = None,
     role: str = "coder",
     enforce_budget: bool = True,
+    session_id: str = "",
 ) -> TurnResult:
     """Dispatch one turn from a context manager.
 
@@ -86,6 +87,13 @@ def complete(
     reconciliation is the whole reason ``stream_options.include_usage`` is sent
     on every call, and skipping it here would leave the estimate a guess for the
     life of the process.
+
+    The same estimate goes *out* with the call, as metering headers. This is the
+    only place that knows all four facts the gateway needs — which session, which
+    turn, which mode, and how big the prompt is — so it is the only place that
+    can send them. Without them the gateway reserves against a deliberately
+    generous fallback that is never refunded, which is how quota comes to report
+    a figure with no relationship to what was actually spent.
     """
     mode_config = config_for(context.mode)
     usage = context.usage()
@@ -104,6 +112,12 @@ def complete(
         enable_thinking=mode_config.enable_thinking,
         tools=tools,
         temperature=mode_config.temperature,
+        metering=Metering(
+            session_id=session_id,
+            turn=context.turn,
+            mode=str(context.mode),
+            estimated_tokens=usage.total,
+        ),
     )
 
     if result.usage.prompt_tokens > 0:

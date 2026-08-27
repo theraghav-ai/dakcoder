@@ -54,6 +54,18 @@ export const DAKCODER_SCOPES: readonly string[] = ['openid', 'profile', 'email',
 
 const SECRET_REFRESH = 'dakcoder.auth.refresh';
 const SECRET_ACCOUNT = 'dakcoder.auth.account';
+/**
+ * The access token itself, stored only when nothing else can rebuild it.
+ *
+ * A signed-in session keeps its access token in memory on purpose: the refresh
+ * token is the durable half, and a short-lived copy on disk buys nothing. A
+ * *minted* token has no refresh token — `acceptMintedToken` deletes the record
+ * precisely because a pasted credential does not rotate — so the in-memory copy
+ * was the only copy, and every reload, every new window and every extension-host
+ * restart landed on `refreshOnce`'s minted branch and asked for the token again.
+ * It was never expired. It was never saved.
+ */
+const SECRET_ACCESS = 'dakcoder.auth.access';
 const SECRET_PKCE = 'dakcoder.auth.pkce.';
 /** State values of flows still in the air, so orphans can be swept — see `sweep`. */
 const PENDING_INDEX = 'dakcoder.auth.pending';
@@ -357,7 +369,7 @@ export class DakcoderAuthProvider
     // deliberately short: a guess that outlives the credential is worse than a
     // guess that expires early, because only one of them fails silently.
     const remaining = claims.exp ? claims.exp - Math.floor(Date.now() / 1000) : 3600;
-    this.setAccess(token, Math.max(60, remaining));
+    await this.setAccess(token, Math.max(60, remaining));
     await this.secrets.store(SECRET_ACCOUNT, JSON.stringify(account));
 
     const session = sessionOf(account, token);
@@ -709,7 +721,7 @@ export class DakcoderAuthProvider
     // rather than an account it cannot mint a token for.
     await this.secrets.store(SECRET_REFRESH, result.refresh_token);
     this.account = account;
-    this.setAccess(result.access_token, result.expires_in);
+    await this.setAccess(result.access_token, result.expires_in);
     await this.secrets.store(SECRET_ACCOUNT, JSON.stringify(account));
 
     const session = sessionOf(account, result.access_token);
@@ -718,9 +730,15 @@ export class DakcoderAuthProvider
     return session;
   }
 
-  private setAccess(token: string, expiresIn: number): void {
+  private async setAccess(token: string, expiresIn: number): Promise<void> {
     const lifetime = Math.max(60, expiresIn) * 1000;
     this.access = { token, expiresAt: Date.now() + lifetime };
+    // Only the credential that cannot be rebuilt. A rotating session recovers
+    // its access token from `SECRET_REFRESH`, so writing this one would be a
+    // second copy of a secret with a shorter life and no additional use.
+    if (this.account?.minted) {
+      await this.secrets.store(SECRET_ACCESS, JSON.stringify(this.access));
+    }
     if (this.proactive) clearTimeout(this.proactive);
     /*
      * A minted token has nothing to refresh *into*, so there is no timer.
@@ -763,6 +781,17 @@ export class DakcoderAuthProvider
     // below would be wrong twice over — there is no refresh token to have been
     // rejected, and on this host there is no `/v1/auth/refresh` to ask.
     if (this.account?.minted) {
+      // Look before concluding. `forget` is global — it deletes the shared
+      // record every window reads — but arriving here only means *this* window
+      // has no usable copy in memory, which is the ordinary state of a window
+      // whose extension host restarted. Treating that as expiry is what let two
+      // idle windows delete a credential a third had stored 200ms earlier, over
+      // and over: each sign-in woke them, each failed to find a token it had
+      // never held, and each answered by signing everybody out.
+      await this.loadAccess();
+      const shared = this.liveToken();
+      if (shared) return shared;
+
       this.log.info('the minted gateway token has expired; asking for another');
       // Read before `forget` clears the record it lives on.
       await this.forget(true);
@@ -814,7 +843,7 @@ export class DakcoderAuthProvider
       // Stored before the access token is handed out: the old refresh token is
       // already spent, so losing the rotated one costs a full sign-in.
       await this.secrets.store(SECRET_REFRESH, rotated.refresh_token);
-      this.setAccess(rotated.access_token, rotated.expires_in);
+      await this.setAccess(rotated.access_token, rotated.expires_in);
       return { kind: 'ok', token: rotated.access_token };
     } catch (err) {
       return isCredentialRejection(err) ? { kind: 'rejected' } : { kind: 'unreachable', error: err };
@@ -851,6 +880,7 @@ export class DakcoderAuthProvider
     this.proactive = undefined;
     await this.secrets.delete(SECRET_REFRESH);
     await this.secrets.delete(SECRET_ACCOUNT);
+    await this.secrets.delete(SECRET_ACCESS);
     if (!notify || !removed) return;
     // The token is already gone and consumers of this event key off id/account,
     // so an empty string is the honest value rather than a stale credential.
@@ -866,6 +896,24 @@ export class DakcoderAuthProvider
 
   private async load(): Promise<void> {
     this.account = parseAccount(await this.secrets.get(SECRET_ACCOUNT));
+    await this.loadAccess();
+  }
+
+  /**
+   * Bring back a stored minted token, or drop it if it really has expired.
+   *
+   * Read through `liveToken`'s own skew rather than a bare comparison, so a
+   * token this window would refuse to send is not one it claims to hold.
+   */
+  private async loadAccess(): Promise<void> {
+    if (!this.account?.minted) return;
+    const stored = parseAccess(await this.secrets.get(SECRET_ACCESS));
+    if (!stored) return;
+    if (stored.expiresAt - Date.now() <= SKEW_MS) {
+      await this.secrets.delete(SECRET_ACCESS);
+      return;
+    }
+    this.access = stored;
   }
 
   /**
@@ -889,8 +937,11 @@ export class DakcoderAuthProvider
     }
 
     // A different account, or a fresh sign-in elsewhere. Whatever token this
-    // window is holding belongs to the previous identity.
+    // window is holding belongs to the previous identity — but the window that
+    // minted has already stored the new one, and reading it is what stops two
+    // open windows from taking turns prompting for the same credential.
     this.access = undefined;
+    await this.loadAccess();
     const token = await this.accessToken();
     if (!token || !this.account) return;
     this.changed.fire({
@@ -1067,6 +1118,17 @@ interface Claims {
  * The only real check on a pasted token is `acceptMintedToken`'s live
  * `/v1/quota` call, which asks the one party that can answer.
  */
+function parseAccess(raw: string | undefined): { token: string; expiresAt: number } | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as { token?: unknown; expiresAt?: unknown };
+    if (typeof parsed.token !== 'string' || typeof parsed.expiresAt !== 'number') return undefined;
+    return { token: parsed.token, expiresAt: parsed.expiresAt };
+  } catch {
+    return undefined;
+  }
+}
+
 function readClaims(token: string): Claims {
   const parts = token.split('.');
   if (parts.length !== 3) return {};

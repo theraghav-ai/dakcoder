@@ -40,6 +40,7 @@ from .config import Deployment, LLMConfig
 __all__ = [
     "LLMClient",
     "ChatResult",
+    "Metering",
     "Usage",
     "ToolCall",
     "EmptyCompletionError",
@@ -58,6 +59,48 @@ RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 _HTML_TAG = re.compile(r"<[^>]+>")
 _WHITESPACE = re.compile(r"\s+")
+
+
+@dataclass(frozen=True, slots=True)
+class Metering:
+    """What the gateway needs to meter and attribute one call.
+
+    Sent as headers rather than in the body, because the body is forwarded
+    upstream and none of this is the model's business — and because the gateway
+    reads them *before* it decides whether the call may go at all.
+
+    Omitting them is not neutral. Without ``estimated_tokens`` the gateway falls
+    back to a deliberately generous guess, so every reservation over-charges
+    against every limit and the calibration loop that is meant to close the gap
+    has nothing to learn from; without ``session_id``, ``turn`` and ``mode`` the
+    ledger — the system of record for "what did this team spend on migrations
+    last month" — holds rows that cannot answer the question it exists for.
+    """
+
+    #: The agent session this turn belongs to.
+    session_id: str = ""
+    #: Which turn of that session. 1-based; 0 means "not part of a run".
+    turn: int = 0
+    #: The agent mode, so spend can be attributed per phase.
+    mode: str = ""
+    #: The caller's own estimate of the assembled prompt, in tokens. The caller
+    #: knows this exactly — it assembled the prompt — so a zero here is a caller
+    #: that did not bother rather than a call that cannot be estimated.
+    estimated_tokens: int = 0
+    #: Priority lane. Background work is shed before interactive work.
+    lane: str = "interactive"
+
+    def headers(self) -> dict[str, str]:
+        out: dict[str, str] = {"X-Lane": self.lane}
+        if self.session_id:
+            out["X-Session-Id"] = self.session_id
+        if self.turn > 0:
+            out["X-Turn"] = str(self.turn)
+        if self.mode:
+            out["X-Mode"] = self.mode
+        if self.estimated_tokens > 0:
+            out["X-Estimated-Tokens"] = str(self.estimated_tokens)
+        return out
 
 
 class UpstreamError(RuntimeError):
@@ -273,6 +316,7 @@ class LLMClient:
         tools: Sequence[dict[str, Any]] | None = None,
         temperature: float | None = None,
         recover_empty: bool = True,
+        metering: Metering | None = None,
     ) -> ChatResult:
         """Run one turn.
 
@@ -280,6 +324,10 @@ class LLMClient:
         larger budget: reasoning expands to fill whatever it is given, so a
         larger budget is what produced the spike's 31-second run for the same
         330-character answer.
+
+        ``metering`` is what the gateway bills and attributes this turn by. It
+        is optional because a probe or a one-off script has nothing meaningful
+        to put in it; a turn of an actual run always should.
         """
         body = self.build_request(
             messages,
@@ -289,25 +337,26 @@ class LLMClient:
             tools=tools,
             temperature=temperature,
         )
+        headers = metering.headers() if metering else None
         try:
-            return self._send(body)
+            return self._send(body, headers)
         except EmptyCompletionError:
             if not recover_empty or not enable_thinking:
                 raise
             retry = dict(body)
             retry["chat_template_kwargs"] = {"enable_thinking": False}
-            result = self._send(retry)
+            result = self._send(retry, headers)
             result.recovered_from_empty = True
             return result
 
     # ── transport ───────────────────────────────────────────────────────────
 
-    def _send(self, body: dict[str, Any]) -> ChatResult:
+    def _send(self, body: dict[str, Any], headers: dict[str, str] | None = None) -> ChatResult:
         last: Exception | None = None
 
         for attempt in range(1, self._config.max_attempts + 1):
             try:
-                result = self._stream_once(body)
+                result = self._stream_once(body, headers)
                 result.attempts = attempt
                 return result
             except UnsupportedParameterError:
@@ -327,8 +376,12 @@ class LLMClient:
 
         raise last or RuntimeError("request failed with no recorded cause")
 
-    def _stream_once(self, body: dict[str, Any]) -> ChatResult:
-        with self._client.stream("POST", "/chat/completions", json=body) as response:
+    def _stream_once(
+        self, body: dict[str, Any], headers: dict[str, str] | None = None
+    ) -> ChatResult:
+        with self._client.stream(
+            "POST", "/chat/completions", json=body, headers=headers
+        ) as response:
             if response.status_code >= 400:
                 response.read()
                 raise self._error_for(response)
@@ -374,6 +427,7 @@ def _consume_stream(lines: Iterator[str]) -> ChatResult:
     reasoning: list[str] = []
     calls: dict[int, dict[str, str]] = {}
     saw_content_key = False
+    done = False
 
     for line in lines:
         line = line.strip()
@@ -381,7 +435,20 @@ def _consume_stream(lines: Iterator[str]) -> ChatResult:
             continue
         payload = line[len("data:") :].strip()
         if payload == "[DONE]":
-            break
+            # Noted, not broken on. Breaking here closes the response while the
+            # server is still inside the `finally` that reconciles quota and
+            # writes the ledger row: Starlette sees the disconnect, cancels the
+            # response task, and the first `await` in that block raises
+            # `CancelledError`. The reservation is then never reconciled and the
+            # turn never reaches the ledger — which is defect D-1, and it made
+            # abandoning the last two bytes of a stream the cheapest way to use
+            # the service. Reading on to EOF costs nothing: `[DONE]` is the last
+            # frame, so this is one more iteration that ends the loop anyway.
+            done = True
+            continue
+        if done:
+            # Anything after `[DONE]` is not part of this completion.
+            continue
         try:
             chunk = json.loads(payload)
         except json.JSONDecodeError:

@@ -1,20 +1,32 @@
 # Open defects
 
 Found while bringing the server side up on VMAIPROD1 (2026-08-26). Each entry
-says what is wrong, how it was measured, and what it costs. Nothing here is
-fixed; the two defects that *were* fixed to make the stack run at all are
-recorded at the bottom for context.
+says what is wrong, how it was measured, and what it costs.
+
+**Nothing is open.** D-1 was fixed on 2026-08-27 and is kept below with its
+measurement, because the measurement is what makes the fix reviewable. The two
+defects fixed on 2026-08-26 to make the stack run at all are recorded after it.
 
 ---
 
-## D-1 · Settlement is skipped on every agent turn
+## D-1 · Settlement is skipped on every agent turn — **fixed 2026-08-27**
 
-**Severity: high.** The usage ledger has no record of real agent work, and quota
-is never reconciled.
+**Severity: high.** The usage ledger had no record of real agent work, and quota
+was never reconciled.
 
-### What happens
+**Fixed by** ARCHITECTURE D-83 (settlement is scheduled on the usage chunk, from
+live code, onto a task the app owns; `LLMClient` reads the stream to EOF) and
+D-84 (the client sends the metering headers the gateway had always read and
+nothing had ever sent). Regression tests:
+`apps/gateway/tests/test_proxy.py::test_a_client_that_stops_reading_at_done_is_still_settled`,
+which abandons the stream the way the real client did, and
+`apps/shared/tests/test_llm.py::test_the_stream_is_read_to_the_end_rather_than_abandoned_at_done`.
+Every other proxy test drains to EOF, which is why this passed CI for as long as
+it did.
 
-`ModelProxy.stream` reserves quota, relays the stream, and settles in a
+### What happened
+
+`ModelProxy.stream` reserved quota, relayed the stream, and settled in a
 `finally`:
 
 ```python
@@ -27,26 +39,26 @@ finally:
 `_settle` awaits `quota.reconcile(...)` and then `ledger.record(...)`.
 
 The client — `LLMClient._consume_stream` in `apps/shared/src/dakcoder_shared/llm.py`
-— breaks out of the loop when it sees `[DONE]`:
+— broke out of the loop when it saw `[DONE]`:
 
 ```python
 if payload == "[DONE]":
     break
 ```
 
-and then closes the response. Starlette sees the disconnect and cancels the
-response task. The generator's `finally` runs under cancellation, so the first
-`await` inside it raises `CancelledError` immediately. Neither the reconcile nor
-the ledger write completes.
+and then closed the response. Starlette saw the disconnect and cancelled the
+response task. The generator's `finally` ran under cancellation, so the first
+`await` inside it raised `CancelledError` immediately. Neither the reconcile nor
+the ledger write completed.
 
-The docstring states the opposite intent, which is what makes this a defect
-rather than a design choice:
+The docstring stated the opposite intent, which is what made this a defect rather
+than a design choice:
 
 > Settlement runs in a `finally`: a client that disconnects mid-stream has still
 > spent whatever the model produced, and losing that would make abandoning turns
 > the cheapest way to use the service.
 
-A cancelled task cannot await, so the `finally` cannot deliver that guarantee.
+A cancelled task cannot await, so the `finally` could not deliver that guarantee.
 
 ### Measured
 
@@ -74,41 +86,45 @@ with make_client(cfg) as c:
     c.chat([{"role": "user", "content": "hi"}], role="fast", max_tokens=4, enable_thinking=False)
 PY
 
-docker exec dakmithra_redis redis-cli -n 3 zcard 'q:{dev:localdev}:hour_tokens'   # +1
-docker exec dakcoder-postgres psql -tA -U postgres -d dakcoder -c "select count(*) from usage_events;"  # unchanged
+docker exec dakmithra_redis redis-cli -n 3 zcard 'q:{dev:localdev}:hour_tokens'   # now +2
+docker exec dakcoder-postgres psql -tA -U postgres -d dakcoder -c "select count(*) from usage_events;"  # now +1
 ```
 
 Observed in the wild too: a ~25-turn planner run produced 179 events and dozens
 of `200 OK` lines in the gateway log, and **zero** rows in `usage_events`.
 
-### What it costs
+### What it cost
 
 1. **No usage history for agent work.** The ledger is described as the system of
-   record — "what did this team spend on migrations last month" — and it holds
-   only turns made by something that reads the stream to EOF. Every turn the
-   agent itself makes is missing. LiteLLM's spend tables still see the traffic,
-   but they know nothing about session, mode or task class, which is precisely
-   why the ledger exists (§16.6).
-2. **Quota is charged at the estimate, permanently.** The reservation is never
-   reconciled, so an over-estimate is never refunded and an under-estimate is
-   never made up. `_estimate`'s fallback is deliberately generous, so in practice
-   users are over-charged against every limit — and the calibration loop that is
-   supposed to close that gap has no measurements to learn from.
-3. **The `saw_usage` fallback never fires**, so a genuinely broken endpoint that
-   stops emitting usage chunks would look identical to normal operation.
+   record — "what did this team spend on migrations last month" — and it held
+   only turns made by something that read the stream to EOF. Every turn the agent
+   itself made was missing. LiteLLM's spend tables still saw the traffic, but
+   they know nothing about session, mode or task class, which is precisely why
+   the ledger exists (§16.6).
+2. **Quota was charged at the estimate, permanently.** The reservation was never
+   reconciled, so an over-estimate was never refunded and an under-estimate never
+   made up. `_estimate`'s fallback is deliberately generous, so in practice users
+   were over-charged against every limit — and the calibration loop that is
+   supposed to close that gap had no measurements to learn from. Compounded by
+   the missing `X-Estimated-Tokens` header (D-84): the generous fallback was in
+   force on every call, not only on the ones that forgot.
+3. **The `saw_usage` fallback never fired**, so a genuinely broken endpoint that
+   stopped emitting usage chunks would have looked identical to normal operation.
 
-### Suggested direction
+### Why the obvious fix was not the fix
 
-Settlement must outlive the request. Detaching it from the cancelled task —
-`asyncio.shield`, or handing the settlement to a task the app owns and awaits at
-shutdown — is the shape of the fix. Both change what happens when the process
-stops mid-settlement, so it needs a decision about durability, not just a
-one-line edit: a shielded task can still be lost on shutdown, which argues for
-recording *before* the reconcile, or for a small outbox.
+`asyncio.shield` around the `await` was the first thing tried and is not enough.
+The `finally` is not guaranteed to run at a useful moment at all: a generator
+suspended at its last `yield` — which is exactly where one ends up when the
+client stops reading after `[DONE]` — is finalised whenever the object is
+collected, which can be under cancellation, at loop shutdown, or never.
 
-Worth adding whichever way it goes: a test where the client closes the response
-after `[DONE]` and the ledger row is still asserted. Every existing proxy test
-drains the stream, which is why this passed CI.
+What ships instead schedules settlement from live code, on the usage chunk, one
+frame before `[DONE]`, onto a task created on the app's loop. A task created
+there is a sibling of the request rather than a child, so cancelling the request
+does not touch it. The `finally` stays as the fallback for streams that end
+*without* a usage chunk. `ModelProxy.drain`, awaited in the app's lifespan,
+closes the last window: the process stopping while a reconcile is in flight.
 
 ---
 
@@ -145,3 +161,4 @@ These two were fixed on 2026-08-26 because nothing ran without them.
   `chatcmpl-tool-<hex>` shape, and `prompt_tokens_details.cached_tokens` is
   absent so prefix-cache hit rate is not measurable. Both are upstream
   observations the probe exists to surface, not faults in this code.
+

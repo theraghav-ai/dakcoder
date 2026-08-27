@@ -30,7 +30,7 @@
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build:test": "tsc --outDir dist-test --module CommonJS --moduleResolution Node --target ES2022 --lib ES2022,DOM --skipLibCheck --rootDir src --esModuleInterop --types node,vscode src/test/protocol.test.ts src/test/state.test.ts",
-    "test": "npm run build:test && node --test dist-test/test/protocol.test.js dist-test/test/state.test.js",
+    "test": "npm run build:test && node --test dist-test/test/protocol.test.js dist-test/test/state.test.js src/test/renderer.test.mjs",
     "verify": "npm run typecheck && npm run test && npm run compile && npm run check:credentials && npm run check:commands && npm run check:l10n && npm run check:gotools",
     "package": "npm run verify && npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository",
     "check:credentials": "node scripts/check-no-credentials.mjs",

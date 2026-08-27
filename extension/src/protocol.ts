@@ -18,6 +18,7 @@ export type EventType =
   | 'turn_start'
   | 'assistant'
   | 'assistant_delta'
+  | 'user'
   | 'tool_call'
   | 'tool_pending'
   | 'tool_result'

@@ -40,7 +40,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from dakcoder_shared.envelope import Event, EventType, ToolResult
-from dakcoder_shared.llm import LLMClient, ToolCall
+from dakcoder_shared.llm import LLMClient, Metering, ToolCall
+from dakcoder_shared.tokens import estimate_tokens
 
 from .context import ContextManager, Message, OverBudgetError, Recap
 from .gate import GateReport, full_gate, inner_loop
@@ -179,6 +180,7 @@ class AgentLoop:
         cancelled: Callable[[], bool] = lambda: False,
         winding_down: Callable[[], bool] = lambda: False,
         max_turns: int = 40,
+        session_id: str = "",
     ) -> None:
         self.context = context
         self.client = client
@@ -204,6 +206,11 @@ class AgentLoop:
         #: finish and leave the workspace in a coherent state.
         self.winding_down = winding_down
         self.max_turns = max_turns
+        #: Passed to the gateway on every call, so quota and the ledger can
+        #: attribute a turn to the run it belongs to. Empty is legitimate — the
+        #: CLI and the tests drive the loop with no session behind it — but a
+        #: run served over the loopback API always sets it.
+        self.session_id = session_id
         self.state = _State()
         self.result: RunResult | None = None
 
@@ -215,9 +222,22 @@ class AgentLoop:
         *,
         acceptance: Sequence[str] = (),
         start: Mode = Mode.PLANNER,
+        continued: bool = False,
     ) -> Iterator[Event]:
-        """Drive the run, yielding events as they happen."""
-        self.context.set_task(task, acceptance=acceptance)
+        """Drive the run, yielding events as they happen.
+
+        ``continued`` is a follow-up on a context that already holds an
+        exchange. The new message is *appended to the working set* rather than
+        re-pinned as the task, for two reasons. The pinned task layer sits above
+        the working set, so re-pinning would put the newest message before the
+        answers to the older ones and read as though the model replied before
+        being asked. And the original task is what the conversation is about —
+        replacing it discards the subject while keeping the answers.
+        """
+        if continued:
+            self.context.append_user(task)
+        else:
+            self.context.set_task(task, acceptance=acceptance)
         self._switch(start)
 
         for _ in range(self.max_turns):
@@ -276,6 +296,7 @@ class AgentLoop:
                 self.context,
                 self.client,
                 tools=self.router.schemas_for(self.state.mode),
+                session_id=self.session_id,
             )
         except OverBudgetError as exc:
             # The context manager exists to prevent this, so reaching it means
@@ -288,6 +309,7 @@ class AgentLoop:
                     self.context,
                     self.client,
                     tools=self.router.schemas_for(self.state.mode),
+                    session_id=self.session_id,
                 )
             except OverBudgetError:
                 self.result = RunResult(
@@ -556,7 +578,18 @@ class AgentLoop:
         )
 
     def _switch(self, mode: Mode) -> None:
-        if mode is self.state.mode and self.context.turn > 0:
+        """Enter a mode, unless we are already in it.
+
+        Both halves of "already" are checked. ``state.mode`` is this loop's idea
+        of where it is; ``context.mode`` is what the message list actually
+        carries, and on a follow-up they start out disagreeing — the loop is
+        newly built and defaults to Planner, while the context is still wherever
+        the previous run left it. Guarding on the loop's copy alone let a
+        conversation that ended in the Debugger answer its next message with the
+        Debugger's overlay and budget under a loop dispatching the Planner's
+        tools.
+        """
+        if mode is self.state.mode and mode is self.context.mode and self.context.turn > 0:
             return
         self.state.mode = mode
         self.state.recent.clear()
@@ -647,6 +680,15 @@ class AgentLoop:
                 role="summariser",
                 max_tokens=1024,
                 enable_thinking=False,
+                # Compaction is a real cost against the developer's quota, and
+                # an unmetered one is a hole in the accounting that grows with
+                # exactly the long runs the ledger most needs to explain.
+                metering=Metering(
+                    session_id=self.session_id,
+                    turn=self.context.turn,
+                    mode="summariser",
+                    estimated_tokens=estimate_tokens(_RECAP_PROMPT + transcript),
+                ),
             )
         except Exception:  # noqa: BLE001 - a degraded recap beats ending the run
             return fallback
