@@ -271,7 +271,9 @@ _No parameters._
 
 Check that routes are named and swagger generation is enabled, so endpoints reach /docs/v3Doc.json. This checks; it does not generate.
 
-_No parameters._
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `paths` | string |  | Comma-separated paths to check. Omit for the whole workspace — but the gate always scopes it, so a legacy service's other handlers do not block a change that never touched them. |
 
 ### `go_mod`
 

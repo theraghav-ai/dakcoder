@@ -151,7 +151,26 @@ class Loopback:
         self._spawn(session, task, mode, tuple(acceptance))
         return session
 
-    def follow_up(self, session: Session, text: str, *, mode: Mode = Mode.PLANNER) -> Session:
+    def _resume_mode(self, session: Session) -> Mode:
+        """Where a follow-up picks up.
+
+        The mode the conversation is actually in, not the Planner.
+
+        ``follow_up`` preserves the context with some care — the docstring below
+        explains why an amnesiac second question is unacceptable — and then
+        threw away the other half of where the run had got to. A session that
+        had just produced a plan and stopped for approval answered "go" by
+        entering the Planner and planning it again, because the default said so.
+        That is the same amnesia one level up: the working set remembered the
+        plan and the loop did not.
+
+        Falls back to the Planner when there is no context yet, which is a new
+        conversation and exactly where the Planner belongs.
+        """
+        context = self.contexts.get(session.id)
+        return context.mode if context is not None else Mode.PLANNER
+
+    def follow_up(self, session: Session, text: str, *, mode: Mode | None = None) -> Session:
         """Another message in the same conversation.
 
         This is what a chat panel does when a run has finished and the developer
@@ -175,7 +194,7 @@ class Loopback:
         session.cancel = threading.Event()
         session.winding_down = threading.Event()
         session.record(Event(EventType.USER, {"text": text, "turn": session.turns}))
-        self._spawn(session, text, mode, (), continued=True)
+        self._spawn(session, text, mode or self._resume_mode(session), (), continued=True)
         return session
 
     def _spawn(
@@ -601,7 +620,16 @@ def create_app(runtime: Loopback) -> FastAPI:
         if session.running:
             session.steer(text)
         else:
-            runtime.follow_up(session, text, mode=Mode(str(body.get("mode", "planner"))))
+            # No default here. This read `body.get("mode", "planner")`, which
+            # made every follow-up an explicit request for the Planner and left
+            # `follow_up`'s own default unreachable — so a session that had
+            # produced a plan and stopped for approval answered "go" by planning
+            # it again. Absent means "carry on where the conversation is"; a
+            # client that genuinely wants a mode still says so and is obeyed.
+            requested = body.get("mode")
+            runtime.follow_up(
+                session, text, mode=Mode(str(requested)) if requested else None
+            )
         return session.as_dict()
 
     @app.post("/v1/sessions/{session_id}/wind-down")

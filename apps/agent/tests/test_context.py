@@ -501,7 +501,14 @@ def test_the_mode_layer_does_not_grow_without_limit():
 
     modes = [m for m in cm.build() if m.layer is Layer.MODE]
     assert len(modes) <= MAX_MODE_MESSAGES
-    assert modes[-1].content == "Report; do not fix.", "the current mode must be the last word"
+    # `endswith` rather than `==`: every overlay after the first is prefixed with
+    # a line saying it replaces the ones above it. Bounding the stack kept the
+    # head from growing; it did nothing about six sets of live instructions, and
+    # the Verifier read the Coder's and announced it was about to make an edit.
+    assert modes[-1].content.endswith("Report; do not fix."), (
+        "the current mode must be the last word"
+    )
+    assert "replaces the mode instructions above it" in modes[-1].content
 
 
 def test_re_entering_the_mode_you_are_in_restates_nothing():
@@ -602,3 +609,23 @@ def test_the_tools_array_is_counted_against_the_budget():
 
     assert cm.usage().tools == 1_414
     assert cm.usage().total > sum(cm.usage().by_layer.values()) - 1
+
+
+def test_each_overlay_says_it_replaces_the_ones_above_it():
+    """The Verifier is handed no write tool and its overlay opens "Report; do
+    not fix anything here". It announced "My job is to make the edit" on four
+    separate turns, because the Coder's instruction was still sitting two
+    messages above its own in the pinned head.
+
+    Bounding the stack at six stopped it growing; it did not stop six sets of
+    instructions all reading as current.
+    """
+    cm = manager()
+    cm.set_task("t")
+    cm.switch_mode(Mode.CODER, "Execute one plan step.")
+    cm.switch_mode(Mode.VERIFIER, "Report; do not fix anything here.")
+
+    overlays = [m for m in cm.build() if m.layer is Layer.MODE]
+    assert "replaces" not in overlays[0].content, "the first overlay replaces nothing"
+    assert "replaces the mode instructions above it" in overlays[-1].content
+    assert "verifier" in overlays[-1].content

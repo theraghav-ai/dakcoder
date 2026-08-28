@@ -25,3 +25,4 @@ code-review/
 # defects against a file nobody ships.
 apps/*/build/
 apps/*/*.egg-info/
+error.txt

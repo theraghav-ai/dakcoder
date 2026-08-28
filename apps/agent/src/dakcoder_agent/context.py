@@ -343,6 +343,8 @@ class ContextManager:
         self._tool_schema_tokens = tool_schema_tokens
 
         self._mode_messages: list[Message] = []
+        #: The last raw mode instruction, for the dedupe in `switch_mode`.
+        self._last_mode_instruction = ""
         self._task: Message | None = None
         self._task_text = ""
         self._plan_text = ""
@@ -535,11 +537,37 @@ class ContextManager:
         """
         self._config = config_for(mode)
         text = instruction.strip()
-        if self._mode_messages and self._mode_messages[-1].content == text:
+
+        # Bounding the stack was not enough on its own: six overlays is still
+        # six sets of instructions, and the model has no way to know which of
+        # them is now in force. In the field the Verifier — whose overlay opens
+        # "Report; do not fix anything here", and which is handed no write tool
+        # — announced "My job is to make the edit" on four separate turns. It
+        # was reading the Coder's instruction, which was still sitting in the
+        # head two messages above its own.
+        #
+        # So each overlay after the first says plainly that it replaces what came
+        # before. Cheap, and it keeps the append-only discipline: the earlier
+        # messages are not rewritten, they are just no longer ambiguous.
+        # Compared before the preamble is added, not after. The preamble only
+        # appears from the second overlay onwards, so comparing the rendered text
+        # would find the first Coder entry ("Execute one plan step.") different
+        # from the second ("You are now in coder mode… Execute one plan step.")
+        # and append a duplicate — turning the cheapest bound here into a no-op.
+        if self._mode_messages and self._last_mode_instruction == text:
             return
+
+        if self._mode_messages:
+            text = (
+                f"You are now in {self._config.mode} mode. This replaces the mode "
+                "instructions above it — where they differ, this one is right and the "
+                f"others describe phases that have already happened.\n\n{text}"
+            )
+
         self._mode_messages.append(
             Message(Role.USER, text, Layer.MODE, source=f"mode:{self._config.mode}")
         )
+        self._last_mode_instruction = instruction.strip()
         del self._mode_messages[:-MAX_MODE_MESSAGES]
 
     def begin_turn(self) -> int:

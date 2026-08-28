@@ -262,3 +262,64 @@ def test_the_go_stages_skip_without_a_module_at_the_root(tmp_path, sidecar) -> N
     # Nothing ran, so nothing may claim to have passed.
     assert all(r.skipped for r in report.results)
 
+
+
+def test_swagger_check_is_scoped_to_what_the_run_touched(gate: Recorder, router: Router) -> None:
+    """The stage that made a legacy service unfixable.
+
+    It was the one lint stage in the gate that ran unscoped. The service in the
+    field has eight handlers predating the contract, none with a `Routes()`
+    method, so an unscoped check returned all eight as blocking — and a change
+    touching two files failed on seven it had never opened. The Verifier
+    reported them as pre-existing twice; the ladder sent it back to the Coder
+    anyway, because a blocking stage blocks whatever the report says.
+
+    `_swagger_check` already stated the principle for its config half — "block
+    on what this run did, report what was already broken". It just was not
+    applied to the half that blocks.
+    """
+    full_gate(router, ["handler/user.go", "repo/postgres/user.go"])
+
+    args = dict(next(a for name, a in gate.calls if name == "swagger_check"))
+    assert args.get("paths"), "swagger_check was handed the whole workspace"
+    assert "handler/user.go" in args["paths"]
+
+
+def test_swagger_check_sits_out_a_run_that_touched_no_go_files(
+    gate: Recorder, router: Router
+) -> None:
+    """A run that changed nothing has nothing for a scoped stage to check, and
+    saying so beats failing it on damage that was there beforehand."""
+    gate.fails("swagger_check")
+    report = full_gate(router, [])
+
+    stage = next(r for r in report.results if r.name == "swagger_check")
+    assert stage.skipped, "an empty scope still ran the check"
+    assert "swagger_check" not in gate.order
+
+
+def test_an_advisory_failure_is_reported_even_when_something_blocks(
+    gate: Recorder, router: Router
+) -> None:
+    """`govalid_gen` failed on every attempt of every run in the field session
+    and was never once diagnosed.
+
+    It is non-blocking, so it never became `blocked_by`; and the summary carried
+    advisory output only when nothing blocked, which on a legacy service is
+    never. So it showed in the panel as a red mark with nothing behind it, and
+    its output reached the model zero times. A stage that fails silently for a
+    whole session is worse than one that does not run.
+    """
+    # The field ordering: `go_build` passes, the advisory stage fails, and a
+    # later blocking stage is what stops the gate. Failing `go_build` instead
+    # would stop before the advisory stage ever ran.
+    gate.fails("govalid_gen", "cannot regenerate: renamed field Foo")
+    gate.fails("swagger_check", "handler/user.go has no Routes() method")
+
+    summary = full_gate(router, ["handler/user.go"]).summary()
+
+    assert "no Routes() method" in summary, "the blocking failure must still lead"
+    assert "cannot regenerate: renamed field Foo" in summary, (
+        "the advisory failure was dropped because something else blocked"
+    )
+    assert "not blocking" in summary

@@ -406,3 +406,39 @@ async def test_a_streamed_turn_leaves_the_transcript_alone(
     kinds = [e["type"] for e in full["transcript"]]
     assert "assistant_delta" not in kinds
     assert "assistant" in kinds
+
+
+async def test_a_follow_up_with_no_mode_carries_on_where_the_conversation_is(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """"go" must not mean "plan it again".
+
+    ``follow_up`` took care to preserve the context and then threw away the
+    other half of where the run had got to: the mode defaulted to Planner, in
+    the signature *and* again in the route. So a session that had produced a
+    plan and stopped answered "go" by entering the Planner and re-orienting.
+    The field transcript shows that happening to "go", "do it" and "you are not
+    writing anything" in turn, with the model politely re-reading the same files
+    each time.
+
+    Absent means carry on. A client that names a mode is still obeyed — the test
+    above covers that.
+    """
+    from dakcoder_agent.modes import Mode
+
+    session = await start(client)
+    await settle(session["id"], scripted)
+    context = scripted.contexts[session["id"]]
+    context.switch_mode(Mode.CODER, "coding")
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/messages", json={"text": "go"}
+    )
+    assert response.status_code == 200, response.text
+    await settle(session["id"], scripted)
+
+    overlays = [m.content for m in context.build() if m.source.startswith("mode:")]
+    assert overlays, "no mode overlay was ever appended"
+    assert "Plan first" not in overlays[-1], (
+        "a bare follow-up re-entered the Planner instead of carrying on"
+    )

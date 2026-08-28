@@ -167,11 +167,27 @@ class GateReport:
         header = "gate: PASS" if self.ok else "gate: FAIL"
         body = "\n".join(lines)
 
+        advisory = "\n\n".join(f"{w.name}:\n{w.content}" for w in self.warnings)
+
         failure = self.blocked_by
         if failure is not None:
-            return f"{header}\n{body}\n\n{failure.name} failed:\n{failure.content}"
-        if self.warnings:
-            advisory = "\n\n".join(f"{w.name}:\n{w.content}" for w in self.warnings)
+            # The advisory output goes in here too.
+            #
+            # It used to be dropped whenever anything blocked, and that is how a
+            # `govalid_gen` failure survived a whole session unexamined: it is
+            # non-blocking, so it never became the failure, and something else
+            # always was — so its output never reached the model once. It showed
+            # in the panel as a red mark with nothing behind it, on every attempt
+            # of every run. A stage that fails silently for the life of a session
+            # is worse than one that does not run.
+            out = f"{header}\n{body}\n\n{failure.name} failed:\n{failure.content}"
+            if advisory:
+                out += (
+                    "\n\nAlso failing, not blocking — fix these only if they bear on "
+                    f"the above:\n\n{advisory}"
+                )
+            return out
+        if advisory:
             return f"{header}\n{body}\n\n{advisory}"
         return f"{header}\n{body}"
 
@@ -273,10 +289,15 @@ GATE: tuple[Stage, ...] = (
         skip_reason=_NO_MODULE,
     ),
     Stage("rules_lint", "rules_lint", _scoped, when=_has_go, skip_reason=_NO_MODULE),
+    # Scoped, like the other lint stages. Unscoped it reported every legacy
+    # handler in the service as a blocker, so no change to a service that
+    # predates the contract could ever clear the gate — the exact failure the
+    # `_scoped` comment at the top of this file was written to prevent, in the
+    # one stage that did not use it.
     Stage(
         "swagger_check",
         "swagger_check",
-        lambda ctx: {},
+        _scoped,
         when=_has_go,
         skip_reason=_NO_MODULE,
     ),

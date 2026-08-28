@@ -136,6 +136,24 @@ class _State:
     last_failure: dict[str, str] = field(default_factory=dict)
     #: The turn each compaction fired on, for the thrash detector.
     compactions: list[int] = field(default_factory=list)
+    #: Consecutive turns in a mode that can write which wrote nothing and called
+    #: nothing. Announcing an edit is not making one, and the difference is
+    #: invisible to every text-based detector here: the model paraphrases itself
+    #: each turn — "Making the edit now", "I have the exact text. Making the edit
+    #: now" — so ``said`` and ``echoes`` never match twice. This counts actions
+    #: rather than words, which cannot be paraphrased around. Reset by any
+    #: mutation. See ``_narrating``.
+    idle: int = 0
+    #: ``router.mutations`` as of the last idle check. Separate from
+    #: ``mutations_seen`` because that one belongs to ``_stuck`` and is already
+    #: up to date by the time ``_narrating`` runs.
+    idle_mutations: int = 0
+    #: How many times each path has been read, and the ranges it was read at.
+    #: The slice ledger keeps the *context* from growing when a file is read
+    #: seven times; it does nothing about the seven turns. Reset for a path when
+    #: that path is written, because re-reading what you just changed is the
+    #: correct move. See ``_re_reading``.
+    reads: dict[str, list[str]] = field(default_factory=dict)
     plan: str = ""
     last_gate: GateReport | None = None
     #: The workspace state the last full gate ran against: how many mutations
@@ -210,6 +228,26 @@ MIN_QUESTIONS = 2
 #: compaction is being undone by the turn that follows it. See ``_thrashing``.
 COMPACTION_WINDOW = 8
 MAX_CLOSE_COMPACTIONS = 3
+
+#: How many turns a writing mode may spend calling nothing before the run stops.
+#:
+#: One is ordinary and means "I am done, run the gate" — that is the normal exit
+#: from an executing mode. Two is the ping-pong starting: the gate came back
+#: failing, the Verifier reported it, and the Coder returned with prose. Three
+#: is a model narrating an edit it is not making, which is what happened for six
+#: turns until the Verifier said so itself: *"I'm stuck in a loop — I keep
+#: saying I'll make the edit but not actually calling patch_file."*
+MAX_IDLE_EXECUTING = 3
+
+#: The modes that can write. ``_narrating`` counts idle turns only in these:
+#: the Planner and the Verifier are supposed to end with prose and no tool call,
+#: because that is how they hand on.
+_EXECUTING = frozenset({Mode.CODER, Mode.SCAFFOLDER, Mode.DEBUGGER})
+
+#: How many times one path may be read before the loop answers with what it
+#: already has. Three is enough for read, edit, re-read; the seventh read of one
+#: file in eight turns is the Planner going in circles, which is what it did.
+MAX_READS = 3
 
 
 class AgentLoop:
@@ -485,6 +523,16 @@ class AgentLoop:
             yield from self._tool_calls(result.chat.tool_calls)
             return
 
+        if why := self._narrating():
+            self.result = RunResult(
+                Outcome.NO_PROGRESS,
+                why,
+                self.context.turn,
+                tuple(self.router.touched),
+                self.state.last_gate,
+            )
+            return
+
         if result.chat.content and (why := self._repeating(result.chat.content)):
             self.result = RunResult(
                 Outcome.NO_PROGRESS,
@@ -590,6 +638,43 @@ class AgentLoop:
                 )
                 continue
 
+            # The fourth read of one file, at a fourth set of line numbers.
+            #
+            # `_stuck` fingerprints the whole call, so re-reading `message.go` at
+            # lines 1-120, then 60-180, then 200-480 is three different calls and
+            # invisible to it. The slice ledger keeps that from growing the
+            # *context* — only the newest read survives — and does nothing about
+            # the turns, which is how a Planner spent seven of its first eight
+            # reading one file and then stopped for no progress without ever
+            # producing a plan.
+            #
+            # Answered rather than refused: the model is told what it has already
+            # read and that the newest read is still in front of it. A path that
+            # has been written since is not counted, because re-reading what you
+            # just changed is the correct move.
+            if ranges := self._re_reading(call):
+                self.context.append_tool_result(
+                    call.name,
+                    f"Not run: you have already read this file {len(ranges)} times this "
+                    f"run, at {', '.join(ranges)}. The most recent read is still in "
+                    "context above — older ones were collapsed because they were "
+                    "superseded, not because they were lost.\n\n"
+                    "Re-reading it again will not show you anything new. Either act on "
+                    "what you have, or say plainly what you are looking for and cannot "
+                    "find.",
+                    tool_call_id=call.id,
+                )
+                yield Event(
+                    EventType.TOOL_RESULT,
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "ok": False,
+                        "content": f"already read {len(ranges)} times this run; not re-read",
+                    },
+                )
+                continue
+
             yield Event(
                 EventType.TOOL_CALL,
                 {"id": call.id, "name": call.name, "arguments": _safe_args(call)},
@@ -630,6 +715,12 @@ class AgentLoop:
             # Kept so a repeat of this exact call can be answered with what it
             # returned, instead of running it a second time to find out.
             self.state.last_failure[fingerprint] = outcome.for_model()[:600]
+
+            # A file that was just written is worth reading again; the ledger of
+            # how often it has been read starts over. Without this, the read
+            # limit below would eventually refuse the one re-read that matters.
+            for mutation in outcome.mutations:
+                self.state.reads.pop(mutation.path, None)
 
             self.context.append_tool_result(
                 call.name,
@@ -795,7 +886,8 @@ class AgentLoop:
             Outcome.UNVERIFIED,
             "the gate did not come clean after "
             f"{MAX_ATTEMPTS} coder attempts and {MAX_DEBUG_CYCLES} debug cycles"
-            + (f"; blocked at {report.blocked_by.name}" if report and report.blocked_by else ""),
+            + (f"; blocked at {report.blocked_by.name}" if report and report.blocked_by else "")
+            + self._unfinished(),
             self.context.turn,
             tuple(self.router.touched),
             report,
@@ -905,6 +997,97 @@ class AgentLoop:
         """
         tail = self.state.recent[-2:]
         return len(tail) == 2 and tail[0] == tail[1]
+
+    def _unfinished(self) -> str:
+        """Files the plan named that were never written.
+
+        A run that stops with half its plan applied says so. The field
+        transcript ended "38 turns · 1 file, blocked at swagger_check" — true,
+        and it buried the thing that actually went wrong: the repo function
+        landed and the handler never did, so the developer was left with a
+        query nothing called. The blocked stage was the pre-existing one; the
+        unwritten handler was this run's.
+
+        Read off the plan text rather than tracked per step, because the loop
+        never learns which step it is on — a step is prose, and the only
+        machine-checkable thing in it is the paths it names.
+        """
+        if not self.state.plan:
+            return ""
+        named = {m.group(0) for m in _PLAN_PATH.finditer(self.state.plan)}
+        missing = sorted(named - set(self.router.touched))
+        if not missing or len(missing) == len(named):
+            # All of them missing means the plan named files by some convention
+            # this does not read, and reporting every path as unwritten would be
+            # noise dressed as a finding.
+            return ""
+        return (
+            ". The plan named files this run never wrote: " + ", ".join(missing)
+        )
+
+    def _re_reading(self, call: ToolCall) -> list[str]:
+        """The ranges a path has already been read at, once that is too many.
+
+        Returns empty until the limit is reached, so the ordinary read-edit-read
+        cycle is untouched; the ledger is cleared for a path the moment that
+        path is written.
+        """
+        if call.name != "read_file":
+            return []
+        parsed = _safe_args(call)
+        path = parsed.get("path") if isinstance(parsed, dict) else None
+        if not isinstance(path, str) or not path:
+            return []
+
+        start, end = parsed.get("start"), parsed.get("end")
+        where = f"lines {start}-{end}" if start or end else "the whole file"
+        seen = self.state.reads.setdefault(path, [])
+        if len(seen) >= MAX_READS:
+            return seen
+        seen.append(where)
+        return []
+
+    def _narrating(self) -> str:
+        """Whether a mode that can write has stopped writing and started talking.
+
+        Counts actions, not words, and that is the whole point. Every other
+        detector here compares reply text, and the run this exists for evaded
+        all of them by paraphrasing: "Making the edit now", then "I have the
+        exact current text. Making the edit now", then the same with the gate
+        restated in front of it. Six turns of that, across Coder and Debugger,
+        with `patch_file` called once. The Verifier eventually wrote *"I'm stuck
+        in a loop — I keep saying I'll make the edit but not actually calling
+        patch_file"*, which is the diagnosis this method makes two turns
+        earlier and acts on.
+
+        Only executing modes count. The Planner and the Verifier are *supposed*
+        to end their turn with prose and no tool call — that is how they hand
+        on — so counting them would stop every healthy run at its first
+        handoff.
+
+        One idle turn is ordinary: it means "I am done, run the gate". Two is
+        the ping-pong starting. Three is a model narrating an edit it is not
+        making, and no further turn of it will produce one.
+        """
+        if self.state.mode not in _EXECUTING:
+            return ""
+        if self.router.mutations != self.state.idle_mutations:
+            # Something landed. Whatever it was saying, it was also working.
+            #
+            # Its own watermark, not ``mutations_seen``: that one is maintained
+            # by ``_stuck`` and is already synced by the time this runs, so
+            # sharing it made every edit invisible here and stopped a Coder that
+            # was editing on every other turn.
+            self.state.idle_mutations = self.router.mutations
+            self.state.idle = 0
+            return ""
+        self.state.idle += 1
+        if self.state.idle < MAX_IDLE_EXECUTING:
+            return ""
+        return (
+            f"{self.state.mode} spent {self.state.idle} turns describing an edit "
+            "without making one — no tool was called and no file changed"
+        )
 
     def _repeating(self, text: str) -> str:
         """Why this tool-free reply counts as no progress, or ``""`` if it does not.
@@ -1177,9 +1360,36 @@ def _slice_path(call: ToolCall, result: ToolResult) -> str | None:
     return path if isinstance(path, str) else None
 
 
-def _count_steps(plan: str) -> int:
-    return len(re.findall(r"^\s*\d+[.)]\s", plan, flags=re.MULTILINE))
+#: A numbered step, however the model chose to dress it up.
+#:
+#: This matched a bare ``1. `` at line start and nothing else, and that is the
+#: whole of a run that spent twelve turns refusing to start work. The Planner
+#: produced a real eight-step plan with ``Accepts:`` on every step — and wrote
+#: the step titles as ``**1. Add the repo function**``. Zero steps matched, so
+#: ``_advance`` read it as "not a plan", ended the run ``done``, and the
+#: developer's "go" arrived as a follow-up that began by planning again. "do
+#: it", "you are not writing anything" and one obscenity later, the model was
+#: still in the Planner, correctly reporting that it had no write tools.
+#:
+#: Markdown heading markers, bold and italics all sit between the line start and
+#: the number, and a plan is not less of a plan for being formatted. ``Step 1:``
+#: is here for the same reason: it is a step, and the loop's job is to recognise
+#: one rather than to insist on a syntax the prompt never specified.
+_STEP = re.compile(
+    r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:[*_]{1,3}[ \t]*)?"
+    r"(?:\d+[.)][ \t]|step[ \t]+\d+[.):][ \t])",
+    re.MULTILINE | re.IGNORECASE,
+)
 
+
+def _count_steps(plan: str) -> int:
+    return len(_STEP.findall(plan))
+
+
+#: A workspace-relative Go/SQL/YAML path as a plan writes one. Deliberately
+#: narrow: it has to match what the router reports in `touched` for the
+#: comparison in ``_unfinished`` to mean anything.
+_PLAN_PATH = re.compile(r"\b[\w./-]+/[\w.-]+\.(?:go|sql|ya?ml)\b")
 
 #: A step in a real plan carries one of these. The Planner is told so.
 _ACCEPTS = re.compile(r"^\s*[-*>\s]*\**\s*Accepts\s*:", re.MULTILINE | re.IGNORECASE)

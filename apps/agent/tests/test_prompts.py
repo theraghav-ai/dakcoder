@@ -166,3 +166,48 @@ def test_the_system_prompt_and_schemas_leave_the_working_set_intact() -> None:
 
     remaining = context.budget - context.usage().total - schemas
     assert remaining >= 26_000, f"only {remaining} tokens left for the working set"
+
+
+# ── the phase is not the limit ──────────────────────────────────────────────
+
+
+def test_the_prompt_frames_a_narrow_tool_list_as_a_phase_not_a_limit() -> None:
+    """Asked "can you edit files or create new files?", the agent said no.
+
+    Truthfully, about its turn: the Planner is handed thirteen read-only tools
+    and its overlay said "you have read-only tools". But the system prompt
+    described an agent that writes — `patch_file`, `write_file`, "say what you
+    are doing before each edit" — and never once said the modes were phases of
+    one run. With no frame for that, the model resolved the contradiction with
+    the more specific, more recent statement and told a developer the product
+    cannot do the thing it exists to do.
+
+    The rule lives in the *system* prompt so that no phase can be entered
+    without it.
+    """
+    text = system_prompt().lower()
+    assert "phase" in text, "nothing tells the model its tool list is a phase"
+    assert "not the limit" in text
+
+
+def test_the_read_only_phase_names_the_one_that_writes() -> None:
+    """The Planner has no write tool and is where a first message lands, so it
+    is where this question gets asked. Saying "read-only" without saying which
+    phase writes is what produced the wrong half of the answer."""
+    text = mode_instruction(Mode.PLANNER).lower()
+    assert "read-only" in text
+    assert "coder" in text, "the read-only phase must name the phase that writes"
+
+
+def test_the_planner_really_has_no_write_tool() -> None:
+    """The premise of the two tests above, asserted rather than assumed.
+
+    If this ever stops being true the prompts are describing a split that no
+    longer exists, and both tests above are checking prose against nothing.
+    """
+    writes = {"write_file", "patch_file", "delete_file", "go_mod"}
+    planner = {s["function"]["name"] for s in registry.schemas_for(Mode.PLANNER)}
+    coder = {s["function"]["name"] for s in registry.schemas_for(Mode.CODER)}
+
+    assert not (planner & writes), f"the Planner can write: {sorted(planner & writes)}"
+    assert writes <= coder, f"the Coder cannot write: {sorted(writes - coder)}"

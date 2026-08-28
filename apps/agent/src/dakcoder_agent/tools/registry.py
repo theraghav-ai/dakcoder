@@ -580,7 +580,13 @@ _SPECS: tuple[ToolSpec, ...] = (
             "Check that routes are named and swagger generation is enabled, so endpoints "
             "reach /docs/v3Doc.json. This checks; it does not generate."
         ),
-        parameters=_obj(),
+        parameters=_obj(
+            paths=_str(
+                "Comma-separated paths to check. Omit for the whole workspace — but the "
+                "gate always scopes it, so a legacy service's other handlers do not "
+                "block a change that never touched them."
+            ),
+        ),
         modes=frozenset(),
         gate_only=True,
     ),

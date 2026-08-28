@@ -486,7 +486,22 @@ def _swagger_check(sidecar: GoTools, inv: Invocation) -> ToolResult:
     blocking: list[str] = []
     advisory: list[str] = []
 
-    reply = sidecar.call("rules_lint", {"only": ["swagger-visible", "routes-in-handler"]})
+    # Scoped to what this run touched, like every other lint call in the gate.
+    #
+    # This one was unscoped, and it is why a two-file change could not pass. The
+    # service has eight legacy handlers, none of which has a `Routes()` method;
+    # an unscoped lint returned all eight as blocking, so `swagger_check` failed
+    # on seven files the run had never opened. The Verifier correctly reported
+    # them as pre-existing — twice — and the ladder sent it back to the Coder
+    # anyway, because a blocking stage is blocking whatever the report says.
+    #
+    # The split below already states the principle for the config half: "block
+    # on what this run did, report what was already broken". It simply was not
+    # applied to the half that does the blocking.
+    args: dict[str, Any] = {"only": ["swagger-visible", "routes-in-handler"]}
+    if scoped := _list(inv.arg("paths")):
+        args["paths"] = scoped
+    reply = sidecar.call("rules_lint", args)
     if reply.is_error:
         return ToolResult.failure(reply.text, fix="Correct the arguments and re-run.")
     try:

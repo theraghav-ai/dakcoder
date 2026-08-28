@@ -172,12 +172,25 @@ def test_the_gate_runs_even_when_the_model_says_it_is_done(
     assert "go_build" in ran
 
 
+def _edit(n: int) -> ChatResult:
+    """One real edit, so the run looks like a model working rather than talking.
+
+    Escalation is only worth reaching when each attempt actually changes
+    something; a Coder that answers a failing gate with prose three times is
+    caught by ``_narrating`` now, and that is a better outcome than five turns
+    of ladder. So the tests that mean to exercise the ladder have to edit.
+    """
+    return calls(("write_file", f'{{"path": "handler/user{n}.go", "content": "package handler"}}'))
+
+
 def test_a_failing_gate_does_not_finish_the_run(router: Router, gated) -> None:
     gated["fail"] = "go_build"
     agent, events = loop_over(
         router,
-        [say("1. Edit handler/user.go"), say("done"), say("the build is broken"), say("fixed"),
-         say("still broken"), say("fixed again"), say("no"), say("x"), say("y"), say("z")],
+        [say("1. Edit handler/user.go"), _edit(1), say("done"), say("the build is broken"),
+         _edit(2), say("fixed"), _edit(3), say("still broken"), _edit(4), say("fixed again"),
+         _edit(5), say("no"), _edit(6), say("x"), _edit(7), say("y"), _edit(8), say("z")],
+        approve=lambda _r: True,
     )
     assert agent.result.outcome == Outcome.UNVERIFIED
     assert any(e.data.get("kind") == "full" for e in of_type(events, EventType.GATE))
@@ -200,8 +213,13 @@ def test_failure_escalates_coder_twice_then_the_debugger(router: Router, gated) 
     seen: list[str] = []
 
     context = ContextManager(mode=Mode.PLANNER, system_prompt="s")
-    client = ScriptedClient([say("1. Edit handler/user.go")] + [say(f"turn {i}") for i in range(20)])
-    agent = AgentLoop(context, client, router)
+    # Each attempt edits. A ladder climbed on prose alone is narration, and
+    # `_narrating` ends it before the third rung — deliberately.
+    turns = [say("1. Edit handler/user.go")]
+    for i in range(10):
+        turns += [_edit(i), say(f"turn {i}")]
+    client = ScriptedClient(turns)
+    agent = AgentLoop(context, client, router, approve=lambda _r: True)
     for _ in agent.run("t"):
         seen.append(str(agent.state.mode))
 
@@ -828,13 +846,17 @@ def test_two_modes_repeating_themselves_at_each_other_is_no_progress(
     anything — the detector was structurally unable to see the shape that
     actually killed the session. It is the mode-keyed ledger that catches it.
     """
-    gated["fail"] = "swagger_check"
+    # `go_build`, not `swagger_check`: the scoped stages skip when the run has
+    # touched nothing, and this run deliberately touches nothing. `go_build` is
+    # unscoped by design — it is authoritative for the whole module — so it is
+    # the stage that still fails here and keeps the circuit turning.
+    gated["fail"] = "go_build"
     agent, _ = loop_over(
         router,
         [
             say("1. Edit handler/user.go\n   Accepts: builds"),
             say("I'll orient myself first, then plan the review."),   # coder
-            say("Stage that failed: swagger_check."),                 # verifier
+            say("Stage that failed: go_build."),                      # verifier
             say("I'll orient myself first, then plan the review."),   # coder, again
         ]
         + [say(f"filler {i}") for i in range(10)],
@@ -866,7 +888,9 @@ def test_the_gate_is_not_re_run_against_an_unchanged_workspace(
         + [say(f"attempt {i}") for i in range(12)],
     )
 
-    assert agent.result.outcome == Outcome.UNVERIFIED
+    # Ends on `_narrating`, not the ladder: this run deliberately never edits,
+    # which is now recognised for what it is rather than spent as five rungs.
+    assert agent.result.outcome == Outcome.NO_PROGRESS
     assert len(runs) == 1, f"the gate ran {len(runs)} times over one unchanged workspace"
     assert [e for e in of_type(events, EventType.GATE) if e.data.get("cached")], (
         "the client was never told the verdict was a repeat"
@@ -1038,3 +1062,186 @@ def test_the_tools_array_is_measured_before_the_compaction_decision(
     agent, _ = loop_over(router, [say("1. Edit handler/user.go\n   Accepts: builds"), say("done")])
 
     assert agent.context.usage().tools > 0, "the tools array was still counted as free"
+
+
+# ── a plan is a plan however it is formatted ────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        "1. Add the repo function\n   Accepts: go build is clean",
+        "**1. Add the repo function**\n   Accepts: go build is clean",
+        "### 1. Add the repo function\n   Accepts: go build is clean",
+        "## Step 1: Add the repo function\nAccepts: go build is clean",
+        "1) Add the repo function\n   Accepts: go build is clean",
+    ],
+    ids=["bare", "bold", "h3", "step-heading", "paren"],
+)
+def test_a_formatted_plan_still_reaches_the_coder(router: Router, gated, plan: str) -> None:
+    """The defect that cost a session twelve turns and the developer their temper.
+
+    `_count_steps` matched a bare `1. ` at line start and nothing else. The
+    Planner produced a real eight-step plan with `Accepts:` on every step and
+    wrote the titles as `**1. …**`; zero steps matched, so the loop called it
+    "not a plan", ended the run `done`, and the developer's "go" arrived as a
+    follow-up that began by planning again. Three more messages and the model
+    was still in the Planner, correctly reporting it had no write tools.
+
+    Parametrised over the formats a model actually emits, because the failure
+    was never about one of them — it was about the loop insisting on a syntax
+    the prompt never specified.
+    """
+    agent, events = loop_over(router, [say(plan), calls(("read_file", '{"path": "x.go"}'))])
+
+    assert of_type(events, EventType.PLAN), "the plan was not recognised as one"
+    assert agent.state.mode is not Mode.PLANNER, "the run never left the Planner"
+
+
+def test_a_numbered_list_of_questions_is_still_not_a_plan(router: Router, gated) -> None:
+    """The other half, which the fix above must not break: questions carry no
+    `Accepts:` line, and that is what separates them from steps."""
+    agent, events = loop_over(
+        router,
+        [say("1. What should it do?\n2. What parameters?\n3. What does it return?")],
+    )
+
+    assert not of_type(events, EventType.PLAN)
+    assert agent.result.outcome == Outcome.DONE
+    assert "asked" in agent.result.summary
+
+
+# ── narrating an edit is not making one ─────────────────────────────────────
+
+
+def test_a_coder_that_only_talks_about_editing_is_stopped(router: Router, gated) -> None:
+    """The six turns that ended the field session, caught on the third.
+
+    Turns 30, 31, 33, 35, 36 and 37 each announced the same edit in slightly
+    different words — "Making the edit now", then "I have the exact current
+    text. Making the edit now", then the same with the gate restated in front —
+    and called nothing. Every detector here compared reply text, so the
+    paraphrasing walked straight through all of them. The Verifier eventually
+    wrote "I'm stuck in a loop — I keep saying I'll make the edit but not
+    actually calling patch_file", which is a diagnosis the loop should not need
+    the model to make for it.
+
+    So this counts actions, which cannot be paraphrased.
+    """
+    gated["fail"] = "go_build"
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Edit handler/user.go\n   Accepts: builds"),
+            say("I have the anchor. Making the edit now."),
+            say("Stage that failed: go_build."),
+            say("I have the exact current text. Making the edit now."),
+            say("Still blocked at go_build. My job is to make the edit. Making it now."),
+        ]
+        + [say(f"and now, edit {i}") for i in range(12)],
+    )
+
+    assert agent.result.outcome == Outcome.NO_PROGRESS
+    assert "without making one" in agent.result.summary
+    assert agent.context.turn < 10, "it was allowed to narrate for ten turns"
+
+
+def test_the_fourth_read_of_one_file_is_answered_not_run(router: Router, gated) -> None:
+    """The Planner read repo/postgres/message.go seven times in eight turns.
+
+    Every read used a different line range, so `_stuck` — which fingerprints the
+    whole call — saw seven different calls. The slice ledger kept the context
+    from growing and did nothing about the turns, and the run stopped for no
+    progress without ever producing a plan.
+    """
+    reads = [
+        calls(("read_file", '{"path": "repo/postgres/message.go", "start": %d, "end": %d}'
+               % (i * 60, i * 60 + 120)))
+        for i in range(6)
+    ]
+    _, events = loop_over(router, reads + [say("done")])
+
+    refused = [
+        e for e in of_type(events, EventType.TOOL_RESULT)
+        if "already read" in str(e.data.get("content", ""))
+    ]
+    assert refused, "the sixth read of one file was dispatched"
+
+
+def test_re_reading_a_file_you_just_wrote_is_allowed(router: Router, gated) -> None:
+    """Checking your own edit is the correct move, so writing a path clears its
+    read ledger."""
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Edit handler/user.go\n   Accepts: builds"),
+            calls(("write_file", '{"path": "handler/user.go", "content": "package handler"}')),
+            say("done"),
+        ],
+        approve=lambda _r: True,
+    )
+    assert "handler/user.go" not in agent.state.reads
+
+
+# ── what the run leaves behind ──────────────────────────────────────────────
+
+def test_editing_between_turns_resets_the_narration_counter(router: Router, gated) -> None:
+    """The counterpart, measured rather than asserted about.
+
+    `_narrating` counts turns in which nothing changed, so the claim that has to
+    hold is comparative: a run that edits between its replies must outlive one
+    that only talks. Asserting a particular terminal outcome instead would be
+    asserting where the *other* stop conditions happen to land, which is a
+    different test and a brittle one.
+    """
+    gated["fail"] = "go_build"
+    plan = say("1. Edit handler/user.go\n   Accepts: builds")
+
+    talker, _ = loop_over(router, [plan] + [say(f"thinking about it, {i}") for i in range(14)])
+
+    worker_turns = [plan]
+    for i in range(7):
+        worker_turns += [_edit(i), say(f"edit {i} is in, moving on")]
+    worker, _ = loop_over(router, worker_turns, approve=lambda _r: True)
+
+    assert worker.context.turn > talker.context.turn, (
+        f"the run that edited stopped at turn {worker.context.turn}, no later than "
+        f"the one that only talked ({talker.context.turn})"
+    )
+    assert "without making one" in talker.result.summary
+
+
+def test_the_summary_names_plan_files_the_run_never_wrote(router: Router, gated) -> None:
+    """"38 turns · 1 file, blocked at swagger_check" was true and buried what
+    went wrong: the repo function landed, the handler never did, and the
+    developer was left with a query nothing calls. The blocked stage was
+    pre-existing; the unwritten handler was this run's.
+
+    Driven through `_unfinished` directly. Getting a scripted run to exhaust the
+    escalation ladder means threading edits past five mode switches, which tests
+    the script far more than it tests the sentence.
+    """
+    context = ContextManager(mode=Mode.CODER, system_prompt="s")
+    agent = AgentLoop(context, ScriptedClient([]), router)
+    agent.state.plan = (
+        "1. Add the repo function to repo/postgres/message.go\n"
+        "   Accepts: compiles\n"
+        "2. Add the handler to handler/message.go\n"
+        "   Accepts: builds\n"
+    )
+    router.touched.append("repo/postgres/message.go")
+
+    summary = agent._unfinished()
+
+    assert "handler/message.go" in summary
+    assert "repo/postgres/message.go" not in summary, "a file that was written was called missing"
+
+
+def test_nothing_is_reported_missing_when_the_plan_named_no_paths(router: Router) -> None:
+    """A plan that names its files by some other convention would otherwise have
+    every path reported unwritten, which is noise dressed as a finding."""
+    context = ContextManager(mode=Mode.CODER, system_prompt="s")
+    agent = AgentLoop(context, ScriptedClient([]), router)
+    agent.state.plan = "1. Add the repo function\n2. Add the handler"
+
+    assert agent._unfinished() == ""
