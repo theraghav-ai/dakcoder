@@ -16,3 +16,4 @@ __pycache__/
 # git alone. Ignoring is not the same as not being there.
 deploy/*.env
 deploy/logs/
+code-review/
