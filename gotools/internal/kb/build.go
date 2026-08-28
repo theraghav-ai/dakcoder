@@ -65,6 +65,10 @@ func Build(in BuildInput) ([]File, error) {
 
 		switch ref.Generator {
 		case "":
+			if len(ref.Sources) == 0 && ref.Body != "" {
+				body = strings.TrimSpace(ref.Body) + "\n"
+				break
+			}
 			body, err = renderFromSources(ref, load)
 		case "config-keys":
 			if ws == nil {

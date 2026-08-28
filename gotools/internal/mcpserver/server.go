@@ -106,6 +106,7 @@ func NewServer(root, version string) (*mcp.Server, error) {
 
 	addScaffoldTools(s, abs)
 	addRepoMapTool(s, abs)
+	addAuditTools(s, abs)
 	return s, nil
 }
 

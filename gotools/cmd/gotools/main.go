@@ -64,6 +64,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdFxWire(args[1:], stdout, stderr)
 	case "repo-map":
 		return cmdRepoMap(args[1:], stdout, stderr)
+	case "db-roundtrip-audit":
+		return cmdDBRoundTripAudit(args[1:], stdout, stderr)
+	case "validation-audit":
+		return cmdValidationAudit(args[1:], stdout, stderr)
+	case "temporal-audit":
+		return cmdTemporalAudit(args[1:], stdout, stderr)
+	case "lib-version-check":
+		return cmdLibVersionCheck(args[1:], stdout, stderr)
 	case "doc-check":
 		return cmdDocCheck(args[1:], stdout, stderr)
 	case "tool-catalog":
@@ -97,6 +105,10 @@ USAGE
   gotools project-scaffold   [flags]   create a new service from a spec
   gotools fx-wire            [flags]   register a constructor in bootstrapper.go
   gotools repo-map           [flags]   module, package tree, exported symbols, FX graph
+  gotools db-roundtrip-audit [flags]   per-method database round trips, N+1s first
+  gotools validation-audit   [flags]   request fields and what their validate tags miss
+  gotools temporal-audit     [flags]   work on the request path that may belong off it
+  gotools lib-version-check  [flags]   CEPT library drift (reports only, never updates)
   gotools doc-check          [flags]   verify rule citations against skill.md / SOP.md
   gotools tool-catalog       [flags]   write contract C1 (the published tool schemas)
   gotools knowledge          [flags]   build the agent's knowledge base from skill.md / SOP.md
@@ -117,6 +129,15 @@ SCAFFOLD FLAGS
   --spec FILE       JSON spec, or - to read stdin
   --dry-run         print what would be written without writing it
   --format text|json
+
+AUDIT FLAGS (db-roundtrip-audit, validation-audit, temporal-audit, lib-version-check)
+  --root DIR        workspace root (default ".")
+  --format text|json
+  --all             audits only: include entries whose verdict is already ok
+  --offline         lib-version-check only: skip the registry, report supersession
+  --timeout D       lib-version-check only: per-module lookup timeout (default 30s)
+
+  These are reports. They always exit 0; none of them gates a build.
 
 REPO-MAP FLAGS
   --root DIR        workspace root (default ".")

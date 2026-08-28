@@ -2,6 +2,7 @@ package rules
 
 import (
 	"go/ast"
+	"go/token"
 	"reflect"
 	"strconv"
 	"strings"
@@ -264,4 +265,103 @@ func newArgType(e ast.Expr) (string, bool) {
 // hasSuffixFold reports a case-insensitive suffix match.
 func hasSuffixFold(s, suffix string) bool {
 	return len(s) >= len(suffix) && strings.EqualFold(s[len(s)-len(suffix):], suffix)
+}
+
+// callsInLoops returns every matching call that sits inside the *body* of a for
+// or range statement — that is, every call whose execution repeats.
+//
+// The loop header is deliberately excluded, and that exclusion is the whole
+// reason this exists rather than a loopDepth counter over ast.Inspect. In
+//
+//	for _, u := range dblib.SelectRows(ctx, db, q, m) { ... }
+//
+// the query is a child of the RangeStmt but runs exactly once. Counting it as
+// an N+1 would be a false positive on the one rule that most needs to be
+// trusted, since its remedy is a rewrite rather than a one-line edit.
+//
+// A function literal resets nothing: a closure defined inside a loop but
+// invoked once is still ambiguous, so it inherits the loop context it was
+// written in rather than pretending to know better.
+func callsInLoops(body ast.Node, match func(*ast.CallExpr) bool) []*ast.CallExpr {
+	var out []*ast.CallExpr
+	var scan func(n ast.Node, inLoop bool)
+	scan = func(n ast.Node, inLoop bool) {
+		if n == nil {
+			return
+		}
+		switch t := n.(type) {
+		case *ast.ForStmt:
+			scan(t.Init, inLoop)
+			scan(t.Cond, inLoop)
+			scan(t.Post, inLoop)
+			scan(t.Body, true)
+			return
+		case *ast.RangeStmt:
+			scan(t.X, inLoop)
+			scan(t.Body, true)
+			return
+		}
+		if c, ok := n.(*ast.CallExpr); ok && inLoop && match(c) {
+			out = append(out, c)
+		}
+		// Descend one level and hand each child back to scan, so the loop
+		// bookkeeping above is never bypassed by Inspect's own recursion.
+		ast.Inspect(n, func(child ast.Node) bool {
+			if child == n {
+				return true
+			}
+			scan(child, inLoop)
+			return false
+		})
+	}
+	scan(body, false)
+	return out
+}
+
+// countCalls returns how many calls in a subtree satisfy match.
+func countCalls(n ast.Node, match func(*ast.CallExpr) bool) int {
+	count := 0
+	ast.Inspect(n, func(x ast.Node) bool {
+		if c, ok := x.(*ast.CallExpr); ok && match(c) {
+			count++
+		}
+		return true
+	})
+	return count
+}
+
+// methodNamed reports whether a rendered call name ends in the given method,
+// so `r.db.Begin`, `ur.Db.Begin` and `pool.Begin` all match "Begin" without the
+// rule having to know what the receiver is called.
+func methodNamed(callName string, methods ...string) bool {
+	for _, m := range methods {
+		if callName == m || strings.HasSuffix(callName, "."+m) {
+			return true
+		}
+	}
+	return false
+}
+
+// stringLitsIn returns every string literal in a subtree, unquoted.
+func stringLitsIn(n ast.Node) []*ast.BasicLit {
+	var out []*ast.BasicLit
+	ast.Inspect(n, func(x ast.Node) bool {
+		if bl, ok := x.(*ast.BasicLit); ok && bl.Kind == token.STRING {
+			out = append(out, bl)
+		}
+		return true
+	})
+	return out
+}
+
+// litValue unquotes a string literal, returning "" when it is not one.
+func litValue(bl *ast.BasicLit) string {
+	if bl == nil || bl.Kind != token.STRING {
+		return ""
+	}
+	v, err := strconv.Unquote(bl.Value)
+	if err != nil {
+		return ""
+	}
+	return v
 }

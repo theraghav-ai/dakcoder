@@ -185,7 +185,11 @@ def main(argv: list[str] | None = None) -> int:
     # Raises if DAKCODER_MODEL_API_KEY is absent — the gateway has no reason to
     # exist without it.
     config = gateway_config()
-    limits = Limits()
+    # Read from the environment rather than hard-coded, so the ceilings can be
+    # opened for a pilot and tightened afterwards with a restart instead of a
+    # deploy. DAKCODER_QUOTA_ENFORCE=false turns every one of them off; the
+    # counters keep running, which is what makes the numbers to tune from.
+    limits = Limits.from_env()
 
     import asyncio
 
@@ -214,6 +218,11 @@ def main(argv: list[str] | None = None) -> int:
                     "listening": f"http://{args.host}:{args.port}",
                     "identity": kind,
                     "quota_store": store_name,
+                    # Printed at startup because "is quota on?" is otherwise
+                    # answerable only by exceeding it, and an operator who
+                    # believes a ceiling is in force when it is not finds out
+                    # from the bill.
+                    "quota": "enforced" if limits.any_enforced else "UNMETERED (counting only)",
                     "ledger": ledger_name,
                     "upstream": config.base_url,
                     "model": config.model_coder,

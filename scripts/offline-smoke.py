@@ -159,8 +159,13 @@ try:
     check("api_version is 1.0", (health or {}).get("api_version") == "1.0")
     check("workspace reported", bool((health or {}).get("workspace")))
 
+    # An exact count, and it is meant to need a deliberate edit. The catalogue
+    # silently shrinking — a provider failing to register, a mode filter gone
+    # wrong — looks like nothing at all from the outside, and this is the only
+    # check that runs against a live daemon rather than against the registry
+    # that would have the same bug.
     status, tools = call("GET", "/v1/tools")
-    check("tool catalogue served", status == 200 and len(tools.get("tools", [])) == 29,
+    check("tool catalogue served", status == 200 and len(tools.get("tools", [])) == 33,
           f"{len(tools.get('tools', []))} tools")
 
     status, _ = call("GET", "/v1/tools", token="wrong-token")

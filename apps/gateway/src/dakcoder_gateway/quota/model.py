@@ -24,12 +24,15 @@ mechanism is a rewrite.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
 __all__ = [
+    "UNLIMITED",
     "Check",
     "Lane",
     "Limits",
@@ -38,6 +41,19 @@ __all__ = [
     "Snapshot",
     "WindowState",
 ]
+
+#: A ceiling of zero means **count this series but never refuse on it**.
+#:
+#: Not "do not count": the counters are the whole reason an unmetered period is
+#: useful. Running unmetered through a pilot and then reading the real numbers
+#: off ``/v1/quota`` is how the limits get chosen; a period that recorded
+#: nothing would leave the next value as much of a guess as the first one.
+#:
+#: Zero rather than ``None`` because zero is already the convention here —
+#: ``Snapshot.tightest`` has always skipped ``limit <= 0`` — and because it
+#: keeps every ceiling an ``int``, so no caller has to learn a new type to stay
+#: correct.
+UNLIMITED = 0
 
 
 class Lane(StrEnum):
@@ -116,9 +132,86 @@ class Limits:
             Series.WEEK_TOKENS: self.tokens_per_week,
             Series.WEEK_SESSIONS: self.sessions_per_week,
         }[series]
+        if base <= UNLIMITED:
+            # Unmetered stays unmetered in every lane. Taking a share of nothing
+            # would give background a ceiling of zero, which reads as unlimited
+            # again — right by accident, and only until someone writes
+            # `max(1, ...)` somewhere and turns it into a hard refusal.
+            return UNLIMITED
         if lane is Lane.BACKGROUND and series is not Series.WEEK_SESSIONS:
             return int(base * self.background_share)
         return base
+
+    def enforced(self, series: Series) -> bool:
+        """Whether this series can refuse a request, as opposed to only counting."""
+        return self.ceiling(series, Lane.INTERACTIVE) > UNLIMITED
+
+    @property
+    def any_enforced(self) -> bool:
+        """False when nothing can be refused — the fully unmetered configuration."""
+        return any(self.enforced(s) for s in Series)
+
+    @classmethod
+    def unmetered(cls, **overrides: Any) -> Limits:
+        """Every ceiling off: counters run, nothing is ever refused.
+
+        The configuration to run under while the agent is still being tuned, and
+        the reason ``UNLIMITED`` counts rather than skips. Pass overrides to keep
+        one guard on — ``Limits.unmetered(runs_per_window=40)`` still catches a
+        runaway retry loop while leaving token budgets open.
+        """
+        open_ceilings: dict[str, Any] = {
+            "tokens_per_window": UNLIMITED,
+            "runs_per_window": UNLIMITED,
+            "sessions_per_week": UNLIMITED,
+            "tokens_per_week": UNLIMITED,
+            "tokens_per_hour": UNLIMITED,
+        }
+        return cls(**{**open_ceilings, **overrides})
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> Limits:
+        """Build limits from the environment.
+
+        ``DAKCODER_QUOTA_ENFORCE=false`` turns every ceiling off in one move —
+        the switch to run under during pilot testing. Individual
+        ``DAKCODER_QUOTA_<NAME>`` values are read either way, so a single guard
+        can be kept while the rest are open, and so tightening later is a
+        restart rather than a deploy.
+
+        An unparseable value raises rather than falling back to a default. A
+        quota that silently ignores its configuration is worse than one that
+        refuses to start: the operator believes a limit is in force, and finds
+        out otherwise from the bill.
+        """
+        src = os.environ if env is None else env
+        fields = {
+            "tokens_per_window": "DAKCODER_QUOTA_TOKENS_PER_WINDOW",
+            "runs_per_window": "DAKCODER_QUOTA_RUNS_PER_WINDOW",
+            "sessions_per_week": "DAKCODER_QUOTA_SESSIONS_PER_WEEK",
+            "tokens_per_week": "DAKCODER_QUOTA_TOKENS_PER_WEEK",
+            "tokens_per_hour": "DAKCODER_QUOTA_TOKENS_PER_HOUR",
+        }
+        kwargs: dict[str, Any] = {}
+        for name, var in fields.items():
+            raw = src.get(var)
+            if raw is None or raw.strip() == "":
+                continue
+            kwargs[name] = _int_env(var, raw)
+
+        if (raw := src.get("DAKCODER_QUOTA_WINDOW_HOURS", "").strip()):
+            kwargs["window"] = timedelta(hours=_float_env("DAKCODER_QUOTA_WINDOW_HOURS", raw))
+        if (raw := src.get("DAKCODER_QUOTA_BACKGROUND_SHARE", "").strip()):
+            kwargs["background_share"] = _float_env("DAKCODER_QUOTA_BACKGROUND_SHARE", raw)
+
+        if not _bool_env(src.get("DAKCODER_QUOTA_ENFORCE"), default=True):
+            # The master switch wins over unset fields but not over ones the
+            # operator named explicitly: `ENFORCE=false` with an explicit
+            # RUNS_PER_WINDOW means "open the budgets, keep the loop guard".
+            for name in fields:
+                kwargs.setdefault(name, UNLIMITED)
+
+        return cls(**kwargs)
 
     def horizon(self, series: Series) -> timedelta | None:
         """How far back the series counts. ``None`` means the session window."""
@@ -131,7 +224,13 @@ class Limits:
         }[series]
 
     def as_dict(self) -> dict[str, Any]:
-        """Published at /v1/health, so the numbers in force are never a guess."""
+        """Published at /v1/health, so the numbers in force are never a guess.
+
+        ``enforced`` is published alongside them for the same reason. A payload
+        of zeroes is ambiguous — unmetered, or misconfigured to refuse
+        everything? — and the one moment somebody reads this is the moment that
+        distinction matters.
+        """
         return {
             "window_seconds": int(self.window.total_seconds()),
             "tokens_per_window": self.tokens_per_window,
@@ -141,7 +240,49 @@ class Limits:
             "tokens_per_hour": self.tokens_per_hour,
             "background_share": self.background_share,
             "cached_discount": self.cached_discount,
+            "enforced": self.any_enforced,
+            "unmetered_series": sorted(str(s) for s in Series if not self.enforced(s)),
         }
+
+
+class ConfigError(ValueError):
+    """A quota setting that cannot be parsed. Raised at startup, never ignored."""
+
+
+def _int_env(var: str, raw: str) -> int:
+    text = raw.strip().replace("_", "").replace(",", "")
+    if text.lower() in {"none", "off", "unlimited", "-"}:
+        return UNLIMITED
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{var}={raw!r} is not a whole number. Use a count, or one of "
+            "'off'/'unlimited'/0 to run that series unmetered."
+        ) from exc
+    return max(UNLIMITED, value)
+
+
+def _float_env(var: str, raw: str) -> float:
+    try:
+        return float(raw.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{var}={raw!r} is not a number") from exc
+
+
+def _bool_env(raw: str | None, *, default: bool) -> bool:
+    if raw is None or raw.strip() == "":
+        return default
+    text = raw.strip().lower()
+    if text in {"1", "true", "yes", "on", "enforce"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(
+        f"DAKCODER_QUOTA_ENFORCE={raw!r} is neither true nor false. "
+        "An ambiguous value here decides whether anyone can be refused, so it "
+        "is not guessed."
+    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -34,6 +34,34 @@ import (
 	"gitlab.cept.gov.in/it-2.0/dakcoder/gotools/internal/naming"
 )
 
+// defaultValidate is the validate tag a field gets when the spec does not name
+// one.
+//
+// It bounds the field rather than merely requiring it. `required` alone means
+// "not empty" and nothing else, so a 10MB string is valid input — and that was
+// the most systemic finding in the review of 41 production services: numeric
+// bounds asked for in 39 of them, string bounds in 34. Emitting bare `required`
+// here would scaffold the defect the review spent the most time on.
+//
+// The numbers are starting points a developer narrows, not guesses at the
+// domain. 255 is a conventional varchar bound; the numeric ceilings are wide
+// enough not to reject real data and narrow enough to reject nonsense. A spec
+// that names its own tag always wins.
+func defaultValidate(goType string) string {
+	switch goType {
+	case "string":
+		return "required,max=255"
+	case "int", "int64":
+		return "required,min=0,max=2147483647"
+	case "float64":
+		return "required,min=0"
+	default:
+		// bool has two values and time.Time parses or does not; neither takes
+		// a bound that means anything.
+		return "required"
+	}
+}
+
 // Resource is the specification of one CRUD resource.
 type Resource struct {
 	// Name is the singular Go type name, e.g. "Pension". Normalised to
@@ -491,7 +519,7 @@ func normaliseFields(fields []Field, issues []Issue) ([]Field, []Issue) {
 		// validate tag.
 		nf.Validate = strings.TrimSpace(nf.Validate)
 		if nf.Validate == "" {
-			nf.Validate = "required"
+			nf.Validate = defaultValidate(nf.Type)
 		}
 		if !tagRe.MatchString(nf.Validate) {
 			issues = append(issues, Issue{path + ".validate",

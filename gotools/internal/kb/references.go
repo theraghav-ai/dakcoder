@@ -51,6 +51,17 @@ type Reference struct {
 	// Generator names a built-in generator for references whose content comes
 	// from the workspace or the rule set rather than from a document.
 	Generator string
+	// Body is the whole reference, hand-authored, for knowledge that has no
+	// source section to extract.
+	//
+	// The four references drawn from the manual code review are like this:
+	// skill.md has nothing to say about batching, about which database library
+	// is which, or about what must never be logged, because those lessons came
+	// from reading 41 services rather than from the template. Extracting a
+	// section that does not exist is not an option, and inventing one in
+	// skill.md would put knowledge in the template that the template did not
+	// teach.
+	Body string
 }
 
 // References is the knowledge base's shape, from plan.md §14.2.
@@ -135,11 +146,30 @@ var References = []Reference{
 			"Running `govalid` is not optional either. The framework returns **422** for any " +
 			"non-GET route whose request DTO has no generated `Validate()` method, so a fresh " +
 			"resource fails before it reaches your code until the validators exist.\n\n" +
-			"Enforced by `request-dto` and `validator-generated`.",
+			"A tag must also *bound* the field, not merely require it. `validate:\"required\"` " +
+			"on a free-text string means \"not empty\" and nothing else, so a 10MB string is " +
+			"valid input. Bounds were the most systemic finding in the review of 41 services: " +
+			"numeric ranges asked for in 39 of them, string constraints in 34.\n\n" +
+			"Enforced by `request-dto`, `request-validate-depth` and `validator-generated`; " +
+			"listed field by field by `gotools validation-audit`.",
 		Corrections: []string{
 			"skill.md's worked example gives request DTOs a `ToDomain()` converter. No such " +
 				"method exists anywhere in the template; handlers pass fields positionally to " +
 				"the repository (plan.md §6). Do not add one.",
+			"skill.md teaches only `required` and `omitempty`, which is why so much production " +
+				"code carries nothing else. The vocabulary you actually need:\n\n" +
+				"| Field | Tag | Why |\n" +
+				"|---|---|---|\n" +
+				"| free text | `required,max=255` | an unbounded string is an unbounded row |\n" +
+				"| code or ref | `required,len=13` | fixed-width identifiers |\n" +
+				"| enum | `required,oneof=pending approved rejected` | rejects unknown states at the edge |\n" +
+				"| email | `required,email` | |\n" +
+				"| number | `required,min=1,max=9999` | bounds reach the database as intent |\n" +
+				"| optional number | `omitempty,min=0` | |\n" +
+				"| date string | `required,datetime=2006-01-02` | |\n" +
+				"| slice | `required,max=100,dive` | caps the request body; `dive` validates elements |\n\n" +
+				"A field that is genuinely unconstrained is fine — `omitempty` alone is an " +
+				"acceptable floor, and says the absence was deliberate.",
 		},
 		Sources: []Ref{
 			{Doc: "skill.md", Section: "Request DTO Pattern"},
@@ -283,6 +313,14 @@ var References = []Reference{
 			"gate; this is what is cheap enough to check after every edit.",
 	},
 }
+
+// init appends the references drawn from the manual code review.
+//
+// Appended rather than written inline so the two bodies of knowledge stay
+// visibly distinct: everything above is extracted from the reference template,
+// everything in references_review.go was learned from reading 41 services in
+// production. When skill.md changes, only the first set needs re-checking.
+func init() { References = append(References, reviewReferences...) }
 
 // ReferenceBySlug looks up a reference by its handle.
 func ReferenceBySlug(slug string) (Reference, bool) {

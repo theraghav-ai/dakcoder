@@ -346,3 +346,49 @@ async def test_a_failure_after_the_first_byte_becomes_an_error_event(
     assert "package " in body, "the chunks that did arrive should still be relayed"
     assert "event: error" in body
     assert "ConnectionError" in body
+
+
+# ── the gateway incident, end to end ────────────────────────────────────────
+
+
+async def test_an_exhausted_window_answers_429_not_503(client) -> None:
+    """The symptom the operator actually saw.
+
+    A full five-hour window made every ``POST /v1/llm`` return 503
+    ``quota_unavailable`` while ``GET /v1/quota`` kept answering 200 — because
+    only the metered path ran the store's ``apply``, and the parsing bug lived
+    there. 503 reads as retryable and carries no ``reset_at``, so clients
+    retried a refusal that could never succeed.
+
+    A refusal must be a 429 carrying the reset, and the two endpoints must not
+    contradict each other.
+    """
+    session = await sign_in(client)
+    headers = bearer(session)
+
+    # Fill the window. The fixture's ceiling is 50,000 tokens.
+    refused = None
+    for _ in range(40):
+        response = await client.post(
+            "/v1/llm/chat/completions",
+            headers=headers,
+            json={"model": "coder", "messages": [{"role": "user", "content": "x" * 40_000}]},
+        )
+        if response.status_code != 200:
+            refused = response
+            break
+
+    assert refused is not None, "the window should have filled"
+    assert refused.status_code == 429, (
+        f"a full window is a refusal, not an outage; got {refused.status_code} "
+        f"{refused.text}"
+    )
+    body = refused.json()
+    assert body["error"] == "quota_exceeded"
+    assert body["reset_at"], "a 429 must say when capacity returns"
+    assert "Retry-After" in refused.headers
+
+    # And the snapshot endpoint agrees rather than reporting health.
+    snapshot = await client.get("/v1/quota", headers=headers)
+    assert snapshot.status_code == 200
+    assert snapshot.json()["used"]["window_tokens"] > 0

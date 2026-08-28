@@ -13,13 +13,16 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from dakcoder_gateway.quota import (
+    UNLIMITED,
     Check,
+    ConfigError,
     Conflict,
     Lane,
     Limits,
     MemoryStore,
     QuotaExceeded,
     QuotaPolicy,
+    ScriptContractError,
     Series,
     StoreUnavailable,
 )
@@ -501,3 +504,194 @@ async def test_limits_are_published_so_the_numbers_are_never_a_guess() -> None:
     published = Limits().as_dict()
     assert published["tokens_per_hour"] == 600_000
     assert published["cached_discount"] == 1.0
+
+
+# ── configuration: unmetered now, ceilings later ────────────────────────────
+
+
+def test_unmetered_limits_never_refuse(clock: Clock) -> None:
+    """The configuration to run under while the agent is being tuned."""
+    limits = Limits.unmetered()
+    assert not limits.any_enforced
+    for series in Series:
+        assert limits.ceiling(series, Lane.INTERACTIVE) == UNLIMITED
+        assert limits.ceiling(series, Lane.BACKGROUND) == UNLIMITED, (
+            "a share of nothing is still nothing; background must not be capped "
+            "into a hard refusal while interactive runs open"
+        )
+
+
+async def test_an_unmetered_policy_counts_but_never_refuses(clock: Clock) -> None:
+    limits = Limits.unmetered()
+    p = QuotaPolicy(MemoryStore(limits), limits, clock=clock)
+
+    await p.start_run("u")
+    for _ in range(20):
+        await p.reserve("u", 5_000_000)
+
+    snap = await p.snapshot("u")
+    assert snap.used[str(Series.WINDOW_TOKENS)] == 100_000_000, (
+        "an unmetered series must still count — those numbers are what the real "
+        "ceiling gets chosen from"
+    )
+
+
+async def test_one_guard_can_stay_on_while_budgets_are_open(clock: Clock) -> None:
+    """The mixed configuration the env file documents."""
+    limits = Limits.unmetered(runs_per_window=2)
+    p = QuotaPolicy(MemoryStore(limits), limits, clock=clock)
+
+    await p.start_run("u")
+    await p.start_run("u")
+    with pytest.raises(QuotaExceeded) as caught:
+        await p.start_run("u")
+    assert caught.value.check.series is Series.WINDOW_RUNS
+
+    # ...while the token budgets stayed open throughout.
+    await p.reserve("u", 50_000_000)
+
+
+def test_from_env_reads_ceilings() -> None:
+    limits = Limits.from_env(
+        {
+            "DAKCODER_QUOTA_TOKENS_PER_HOUR": "1_200_000",
+            "DAKCODER_QUOTA_RUNS_PER_WINDOW": "80",
+            "DAKCODER_QUOTA_WINDOW_HOURS": "3",
+        }
+    )
+    assert limits.tokens_per_hour == 1_200_000
+    assert limits.runs_per_window == 80
+    assert limits.window == timedelta(hours=3)
+    # Unset values keep their defaults rather than becoming zero, which would
+    # silently open a ceiling nobody meant to open.
+    assert limits.tokens_per_week == Limits().tokens_per_week
+
+
+def test_enforce_false_opens_every_ceiling() -> None:
+    limits = Limits.from_env({"DAKCODER_QUOTA_ENFORCE": "false"})
+    assert not limits.any_enforced
+
+
+def test_an_explicit_value_survives_the_master_switch() -> None:
+    """`ENFORCE=false` means "open the budgets", not "ignore what I wrote"."""
+    limits = Limits.from_env(
+        {"DAKCODER_QUOTA_ENFORCE": "off", "DAKCODER_QUOTA_RUNS_PER_WINDOW": "40"}
+    )
+    assert limits.runs_per_window == 40
+    assert limits.tokens_per_hour == UNLIMITED
+    assert limits.any_enforced
+
+
+def test_off_and_unlimited_are_accepted_as_values() -> None:
+    limits = Limits.from_env(
+        {"DAKCODER_QUOTA_TOKENS_PER_HOUR": "off", "DAKCODER_QUOTA_TOKENS_PER_WEEK": "unlimited"}
+    )
+    assert limits.tokens_per_hour == UNLIMITED
+    assert limits.tokens_per_week == UNLIMITED
+
+
+def test_an_unparseable_setting_raises_rather_than_defaulting() -> None:
+    """A quota that ignores its configuration is worse than one that will not
+    start: the operator believes a limit is in force and learns otherwise from
+    the bill."""
+    with pytest.raises(ConfigError):
+        Limits.from_env({"DAKCODER_QUOTA_TOKENS_PER_HOUR": "600k"})
+    with pytest.raises(ConfigError):
+        Limits.from_env({"DAKCODER_QUOTA_ENFORCE": "maybe"})
+
+
+def test_health_says_whether_quota_is_enforced() -> None:
+    """A payload of zeroes is ambiguous — unmetered, or misconfigured to refuse
+    everything? The one moment somebody reads this is when that matters."""
+    published = Limits.unmetered().as_dict()
+    assert published["enforced"] is False
+    assert str(Series.HOUR_TOKENS) in published["unmetered_series"]
+
+    assert Limits().as_dict()["enforced"] is True
+    assert Limits().as_dict()["unmetered_series"] == []
+
+
+# ── our bugs are not outages ────────────────────────────────────────────────
+
+
+async def test_a_parsing_bug_is_not_reported_as_an_outage(clock: Clock) -> None:
+    """The second half of the gateway incident.
+
+    ``_guarded`` caught every exception and answered StoreUnavailable, so an
+    IndexError in our own reply parsing was reported as "Redis is unreachable"
+    — a 503, which reads as retryable — for what looked like a whole session.
+    The operator saw /v1/quota return 200 while every POST /v1/llm 503'd, which
+    is a contradiction that pointed away from the real cause.
+    """
+
+    class BrokenStore(MemoryStore):
+        async def apply(self, sub, checks, now):
+            raise IndexError("list index out of range")
+
+    limits = Limits()
+    p = QuotaPolicy(BrokenStore(limits), limits, clock=clock)
+
+    with pytest.raises(IndexError):
+        await p.reserve("u", 100)
+
+
+async def test_an_unreachable_store_still_fails_closed(clock: Clock) -> None:
+    """The behaviour that must not have regressed: infrastructure trouble is
+    still a refusal, never an unmetered success."""
+
+    class DownStore(MemoryStore):
+        async def apply(self, sub, checks, now):
+            raise ConnectionError("connection refused")
+
+    limits = Limits()
+    p = QuotaPolicy(DownStore(limits), limits, clock=clock)
+
+    with pytest.raises(StoreUnavailable):
+        await p.reserve("u", 100)
+
+
+async def test_a_script_contract_error_is_ours_not_redis(clock: Clock) -> None:
+    class DisagreeingStore(MemoryStore):
+        async def apply(self, sub, checks, now):
+            raise ScriptContractError("the Lua and this parser disagree")
+
+    limits = Limits()
+    p = QuotaPolicy(DisagreeingStore(limits), limits, clock=clock)
+
+    with pytest.raises(ScriptContractError):
+        await p.reserve("u", 100)
+
+
+def test_real_redis_failures_are_still_outages_not_bugs() -> None:
+    """The guard that keeps the fix from becoming a new bug.
+
+    ``_guarded`` now lets programming errors through as a 500. That is only
+    safe while no genuine Redis failure mode is a subclass of one of them — if
+    ``ConnectionError`` were, say, an ``OSError`` that also inherited
+    ``ValueError``, this change would silently convert every outage from a
+    fail-closed 503 into a 500 and take the retry semantics with it.
+
+    Asserted against the real exception hierarchy rather than assumed.
+    """
+    rex = pytest.importorskip("redis.exceptions")
+
+    for name in (
+        "RedisError",
+        "ConnectionError",
+        "TimeoutError",
+        "ResponseError",
+        "BusyLoadingError",
+        "AuthenticationError",
+        "InvalidResponse",
+        "NoScriptError",
+    ):
+        exc = getattr(rex, name, None)
+        if exc is None:
+            continue
+        assert not issubclass(exc, QuotaPolicy._OUR_BUGS), (
+            f"redis.exceptions.{name} would be re-raised as a 500 instead of "
+            "failing closed with a 503"
+        )
+
+    assert not issubclass(asyncio.TimeoutError, QuotaPolicy._OUR_BUGS)
+    assert not issubclass(OSError, QuotaPolicy._OUR_BUGS)

@@ -1,0 +1,93 @@
+# golangci-lint configuration for an n-api-template service.
+#
+# This is the profile for services dakcoder writes. It is NOT the profile that
+# lints gotools itself — that one lives at gotools/.golangci.yml and is
+# deliberately different, because the two codebases have different jobs.
+#
+# It exists because neither the reference template nor any reviewed service had
+# a .golangci.yml at all, so three of the reviewers' standing suggestions —
+# error handling, resource management and concurrency safety — had nothing
+# enforcing them. Those three are better served by configuration than by rules
+# we would otherwise have to write and maintain ourselves.
+#
+# The enabled set stays conservative on purpose. A linter that fires on style
+# preferences teaches people to add nolint directives, and those then hide the
+# findings that matter.
+version: "2"
+
+run:
+  timeout: 3m
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    # --- Resource management (review suggestion #9) -----------------------
+    - bodyclose # HTTP response bodies that are never closed
+    - rowserrcheck # rows.Err() unchecked after iterating
+    - sqlclosecheck # rows and statements left open
+
+    # --- Error handling (review suggestion #7) ---------------------------
+    - errorlint # %w vs %v; errors.Is/As correctness
+    - nilerr # returning nil after checking err != nil
+    - nilnil # returning (nil, nil) from a constructor
+
+    # --- Context and cancellation (review suggestion #8) -----------------
+    - contextcheck # a function passing a non-inherited context
+    - noctx # HTTP requests sent without a context
+
+    # --- Concurrency (review suggestion #12) -----------------------------
+    # The race detector is the real check here and it runs in CI
+    # (`go test -race`). These catch the two mistakes it cannot see because
+    # they are deterministic.
+    - copyloopvar
+    - makezero
+
+    # --- General correctness ----------------------------------------------
+    - gocritic
+    - misspell
+    - prealloc
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    gocritic:
+      enabled-tags: [diagnostic, performance, style]
+      # ifElseChain IS enabled here, unlike in the gotools profile.
+      #
+      # The reviewers asked for `switch` over if/else-if chains in five separate
+      # services, and service code dispatching on a status or a type code is
+      # exactly where a missing branch hides. gotools disables this check for
+      # its own source because rule dispatch genuinely reads better as if/else —
+      # different code, different answer.
+      disabled-checks:
+        - hugeParam
+    revive:
+      rules:
+        - name: exported
+          arguments: [checkPrivateReceivers]
+        - name: error-strings
+        - name: context-as-argument
+        - name: early-return
+        - name: indent-error-flow
+
+  exclusions:
+    rules:
+      # Generated validators and protobuf stubs are not hand-written code.
+      - path: _validator\.go
+        linters: [revive, gocritic, unparam, unused]
+      - path: gen/
+        linters: [revive, gocritic, unparam, unused, prealloc]
+      # Tests build deliberately awkward fixtures; the style rules that apply
+      # to production code are noise there.
+      - path: _test\.go
+        linters: [gocritic, revive, unparam, prealloc, bodyclose]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

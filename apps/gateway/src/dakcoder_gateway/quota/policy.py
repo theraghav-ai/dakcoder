@@ -35,7 +35,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .model import Check, Lane, Limits, QuotaExceeded, Series, Snapshot, WindowState
-from .store import Applied, Conflict, MemoryStore, QuotaStore
+from .store import Applied, Conflict, MemoryStore, QuotaStore, ScriptContractError
 
 __all__ = ["QuotaPolicy", "Reservation", "StoreUnavailable"]
 
@@ -353,13 +353,32 @@ class QuotaPolicy:
             )
         return applied
 
+    #: Failures that mean "our code is wrong", not "the infrastructure is down".
+    #:
+    #: These are re-raised as themselves so they surface as a 500 and reach the
+    #: logs with a traceback. Folding them into StoreUnavailable is what hid a
+    #: parsing bug behind "Redis is unreachable" for an entire session: the
+    #: gateway 503'd every metered request while /v1/quota answered 200, because
+    #: only the metered path ran the code that was broken. Two contradictory
+    #: signals, and the honest one was suppressed.
+    #:
+    #: A 500 is also the safer answer for the client. 503 reads as retryable, so
+    #: a client that trusts it retries a request that can never succeed.
+    _OUR_BUGS = (TypeError, KeyError, IndexError, AttributeError, ValueError, AssertionError)
+
     async def _guarded(self, awaitable):
-        """Fail closed.
+        """Fail closed on infrastructure, fail loud on ourselves.
 
         Every store call goes through here, so there is exactly one place where
         infrastructure trouble is turned into an answer — and the answer is no.
         Scattering try/except through the policy is how one path ends up
         defaulting to "allow" and nobody notices until the audit.
+
+        "Fail closed" still means a refusal for anything that looks like the
+        store being unreachable. What changed is that it no longer means a
+        refusal for *every* exception: a programming error inside our own
+        parsing is not an outage, and reporting it as one costs the operator the
+        only clue they had.
         """
         try:
             return await awaitable
@@ -367,7 +386,16 @@ class QuotaPolicy:
             # Both are answers, not outages. Turning a 409 into a 503 would tell
             # the caller to retry the one request that must not be retried.
             raise
-        except Exception as exc:  # noqa: BLE001 - any store failure is a refusal
+        except ScriptContractError:
+            # Ours, and specifically ours: the store answered, we could not read
+            # it. Let it out with its traceback intact.
+            raise
+        except self._OUR_BUGS:
+            # A bug in this process. Requests still fail — nothing is allowed
+            # unmetered — but they fail as a 500, which is what an unhandled
+            # defect is, and which nobody will mistake for a Redis blip.
+            raise
+        except Exception as exc:  # noqa: BLE001 - a store failure is a refusal
             raise StoreUnavailable(
                 "the quota store is unreachable, so this request cannot be metered. "
                 "Requests are refused rather than allowed unmetered — an agent that "

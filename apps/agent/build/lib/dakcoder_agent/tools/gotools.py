@@ -361,6 +361,22 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
     def swagger_check(inv: Invocation) -> ToolResult:
         return _swagger_check(sidecar, inv)
 
+    # The four review audits take no arguments: each answers one question about
+    # the whole workspace. `_plain` is right for all of them for the same reason
+    # it is right for rules_lint — a report full of findings is the tool
+    # succeeding, and returning ok=False would make the loop retry it.
+    def db_roundtrip_audit(_inv: Invocation) -> ToolResult:
+        return _plain(sidecar.call("db_roundtrip_audit", {}))
+
+    def validation_audit(_inv: Invocation) -> ToolResult:
+        return _plain(sidecar.call("validation_audit", {}))
+
+    def temporal_audit(_inv: Invocation) -> ToolResult:
+        return _plain(sidecar.call("temporal_audit", {}))
+
+    def lib_version_check(_inv: Invocation) -> ToolResult:
+        return _plain(sidecar.call("lib_version_check", {}))
+
     return {
         "repo_map": repo_map,
         "rules_lint": rules_lint,
@@ -369,6 +385,10 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
         "resource_scaffold": resource_scaffold,
         "project_scaffold": project_scaffold,
         "swagger_check": swagger_check,
+        "db_roundtrip_audit": db_roundtrip_audit,
+        "validation_audit": validation_audit,
+        "temporal_audit": temporal_audit,
+        "lib_version_check": lib_version_check,
     }
 
 

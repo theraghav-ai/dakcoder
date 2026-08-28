@@ -36,9 +36,13 @@ func TestCatalogueCoversEveryTool(t *testing.T) {
 	for _, tool := range c.Tools {
 		got = append(got, tool.Name)
 	}
+	// Alphabetical, as the catalogue is built. The four *_audit / *_check tools
+	// are read-only reports added for the code-review findings; every one of
+	// them must stay out of the mutating set asserted below.
 	want := []string{
-		"fx_wire", "legacy_audit", "list_rules", "project_scaffold",
-		"repo_map", "resource_scaffold", "rules_lint",
+		"db_roundtrip_audit", "fx_wire", "legacy_audit", "lib_version_check",
+		"list_rules", "project_scaffold", "repo_map", "resource_scaffold",
+		"rules_lint", "temporal_audit", "validation_audit",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("tools = %v, want %v", got, want)

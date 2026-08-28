@@ -16,6 +16,7 @@ import pytest
 from dakcoder_agent.modes import Mode
 from dakcoder_agent.tools import registry
 from dakcoder_agent.tools.catalog import as_json, as_markdown, conformance
+from dakcoder_agent.tools.gotools import handlers_for
 
 DOCS = Path(__file__).resolve().parents[3] / "docs"
 
@@ -102,3 +103,26 @@ def test_the_markdown_names_every_tool(  ) -> None:
     text = as_markdown()
     for name in registry.REGISTRY:
         assert f"`{name}`" in text
+
+
+def test_every_sidecar_tool_the_model_is_offered_has_a_handler() -> None:
+    """A spec without a handler is a tool the model can call and the router
+    cannot dispatch — and nothing else catches it.
+
+    The registry validates C1 at import and the catalogue check keeps the
+    published file current, but neither knows whether the bridge can actually
+    execute the call. That gap is invisible until a turn spends a call on it and
+    gets an error back, which is the most expensive possible place to find out.
+    """
+    declared = {
+        spec.name
+        for spec in registry.all_specs()
+        if spec.provider is registry.Provider.GOTOOLS
+    }
+    wired = set(handlers_for(None))
+
+    missing = sorted(declared - wired)
+    assert not missing, (
+        f"{missing} are offered to the model as gotools tools but the bridge has "
+        "no handler for them"
+    )

@@ -14,6 +14,10 @@
       "search_docs",
       "rules_lint",
       "legacy_audit",
+      "db_roundtrip_audit",
+      "validation_audit",
+      "temporal_audit",
+      "lib_version_check",
       "git_status",
       "git_diff",
       "git_blame"
@@ -37,6 +41,7 @@
       "search_repo",
       "search_docs",
       "rules_lint",
+      "validation_audit",
       "playbook",
       "write_file",
       "patch_file",
@@ -55,6 +60,8 @@
       "search_repo",
       "rules_lint",
       "legacy_audit",
+      "db_roundtrip_audit",
+      "validation_audit",
       "playbook",
       "go_build",
       "git_status",
@@ -320,6 +327,73 @@
       "modes": [
         "planner",
         "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
+      "name": "db_roundtrip_audit",
+      "description": "Profile every repository method: database calls, any inside a loop, batched, in a transaction, with a verdict. Worst first. Use before optimising by eye.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "planner",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
+      "name": "validation_audit",
+      "description": "List every request field, its validate tag, and what the tag leaves unbounded. `required` alone means only 'not empty', so a 10MB string passes.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "coder",
+        "planner",
+        "verifier"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
+      "name": "temporal_audit",
+      "description": "List inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only — it makes no recommendation.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
+      "name": "lib_version_check",
+      "description": "Report CEPT library drift: which are behind, which are superseded by n-api-*. Reports only — never edit go.mod on it, tell the user.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "planner"
       ],
       "mutates": false,
       "approval": "none",

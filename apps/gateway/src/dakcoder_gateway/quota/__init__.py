@@ -7,7 +7,9 @@ infrastructure is unwell is a control nobody can rely on.
 """
 
 from .model import (
+    UNLIMITED,
     Check,
+    ConfigError,
     Lane,
     Limits,
     QuotaExceeded,
@@ -16,11 +18,13 @@ from .model import (
     WindowState,
 )
 from .policy import QuotaPolicy, Reservation, Settlement, StoreUnavailable
-from .store import Applied, Conflict, MemoryStore, QuotaStore, RedisStore
+from .store import Applied, Conflict, MemoryStore, QuotaStore, RedisStore, ScriptContractError
 
 __all__ = [
+    "UNLIMITED",
     "Applied",
     "Check",
+    "ConfigError",
     "Conflict",
     "Lane",
     "Limits",
@@ -30,6 +34,7 @@ __all__ = [
     "QuotaStore",
     "RedisStore",
     "Reservation",
+    "ScriptContractError",
     "Series",
     "Settlement",
     "Snapshot",

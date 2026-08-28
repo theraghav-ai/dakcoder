@@ -298,8 +298,14 @@ func TestEveryReferenceDeclaresAPurpose(t *testing.T) {
 			t.Errorf("duplicate slug %q", ref.Slug)
 		}
 		seen[ref.Slug] = true
-		if len(ref.Sources) == 0 && ref.Generator == "" {
-			t.Errorf("%s has neither sources nor a generator; it would be empty", ref.Slug)
+		// A reference gets its body from one of three places: extracted
+		// document sections, a built-in generator, or hand-authored prose. The
+		// third exists for knowledge that has no source section to extract —
+		// what the review of 41 services taught is not in skill.md, and adding
+		// it there would put knowledge in the template that the template did
+		// not teach.
+		if len(ref.Sources) == 0 && ref.Generator == "" && ref.Body == "" {
+			t.Errorf("%s has no sources, generator or body; it would be empty", ref.Slug)
 		}
 	}
 }

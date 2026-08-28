@@ -54,10 +54,14 @@ configs/         one file per environment
 | `@skill:config-keys` | reading a config value, or adding a key — every key, and which environments declare it |
 | `@skill:legacy-patterns` | auditing or migrating a pre-template (api-* generation) service |
 | `@skill:go-idiom` | general Go style questions — sits under the template rules, not over them |
+| `@skill:data-access-library` | before editing any repository, or when a lint finding names a legacy library |
+| `@skill:db-performance` | writing a repository method that touches the database more than once |
+| `@skill:clients-and-context` | adding an outbound call, a new client, or anything that takes a context |
+| `@skill:logging` | adding a log line, or deciding where to report an error |
 
 ## Verification
 
-`rules_lint` runs after every edit batch and checks 21 rules. Every violation carries a one-line fix and a citation, so it can be acted on without fetching anything — call `list_rules` only if you need the whole set.
+`rules_lint` runs after every edit batch and checks 41 rules. Every violation carries a one-line fix and a citation, so it can be acted on without fetching anything — call `list_rules` only if you need the whole set.
 
 Pass `paths` with the files you changed. Findings elsewhere are reported but never block, which is what stops a stray legacy violation turning into unrequested work.
 

@@ -248,6 +248,20 @@ func NewProject(root string, p Project, r spec.Resource) (*Result, error) {
 	}
 	res.add(".gitignore", ActionCreate, content)
 
+	// The static-analysis profile for the service.
+	//
+	// Shipped with the scaffold rather than left to the developer because it is
+	// the cheapest half of the code review: three of the reviewers' standing
+	// suggestions — error handling, resource management and concurrency safety
+	// — are enforced entirely by configuration here, with no rule of our own to
+	// write or maintain. Neither the reference template nor any reviewed
+	// service had one, so nothing was checking them.
+	content, err = render("golangci.yml.tmpl", d)
+	if err != nil {
+		return nil, err
+	}
+	res.add(".golangci.yml", ActionCreate, content)
+
 	content, err = render("README.md.tmpl", d)
 	if err != nil {
 		return nil, err

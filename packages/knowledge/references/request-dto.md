@@ -18,13 +18,29 @@ The location is not bureaucracy. `govalid` is run as `govalid ./request.go` from
 
 Running `govalid` is not optional either. The framework returns **422** for any non-GET route whose request DTO has no generated `Validate()` method, so a fresh resource fails before it reaches your code until the validators exist.
 
-Enforced by `request-dto` and `validator-generated`.
+A tag must also *bound* the field, not merely require it. `validate:"required"` on a free-text string means "not empty" and nothing else, so a 10MB string is valid input. Bounds were the most systemic finding in the review of 41 services: numeric ranges asked for in 39 of them, string constraints in 34.
+
+Enforced by `request-dto`, `request-validate-depth` and `validator-generated`; listed field by field by `gotools validation-audit`.
 
 ## Corrections to the source
 
 The document below is reproduced as written. These parts of it are wrong:
 
 - skill.md's worked example gives request DTOs a `ToDomain()` converter. No such method exists anywhere in the template; handlers pass fields positionally to the repository (plan.md §6). Do not add one.
+- skill.md teaches only `required` and `omitempty`, which is why so much production code carries nothing else. The vocabulary you actually need:
+
+| Field | Tag | Why |
+|---|---|---|
+| free text | `required,max=255` | an unbounded string is an unbounded row |
+| code or ref | `required,len=13` | fixed-width identifiers |
+| enum | `required,oneof=pending approved rejected` | rejects unknown states at the edge |
+| email | `required,email` | |
+| number | `required,min=1,max=9999` | bounds reach the database as intent |
+| optional number | `omitempty,min=0` | |
+| date string | `required,datetime=2006-01-02` | |
+| slice | `required,max=100,dive` | caps the request body; `dive` validates elements |
+
+A field that is genuinely unconstrained is fine — `omitempty` alone is an acceptable floor, and says the absence was deliberate.
 
 ## Request DTO Pattern
 

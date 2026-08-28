@@ -12,18 +12,119 @@ C1 limits: at most **6 parameters** per tool, description at most **200 characte
 
 | Tool | Mutates | Params | Description |
 |---|---|---|---|
+| [`db_roundtrip_audit`](#db_roundtrip_audit) |  | 1 | Per repository method: database calls, whether any is in a loop, batched, in a transaction, plus a verdict. Worst first. Call before optimising by eye. |
 | [`fx_wire`](#fx_wire) | ✓ | 4 | Register a repository or handler in bootstrap/bootstrapper.go with the correct annotation. Never hand-edit it: an unannotated handler serves no routes. |
 | [`legacy_audit`](#legacy_audit) |  | 3 | Detect pre-template (api-*) patterns in an existing service: routes.go, gin handlers, manual validation, swaggo docs, handleSuccess helpers. Use when planning a migration, not during ordinary edits. |
+| [`lib_version_check`](#lib_version_check) |  | 1 | CEPT library drift: which are behind, which are superseded by the n-api-* generation. Reports only — never edit go.mod on it; tell the user. Call when asked about versions or migration. |
 | [`list_rules`](#list_rules) |  | 1 | List the rule ids, severities and citations. Call this before explaining a violation so you quote the real rule id and its source. |
 | [`project_scaffold`](#project_scaffold) | ✓ | 4 | Create a new n-api-template service in an empty directory, seeded with one working resource. Greenfield only; to add to an existing service use resource_scaffold. |
 | [`repo_map`](#repo_map) |  | 3 | Module path, library generation, package tree with exported symbols, and the FX composition root. Call once to orient; pass `package` for one package in full. |
 | [`resource_scaffold`](#resource_scaffold) | ✓ | 3 | Write a whole CRUD resource — domain, DDL, repository, DTOs, handler, FX registration — from a field spec. Use this instead of writing the files yourself. |
 | [`rules_lint`](#rules_lint) |  | 3 | Check Go against the n-api-template contract: layer boundaries, handler signature, repository contract, DTO envelopes, FX wiring. Run after each edit batch, passing `paths` with the files you changed. |
+| [`temporal_audit`](#temporal_audit) |  | 1 | Inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only, no recommendation. Call when asked about async or Temporal. |
+| [`validation_audit`](#validation_audit) |  | 1 | Every request field, its validate tag, and what the tag leaves unbounded. Call when writing or reviewing request DTOs: `required` alone means only 'not empty', so a 10MB string passes. |
 
 A tool marked **Mutates** writes to the workspace and passes through the
 approval gate (Part A §7.2). Each of them takes `dry_run`, which returns the
 full result without touching the working tree — that is what the gate uses to
 show a diff before anything is written.
+
+---
+
+## db_roundtrip_audit
+
+Per repository method: database calls, whether any is in a loop, batched, in a transaction, plus a verdict. Worst first. Call before optimising by eye.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `root` | string |  | workspace root; omit to use the server's default |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "methods": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "batched": {
+            "type": "boolean"
+          },
+          "in_loop": {
+            "type": "boolean"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "method": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "score": {
+            "type": "integer"
+          },
+          "statements": {
+            "type": "integer"
+          },
+          "transaction": {
+            "type": "boolean"
+          },
+          "verdict": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "line",
+          "method",
+          "statements",
+          "in_loop",
+          "batched",
+          "transaction",
+          "verdict",
+          "score"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "methods",
+    "summary"
+  ],
+  "type": "object"
+}
+```
+
+</details>
 
 ---
 
@@ -296,6 +397,118 @@ Detect pre-template (api-*) patterns in an existing service: routes.go, gin hand
     "out_of_scope_count",
     "files_scanned",
     "duration_ms"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+---
+
+## lib_version_check
+
+CEPT library drift: which are behind, which are superseded by the n-api-* generation. Reports only — never edit go.mod on it; tell the user. Call when asked about versions or migration.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `root` | string |  | workspace root; omit to use the server's default |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "note": {
+      "type": "string"
+    },
+    "result": {
+      "additionalProperties": false,
+      "properties": {
+        "module": {
+          "type": "string"
+        },
+        "registry_error": {
+          "type": "string"
+        },
+        "registry_reachable": {
+          "type": "boolean"
+        },
+        "reports": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "behind": {
+                "type": "integer"
+              },
+              "current": {
+                "type": "string"
+              },
+              "latest": {
+                "type": "string"
+              },
+              "module": {
+                "type": "string"
+              },
+              "note": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "superseded_by": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "module",
+              "current",
+              "status"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        }
+      },
+      "required": [
+        "module",
+        "reports",
+        "registry_reachable"
+      ],
+      "type": [
+        "null",
+        "object"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "result",
+    "summary",
+    "note"
   ],
   "type": "object"
 }
@@ -1222,6 +1435,179 @@ Check Go against the n-api-template contract: layer boundaries, handler signatur
     "out_of_scope_count",
     "files_scanned",
     "duration_ms"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+---
+
+## temporal_audit
+
+Inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only, no recommendation. Call when asked about async or Temporal.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `root` | string |  | workspace root; omit to use the server's default |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "candidates": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "call": {
+            "type": "string"
+          },
+          "func": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "line",
+          "func",
+          "kind",
+          "call"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "note": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "candidates",
+    "summary",
+    "note"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+---
+
+## validation_audit
+
+Every request field, its validate tag, and what the tag leaves unbounded. Call when writing or reviewing request DTOs: `required` alone means only 'not empty', so a 10MB string passes.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `root` | string |  | workspace root; omit to use the server's default |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "fields": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "missing": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "struct": {
+            "type": "string"
+          },
+          "tag": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "line",
+          "struct",
+          "field",
+          "type",
+          "tag"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "fields",
+    "summary"
   ],
   "type": "object"
 }

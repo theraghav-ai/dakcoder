@@ -1711,6 +1711,232 @@ The load-bearing assertions, and what each is guarding against:
 
 ## 5. Changelog
 
+### 2026-08-28 — The four audits reach the model, and what that cost
+
+The audits added earlier were reachable over MCP and the CLI but not from the
+agent: `tools/gotools.py` is a static bridge and the model-facing catalogue is a
+curated set, so a tool exists for the agent only when it is named in both.
+Wiring them raised the catalogue from 29 tools to 33.
+
+**The prompt budget decided one of the four mode assignments, and it was right
+to.** Tool descriptions sit in the prefix of every turn in every mode they are
+offered in, so the question is not "could this help here" but "does it earn its
+tokens on every turn". Measured:
+
+| mode | before | after | cap |
+|---|---:|---:|---:|
+| planner | 1,969 | 2,298 | 3,100 |
+| coder | 2,794 | 2,876 | 3,100 |
+| verifier | 1,921 | 2,087 | 3,100 |
+| debugger | 3,087 | **3,172** | 3,100 |
+
+Debugger had thirteen tokens of headroom and `db_roundtrip_audit` alone put it
+over. The fix was to drop the tool, not to raise the cap: a debugger turn is
+chasing one failure, `rules_lint` and `playbook` already serve that, and if a
+slow endpoint *is* the failure then the planner turn that scoped the work is
+where the survey belongs. `lib_version_check` and `temporal_audit` are
+planner-only for a reason beyond cost — offering either to a coder or verifier
+turn invites a library bump or an architecture change in the middle of unrelated
+work.
+
+A test now asserts every `Provider.GOTOOLS` spec has a bridge handler. Nothing
+covered that: the registry validates C1 at import and the catalogue check keeps
+the published file current, but neither knows whether the router can dispatch
+the call — a gap that stays invisible until a turn spends a call on it.
+
+**Rebuilt, and what did not need rebuilding.** The server installs editable
+(`uv pip install -e apps/shared -e apps/gateway -e apps/agent`), so a `git pull`
+carries every Python change there and no wheel is involved; the `gotools` binary
+is the one server artefact that must be rebuilt, because it is compiled. The
+`.vsix` is the opposite case — it vendors both the cross-compiled binaries and
+the agent wheel, so it needs both.
+
+| artefact | rebuilt | why |
+|---|---|---|
+| `gotools` binaries ×4 | yes | 20 new rules, 4 new MCP tools |
+| `dakcoder_agent` wheel | yes → 0.2.0 | registry and bridge changed |
+| `dakcoder_shared` wheel | no | no source change |
+| `extension/dist` | recompiled | `extension/src` unchanged; bundled payload changed |
+| `dakcoder-go.vsix` | yes → 0.2.0 | carries both changed artefacts |
+| gateway | source | editable install; `git pull` and restart |
+
+**One thing the packaging does not carry.** `packages/knowledge` is not in the
+agent wheel — `_knowledge_root` finds it by walking up for a `packages/knowledge`
+directory, which succeeds in an editable install from a checkout and fails in a
+venv built from the `.vsix`. So the four new references are live on the server
+and absent from a packaged runtime, where `search_docs` degrades to "the
+knowledge base is not installed in this runtime". Pre-existing, not introduced
+here, and left alone deliberately: fixing it means deciding whether the
+knowledge base belongs inside the wheel as package data, which is a question
+about wheel size and about where that corpus lives.
+
+### 2026-08-28 — A truncated Lua array reported a full window as a dead Redis
+
+Every `POST /v1/llm` returned 503 `quota_unavailable` while `GET /v1/quota`
+answered 200 with healthy-looking counters. Two endpoints contradicting each
+other, and the honest one was the wrong one.
+
+The live counters explained the trigger and nothing else: `dev:localdev` had
+1,491,655 of 1,500,000 tokens in its five-hour window — 8,345 left, less than
+one turn's reservation. So `reserve()` was **correctly** refusing. It just
+crashed on the way to saying so.
+
+`_APPLY_LUA` returned from inside its totalling loop the moment a check failed,
+so `used` held only the entries *before* the violated index. The Python then
+zipped it against the full check list:
+
+```python
+used = {c.series: int(result["used"][i]) for i, c in enumerate(checks)}
+#                     IndexError: list index out of range
+```
+
+`_guarded` caught `Exception` broadly — deliberately, "any store failure is a
+refusal" — so an `IndexError` in our own parser was reported as *"the quota
+store is unreachable."* Three consequences, each worse than the last. 503 reads
+as retryable where 429 carries `reset_at`, so clients retried a refusal that
+could never succeed, which is why the 503s arrived in threes. `/v1/quota` stayed
+green because it only calls `usage()`/`window()` and never touches `apply()`.
+And the real cause — a full window — never reached a single response.
+
+**Why the tests missed it.** `MemoryStore.apply` returns a full `used` dict on
+refusal, so every unit test passed. The exposure was already written down in
+`RedisStore`'s own docstring: *"A Redis binding that has never spoken to Redis
+is an untested binding whatever its unit tests say — the failure modes here are
+all in the script."* It was right, and the suite still ran without a server.
+
+**Fixed in three places.** Pass one now totals every check and records the first
+violation index, returning after the loop — `used` always has *n* entries, and
+pass two still never runs, so all-or-nothing holds. The Python asserts that
+length instead of trusting it, raising a named `ScriptContractError`. And
+`_guarded` re-raises `TypeError`/`KeyError`/`IndexError`/`AttributeError`/
+`ValueError`/`AssertionError` as themselves, so a defect in this process is a
+500 with a traceback rather than a fabricated outage.
+
+Fail-closed is unchanged for anything that is actually an outage, and there is a
+test asserting that against the real `redis.exceptions` hierarchy — because the
+one way this fix could become a new bug is a genuine failure mode turning out to
+subclass one of those six.
+
+**Quota is now configurable, and off by default for the pilot.** `Limits` reads
+`DAKCODER_QUOTA_*` from the environment, `DAKCODER_QUOTA_ENFORCE=false` opens
+every ceiling in one move, and an explicitly-set value survives the master switch
+so a single guard can stay on. An unparseable setting raises at startup rather
+than falling back to a default: an operator who believes a limit is in force and
+is wrong finds out from the bill.
+
+`UNLIMITED` is **zero, and it counts**. Not skipping the series is the whole
+point — running unmetered through a pilot and reading the real numbers off
+`/v1/quota` afterwards is how the ceilings get chosen, and a period that recorded
+nothing would leave the next value as much of a guess as the first. Zero rather
+than `None` because `Snapshot.tightest` has always skipped `limit <= 0`, and
+because it keeps every ceiling an `int`. `/v1/health` and the startup line now
+say `enforced` or `UNMETERED`, since a payload of zeroes cannot otherwise be
+told from a misconfiguration that refuses everything.
+
+**Still not executed against a real Redis on a developer laptop.** The
+conformance suite has new cases for the refusal path — including one where the
+violated check is deliberately *not* first, because with it first the array
+happened to be long enough and the bug hid — and CI runs them against
+`redis:7-alpine`. Locally they skip. A structural test on the script's source
+covers the gap in the meantime: it asserts the totalling loop contains no early
+`return`, which is the one property whose absence broke the contract.
+
+### 2026-08-28 — What 17,480 manual review findings added to the rule set
+
+The IT 2.0 manual code review of 41 production services — 42 spreadsheets,
+17,480 observations, 9,229 still open — was read, categorised and implemented.
+The gap analysis, the measurements behind it and the template owner's six
+decisions are in [CODE-REVIEW-FINDINGS.md](CODE-REVIEW-FINDINGS.md).
+
+**The finding that shaped everything else**: the three axes the human reviewers
+spent their time on — database round trips, request-validation depth, and what
+belongs off the request path — were the three the linter was blind to. Grepping
+`internal/rules/*.go` for `Batch`, `rows.Next`, `Println`, `transaction`,
+`SELECT *`, `NOW()`, `gctx` and `min`/`max` returned nothing at all. The
+existing 21 compliance rules asserted that generated code was *on-template and
+wired*; the review was about whether it was *correct, fast and safe*. Disjoint
+sets.
+
+**Added**: 20 rules (21 → 41 compliance), four report commands
+(`db-roundtrip-audit`, `validation-audit`, `temporal-audit`,
+`lib-version-check`) exposed as MCP tools, four knowledge references, a
+target-service `.golangci.yml` shipped by `project_scaffold`, and bounded
+`validate` tags from `resource_scaffold`.
+
+**Two defects found in existing rules while doing it.**
+
+`repo-contract` required a `context.WithTimeout` taken from config, and this
+satisfied both conditions while reporting clean:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), cfg.GetDuration("db.QueryTimeoutMed"))
+```
+
+The parent is `Background`, so the request's cancellation and trace are severed
+and a query outlives the client that asked for it. Eleven occurrences in the
+legacy corpus against 110 correct uses — rare enough to survive review, common
+enough to matter. The rule now checks the parent, not merely the presence of a
+deadline.
+
+`repo-rowmapper` only ever fired on calls that were already `dblib.*`, so the
+hand-rolled path it exists to prevent — `r.db.Query` then `rows.Next()`, or
+`QueryRow(...).Scan(...)` — was invisible to it. `repo-raw-rows` closes that:
+41 findings in the legacy corpus.
+
+**Three decisions worth recording, because each one narrowed a rule.**
+
+*Batch and transaction are not substitutes.* The sheets say "use batch instead
+of transaction" bluntly, 100 times across 15 services, and implementing that
+literally would have told people to drop transactions that were holding writes
+together. `repo-transaction-scope` therefore fires only where a transaction
+already exists, and never says "drop it" to one spanning several statements.
+
+*Batching is never mandatory* (owner's decision). `repo-multi-roundtrip` has two
+advisory tiers — notice at 2 calls, recommend at 3 — and blocks at neither,
+because when the second query needs the first one's result there is nothing to
+batch and the rule cannot tell.
+
+*Sensitive-field matching is on words, not substrings.* Measured against the
+8,229 distinct field names in the sheets, a substring match on `pan` hits 20 and
+19 are innocent — `CompanyName`, `Discrepancy`, `NoOfPanchayatSanchaarSevaKendras`.
+`identWords` splits on camel-case and underscores instead. The same measurement
+found the identity number spelled four ways in production request structs
+(`AadhaarNumber`, `Aadhaar_Number`, `AadharNumber`, `ReceiverAdharNo`), which is
+why the list carries all four and why it is per-service configurable.
+
+`magic-literal` needed the same treatment for the same reason: unrestricted it
+produced 407 findings on one service, nearly all of them column names and Go's
+reference time layout. Scoped away from the repository layer and away from
+schema-shaped literals, it reports 90 — and the ones it reports are `"Pending"`
+and `"Conflict"`, which is what the reviewers meant.
+
+**On the two database libraries.** `api-db` and `n-api-db` are the same code
+under two module paths: identical file lists, identical exported API, differing
+only in `go.mod`'s `module` line. Migration is a one-line import change with no
+call-site edits — which is worth stating plainly, because the opposite
+assumption is why services defer it. Both are imported as `dblib`, so the import
+line is the only evidence of which generation a file is on. That is now
+`references/data-access-library.md`, behind the `legacy-lib-generation` rule
+that previously reported the problem without being able to explain the fix.
+
+Two traps documented there: `dblib.Tx` takes a `*gin.Context` and is therefore
+unusable under `layer-sql-boundary`, and `dblib.TimedBatch` exists in both
+libraries but is used by nothing and is deliberately not adopted.
+
+**Validated against both corpora.** The reference template stays at zero
+blocking violations — the invariant that keeps the rules honest. The legacy
+service produces 353 findings from the new rules, and the counts match the
+hand analysis that motivated them: `repo-no-logging` 135, exactly the log calls
+in its repository layer; `client-singleton` 3, exactly the `resty.New()` sites.
+
+**Deliberately not built**: CTE/JOIN consolidation and Temporal placement, the
+first and second largest categories left on the table. Both need judgement a
+syntactic rule will get wrong — cardinality in one case, failure semantics in
+the other — and the owner deprioritised Temporal pending a decision on adoption.
+`temporal-audit` ships as a report with no recommendation attached. Test
+coverage is also absent by decision: `new-template` ships zero `_test.go` files,
+so a coverage rule would fire on every change from day one.
+
 ### 2026-08-26 — One window's empty pocket signed everybody out
 
 The runtime refused to start: `a local runtime needs a dakcoder JWT to reach the

@@ -79,6 +79,18 @@ class Conflict(Exception):
     """An idempotency key reused with a different body."""
 
 
+class ScriptContractError(RuntimeError):
+    """The Lua script and this module disagree about the shape of a reply.
+
+    A bug on our side, never an outage, and separated from every connection
+    error for that reason. The distinction is not academic: when the script
+    truncated its ``used`` array on a refusal, the resulting IndexError was
+    caught as a store failure and answered 503 — retryable, no ``reset_at`` —
+    so clients retried a refusal that would never succeed, and the real cause
+    (a full five-hour window) never appeared in any response.
+    """
+
+
 # ── the reference implementation ────────────────────────────────────────────
 
 
@@ -106,6 +118,9 @@ class MemoryStore:
             used = self._usage(sub, now)
 
             for check in checks:
+                # limit <= 0 means unmetered: still counted below, never refused.
+                if check.limit <= 0:
+                    continue
                 if used.get(check.series, 0) + check.amount > check.limit:
                     return Applied(
                         ok=False,
@@ -271,8 +286,17 @@ local now = tonumber(ARGV[1])
 local n = tonumber(ARGV[2])
 local used = {}
 local base = 3
+local violated = -1
 
--- pass one: trim and total, refusing before anything is written
+-- pass one: trim and total every series, refusing before anything is written.
+--
+-- The loop runs to completion even once a check has failed, and that is not
+-- tidiness. Returning from inside it left `used` holding only the entries up to
+-- the violated index, while the Python zipped it against the full check list —
+-- so the first refusal raised IndexError, _guarded caught it as a store outage,
+-- and every metered request 503'd while /v1/quota kept answering 200 because it
+-- never calls this script. Totalling everything costs one ZRANGE per series on
+-- a path that was already reading them.
 for i = 0, n - 1 do
   local key     = ARGV[base + i * 4]
   local horizon = tonumber(ARGV[base + i * 4 + 1])
@@ -290,9 +314,18 @@ for i = 0, n - 1 do
   if total < 0 then total = 0 end
   used[i + 1] = total
 
-  if total + amount > limit then
-    return cjson.encode({ok = false, index = i, used = used})
+  -- A limit of zero or less means count but never refuse, so an unmetered
+  -- series still accumulates and can be read from /v1/quota. That is what
+  -- makes an unmetered pilot useful: the numbers to set the real limit from.
+  if violated < 0 and limit > 0 and total + amount > limit then
+    violated = i
   end
+end
+
+if violated >= 0 then
+  -- Pass two never runs, so the all-or-nothing property still holds: a request
+  -- refused by the weekly cap has consumed nothing from the hourly one.
+  return cjson.encode({ok = false, index = violated, used = used})
 end
 
 -- pass two: nothing can fail from here, so every write lands or none did
@@ -343,15 +376,33 @@ class RedisStore:
 
         raw = await self._script(keys=keys, args=argv)
         result = json.loads(raw)
-        used = {c.series: int(result["used"][i]) for i, c in enumerate(checks)}
+
+        # The script promises one `used` entry per check, on both paths. Assert
+        # it rather than trusting it: this exact invariant was broken once, and
+        # because the mismatch surfaced as an IndexError inside _guarded it was
+        # reported as "Redis is unreachable" for a whole session. A named error
+        # says which side is wrong.
+        totals = result.get("used") or []
+        if len(totals) != len(checks):
+            raise ScriptContractError(
+                f"the quota script returned {len(totals)} total(s) for "
+                f"{len(checks)} check(s); the Lua and this parser disagree"
+            )
+        used = {c.series: int(totals[i]) for i, c in enumerate(checks)}
         window = await self.window(sub, now)
 
         if not result["ok"]:
+            index = int(result["index"])
+            if not 0 <= index < len(checks):
+                raise ScriptContractError(
+                    f"the quota script reported violated index {index}, "
+                    f"outside the {len(checks)} check(s) it was given"
+                )
             return Applied(
                 ok=False,
                 used=used,
                 reset_at=await self._resets(sub, now, [c.series for c in checks]),
-                violated=checks[int(result["index"])],
+                violated=checks[index],
                 window=window,
             )
         return Applied(

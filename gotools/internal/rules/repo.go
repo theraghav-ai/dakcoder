@@ -8,9 +8,21 @@ import (
 )
 
 // dblibExec are the dblib entry points that execute a built query.
+//
+// The OK and Returning variants are here as well as the plain ones: they cost a
+// round trip exactly like the others, so a method built from them needs a
+// deadline just the same, and the round-trip rules in dbperf.go have to count
+// them or a repository written entirely in InsertReturning looks free.
+//
+// Deliberately excluded are the Queue* functions, which append to a batch
+// rather than execute; they cost nothing until SendBatch.
 var dblibExec = map[string]bool{
 	"dblib.Insert": true, "dblib.SelectOne": true, "dblib.SelectRows": true,
 	"dblib.Update": true, "dblib.Delete": true, "dblib.Exec": true,
+	"dblib.SelectOneOK": true, "dblib.SelectRowsOK": true, "dblib.SelectRowsTag": true,
+	"dblib.InsertReturning": true, "dblib.UpdateReturning": true,
+	"dblib.InsertReturningrows": true, "dblib.ExecRow": true,
+	"dblib.DBQueryMultipleRows": true,
 }
 
 // RepoContract enforces the three properties every repository method must have:
@@ -103,6 +115,26 @@ var RepoContract = Rule{
 						Fix(`ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow")); defer cancel()`).
 						Report("%s executes a query without context.WithTimeout; a slow query would hang the request", fd.Name.Name)
 					return
+				}
+				// The deadline must hang off the *incoming* context.
+				//
+				// Without this check the rule has a false negative that looks
+				// exactly like a pass:
+				//
+				//	ctx, cancel := context.WithTimeout(context.Background(), cfg.GetDuration("db.QueryTimeoutMed"))
+				//
+				// A timeout exists and it came from config, so both conditions
+				// below are satisfied — but the parent is Background, so the
+				// request's cancellation and its trace are severed. When the
+				// client goes away the query keeps running. This appears 11
+				// times in the legacy corpus against 110 correct uses, which is
+				// precisely the ratio that makes it worth catching: rare enough
+				// to survive review, common enough to matter.
+				for _, call := range detachedTimeouts(fd.Body) {
+					p.At(f, call).
+						Fix("derive the deadline from the incoming context: context.WithTimeout(ctx, ...)").
+						Report("%s starts its timeout from %s rather than the request context; cancellation and tracing are lost",
+							fd.Name.Name, typeString(call.Args[0]))
 				}
 				// The deadline must come from config, not a literal.
 				if !callsMatching(fd.Body, "GetDuration") {

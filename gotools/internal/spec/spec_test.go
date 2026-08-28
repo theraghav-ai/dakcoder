@@ -61,8 +61,12 @@ func TestNormaliseInfersEverythingDerivable(t *testing.T) {
 	if got.Fields[0].JSON != "amount" || got.Fields[0].DB != "amount" {
 		t.Errorf("tags = %q/%q, want amount/amount", got.Fields[0].JSON, got.Fields[0].DB)
 	}
-	if got.Fields[0].Validate != "required" {
-		t.Errorf("default validate = %q, want required", got.Fields[0].Validate)
+	// The default validate tag bounds the field, it does not merely require it.
+	// Bare `required` on a numeric field is the defect the manual review of 41
+	// services raised most often — 39 of them — so scaffolding it would be
+	// generating the finding.
+	if got.Fields[0].Validate != "required,min=0" {
+		t.Errorf("default validate = %q, want a bound tag", got.Fields[0].Validate)
 	}
 	if got.Fields[0].SQL == "" {
 		t.Error("sql type should be inferred from the Go type")

@@ -322,6 +322,83 @@ _SPECS: tuple[ToolSpec, ...] = (
         modes=frozenset({_P, _V}),
         provider=Provider.GOTOOLS,
     ),
+    # ── the four review audits ──────────────────────────────────────────────
+    #
+    # Reports rather than checks: `rules_lint` says "this edit is wrong", these
+    # say "here is the shape of the problem across the service". They come from
+    # the manual review of 41 production services, where the three sheets a
+    # human filled in by hand were database round trips, request validation and
+    # what belongs off the request path.
+    #
+    # None takes a parameter. Each answers one question about the whole
+    # workspace, and every parameter is a chance for the model to get a call
+    # wrong for no gain.
+    #
+    # The mode sets are deliberately narrow. A tool's description sits in the
+    # prompt for every mode it is offered in, so the question is not "could this
+    # ever help here" but "does it earn its tokens on every turn in this mode".
+    ToolSpec(
+        name="db_roundtrip_audit",
+        description=(
+            "Profile every repository method: database calls, any inside a loop, "
+            "batched, in a transaction, with a verdict. Worst first. Use before "
+            "optimising by eye."
+        ),
+        parameters=_obj(),
+        # Not Coder or Scaffolder: they are writing one method, and rules_lint
+        # already tells them about that one. This answers a question about the
+        # service, which is what Planner and Verifier ask.
+        #
+        # Not Debugger either, and that one was measured rather than reasoned:
+        # the debugger prefix was already 3,087 tokens against a 3,100 cap, so
+        # this tool alone put it over. The cap is the constraint working, not an
+        # obstacle to route around — a debugger turn is chasing one failure, and
+        # `rules_lint` plus `playbook` already serve that. If a slow endpoint is
+        # the failure, the Planner turn that scoped the work is where this
+        # belongs.
+        modes=frozenset({_P, _V}),
+        provider=Provider.GOTOOLS,
+    ),
+    ToolSpec(
+        name="validation_audit",
+        description=(
+            "List every request field, its validate tag, and what the tag leaves "
+            "unbounded. `required` alone means only 'not empty', so a 10MB string "
+            "passes."
+        ),
+        parameters=_obj(),
+        # Coder earns its place here: writing a request DTO is exactly when the
+        # missing bound is cheap to add and invisible to add later.
+        modes=frozenset({_P, _C, _V}),
+        provider=Provider.GOTOOLS,
+    ),
+    ToolSpec(
+        name="temporal_audit",
+        description=(
+            "List inline work that may belong off the request path: uploads, SMS, "
+            "email, reports, outbound calls. Candidates only — it makes no "
+            "recommendation."
+        ),
+        parameters=_obj(),
+        # Planner alone. The output is a survey with no advice attached, and the
+        # decision it feeds — what should happen when that work fails halfway —
+        # is not one a Coder or Verifier turn is positioned to take.
+        modes=frozenset({_P}),
+        provider=Provider.GOTOOLS,
+    ),
+    ToolSpec(
+        name="lib_version_check",
+        description=(
+            "Report CEPT library drift: which are behind, which are superseded by "
+            "n-api-*. Reports only — never edit go.mod on it, tell the user."
+        ),
+        parameters=_obj(),
+        # Planner alone, and for a reason beyond cost: offering this to Coder or
+        # Verifier invites a library bump in the middle of unrelated work, which
+        # turns a review into a regression hunt.
+        modes=frozenset({_P}),
+        provider=Provider.GOTOOLS,
+    ),
     ToolSpec(
         name="playbook",
         description=(
