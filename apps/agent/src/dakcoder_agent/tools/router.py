@@ -168,6 +168,12 @@ class Router:
         self._clock = clock
         #: Every path mutated this session, in order, for the gate to scope itself to.
         self.touched: list[str] = []
+        #: How many mutations have been applied, counting repeats of the same
+        #: path. ``touched`` deduplicates, so it cannot answer "has anything
+        #: changed since I last looked" — editing one file twice leaves it
+        #: identical. The loop asks that question to decide whether re-running
+        #: the gate could possibly say something new.
+        self.mutations: int = 0
 
     def register(self, name: str, handler: ToolHandler) -> None:
         if name not in registry.REGISTRY:
@@ -258,6 +264,7 @@ class Router:
         result = self._run(spec, handler, invocation)
 
         for mutation in result.mutations:
+            self.mutations += 1
             if mutation.path not in self.touched:
                 self.touched.append(mutation.path)
 

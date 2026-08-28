@@ -15,9 +15,11 @@ from dakcoder_shared.config import (
 )
 from dakcoder_shared.llm import (
     BACKOFF_SECONDS,
+    ChatResult,
     EmptyCompletionError,
     LLMClient,
     Metering,
+    ToolCall,
     UnsupportedParameterError,
     UpstreamError,
     _consume_stream,
@@ -571,3 +573,49 @@ def test_a_retry_that_had_already_spoken_stays_silent(no_sleep):
     assert len(attempts) == 2
     assert seen == ["half an ", "answer"], f"the retry said it again: {seen}"
     assert result.content == "the whole answer", "and the authoritative text is the whole one"
+
+
+# ── a cut-off tool call, whatever the finish reason says ────────────────────
+
+
+def test_a_cut_off_call_is_caught_without_a_length_finish_reason():
+    """The case the `truncated` property was written for, arriving unlabelled.
+
+    A server reported `finish_reason: "tool_calls"` on a reply cut off inside a
+    call, so the arguments came through as the bare `{` with nothing to say they
+    had been interrupted — and the router answered "arguments are not valid
+    JSON", which is the one piece of advice the model cannot act on.
+    """
+    result = ChatResult(
+        tool_calls=[ToolCall(id="t1", name="lib_version_check", arguments="{")],
+        finish_reason="tool_calls",
+    )
+    assert [c.name for c in result.incomplete_tool_calls()] == ["lib_version_check"]
+
+
+def test_a_call_cut_off_inside_a_string_counts_too():
+    result = ChatResult(
+        tool_calls=[ToolCall(id="t1", name="read_file", arguments='{"path": "handler/whats')],
+        finish_reason="tool_calls",
+    )
+    assert result.incomplete_tool_calls()
+
+
+def test_genuinely_malformed_arguments_are_left_to_the_router():
+    """The router has a message for these, and it is the right one. Claiming
+    they were cut off would send the model to make its reply shorter, which
+    fixes nothing."""
+    for arguments in ("not json at all", "{'path': 'x'}}", "[1, 2]]"):
+        result = ChatResult(
+            tool_calls=[ToolCall(id="t1", name="read_file", arguments=arguments)],
+            finish_reason="tool_calls",
+        )
+        assert result.incomplete_tool_calls() == [], arguments
+
+
+def test_complete_arguments_are_never_reported_as_cut_off():
+    result = ChatResult(
+        tool_calls=[ToolCall(id="t1", name="read_file", arguments='{"path": "a.go"}')],
+        finish_reason="length",
+    )
+    assert result.incomplete_tool_calls() == []

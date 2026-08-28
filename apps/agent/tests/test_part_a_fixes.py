@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +25,7 @@ from dakcoder_agent.modes import Mode
 from dakcoder_agent.tools.router import ApprovalRequest, Router
 from dakcoder_shared.envelope import Event, EventType, Mutation, MutationKind, ToolResult
 from dakcoder_shared.llm import ChatResult, Usage
+from dakcoder_shared.paths import Workspace
 
 
 class Replies:
@@ -41,9 +43,21 @@ class Replies:
         return ChatResult(content=body, finish_reason="stop", usage=Usage(prompt_tokens=100))
 
 
+def bare_router() -> Router:
+    """A real Router with no handlers wired.
+
+    Was ``Router.__new__(Router)``, which skips ``__init__`` and therefore has
+    none of the attributes the loop reads — ``touched`` among them, which every
+    exit path already uses to report what changed. These tests only survived
+    because none of them reaches one. A constructed Router costs nothing and
+    does not lie about its shape.
+    """
+    return Router(Workspace(Path.cwd()))
+
+
 def loop_with(client, *, mode: Mode = Mode.CODER) -> AgentLoop:
     context = ContextManager(mode=mode, system_prompt="s")
-    return AgentLoop(context, client, Router.__new__(Router))
+    return AgentLoop(context, client, bare_router())
 
 
 # ── the compaction crash ────────────────────────────────────────────────────
@@ -112,7 +126,7 @@ def test_compaction_runs_end_to_end_through_the_context_manager():
     for i in range(12):
         context.append_tool_result("read_file", "x" * 400, tool_call_id=str(i), path=f"f{i}.go")
 
-    agent = AgentLoop(context, client, Router.__new__(Router))
+    agent = AgentLoop(context, client, bare_router())
     recap = context.compact(agent._summarise, keep_recent=2)
 
     assert isinstance(recap, Recap)

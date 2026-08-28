@@ -5,8 +5,15 @@ from __future__ import annotations
 import pytest
 
 from dakcoder_agent import ContextManager, Layer, Mode, Recap, Role
-from dakcoder_agent.context import DEFAULT_TOOL_CAP, TOOL_CAPS, OverBudgetError
-from dakcoder_agent.modes import ModeConfig, config_for
+from dakcoder_agent.context import (
+    DEFAULT_TOOL_CAP,
+    MAX_DIRECTIVES,
+    MAX_MODE_MESSAGES,
+    RECAP_BUDGET_TOKENS,
+    TOOL_CAPS,
+    OverBudgetError,
+)
+from dakcoder_agent.modes import PROMPT_BUDGET, ModeConfig, config_for
 from dakcoder_shared.tokens import Calibration, estimate_tokens
 
 SYSTEM = "You are dakcoder. " + ("Follow the n-api-template contract. " * 40)
@@ -243,10 +250,45 @@ def test_usage_accounts_for_every_layer_and_the_tool_schemas():
 
 @pytest.mark.parametrize(
     "mode,budget",
-    [(Mode.PLANNER, 24_000), (Mode.CODER, 32_768), (Mode.DEBUGGER, 32_768)],
+    # Read off the constant rather than restated, so raising the budget is one
+    # edit rather than a hunt for every place that pinned the old number.
+    [(Mode.PLANNER, PROMPT_BUDGET), (Mode.CODER, PROMPT_BUDGET), (Mode.DEBUGGER, PROMPT_BUDGET)],
 )
 def test_budget_follows_the_mode(mode: Mode, budget: int):
     assert manager(mode=mode).budget == budget
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_compaction_can_retain_one_whole_file_read(mode: Mode):
+    """The invariant the Planner's 24,000 budget broke.
+
+    Compaction retains to ``budget * 0.35`` minus the pinned head. A capped
+    ``read_file`` is 6,000 tokens. When the retention floor is below that,
+    compaction cannot keep even one of the files the model just read — so the
+    model re-reads it, which puts the context back over the threshold that fired
+    the compaction, which evicts it again. That circuit ran seventy-one turns
+    and twenty-five compactions in one session without producing a plan.
+
+    Checked for every mode, because the mode that broke it was the one nobody
+    thought to check: the Planner reads the most and had the smallest budget.
+    """
+    cm = manager(mode=mode)
+    cm.set_task("write a new handler")
+    cm.switch_mode(mode, "do the thing")
+
+    overhead = (
+        1200  # tool_schema_tokens, as `manager` sets it
+        + estimate_tokens(SYSTEM)
+        + estimate_tokens("do the thing")
+        + estimate_tokens(cm.build()[-1].content)
+        + RECAP_BUDGET_TOKENS
+    )
+    floor = int(cm.budget * 0.35) - overhead
+
+    assert floor >= TOOL_CAPS["read_file"].max_tokens, (
+        f"{mode} retains {floor:,} tokens, below one capped read_file "
+        f"({TOOL_CAPS['read_file'].max_tokens:,}); compaction cannot keep a file it just read"
+    )
 
 
 def test_compaction_triggers_at_the_threshold():
@@ -413,7 +455,7 @@ def test_prompt_and_output_budgets_are_tracked_separately():
     """Conflating them is how a mode ends up with room to think and none to
     answer."""
     cfg = config_for(Mode.PLANNER)
-    assert cfg.prompt_budget == 24_000
+    assert cfg.prompt_budget == PROMPT_BUDGET
     assert cfg.max_tokens == 4096
 
 
@@ -437,3 +479,126 @@ def test_over_budget_error_exists_for_the_overflow_path():
     """§6.5's overflow_recovery path needs a typed failure, not a silent trim:
     a prompt that quietly dropped the task would answer the wrong question."""
     assert issubclass(OverBudgetError, RuntimeError)
+
+
+# ── the pinned layers are pinned, not unbounded ─────────────────────────────
+
+
+def test_the_mode_layer_does_not_grow_without_limit():
+    """MODE is pinned, so compaction can never reclaim it.
+
+    A run that walks the escalation ladder switches mode on nearly every turn.
+    One session reached thirteen instructions stacked in the head — five Coder,
+    four Verifier — each contradicting the one above it, in the one layer that
+    is exempt from eviction.
+    """
+    cm = manager()
+    cm.set_task("t")
+    for _ in range(20):
+        cm.begin_turn()
+        cm.switch_mode(Mode.CODER, "Execute one plan step.")
+        cm.switch_mode(Mode.VERIFIER, "Report; do not fix.")
+
+    modes = [m for m in cm.build() if m.layer is Layer.MODE]
+    assert len(modes) <= MAX_MODE_MESSAGES
+    assert modes[-1].content == "Report; do not fix.", "the current mode must be the last word"
+
+
+def test_re_entering_the_mode_you_are_in_restates_nothing():
+    """Cheaper than the guard in the loop and, unlike it, keeps the head
+    byte-identical — so a re-entry costs no prefill either."""
+    cm = manager()
+    cm.set_task("t")
+    cm.switch_mode(Mode.CODER, "Execute one plan step.")
+    before = cm.build()
+
+    cm.switch_mode(Mode.CODER, "Execute one plan step.")
+
+    assert cm.build() == before
+
+
+def test_a_pinned_directive_survives_compaction():
+    """The working-set copy of a developer message is the first thing evicted.
+
+    In a run compacting every other turn that is two turns of life, after which
+    the session carries on with the task it was redirected away from — and the
+    developer has no way to tell, because the redirect appeared to land.
+    """
+    cm = manager()
+    cm.set_task("Add a Pension resource")
+    cm.begin_turn()
+    cm.append_user("stop reading and write the handler")
+    cm.pin_directive("stop reading and write the handler")
+    cm.append_assistant("reading one more file")
+
+    cm.compact(lambda messages: Recap(goal="g"), keep_recent=0)
+
+    assert cm.directives == ("stop reading and write the handler",)
+    assert "stop reading and write the handler" in "\n".join(m.content for m in cm.build())
+
+
+def test_the_directive_block_is_bounded():
+    cm = manager()
+    cm.set_task("t")
+    for i in range(20):
+        cm.pin_directive(f"correction {i}")
+
+    assert len(cm.directives) == MAX_DIRECTIVES
+    assert cm.directives[-1] == "correction 19", "the newest correction was dropped"
+
+
+def test_the_same_directive_twice_is_pinned_once():
+    cm = manager()
+    cm.set_task("t")
+    cm.pin_directive("use patch_file")
+    cm.pin_directive("use patch_file")
+
+    assert cm.directives == ("use patch_file",)
+
+
+def test_a_planner_turn_that_reads_two_files_does_not_trip_compaction():
+    """The turn the seventy-one-turn session made on every one of its turns.
+
+    `repo_map` plus two `read_file` results is what orienting in an unfamiliar
+    service costs. At the old 24,000 budget that turn was over the threshold
+    the moment it landed, so it was compacted away before the model could use
+    it — and the model, now missing the files, read them again.
+    """
+    cm = manager(mode=Mode.PLANNER)
+    cm.set_task("write a new handler to send a whatsapp message")
+    cm.begin_turn()
+    # Big enough to reach the insertion caps, which is what the session's files
+    # actually did — 312 and 718 lines of handler and service code.
+    cm.append_tool_result(
+        "repo_map",
+        "\n".join(f"  handler/file{i}.go  types: X{i}  funcs: NewX{i}, ListX{i}" for i in range(900)),
+    )
+    body = "\n".join(
+        f"func (h *WhatsappHandler) Method{i}(sctx *serverRoute.Context) error {{ return nil }}"
+        for i in range(700)
+    )
+    for path in ("handler/whatsapp.go", "internal/app/service/whatsapp.go"):
+        cm.append_tool_result("read_file", body, path=path)
+
+    assert not cm.should_compact(), (
+        f"the orienting turn is {cm.usage().total:,} tokens against a "
+        f"{cm.budget:,} budget and already over the threshold"
+    )
+
+
+def test_the_tools_array_is_counted_against_the_budget():
+    """It is part of the prompt and it is sent on every call.
+
+    `serve.py` built every session's context with the default of zero, so the
+    schemas were charged to the endpoint and counted as nothing here — and the
+    compaction threshold, the retention floor and `complete`'s budget check
+    were all decided against a prompt smaller than the one actually sent.
+    """
+    cm = ContextManager(mode=Mode.CODER, system_prompt=SYSTEM)
+    cm.set_task("t")
+    assert cm.usage().tools == 0
+
+    cm.observe_tool_schemas(1_414)
+
+    assert cm.usage().tools == 1_414
+    assert cm.usage().total > sum(cm.usage().by_layer.values()) - 1

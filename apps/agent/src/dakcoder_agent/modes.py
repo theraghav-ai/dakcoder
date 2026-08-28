@@ -80,21 +80,51 @@ class ModeConfig:
             )
 
 
+#: The prompt budget every mode gets. One number, because five copies of it is
+#: how the Planner came to have a different one that nobody noticed.
+#:
+#: It was 24,000 for the Planner and 32,768 for the rest, and the Planner's was
+#: what a seventy-one-turn session died on: compaction retains to
+#: ``budget * 0.35`` minus the pinned head, which at 24,000 left about 5.3k for
+#: the working set, against a ``read_file`` capped at 6,000. The mode could not
+#: keep one of the files it had just read, so it read them again, and again.
+#: At 32,768 the floor is ~6.9k, which clears a whole file read, and the
+#: threshold is ~22.9k, which is above what an orienting turn costs.
+#:
+#: **65,536 was measured and rejected**, so that it does not have to be measured
+#: again. It buys a ~18.4k retention floor and drops compaction from eight times
+#: in twenty-five turns to twice — and it costs, on the same simulated run:
+#:
+#:     P95 prompt per turn      21,621  ->  44,004   (§5.3 target 24,000)
+#:     effective prefill       142,258  -> 531,377   (§5.3 target 180,000)
+#:     raw prefill             347,601  -> 818,311
+#:
+#: Three §5.3 cost targets, all breached, for a floor the failure did not need.
+#: There is no tuning that recovers them either: dropping ``compact_at`` far
+#: enough to hold the old P95 puts compaction back to seventeen or more, and
+#: lowering ``retain_pct`` barely registers because at 65,536 compaction hardly
+#: fires. The cost follows the budget.
+#:
+#: So the ceiling is not the lever. ``_thrashing`` in loop.py is what catches a
+#: task genuinely too large for this, and it says so in a sentence rather than
+#: spending seventy-one turns finding out.
+PROMPT_BUDGET = 32_768
+
 MODES: dict[Mode, ModeConfig] = {
     # Reversed from the earlier plan. The spike found no quality gain on
     # structured output, and a plan *is* structured output.
-    Mode.PLANNER: ModeConfig(Mode.PLANNER, 24_000, 4096, False, 0.1),
+    Mode.PLANNER: ModeConfig(Mode.PLANNER, PROMPT_BUDGET, 4096, False, 0.1),
     # Emits a JSON spec, which resource_scaffold then validates.
-    Mode.SCAFFOLDER: ModeConfig(Mode.SCAFFOLDER, 32_768, 2048, False, 0.1),
+    Mode.SCAFFOLDER: ModeConfig(Mode.SCAFFOLDER, PROMPT_BUDGET, 2048, False, 0.1),
     # Mechanical edits and tool dispatch — the bulk of all turns.
-    Mode.CODER: ModeConfig(Mode.CODER, 32_768, 4096, False, 0.1),
+    Mode.CODER: ModeConfig(Mode.CODER, PROMPT_BUDGET, 4096, False, 0.1),
     # Runs commands, reads output, reports.
-    Mode.VERIFIER: ModeConfig(Mode.VERIFIER, 32_768, 2048, False, 0.1),
+    Mode.VERIFIER: ModeConfig(Mode.VERIFIER, PROMPT_BUDGET, 2048, False, 0.1),
     # The one place reasoning might genuinely pay, because ranking hypotheses is
     # the rare task where the reasoning text itself is the deliverable. Treated
     # as a Phase-2 A/B with the eval suite as judge — NOT as a default. Left off
     # here so that switching it on is a deliberate edit with a test behind it.
-    Mode.DEBUGGER: ModeConfig(Mode.DEBUGGER, 32_768, 6144, False, 0.1),
+    Mode.DEBUGGER: ModeConfig(Mode.DEBUGGER, PROMPT_BUDGET, 6144, False, 0.1),
 }
 
 

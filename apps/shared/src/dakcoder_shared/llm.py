@@ -222,16 +222,63 @@ class ChatResult:
         return self.finish_reason == "length"
 
     def incomplete_tool_calls(self) -> list[ToolCall]:
-        """Tool calls whose arguments did not survive the cut."""
-        if not self.truncated:
-            return []
+        """Tool calls whose arguments did not survive the cut.
+
+        ``truncated`` is the declared signal and the one to trust. It is not the
+        only one, which is how the case this method exists for got through
+        anyway: a server reported ``finish_reason: "tool_calls"`` on a reply cut
+        off inside a call, the arguments arrived as the bare character ``{``,
+        and with nothing saying it had been interrupted the router answered
+        "arguments are not valid JSON" — the exact advice the model cannot act
+        on.
+
+        So arguments that are unparseable *and shaped like a prefix* — braces
+        opened and never closed, or a string left hanging — count here whatever
+        the finish reason claims. Arguments unparseable for any other reason are
+        genuinely malformed and stay with the router, which has a message for
+        them.
+        """
         out = []
         for call in self.tool_calls:
             try:
                 call.parsed()
             except ValueError:
-                out.append(call)
+                if self.truncated or _looks_cut_off(call.arguments):
+                    out.append(call)
         return out
+
+
+def _looks_cut_off(arguments: str) -> bool:
+    """Whether unparseable arguments are a *prefix* of valid JSON rather than junk.
+
+    A single scan, tracking string state so a brace inside a quoted value is not
+    counted as structure. Ending with depth still open, or inside a string, or
+    on a trailing escape, means the text stopped early — which is what being
+    interrupted looks like and is not what a model emitting bad JSON produces.
+    """
+    text = arguments.strip()
+    if not text.startswith(("{", "[")):
+        return False
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            in_string = not in_string
+        elif not in_string:
+            if char in "{[":
+                depth += 1
+            elif char in "}]":
+                depth -= 1
+                if depth < 0:
+                    # More closers than openers is malformed, not truncated.
+                    return False
+    return depth > 0 or in_string or escaped
 
 
 def strip_html(body: str, *, limit: int = 300) -> str:

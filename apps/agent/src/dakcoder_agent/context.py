@@ -99,6 +99,22 @@ class Layer(StrEnum):
 #: asked to do will confidently finish something else.
 PINNED_LAYERS = frozenset({Layer.SYSTEM, Layer.MODE, Layer.TASK})
 
+#: How many developer directives the pinned task block may carry at once.
+#:
+#: Bounded because the layer is pinned and a long conversation would otherwise
+#: grow it without limit. Six is well past any run that is still going well; the
+#: oldest is dropped first, and every one of them is also in the working set
+#: until compaction reaches it.
+MAX_DIRECTIVES = 6
+
+#: How many mode instructions the pinned head may carry at once.
+#:
+#: There are five modes and a healthy run visits four or five of them, so this
+#: never binds on one. It binds on a run that ping-pongs — and because the layer
+#: is pinned, an unbounded one is the one part of the prompt that grows forever
+#: and that compaction is forbidden to touch. See ``switch_mode``.
+MAX_MODE_MESSAGES = 6
+
 
 @dataclass(frozen=True, slots=True)
 class Message:
@@ -241,6 +257,18 @@ class Recap:
     plan_step: str = ""
     files_created: tuple[str, ...] = ()
     files_modified: tuple[str, ...] = ()
+    #: Files whose contents were evicted by this compaction.
+    #:
+    #: The field the recap did not have, and the omission that made compaction
+    #: self-defeating: what a compaction throws away is mostly file reads, and a
+    #: recap that does not mention them leaves re-reading as the only rational
+    #: next move — which puts the context straight back over the threshold that
+    #: fired the compaction. One session went round that circuit twenty-five
+    #: times without ever producing a plan.
+    #:
+    #: Recovered from the evicted messages rather than asked of the summariser,
+    #: because it is a fact about what was dropped and the loop already knows it.
+    files_read: tuple[str, ...] = ()
     decisions: tuple[str, ...] = ()
     verified: tuple[str, ...] = ()
     open_items: tuple[str, ...] = ()
@@ -264,6 +292,13 @@ class Recap:
             out.append(f"{'Plan step:':17}{self.plan_step}\n")
         out.append(block("Files created", self.files_created))
         out.append(block("Files modified", self.files_modified))
+        if self.files_read:
+            out.append(block("Already read", self.files_read))
+            out.append(
+                f"{'':17}(their contents were compacted away. Re-read one only if you\n"
+                f"{'':17}need a line range you have not seen — re-reading all of them\n"
+                f"{'':17}is what caused this compaction.)\n"
+            )
         out.append(block("Decisions", self.decisions))
         out.append(block("Verified", self.verified))
         out.append(block("Open", self.open_items))
@@ -312,6 +347,8 @@ class ContextManager:
         self._task_text = ""
         self._plan_text = ""
         self._acceptance: tuple[str, ...] = ()
+        #: Follow-ups and corrections, pinned. See ``pin_directive``.
+        self._directives: list[str] = []
         self._recap: Message | None = None
         self._working: list[Message] = []
 
@@ -327,6 +364,27 @@ class ContextManager:
     @property
     def budget(self) -> int:
         return self._config.prompt_budget
+
+    def observe_tool_schemas(self, tokens: int) -> None:
+        """Record what the tools array costs on the wire.
+
+        The schemas are part of the prompt and are sent on every call, but the
+        constructor takes them as a number the caller supplies once — and the
+        runtime never supplied one. ``serve.py`` built every session's context
+        with the default of zero, so thirteen Planner schemas, about 1.4k
+        tokens, were charged to the endpoint and counted as nothing here.
+
+        Everything downstream is decided against that figure: when to compact,
+        how much to retain, and whether ``complete`` refuses the turn. All three
+        were being decided against a prompt 1.4k smaller than the one actually
+        sent. The budget regression suite passes 1,200 explicitly, which is why
+        it never saw this — the simulation was more honest than production.
+
+        Measured per turn rather than fixed, because mode filtering means the
+        array differs by mode: the Planner is offered read-only tools and the
+        Coder the write ones.
+        """
+        self._tool_schema_tokens = max(0, tokens)
 
     @property
     def turn(self) -> int:
@@ -398,9 +456,43 @@ class ContextManager:
         self._plan_text = plan.strip()
         self._rebuild_task()
 
+    def pin_directive(self, text: str) -> None:
+        """Keep something the developer said where compaction cannot reach it.
+
+        A follow-up and a mid-run correction both arrive as ordinary user
+        messages in the working set, which is the layer compaction consumes
+        first. So the developer's instruction is the *first* thing thrown away,
+        and in a run that compacts every few turns it is gone within two —
+        which is how a session answered "hi" by carrying on reading the same
+        two files for another forty turns, the message having been deleted from
+        the run before the next turn assembled.
+
+        That defeats the point of steering. Its whole promise is that a wrong
+        turn at turn 12 can be corrected without ending the run, and a
+        correction that evaporates at turn 14 is worse than no correction at
+        all: the developer believes the run was redirected.
+
+        Pinned as well as appended, not instead. The working-set copy keeps the
+        conversational position — the message sits after the answers it follows
+        — and this copy keeps the instruction alive. Deterministic on purpose:
+        the alternative was asking the summariser to carry it, and a recap that
+        silently degrades to a fallback is exactly the fragility this needs not
+        to have.
+        """
+        directive = text.strip()
+        if not directive or directive in self._directives:
+            return
+        self._directives.append(directive)
+        del self._directives[:-MAX_DIRECTIVES]
+        self._rebuild_task()
+
     @property
     def task_text(self) -> str:
         return self._task_text
+
+    @property
+    def directives(self) -> tuple[str, ...]:
+        return tuple(self._directives)
 
     @property
     def acceptance(self) -> tuple[str, ...]:
@@ -413,6 +505,9 @@ class ContextManager:
         if self._acceptance:
             criteria = "\n".join(f"- {c}" for c in self._acceptance)
             parts.append(f"\n# Accepts\n{criteria}")
+        if self._directives:
+            since = "\n".join(f"- {d}" for d in self._directives)
+            parts.append(f"\n# Since then, the developer has said\n{since}")
         self._task = Message(Role.USER, "\n".join(parts), Layer.TASK, source="task")
 
     def switch_mode(self, mode: Mode | str, instruction: str) -> None:
@@ -421,11 +516,31 @@ class ContextManager:
         Not by rebuilding the list with a different system prompt. That is
         finding S6, and it is what makes a planner-to-coder handoff cost one
         message rather than a full prefill of everything already in context.
+
+        Bounded, though, which it was not. ``MODE`` is a pinned layer, so
+        compaction can never reach it, and a run that walks the escalation
+        ladder switches mode on almost every turn: one session reached thirteen
+        mode instructions stacked in the head, five of them the Coder's and four
+        the Verifier's, each contradicting the one above it. That is an
+        un-evictable layer growing without limit, and a prompt whose loudest
+        signal is a pile of stale instructions.
+
+        Two bounds, both cheap. Re-stating the instruction already at the bottom
+        of the layer adds nothing, so it is skipped — which also keeps the head
+        byte-identical across a re-entry and costs no prefill. Beyond
+        ``MAX_MODE_MESSAGES`` the oldest is dropped: it is the one furthest from
+        what the model is doing now, and paying one prefill to stop the head
+        growing forever is the right trade. A healthy run makes four or five
+        switches and never reaches it.
         """
         self._config = config_for(mode)
+        text = instruction.strip()
+        if self._mode_messages and self._mode_messages[-1].content == text:
+            return
         self._mode_messages.append(
-            Message(Role.USER, instruction.strip(), Layer.MODE, source=f"mode:{self._config.mode}")
+            Message(Role.USER, text, Layer.MODE, source=f"mode:{self._config.mode}")
         )
+        del self._mode_messages[:-MAX_MODE_MESSAGES]
 
     def begin_turn(self) -> int:
         self._turn += 1

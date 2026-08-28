@@ -15,9 +15,9 @@ import re
 
 import pytest
 
-from dakcoder_agent.context import ContextManager
+from dakcoder_agent.context import ContextManager, Layer, Recap
 from dakcoder_agent.gate import GATE
-from dakcoder_agent.loop import AgentLoop, Outcome
+from dakcoder_agent.loop import COMPACTION_WINDOW, AgentLoop, Outcome
 from dakcoder_agent.modes import Mode
 from dakcoder_agent.tools.router import ApprovalRequest, Router
 from dakcoder_shared.envelope import EventType, ToolResult
@@ -752,3 +752,289 @@ def test_a_configuration_error_in_the_summariser_is_announced() -> None:
     assert recap is not None, "a degraded recap still beats ending the run"
     errors = [e for e in seen if "summariser" in str(e.data)]
     assert errors, "a permanent summariser failure must be visible in the transcript"
+
+
+# ── the review session that ran nineteen turns ──────────────────────────────
+
+QUESTIONS = """`review.md` already exists — a 298-line review of exactly this
+codebase. Before I plan, I need to know what you want, because "update" means
+several different things here.
+
+1. **Depth.** The current doc is a contract-migration review. Do you also want
+   the things it left out — error handling, naming, duplication, concurrency?
+2. **Audience.** Is this for you, or for a lead who has not seen the codebase?
+3. **Scope.** Keep the existing structure and refresh the numbers, or am I free
+   to restructure?
+"""
+
+
+def test_a_planner_that_asks_questions_does_not_hand_them_to_the_coder(
+    router: Router, gated
+) -> None:
+    """The nineteen-turn session, reduced to its first wrong step.
+
+    The Planner did exactly what it is told to do — ask at most four clarifying
+    questions — and the loop handed the questions to the Coder as a plan,
+    because `_count_steps` counts numbered lines and a numbered list of
+    questions is numbered.
+
+    Everything after that followed: the Coder had no step to execute so it
+    produced prose, `_verify` ran the gate on a workspace nothing had touched,
+    the gate failed on damage that pre-dated the session, the Verifier reported
+    it, and the ladder sent it back to the Coder. Ten turns and every escalation
+    slot went into that circuit, and it was reported as `unverified` — naming
+    the gate as the problem when the problem was a handoff that should never
+    have happened, with four unanswered questions still on screen.
+    """
+    agent, events = loop_over(router, [say(QUESTIONS), say("I'll orient myself first.")])
+
+    assert agent.result.outcome == Outcome.DONE
+    assert agent.context.turn == 1, "the questions were handed on anyway"
+    assert of_type(events, EventType.PLAN) == [], "a question was pinned as the plan"
+    assert of_type(events, EventType.GATE) == [], "a gate ran on work nobody did"
+    assert "asked for a decision" in agent.result.summary
+
+
+def test_a_plan_that_asks_something_and_still_plans_reaches_the_coder(
+    router: Router, gated
+) -> None:
+    """The other side of the branch, so the triage cannot quietly widen.
+
+    A real plan may ask. What makes it a plan is that its steps carry the
+    `Accepts:` lines the Planner is told to write, and those are what the check
+    keys off — not the absence of a question mark.
+    """
+    plan = (
+        "1. Add handler/pension.go\n"
+        "   Accepts: go build is clean\n"
+        "2. Wire the route in routes/routes.go\n"
+        "   Accepts: GET /pensions answers 200\n\n"
+        "Is the table really `pensions`? Should the list filter on status? "
+        "I have assumed yes to both."
+    )
+    agent, events = loop_over(router, [say(plan), say("done")])
+
+    assert of_type(events, EventType.PLAN) != [], "a plan with Accepts lines was read as a question"
+    assert agent.result.outcome == Outcome.DONE
+
+
+def test_two_modes_repeating_themselves_at_each_other_is_no_progress(
+    router: Router, gated
+) -> None:
+    """The circuit itself, in case anything else ever feeds it.
+
+    `said` holds the last three replies whatever mode said them, so an
+    alternation reads as `[coder, verifier, coder]` and never reaches three of
+    anything — the detector was structurally unable to see the shape that
+    actually killed the session. It is the mode-keyed ledger that catches it.
+    """
+    gated["fail"] = "swagger_check"
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Edit handler/user.go\n   Accepts: builds"),
+            say("I'll orient myself first, then plan the review."),   # coder
+            say("Stage that failed: swagger_check."),                 # verifier
+            say("I'll orient myself first, then plan the review."),   # coder, again
+        ]
+        + [say(f"filler {i}") for i in range(10)],
+    )
+
+    assert agent.result.outcome == Outcome.NO_PROGRESS
+    assert agent.context.turn == 4, "the ping-pong was allowed to keep going"
+    assert "same thing" in agent.result.summary
+
+
+def test_the_gate_is_not_re_run_against_an_unchanged_workspace(
+    router: Router, gated
+) -> None:
+    """Six identical gate runs is not six pieces of evidence.
+
+    Re-appending an identical report is what kept the circuit alive: the
+    Verifier was handed the exact input that produced its last paragraph and
+    asked for a different one. When nothing has changed the model is told
+    *that*, which is the only new information available.
+    """
+    runs: list[int] = []
+    build = router.handlers["go_build"]
+    router.handlers["go_build"] = lambda inv: (runs.append(1), build(inv))[1]
+    gated["fail"] = "go_build"
+
+    agent, events = loop_over(
+        router,
+        [say("1. Edit handler/user.go\n   Accepts: builds")]
+        + [say(f"attempt {i}") for i in range(12)],
+    )
+
+    assert agent.result.outcome == Outcome.UNVERIFIED
+    assert len(runs) == 1, f"the gate ran {len(runs)} times over one unchanged workspace"
+    assert [e for e in of_type(events, EventType.GATE) if e.data.get("cached")], (
+        "the client was never told the verdict was a repeat"
+    )
+
+
+def test_the_same_call_across_mode_switches_is_still_no_progress(
+    router: Router, gated
+) -> None:
+    """`_switch` clears `recent`, so a call made once per trip round the ladder
+    resets the detector every time and can repeat forever."""
+    gated["fail"] = "go_build"
+    read = ("read_file", '{"path": "handler/user.go"}')
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Read handler/user.go\n   Accepts: builds"),
+            calls(read), say("looked"),      # coder  -> verifier
+            say("the build is broken"),      # verifier -> coder
+            calls(read), say("looked again"),
+            say("still broken"),
+            calls(read),
+        ],
+    )
+
+    assert agent.result.outcome == Outcome.NO_PROGRESS
+    assert "read_file" in agent.result.summary
+
+
+def test_a_call_repeated_after_an_edit_is_re_checking_not_looping(
+    router: Router, gated
+) -> None:
+    """The guard on the guard. Re-reading a file you have just written is the
+    normal shape of careful work, and the run-wide ledger must not read it as a
+    loop — so a mutation clears it."""
+    read = ("read_file", '{"path": "handler/user.go"}')
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Write two files\n   Accepts: builds"),
+            calls(read),
+            calls(("write_file", '{"path": "a.go", "content": "package a"}')),
+            calls(read),
+            calls(("write_file", '{"path": "b.go", "content": "package b"}')),
+            calls(read),
+            say("done"),
+        ],
+        approve=lambda _r: True,
+    )
+
+    assert agent.result.outcome == Outcome.DONE
+
+
+# ── the whatsapp session that ran seventy-one turns ─────────────────────────
+
+
+def test_reading_the_same_file_every_few_turns_is_no_progress(
+    router: Router, gated
+) -> None:
+    """The seventy-one-turn session, reduced.
+
+    A Planner asked to write a handler read two files totalling a thousand lines
+    against a 24k budget. That tripped compaction, compaction evicted the reads,
+    the model re-read them, and round it went for seventy-one turns and
+    twenty-five compactions without ever producing a plan. It ended on the turn
+    cap and was reported as `exhausted`, which named the turn budget as the
+    problem.
+
+    `recent` could not see it: each turn called `repo_map`, then one file, then
+    another, so no fingerprint ever appeared three times *in a row* — and
+    `_switch` would have cleared the ledger anyway. The run-wide count does see
+    it, because nothing was being written between the reads.
+    """
+    same = ("read_file", '{"path": "handler/whatsapp.go"}')
+    other = ("read_file", '{"path": "handler/message.go"}')
+    agent, _ = loop_over(
+        router,
+        [calls(same, other), calls(other, same), calls(same)],
+        mode=Mode.PLANNER,
+    )
+
+    assert agent.result.outcome == Outcome.NO_PROGRESS
+    assert "read_file" in agent.result.summary
+
+
+def test_compacting_every_other_turn_stops_the_run(router: Router, gated) -> None:
+    """The same session by its other signature.
+
+    A model that varies its arguments — `repo_map {}`, then
+    `repo_map {"max_tokens": 6000}` — slips past the call ledger while doing
+    exactly the same thing. The density of compaction is the signal that does
+    not depend on the arguments: three inside eight turns means each one is
+    being undone by the turn after it.
+    """
+    context = ContextManager(mode=Mode.PLANNER, system_prompt="s", compact_at=0.0)
+    agent = AgentLoop(
+        context,
+        # Distinct arguments every turn, so only the compaction density can see
+        # it — which is the whole point of the check.
+        ScriptedClient([calls(("read_file", f'{{"path": "handler/f{i}.go"}}')) for i in range(12)]),
+        router,
+    )
+    list(agent.run("write a handler", start=Mode.PLANNER))
+
+    assert agent.result.outcome == Outcome.NO_PROGRESS
+    assert "compactions" in agent.result.summary
+    assert agent.context.turn <= COMPACTION_WINDOW + 1, "it was allowed to keep evicting"
+
+
+def test_a_follow_up_survives_the_compaction_that_follows_it(
+    router: Router, gated
+) -> None:
+    """The developer's message must not be the first thing thrown away.
+
+    A follow-up lands in the working set, which is the layer compaction
+    consumes first — so in a run compacting every other turn it was gone within
+    two, and the session carried on with the task it had been redirected away
+    from. Steering promises that a wrong turn can be corrected without ending
+    the run; a correction deleted two turns later is worse than none, because
+    the developer believes it landed.
+    """
+    context = ContextManager(mode=Mode.CODER, system_prompt="s")
+    agent = AgentLoop(context, ScriptedClient([say("ok")]), router)
+    list(agent.run("Add a Pension resource", start=Mode.CODER))
+
+    list(agent.run("stop reading and write the handler", continued=True, start=Mode.CODER))
+    context.compact(lambda messages: Recap(goal="g"), keep_recent=0)
+
+    pinned = "\n".join(m.content for m in context.build() if m.layer is Layer.TASK)
+    assert "stop reading and write the handler" in pinned
+
+
+def test_the_recap_says_which_files_were_already_read(router: Router, gated) -> None:
+    """The field the recap did not have, and why the loop above never ended.
+
+    What a compaction throws away is mostly file reads. A recap that does not
+    mention them leaves re-reading as the only rational next move — which puts
+    the context straight back over the threshold that fired the compaction.
+
+    They were also mislabelled: `_touched` returned every read path as
+    `files_modified`, so the recap told the model it had edited files it had
+    only opened.
+    """
+    context = ContextManager(mode=Mode.PLANNER, system_prompt="s")
+    context.set_task("write a whatsapp handler")
+    context.begin_turn()
+    for i, path in enumerate(("handler/whatsapp.go", "internal/app/service/whatsapp.go")):
+        context.append_tool_result("read_file", f"contents of {path}", tool_call_id=str(i), path=path)
+
+    class NoSummariser:
+        def chat(self, *_a, **_k):
+            raise ConnectionError("the gateway is down")
+
+    agent = AgentLoop(context, NoSummariser(), router)
+    recap = agent._summarise([m for m in context.build() if m.path])
+
+    assert recap.files_read == ("handler/whatsapp.go", "internal/app/service/whatsapp.go")
+    assert recap.files_modified == (), "a file that was read was reported as modified"
+    body = recap.markdown()
+    assert "Already read" in body
+    assert "handler/whatsapp.go" in body
+
+
+def test_the_tools_array_is_measured_before_the_compaction_decision(
+    router: Router, gated
+) -> None:
+    """The schemas are part of the prompt this turn sends, so a threshold
+    consulted without them is consulted against the wrong number."""
+    agent, _ = loop_over(router, [say("1. Edit handler/user.go\n   Accepts: builds"), say("done")])
+
+    assert agent.context.usage().tools > 0, "the tools array was still counted as free"

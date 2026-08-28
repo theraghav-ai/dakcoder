@@ -115,12 +115,33 @@ class _State:
     #: run that repeats itself does so *while* advancing modes — planner, coder,
     #: verifier, debugger, coder — so a shared ledger could never reach three.
     said: list[str] = field(default_factory=list)
+    #: How many times each ``(mode, reply)`` has been seen. ``said`` catches
+    #: three identical replies in a row; this catches the same reply coming back
+    #: every time the loop re-enters a mode, which is what a two-mode ping-pong
+    #: looks like and what ``said`` is structurally unable to see — with Coder
+    #: and Verifier alternating, ``said`` holds ``[coder, verifier, coder]`` and
+    #: never reaches three of anything.
+    echoes: dict[tuple[str, str], int] = field(default_factory=dict)
+    #: Fingerprint counts for the whole run rather than the current mode, reset
+    #: whenever a mutation lands. ``recent`` is cleared by ``_switch``, so a call
+    #: repeated once per trip round a mode cycle is invisible to it.
+    seen_calls: dict[str, int] = field(default_factory=dict)
+    #: ``router.mutations`` as of the last call, so ``seen_calls`` can be cleared
+    #: when something actually changed. Repeating a call after an edit is
+    #: re-checking work; repeating it after nothing is a loop.
+    mutations_seen: int = 0
     #: What each fingerprinted call last returned, so a repeat can be answered
     #: with the result rather than by running it again. Bounded by the number of
     #: distinct calls in a run, which is small.
     last_failure: dict[str, str] = field(default_factory=dict)
+    #: The turn each compaction fired on, for the thrash detector.
+    compactions: list[int] = field(default_factory=list)
     plan: str = ""
     last_gate: GateReport | None = None
+    #: The workspace state the last full gate ran against: how many mutations
+    #: the router had recorded, and which files. The gate is a function of those
+    #: plus the toolchain, so an unchanged pair means an unchanged verdict.
+    gate_key: tuple[int, tuple[str, ...]] | None = None
     dependencies_changed: bool = False
 
 
@@ -167,6 +188,28 @@ def _parse_recap(text: str) -> dict[str, Any] | None:
 MAX_ATTEMPTS = 2
 MAX_DEBUG_CYCLES = 3
 NO_PROGRESS_REPEATS = 3
+
+#: How many times one mode may repeat one tool-free reply before the run stops.
+#:
+#: Two, not three, and deliberately tighter than ``NO_PROGRESS_REPEATS``. This
+#: counts occurrences of the *same reply from the same mode* with no tool call
+#: in it, which is a narrower thing than three identical turns in a row: a mode
+#: that has already been re-entered once and said exactly what it said last time
+#: has demonstrated that returning to it does not change the answer. Turns that
+#: call a tool never reach this ledger, so a Coder prefixing each edit with one
+#: stock sentence is unaffected.
+MODE_ECHO_LIMIT = 2
+
+#: How many question marks make a Planner reply a question rather than a plan
+#: that happens to contain one. See ``_asks_the_developer``.
+MIN_QUESTIONS = 2
+
+#: The compaction-thrash window, in turns, and how many compactions inside it
+#: mean the run is evicting rather than working. A healthy run compacts roughly
+#: every seven or eight turns — reaching three inside eight means each
+#: compaction is being undone by the turn that follows it. See ``_thrashing``.
+COMPACTION_WINDOW = 8
+MAX_CLOSE_COMPACTIONS = 3
 
 
 class AgentLoop:
@@ -260,6 +303,9 @@ class AgentLoop:
         """
         if continued:
             self.context.append_user(task)
+            # And pinned, because the working-set copy is the first thing the
+            # next compaction evicts. See `ContextManager.pin_directive`.
+            self.context.pin_directive(task)
         else:
             self.context.set_task(task, acceptance=acceptance)
         self._switch(start)
@@ -304,6 +350,7 @@ class AgentLoop:
             # way the original task did, and the model treats it as instruction
             # rather than as tool output it can weigh against its own plan.
             self.context.append_user(correction)
+            self.context.pin_directive(correction)
             yield Event(EventType.STEER, {"text": correction, "turn": self.context.turn})
 
         turn = self.context.begin_turn()
@@ -312,8 +359,24 @@ class AgentLoop:
             {"turn": turn, "mode": str(self.state.mode), "attempt": self.state.attempts},
         )
 
+        # Measured before the compaction decision, not after: the schemas are
+        # part of the prompt this turn will send, so a threshold consulted
+        # without them is consulted against the wrong number. Computed once and
+        # reused below, which also stops the array being built twice per turn.
+        tools = self.router.schemas_for(self.state.mode)
+        self.context.observe_tool_schemas(estimate_tokens(json.dumps(tools)))
+
         if self.context.should_compact():
             yield from self._compact()
+            if reason := self._thrashing():
+                self.result = RunResult(
+                    Outcome.NO_PROGRESS,
+                    reason,
+                    self.context.turn,
+                    tuple(self.router.touched),
+                    self.state.last_gate,
+                )
+                return
 
         # One coalescer per turn, and the tail flushed however the turn ends.
         # Forgetting that flush is the classic bug in code shaped like this:
@@ -323,7 +386,7 @@ class AgentLoop:
             result = complete(
                 self.context,
                 self.client,
-                tools=self.router.schemas_for(self.state.mode),
+                tools=tools,
                 session_id=self.session_id,
                 on_delta=lambda fragment: self._relay(deltas.feed(fragment)),
             )
@@ -337,7 +400,7 @@ class AgentLoop:
                 result = complete(
                     self.context,
                     self.client,
-                    tools=self.router.schemas_for(self.state.mode),
+                    tools=tools,
                     session_id=self.session_id,
                     on_delta=lambda fragment: self._relay(deltas.feed(fragment)),
                 )
@@ -399,9 +462,10 @@ class AgentLoop:
             names = ", ".join(sorted({c.name for c in incomplete}))
             self.context.append_tool_result(
                 incomplete[0].name,
-                f"Your reply hit the {config_for(self.state.mode).max_tokens:,}-token output limit "
-                f"partway through calling {names}, so the arguments arrived incomplete "
-                "and the call was not made. Nothing is wrong with your JSON.\n\n"
+                f"Your call to {names} arrived cut off — the arguments stop partway "
+                "through, so the call was not made. Nothing is wrong with your JSON; "
+                "this is what running into the "
+                f"{config_for(self.state.mode).max_tokens:,}-token output limit looks like.\n\n"
                 "Make the next reply shorter: fewer tool calls in one turn, and less "
                 "prose before them. One call is enough.",
                 tool_call_id=incomplete[0].id,
@@ -421,10 +485,10 @@ class AgentLoop:
             yield from self._tool_calls(result.chat.tool_calls)
             return
 
-        if result.chat.content and self._repeating(result.chat.content):
+        if result.chat.content and (why := self._repeating(result.chat.content)):
             self.result = RunResult(
                 Outcome.NO_PROGRESS,
-                f"the same reply {NO_PROGRESS_REPEATS} turns running, with no tool call",
+                why,
                 self.context.turn,
                 tuple(self.router.touched),
                 self.state.last_gate,
@@ -602,6 +666,20 @@ class AgentLoop:
 
         if mode is Mode.PLANNER:
             steps = _count_steps(text)
+            if _asks_the_developer(text):
+                # A question is not a plan, however it is numbered. Ending here
+                # leaves the questions on screen as the last thing said, and the
+                # developer's answer arrives as a follow-up on this transcript —
+                # which is what `continued` is for and what the Planner was
+                # waiting on all along.
+                self.result = RunResult(
+                    Outcome.DONE,
+                    "the planner asked for a decision before it could plan; answer it "
+                    "and the run continues from here",
+                    self.context.turn,
+                    tuple(self.router.touched),
+                )
+                return
             if steps == 0 and not _is_scaffold_plan(text):
                 # A reply with no steps is not a plan, and the Planner is the one
                 # mode positioned to say so: it has read the task and answered it.
@@ -636,13 +714,46 @@ class AgentLoop:
             return
 
     def _verify(self) -> Iterator[Event]:
-        """Run the gate and act on it. The one thing the model cannot skip."""
+        """Run the gate and act on it. The one thing the model cannot skip.
+
+        Skipped in exactly one case, and it is not the model's to invoke: the
+        workspace is byte-for-byte what it was when the gate last ran. The gate
+        is a function of the files and the toolchain, so re-running it there
+        cannot produce a different verdict — it can only spend another `go
+        build`, `go vet` and `swagger_check` arriving at the report already in
+        context.
+
+        That is not merely wasteful. Re-appending an identical report is what
+        kept a real run alive: the Verifier read the same failure and wrote the
+        same paragraph, the ladder sent it back to the Coder, and round it went.
+        The model was being handed the exact input that produced the last reply
+        and asked for a different one. So when nothing has changed it is told
+        *that*, which is new information and the only thing here that is.
+        """
+        key = (self.router.mutations, tuple(self.router.touched))
+        if self.state.last_gate is not None and key == self.state.gate_key:
+            # Only reachable on a failing report: a clean one ends the run below.
+            report = self.state.last_gate
+            blocker = report.blocked_by.name if report.blocked_by else "the gate"
+            yield Event(EventType.GATE, {"kind": "full", "cached": True, **report.as_dict()})
+            self.context.append_tool_result(
+                "go_build",
+                f"The gate was not re-run. Nothing in the workspace has changed since it "
+                f"last ran, so its verdict cannot have changed: still blocked at "
+                f"{blocker}, and the output above is still the whole of it.\n\n"
+                "Nothing will move until a file does. Make the edit, or say plainly what "
+                "is stopping you from making it — restating the failure is not a change.",
+            )
+            self._switch(Mode.VERIFIER)
+            return
+
         report = full_gate(
             self.router,
             self.router.touched,
             dependencies_changed=self.state.dependencies_changed,
         )
         self.state.last_gate = report
+        self.state.gate_key = key
         yield Event(EventType.GATE, {"kind": "full", **report.as_dict()})
 
         if report.ok:
@@ -758,12 +869,30 @@ class AgentLoop:
     # -- helpers ----------------------------------------------------------
 
     def _stuck(self, fingerprint: str) -> bool:
+        """Whether this exact call has stopped being an attempt at anything.
+
+        Two ledgers again, for the same reason ``_repeating`` needs two.
+
+        ``recent`` is the consecutive run within one mode, and ``_switch``
+        clears it — which is right for what it measures and blind to a call
+        made once per trip round a mode cycle. ``seen_calls`` counts the whole
+        run, and is cleared the moment a mutation lands: repeating a call after
+        an edit is re-checking work, and repeating it after nothing changed is
+        a loop.
+        """
+        if self.router.mutations != self.state.mutations_seen:
+            self.state.mutations_seen = self.router.mutations
+            self.state.seen_calls.clear()
+
         self.state.recent.append(fingerprint)
         del self.state.recent[:-NO_PROGRESS_REPEATS]
-        return (
+        self.state.seen_calls[fingerprint] = self.state.seen_calls.get(fingerprint, 0) + 1
+
+        consecutive = (
             len(self.state.recent) == NO_PROGRESS_REPEATS
             and len(set(self.state.recent)) == 1
         )
+        return consecutive or self.state.seen_calls[fingerprint] >= NO_PROGRESS_REPEATS
 
     def _repeated_once(self, fingerprint: str) -> bool:
         """Whether this exact call was also the previous one.
@@ -777,8 +906,8 @@ class AgentLoop:
         tail = self.state.recent[-2:]
         return len(tail) == 2 and tail[0] == tail[1]
 
-    def _repeating(self, text: str) -> bool:
-        """The same reply, three turns running, with no tool call between them.
+    def _repeating(self, text: str) -> str:
+        """Why this tool-free reply counts as no progress, or ``""`` if it does not.
 
         ``_stuck`` judges a turn by the arguments it dispatched, so a turn that
         dispatches nothing is invisible to it. That is the hole a typo fell
@@ -786,15 +915,74 @@ class AgentLoop:
         and the loop had no way to notice because not one of those turns called
         a tool. Whitespace is normalised because a model that re-wraps the same
         paragraph has not made progress either.
+
+        Two ledgers, because a stuck run has two shapes and neither sees the
+        other.
+
+        ``said`` is the original: the same reply three turns running, whatever
+        mode said it. It catches a model that has given up and is restating one
+        refusal as the ladder walks past it.
+
+        ``echoes`` is keyed by mode as well as text and counts occurrences
+        rather than a consecutive run — which is the shape ``said`` cannot see
+        and the one that cost a real session nineteen turns. Coder and Verifier
+        alternated, each repeating its own sentence, so ``said`` held
+        ``[coder, verifier, coder]`` and never reached three of anything. The
+        run was ended by the escalation ladder running out, ten turns and five
+        escalation slots later, and reported as ``unverified`` — which named the
+        gate as the problem when the problem was that nothing was being
+        attempted at all.
         """
-        self.state.said.append(" ".join(text.split()))
+        normalised = " ".join(text.split())
+        if not normalised:
+            return ""
+
+        self.state.said.append(normalised)
         del self.state.said[:-NO_PROGRESS_REPEATS]
+        if len(self.state.said) == NO_PROGRESS_REPEATS and len(set(self.state.said)) == 1:
+            return f"the same reply {NO_PROGRESS_REPEATS} turns running, with no tool call"
+
+        key = (str(self.state.mode), normalised)
+        self.state.echoes[key] = self.state.echoes.get(key, 0) + 1
+        if self.state.echoes[key] >= MODE_ECHO_LIMIT:
+            return (
+                f"the {self.state.mode} said the same thing {self.state.echoes[key]} times "
+                "without calling a tool; the loop is cycling between modes rather than "
+                "making progress"
+            )
+        return ""
+
+    def _thrashing(self) -> str:
+        """Whether the run is spending its turns on eviction rather than work.
+
+        Compaction is designed to be rare: it retains to a token floor
+        precisely so the next turn does not immediately trip the threshold
+        again. When it stops being rare, the working set is bigger than the
+        budget can hold, and every compaction evicts the file the model then
+        re-reads — which puts it straight back over the threshold. That is a
+        closed circuit and it does not open on its own.
+
+        A real session ran it seventy-one turns: two files totalling a thousand
+        lines against a 24k Planner budget, twenty-five compactions, not one
+        plan, and it ended on the turn budget rather than on anything that
+        understood what had happened. Reported as ``exhausted``, which named the
+        turn cap as the problem.
+
+        Judged on density rather than a total, because a long healthy run does
+        compact several times — just never three times inside eight turns.
+        """
+        window = [t for t in self.state.compactions if self.context.turn - t < COMPACTION_WINDOW]
+        if len(window) < MAX_CLOSE_COMPACTIONS:
+            return ""
         return (
-            len(self.state.said) == NO_PROGRESS_REPEATS
-            and len(set(self.state.said)) == 1
+            f"{len(window)} compactions in {COMPACTION_WINDOW} turns: the working set is "
+            f"larger than the {self.context.budget:,}-token {self.state.mode} budget can "
+            "hold, so each turn is evicting what the last one read. Narrow the task, or "
+            "work on fewer files at once"
         )
 
     def _compact(self) -> Iterator[Event]:
+        self.state.compactions.append(self.context.turn)
         before = self.context.usage().total
         recap = self.context.compact(self._summarise)
         yield Event(
@@ -836,11 +1024,12 @@ class AgentLoop:
             f"[{m.role}{'' if not m.path else ' ' + m.path}] {m.content}" for m in messages
         )
 
-        created, modified = self._touched(messages)
+        read = self._read_paths(messages)
+        modified = tuple(self.router.touched)
         fallback = Recap(
             goal=self.state.plan.splitlines()[0] if self.state.plan else "",
-            files_created=created,
             files_modified=modified,
+            files_read=read,
             open_items=("the recap could not be summarised; the tail is preserved below",),
             decisions=(transcript[-2000:],) if transcript else (),
             turns=turns,
@@ -905,8 +1094,11 @@ class AgentLoop:
         return Recap(
             goal=parsed.get("goal", "") or fallback.goal,
             plan_step=parsed.get("plan_step", ""),
-            files_created=tuple(parsed.get("files_created") or created),
+            files_created=tuple(parsed.get("files_created") or ()),
             files_modified=tuple(parsed.get("files_modified") or modified),
+            # Not taken from the model. What was evicted is a fact about this
+            # compaction, and the loop is the only thing that knows it.
+            files_read=read,
             decisions=tuple(parsed.get("decisions") or ()),
             verified=tuple(parsed.get("verified") or ()),
             open_items=tuple(parsed.get("open_items") or ()),
@@ -915,15 +1107,20 @@ class AgentLoop:
         )
 
     @staticmethod
-    def _touched(messages: Sequence[Message]) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        """File paths recovered from the messages themselves.
+    def _read_paths(messages: Sequence[Message]) -> tuple[str, ...]:
+        """Files whose contents this compaction is about to throw away.
 
-        Recovered rather than asked for, so the two list fields are right even
-        when the model returns nothing usable.
+        Recovered from the messages rather than asked of the summariser, so the
+        list is right even when the model returns nothing usable — and because
+        it is a fact about the eviction, which the summariser is not told about.
+
+        ``Message.path`` is set only by ``_slice_path``, and only for a
+        successful ``read_file``. These are reads, not writes: the previous
+        version returned them as ``files_modified``, which told the model it had
+        edited files it had merely opened.
         """
         seen = [m.path for m in messages if m.path]
-        ordered = list(dict.fromkeys(seen))
-        return (), tuple(ordered)
+        return tuple(dict.fromkeys(seen))
 
     def _done_summary(self, report: GateReport) -> str:
         """What the developer reads when a run ends DONE.
@@ -981,9 +1178,39 @@ def _slice_path(call: ToolCall, result: ToolResult) -> str | None:
 
 
 def _count_steps(plan: str) -> int:
-    import re
-
     return len(re.findall(r"^\s*\d+[.)]\s", plan, flags=re.MULTILINE))
+
+
+#: A step in a real plan carries one of these. The Planner is told so.
+_ACCEPTS = re.compile(r"^\s*[-*>\s]*\**\s*Accepts\s*:", re.MULTILINE | re.IGNORECASE)
+
+
+def _asks_the_developer(plan: str) -> bool:
+    """Whether the Planner asked for a decision instead of producing a plan.
+
+    The Planner is told it may ask up to four clarifying questions, and it does.
+    Until now a reply made entirely of them still went to the Coder, because
+    ``_count_steps`` counts numbered lines and a numbered list of questions is
+    numbered. This is the sibling of ``_restated_the_plan`` — the same handoff
+    failing at the other end — and it is the one that cost nineteen turns: the
+    Coder had no step to execute, so it produced prose; ``_verify`` ran the gate
+    on a workspace nothing had touched; it failed on damage that was there
+    before the session started; the Verifier reported it; the ladder sent it
+    back to the Coder. Round that went until the escalation budget ran out, with
+    four unanswered questions still on screen and the run reported as
+    ``unverified`` — blaming the gate for a handoff that should never have
+    happened.
+
+    Two signals, and both are required. The Planner's own instruction says every
+    real step carries an ``Accepts:`` line, so a reply with none is not a plan
+    by our own definition — but that alone would also catch the terse one-line
+    plans, so it has to be paired with the questions actually being present. A
+    genuine eight-step plan that happens to ask something keeps its ``Accepts:``
+    lines and is unaffected.
+    """
+    if _ACCEPTS.search(plan):
+        return False
+    return plan.count("?") >= MIN_QUESTIONS
 
 
 def _is_scaffold_plan(plan: str) -> bool:
