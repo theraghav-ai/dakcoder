@@ -32,6 +32,7 @@ import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from dakcoder_shared.envelope import Mutation, ToolResult
@@ -428,20 +429,111 @@ class Router:
                     fix="This is an environment problem, not a code problem. "
                     "Report it rather than working around it.",
                 )
-            return ToolResult.failure(
-                f"{spec.name}: {missing} does not exist.",
-                fix="Check the path with repo_map or search_repo before reading it.",
-            )
+            return self._missing_path(spec, invocation, missing)
         except TimeoutError as exc:
             return ToolResult.failure(
                 f"{spec.name} timed out: {exc}",
                 fix="Narrow the scope — one package rather than the whole module.",
+            )
+        except IsADirectoryError as exc:
+            return ToolResult.failure(
+                f"{spec.name}: {getattr(exc, 'filename', None) or exc} is a directory.",
+                fix="Use repo_map to list it, or name a file inside it.",
             )
         except Exception as exc:  # noqa: BLE001 - a tool crash must not end the session
             return ToolResult.failure(
                 f"{spec.name} failed: {type(exc).__name__}: {exc}",
                 meta={"traceback": True},
             )
+
+
+    #: How many near-miss paths to offer. Three is enough to contain the right
+    #: answer and short enough that a wrong list costs almost nothing.
+    _SUGGESTIONS = 3
+
+    def _missing_path(self, spec: ToolSpec, invocation: Invocation, missing: str) -> ToolResult:
+        """Report a path that is not there, and say what is.
+
+        "does not exist — check the path with repo_map or search_repo" is true,
+        actionable in principle, and was ignored three turns running in the
+        field. The model had guessed a plausible filename; being told to go
+        looking gave it nothing to look *for*, so it made the same guess again
+        and the run died against the no-progress detector.
+
+        Naming the closest real files ends that in one turn. The guess is
+        usually close — right directory, wrong file, or the right name in a
+        different package — which is exactly the case a similarity match wins.
+
+        The path is reported workspace-relative. The raw exception carries an
+        absolute OS path, and every other message in this process speaks
+        relative paths; handing the model
+        ``D:\\desktop\\svc\\handler\\response\\x.go`` invites it to send that
+        back, which the workspace guard then refuses for a different reason.
+        """
+        wanted = self._relative(missing)
+        suggestions = self._nearest(wanted)
+
+        if not suggestions:
+            return ToolResult.failure(
+                f"{spec.name}: {wanted} does not exist, and nothing in the workspace "
+                "has a similar name.",
+                fix="Call repo_map to see what is actually here before reading again. "
+                "Do not retry this path.",
+            )
+        listed = "\n".join(f"  {p}" for p in suggestions)
+        return ToolResult.failure(
+            f"{spec.name}: {wanted} does not exist. The closest files that do:\n{listed}",
+            fix=f"Read one of those, or call repo_map. Do not retry {wanted}.",
+        )
+
+    def _relative(self, path: str) -> str:
+        """Render a path relative to the workspace, falling back to the name."""
+        try:
+            return self.workspace.relative(Path(path))
+        except (ValueError, OSError):
+            return Path(path).name
+
+    def _nearest(self, wanted: str) -> list[str]:
+        """Workspace files whose names are closest to the one asked for.
+
+        Matched on the basename first and the whole path second: a model that
+        guesses the directory wrong but the filename right is the common case,
+        and a whole-path match scores that no better than an unrelated file in
+        the directory it guessed.
+        """
+        target = Path(wanted)
+        try:
+            candidates = [
+                p for p in self.workspace.root.rglob(f"*{target.suffix or ''}")
+                if p.is_file() and not _ignored(p)
+            ]
+        except OSError:
+            return []
+
+        stem = target.stem.lower()
+        scored: list[tuple[float, str]] = []
+        for p in candidates[:5_000]:  # a bound, not a limit anyone should reach
+            try:
+                rel = p.relative_to(self.workspace.root).as_posix()
+            except ValueError:
+                continue
+            score = difflib.SequenceMatcher(None, stem, p.stem.lower()).ratio()
+            # A directory in common is worth something, but never enough to beat
+            # a better filename: the filename is what the model was reaching for.
+            if target.parent != Path(".") and str(target.parent) in rel:
+                score += 0.15
+            scored.append((score, rel))
+
+        scored.sort(key=lambda s: (-s[0], s[1]))
+        return [rel for score, rel in scored[: self._SUGGESTIONS] if score >= 0.5]
+
+
+#: Directories whose contents are never a useful suggestion.
+_IGNORED_DIRS = frozenset({".git", "vendor", "node_modules", ".venv", "bin", "dist", "build"})
+
+
+def _ignored(path: Path) -> bool:
+    return any(part in _IGNORED_DIRS for part in path.parts)
 
 
 # ── approval reasons ────────────────────────────────────────────────────────

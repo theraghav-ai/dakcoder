@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dakcoder-shared"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared config, contracts and helpers for the dakcoder agent and gateway"
 requires-python = ">=3.11"
 # `dakcoder_shared.llm` imports httpx at module scope, so this is a hard

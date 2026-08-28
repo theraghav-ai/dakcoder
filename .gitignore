@@ -17,3 +17,11 @@ __pycache__/
 deploy/*.env
 deploy/logs/
 code-review/
+
+# Python build artifacts. `python -m build` writes a full copy of every source
+# file here, and 41 of them were committed — stale, and differing from src/.
+# During one debugging session several reviewers read build/lib/ instead of
+# src/, quoted line numbers that do not exist in the running code, and reported
+# defects against a file nobody ships.
+apps/*/build/
+apps/*/*.egg-info/

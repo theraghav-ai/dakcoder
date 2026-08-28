@@ -202,6 +202,37 @@ class ChatResult:
     #: completion. Counted, because §18 wants zero of these.
     recovered_from_empty: bool = False
 
+    @property
+    def truncated(self) -> bool:
+        """Whether the model ran out of output budget mid-reply.
+
+        Worth a name because of what it does to a *tool call*. Arguments arrive
+        as streamed fragments and are concatenated, so a turn cut off partway
+        through one leaves a valid-looking JSON prefix — in the wild, the single
+        character ``{``. Parsing it raises "Expecting property name enclosed in
+        double quotes", which reads as the model having emitted bad JSON.
+
+        It has not. It emitted correct JSON and was interrupted. Telling it to
+        send valid JSON is advice it cannot act on, because the fix is to
+        produce *less* output, not different output — so it makes the same
+        oversized reply, is cut off at the same place, and the run dies against
+        the no-progress detector three turns later. That is the loop this
+        property exists to let the caller break.
+        """
+        return self.finish_reason == "length"
+
+    def incomplete_tool_calls(self) -> list[ToolCall]:
+        """Tool calls whose arguments did not survive the cut."""
+        if not self.truncated:
+            return []
+        out = []
+        for call in self.tool_calls:
+            try:
+                call.parsed()
+            except ValueError:
+                out.append(call)
+        return out
+
 
 def strip_html(body: str, *, limit: int = 300) -> str:
     """Reduce an upstream HTML error page to one sentence.

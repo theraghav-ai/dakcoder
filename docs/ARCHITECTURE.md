@@ -1711,6 +1711,72 @@ The load-bearing assertions, and what each is guarding against:
 
 ## 5. Changelog
 
+### 2026-08-28 — Four reasons a run repeats itself, and one that had never worked
+
+Two more sessions died against the no-progress detector. Neither was the
+oversized-payload problem fixed earlier the same day.
+
+**A tool call cut off by `max_tokens` was reported as bad JSON.** Arguments
+arrive as streamed fragments and are concatenated, so a reply interrupted
+mid-call leaves a valid-looking prefix — in the field, the single character `{`.
+Dispatching it produced *"Expecting property name enclosed in double quotes"*,
+so the model was told to send valid JSON. It had sent valid JSON and been
+interrupted; the fix is shorter output, not different output, and nothing in
+the agent read `finish_reason` to tell the difference. Reproduced exactly
+against `_consume_stream`. `ChatResult.truncated` now names it, and the loop
+feeds back the real cause without dispatching a call that cannot succeed.
+
+**A missing file gave the model nothing to look for.** `read_file` on a guessed
+path answered "does not exist — check the path with repo_map or search_repo",
+with the raw *absolute* OS path, in a process where everything else speaks
+workspace-relative. True, actionable in principle, ignored three turns running.
+The router now names the closest real files:
+
+```
+read_file: handler/response/flow_send_message_request.go does not exist.
+The closest files that do:
+  handler/response/flow_send_message_response.go
+fix: Read one of those, or call repo_map. Do not retry <path>.
+```
+
+**The detector killed the run without ever warning the model.** It fires on the
+third identical call and ends everything, discarding every turn spent — but
+nothing had told the model it was repeating, because the tool simply ran again
+and returned the same result, which is the input that produced the repeat. The
+second identical call is now intercepted rather than dispatched, and answered
+with what the call returned the first time. The third still ends the run: a
+model that ignores the intervention is genuinely stuck.
+
+**And the one that had never worked.** A fan-out of five investigators and
+their refuters — 38 agents, most findings correctly refuted — surfaced one
+defect no amount of reading the loop would have found. `_summarise` asked for
+`role="summariser"`, and `LLMConfig.model_for` whitelists coder, fast and embed.
+The model is resolved inside `chat()` before any request is sent, so the
+`ValueError` landed in a broad `except` and **every compaction in production
+has silently returned the fallback recap** — whose `do_not_retry` is always
+empty. That is the field context.py calls *"what stops the post-compaction agent
+cheerfully repeating the dead end that got it here"*, and it has never once been
+populated outside a test. Verified by executing the real config on both
+deployments. The gateway's own role table does map `summariser`; the client
+never gets far enough to use it.
+
+Fixed to `role="fast"`, which is what §6.5 specifies. The `except` now
+distinguishes our configuration errors — permanent, and degrading every
+compaction for the life of the process — from transport failures, and announces
+them. Same lesson as the quota incident earlier the same day: a catch-all that
+turns our bugs into somebody else's outage hides the one clue there was.
+
+No test caught it because every compaction test fakes the client, and a fake
+that ignores `role` cannot fail on a role it was never going to validate. The
+new test asserts the role against the real resolver instead.
+
+**Also**: `apps/*/build/` was committed — 41 stale duplicates of every source
+file, differing from `src/`. Several reviewers in the investigation read them,
+quoted line numbers that do not exist in the running code, and reported defects
+against a file nobody ships. Untracked and ignored.
+
+Rebuilt to 0.2.2 (`dakcoder_shared` 0.1.1, for the two new `ChatResult` members).
+
 ### 2026-08-28 — A 705KB JSON line, truncated, read as a broken tool
 
 A review session died after seventeen turns. The planner called `legacy_audit`,

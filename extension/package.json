@@ -2,7 +2,7 @@
   "name": "dakcoder-go",
   "displayName": "dakcoder",
   "description": "The India Post IT 2.0 backend coding agent for Go services on the n-api-template contract.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "dop",
   "license": "UNLICENSED",
   "private": true,

@@ -10,6 +10,8 @@ and the decisions once.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
+import re
 
 import pytest
 
@@ -632,3 +634,121 @@ def test_a_coder_that_calls_a_tool_is_left_alone(router: Router, gated) -> None:
     assert of_type(events, EventType.TOOL_CALL), "the call never happened"
     assert agent.result.outcome == Outcome.DONE
     assert "not a plan" not in agent.result.summary
+
+
+# ── the two loops that killed real sessions ─────────────────────────────────
+
+
+def test_a_repeated_call_is_answered_before_the_run_is_killed(router: Router, gated) -> None:
+    """The second identical call is intercepted; only the third ends the run.
+
+    Two sessions died here. The detector fired on the third identical call and
+    ended the run, throwing away every turn spent so far — but nothing had told
+    the model it was repeating itself, because the tool simply ran again and
+    returned the same thing, which is the input that produced the repeat.
+    """
+    same = ("read_file", '{"path":"handler/user.go"}')
+    agent, events = loop_over(router, [calls(same), calls(same), calls(same)], mode=Mode.CODER)
+
+    results = [e.data for e in of_type(events, EventType.TOOL_RESULT)]
+    intercepted = [r for r in results if "not re-run" in str(r.get("content", ""))]
+    assert intercepted, "the second identical call must be answered, not dispatched again"
+    assert intercepted[0]["ok"] is False
+
+    # The third still ends the run: a model that ignores the intervention is
+    # genuinely stuck, and the detector is still the backstop.
+    assert agent.result.outcome == Outcome.NO_PROGRESS
+
+
+def test_the_intervention_carries_what_the_call_returned(router: Router, gated) -> None:
+    """Telling the model "you repeated yourself" without saying what came back
+    leaves it exactly as stuck as it was."""
+    missing = ("read_file", '{"path":"handler/does_not_exist.go"}')
+    _agent, events = loop_over(router, [calls(missing), calls(missing)], mode=Mode.CODER)
+
+    results = [e.data for e in of_type(events, EventType.TOOL_RESULT)]
+    intercepted = [r for r in results if "not re-run" in str(r.get("content", ""))]
+    assert intercepted, "expected an interception"
+
+
+def test_a_truncated_tool_call_is_not_reported_as_bad_json(router: Router, gated) -> None:
+    """A reply cut off by max_tokens leaves a JSON prefix — in the field, `{`.
+
+    Dispatching it says "malformed arguments", so the model is told to send
+    valid JSON. It did send valid JSON and was interrupted; acting on that
+    advice means making the same oversized reply and being cut off again. The
+    loop must name the real cause instead.
+    """
+    truncated = ChatResult(
+        tool_calls=[ToolCall(id="t1", name="legacy_audit", arguments="{")],
+        finish_reason="length",
+        usage=Usage(prompt_tokens=100),
+    )
+    _agent, events = loop_over(router, [truncated, say("shorter now")], mode=Mode.CODER)
+
+    results = [e.data for e in of_type(events, EventType.TOOL_RESULT)]
+    assert results, "the model must be told something"
+    text = str(results[0].get("content", ""))
+    assert "output limit" in text, f"expected the real cause, got {text!r}"
+    assert "malformed" not in text.lower(), "the JSON was not malformed; it was cut off"
+
+    # And the call must not have been dispatched: it cannot succeed.
+    dispatched = [e for e in of_type(events, EventType.TOOL_CALL)]
+    assert not dispatched, "a truncated call must not be run"
+
+
+def test_the_summariser_uses_a_role_the_config_accepts() -> None:
+    """Compaction asked for a role that does not exist, for its whole life.
+
+    `LLMConfig.model_for` whitelists coder, fast and embed. The model is
+    resolved inside `chat()` before any request is sent, so `role="summariser"`
+    raised a ValueError that the broad `except` swallowed — and every compaction
+    in production returned the fallback recap, whose `do_not_retry` is always
+    empty. That field is the one context.py calls "what stops the
+    post-compaction agent cheerfully repeating the dead end that got it here".
+
+    No test caught it because every compaction test fakes the client, and a fake
+    that ignores `role` cannot fail on a role it was never going to validate.
+    This one asserts against the real resolver.
+    """
+    import inspect
+
+    from dakcoder_agent import loop as loop_module
+    from dakcoder_shared.config import Deployment, LLMConfig
+
+    source = inspect.getsource(loop_module.AgentLoop._summarise)
+    role = re.search(r'role="([^"]+)"', source)
+    assert role, "the summariser must name a role explicitly"
+
+    for deployment in (Deployment.LOCAL, Deployment.GATEWAY):
+        config = LLMConfig(base_url="http://x/v1", api_key="k", deployment=deployment)
+        # Raises if the role is not one the config knows: the exact failure that
+        # was invisible in production.
+        config.model_for(role.group(1))
+
+
+def test_a_configuration_error_in_the_summariser_is_announced() -> None:
+    """A permanent failure must not look like a transient one.
+
+    The broad `except` treated a misconfigured role — which degrades every
+    compaction for the life of the process — the same as a dropped connection.
+    Transport failures still degrade quietly; ours are announced.
+    """
+    from dakcoder_agent.context import ContextManager, Message, Role
+
+    class Misconfigured:
+        def chat(self, *_a, **_k):
+            raise ValueError("unknown model role 'summariser'")
+
+    seen: list = []
+    agent = AgentLoop(
+        ContextManager(system_prompt="sp"),
+        Misconfigured(),
+        Router(Workspace(Path(__file__).parent)),
+        on_event=seen.append,
+    )
+    recap = agent._summarise([Message(Role.USER, "did a thing", turn=1)])
+
+    assert recap is not None, "a degraded recap still beats ending the run"
+    errors = [e for e in seen if "summariser" in str(e.data)]
+    assert errors, "a permanent summariser failure must be visible in the transcript"

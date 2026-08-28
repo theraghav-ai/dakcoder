@@ -46,7 +46,7 @@ from dakcoder_shared.tokens import estimate_tokens
 from .context import ContextManager, Message, OverBudgetError, Recap
 from .gate import GateReport, full_gate, inner_loop
 from .llm import TurnResult, complete, reasoning_leaked
-from .modes import Mode
+from .modes import Mode, config_for
 from .prompts import mode_instruction, system_prompt
 from .tools.router import ApprovalRequest, Router
 
@@ -115,6 +115,10 @@ class _State:
     #: run that repeats itself does so *while* advancing modes — planner, coder,
     #: verifier, debugger, coder — so a shared ledger could never reach three.
     said: list[str] = field(default_factory=list)
+    #: What each fingerprinted call last returned, so a repeat can be answered
+    #: with the result rather than by running it again. Bounded by the number of
+    #: distinct calls in a run, which is small.
+    last_failure: dict[str, str] = field(default_factory=dict)
     plan: str = ""
     last_gate: GateReport | None = None
     dependencies_changed: bool = False
@@ -379,6 +383,40 @@ class AgentLoop:
             self.context.append_assistant(result.chat.content)
             yield Event(EventType.ASSISTANT, {"text": result.chat.content})
 
+        # A reply cut off by the output budget, mid-tool-call.
+        #
+        # The arguments are a valid-looking JSON prefix — `{` is what it looks
+        # like in practice — so dispatching them produces "malformed arguments",
+        # and the model is told to send valid JSON. It did send valid JSON. It
+        # was interrupted. Acting on that advice means making the same oversized
+        # reply, being cut off at the same place, and dying against the
+        # no-progress detector three turns later, which is exactly what happened
+        # in the field.
+        #
+        # Named for what it is, and fed back before dispatch so the turn is not
+        # spent on a call that cannot succeed.
+        if incomplete := result.chat.incomplete_tool_calls():
+            names = ", ".join(sorted({c.name for c in incomplete}))
+            self.context.append_tool_result(
+                incomplete[0].name,
+                f"Your reply hit the {config_for(self.state.mode).max_tokens:,}-token output limit "
+                f"partway through calling {names}, so the arguments arrived incomplete "
+                "and the call was not made. Nothing is wrong with your JSON.\n\n"
+                "Make the next reply shorter: fewer tool calls in one turn, and less "
+                "prose before them. One call is enough.",
+                tool_call_id=incomplete[0].id,
+            )
+            yield Event(
+                EventType.TOOL_RESULT,
+                {
+                    "id": incomplete[0].id,
+                    "name": incomplete[0].name,
+                    "ok": False,
+                    "content": f"output limit reached mid-call; {names} was not dispatched",
+                },
+            )
+            return
+
         if result.chat.tool_calls:
             yield from self._tool_calls(result.chat.tool_calls)
             return
@@ -454,6 +492,40 @@ class AgentLoop:
                 )
                 return
 
+            # One warning before the kill.
+            #
+            # The detector fires on the third identical call and ends the run,
+            # which throws away every turn spent so far and hands the developer
+            # nothing. On the second, the model has repeated itself once and is
+            # still able to act — but only if something tells it so, and until
+            # now nothing did: the tool ran again and returned the same result,
+            # which is precisely the input that produced the repeat.
+            #
+            # So the second identical call is intercepted instead of dispatched.
+            # The model is told what it did, what came back, and that the same
+            # call will not be run again. That converts a fatal loop into a
+            # recoverable turn, and it costs one tool call rather than a run.
+            if self._repeated_once(fingerprint):
+                previous = self.state.last_failure.get(fingerprint, "the same result")
+                self.context.append_tool_result(
+                    call.name,
+                    f"Not run: you have already called {call.name} with exactly these "
+                    f"arguments this turn and last, and it returned:\n\n{previous}\n\n"
+                    "Repeating it will return the same thing. Do something different — "
+                    "a different tool, different arguments, or say what is blocking you.",
+                    tool_call_id=call.id,
+                )
+                yield Event(
+                    EventType.TOOL_RESULT,
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "ok": False,
+                        "content": f"{call.name} repeated with identical arguments; not re-run",
+                    },
+                )
+                continue
+
             yield Event(
                 EventType.TOOL_CALL,
                 {"id": call.id, "name": call.name, "arguments": _safe_args(call)},
@@ -490,6 +562,10 @@ class AgentLoop:
             mutated = mutated or bool(outcome.mutations)
             if call.name == "go_mod":
                 self.state.dependencies_changed = True
+
+            # Kept so a repeat of this exact call can be answered with what it
+            # returned, instead of running it a second time to find out.
+            self.state.last_failure[fingerprint] = outcome.for_model()[:600]
 
             self.context.append_tool_result(
                 call.name,
@@ -689,6 +765,18 @@ class AgentLoop:
             and len(set(self.state.recent)) == 1
         )
 
+    def _repeated_once(self, fingerprint: str) -> bool:
+        """Whether this exact call was also the previous one.
+
+        Read off the same ledger ``_stuck`` maintains, one repeat earlier. Kept
+        as its own predicate rather than a parameter on ``_stuck`` because the
+        two answer different questions — "is this run over" and "does this turn
+        need an intervention" — and a single function returning a tri-state
+        would make both call sites harder to read than either is now.
+        """
+        tail = self.state.recent[-2:]
+        return len(tail) == 2 and tail[0] == tail[1]
+
     def _repeating(self, text: str) -> bool:
         """The same reply, three turns running, with no tool call between them.
 
@@ -761,7 +849,23 @@ class AgentLoop:
         try:
             reply = self.client.chat(
                 [{"role": "user", "content": _RECAP_PROMPT + transcript}],
-                role="summariser",
+                # `fast`, which is what §6.5 specifies and what
+                # `LLMConfig.model_for` actually accepts.
+                #
+                # This said "summariser" for its whole life, and `model_for`
+                # rejects that on both deployments — it whitelists coder, fast
+                # and embed. The model is resolved inside `chat` before any
+                # request is sent, so the ValueError landed in the `except`
+                # below and every compaction in production silently returned
+                # the fallback recap. Which means `do_not_retry` — the field
+                # context.py calls "what stops the post-compaction agent
+                # cheerfully repeating the dead end that got it here" — has
+                # never once been populated outside a test.
+                #
+                # The gateway's own role table does map "summariser"
+                # (proxy.py), which is presumably where the name came from; the
+                # client never gets far enough to use it.
+                role="fast",
                 max_tokens=1024,
                 enable_thinking=False,
                 # Compaction is a real cost against the developer's quota, and
@@ -774,6 +878,24 @@ class AgentLoop:
                     estimated_tokens=estimate_tokens(_RECAP_PROMPT + transcript),
                 ),
             )
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            # Ours, not the endpoint's. A misconfigured role or a bad argument
+            # is a permanent failure that degrades every compaction for the life
+            # of the process, and the broad `except` below hid exactly that for
+            # this method's entire history. Announced so it is visible in the
+            # transcript rather than inferred later from a thin recap.
+            self.on_event(
+                Event(
+                    EventType.ERROR,
+                    {
+                        "where": "summariser",
+                        "message": f"the recap could not be requested: {exc}",
+                        "effect": "compaction degraded to a fallback recap; dead ends "
+                        "will not be carried across it",
+                    },
+                )
+            )
+            return fallback
         except Exception:  # noqa: BLE001 - a degraded recap beats ending the run
             return fallback
 
