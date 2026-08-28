@@ -324,11 +324,17 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
         # A finding is not a tool failure — it is the tool succeeding. Marking it
         # ok=False would make the loop treat a lint report as a broken tool and
         # retry it, which wastes a turn and reads as noise in a transcript.
-        return _plain(sidecar.call("rules_lint", args))
+        return _report(
+            sidecar.call("rules_lint", args),
+            lambda p: _render_lint(p, scope_hint="pass paths= to scope the lint"),
+        )
 
     def legacy_audit(inv: Invocation) -> ToolResult:
         args = {"paths": _list(inv.arg("paths"))} if inv.arg("paths") else {}
-        return _plain(sidecar.call("legacy_audit", args))
+        return _report(
+            sidecar.call("legacy_audit", args),
+            lambda p: _render_lint(p, scope_hint="pass paths= to scope the audit"),
+        )
 
     def fx_wire(inv: Invocation) -> ToolResult:
         reply = sidecar.call("fx_wire", {"kind": inv.arg("kind"), "ctor": inv.arg("ctor")})
@@ -362,20 +368,85 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
         return _swagger_check(sidecar, inv)
 
     # The four review audits take no arguments: each answers one question about
-    # the whole workspace. `_plain` is right for all of them for the same reason
-    # it is right for rules_lint — a report full of findings is the tool
-    # succeeding, and returning ok=False would make the loop retry it.
+    # the whole workspace. A report full of findings is the tool succeeding, so
+    # none of them returns ok=False — that would make the loop retry the one
+    # thing that is working.
     def db_roundtrip_audit(_inv: Invocation) -> ToolResult:
-        return _plain(sidecar.call("db_roundtrip_audit", {}))
+        return _report(
+            sidecar.call("db_roundtrip_audit", {}),
+            lambda p: _render_rows(
+                p,
+                "methods",
+                lambda m: (
+                    f"  {m.get('path')}:{m.get('line')}  {m.get('method')}  "
+                    f"[{m.get('statements')} stmt"
+                    f"{', in a loop' if m.get('in_loop') else ''}"
+                    f"{', batched' if m.get('batched') else ''}"
+                    f"{', txn' if m.get('transaction') else ''}]  {m.get('verdict')}"
+                ),
+                empty="no repository method makes more than one database call.",
+                how="worst are shown first",
+            ),
+        )
 
     def validation_audit(_inv: Invocation) -> ToolResult:
-        return _plain(sidecar.call("validation_audit", {}))
+        return _report(
+            sidecar.call("validation_audit", {}),
+            lambda p: _render_rows(
+                p,
+                "fields",
+                lambda f: (
+                    f"  {f.get('path')}:{f.get('line')}  "
+                    f"{f.get('struct')}.{f.get('field')} ({f.get('type')})  "
+                    + (
+                        # "missing no validate tag" is what the naive form reads
+                        # as, and the field with no tag at all is the worst case
+                        # of the two — it should not be the one that reads like
+                        # a typo.
+                        "has no validate tag"
+                        if f.get("missing") == "no validate tag"
+                        else f'validate="{f.get("tag")}" — needs {f.get("missing")}'
+                    )
+                ),
+                empty="every request field is bound.",
+                how="the same fix applies to each",
+            ),
+        )
 
     def temporal_audit(_inv: Invocation) -> ToolResult:
-        return _plain(sidecar.call("temporal_audit", {}))
+        return _report(
+            sidecar.call("temporal_audit", {}),
+            lambda p: _render_rows(
+                p,
+                "candidates",
+                lambda c: (
+                    f"  {c.get('path')}:{c.get('line')}  {c.get('func')}  "
+                    f"[{c.get('kind')}]  {c.get('call')}"
+                ),
+                empty="no off-request-path candidates found.",
+                how="all are the same kinds of work",
+            ),
+        )
 
     def lib_version_check(_inv: Invocation) -> ToolResult:
-        return _plain(sidecar.call("lib_version_check", {}))
+        def render(payload: Mapping[str, Any]) -> str:
+            result = payload.get("result") or {}
+            rows = list(result.get("reports") or [])
+            out = [str(payload.get("summary") or "").strip(), ""]
+            for r in rows[:_MAX_ROWS]:
+                module = str(r.get("module", "")).rsplit("/", 1)[-1]
+                status = str(r.get("status", ""))
+                if r.get("superseded_by"):
+                    status = "SUPERSEDED -> " + str(r["superseded_by"]).rsplit("/", 1)[-1]
+                if r.get("behind"):
+                    status += f" (behind {r['behind']})"
+                out.append(f"  {module:24s} {r.get('current','?'):10s} {status}")
+            out.extend(_elided(_MAX_ROWS, len(rows), "all are CEPT modules"))
+            if note := str(payload.get("note") or "").strip():
+                out.extend(["", note])
+            return "\n".join(line for line in out if line is not None)
+
+        return _report(sidecar.call("lib_version_check", {}), render)
 
     return {
         "repo_map": repo_map,
@@ -529,6 +600,117 @@ def _plain(reply: Reply) -> ToolResult:
             fix="Correct the arguments and call the tool again.",
         )
     return ToolResult.success(reply.text)
+
+
+# ── rendering reports for a model ───────────────────────────────────────────
+#
+# The sidecar answers in JSON, on one line. That is right for a program and
+# wrong for the thing that actually reads it.
+#
+# A lint of one legacy service returns 705,000 characters of single-line JSON.
+# The context manager caps a tool result at a few thousand tokens, so what
+# reached the model was a JSON fragment ending mid-string: unparseable, and
+# indistinguishable from the tool being broken. It said "the audits came back
+# truncated", scoped the call, got another fragment, and repeated until the
+# loop-breaker stopped it seventeen turns later.
+#
+# Truncating *text* degrades honestly — you lose the tail and keep the findings.
+# Truncating a JSON object loses everything. So these render, and they render
+# worst-first with an explicit count of what was left out, because the number
+# omitted is itself a finding.
+
+#: How much of a report to render. Chosen against the context caps below with
+#: room to spare: a report that is itself elided has failed at the one job it
+#: has, which is to be readable after elision.
+_MAX_GROUPS = 8
+_MAX_PER_GROUP = 3
+_MAX_ROWS = 40
+
+
+def _elided(shown: int, total: int, how: str) -> list[str]:
+    """The line that says what is missing, and how to see it."""
+    if total <= shown:
+        return []
+    return [f"… {total - shown:,} more not shown — {how}"]
+
+
+def _render_lint(payload: Mapping[str, Any], *, scope_hint: str) -> str:
+    """Group findings by rule, worst-first, with examples.
+
+    Grouped rather than listed because the shape of the answer is what a review
+    needs first: "1,085 missing db tags" is one decision, and the same
+    information as eleven hundred lines that crowd out everything else.
+    """
+    findings = list(payload.get("violations") or [])
+    findings += list(payload.get("out_of_scope") or [])
+    warnings = list(payload.get("warnings") or [])
+    files = payload.get("files_scanned", 0)
+
+    if not findings and not warnings:
+        return f"clean — nothing to report across {files} file(s)."
+
+    by_rule: dict[str, list[Mapping[str, Any]]] = {}
+    for f in findings + warnings:
+        by_rule.setdefault(str(f.get("rule", "?")), []).append(f)
+    ranked = sorted(by_rule.items(), key=lambda kv: -len(kv[1]))
+
+    out = [
+        f"{len(findings):,} blocking and {len(warnings):,} advisory finding(s) "
+        f"across {files} file(s), in {len(by_rule)} rule(s). Grouped, worst first."
+    ]
+    for rule, group in ranked[:_MAX_GROUPS]:
+        out.append("")
+        out.append(f"{rule} — {len(group):,}")
+        for f in group[:_MAX_PER_GROUP]:
+            out.append(f"  {f.get('path')}:{f.get('line')}  {f.get('message')}")
+        if fix := (group[0].get("fix") if group else None):
+            out.append(f"  fix: {fix}")
+        out.extend("  " + line for line in _elided(_MAX_PER_GROUP, len(group), "same rule"))
+
+    out.append("")
+    out.extend(_elided(_MAX_GROUPS, len(ranked), f"{scope_hint}, or pass only= for one rule"))
+    return "\n".join(out)
+
+
+def _render_rows(
+    payload: Mapping[str, Any],
+    key: str,
+    row: Any,
+    *,
+    empty: str,
+    how: str,
+) -> str:
+    """Render a list report as one line per entry, with a summary and a count."""
+    rows = list(payload.get(key) or [])
+    summary = str(payload.get("summary") or "").strip()
+    if not rows:
+        return summary or empty
+
+    out = [summary] if summary else []
+    out.append("")
+    out.extend(row(r) for r in rows[:_MAX_ROWS])
+    out.extend(_elided(_MAX_ROWS, len(rows), how))
+    if note := str(payload.get("note") or "").strip():
+        out.extend(["", note])
+    return "\n".join(out)
+
+
+def _report(reply: Reply, render) -> ToolResult:
+    """Turn a sidecar report into readable text, never raising on shape.
+
+    A renderer that throws on an unexpected payload would turn a working tool
+    into a bridge error, which is the failure this whole path exists to avoid.
+    The raw JSON is the fallback: worse to read, but not a lie.
+    """
+    if reply.is_error:
+        return ToolResult.failure(reply.text, fix="Correct the arguments and call the tool again.")
+    try:
+        payload = json.loads(reply.text)
+        if not isinstance(payload, Mapping):
+            raise ValueError("not an object")
+        return ToolResult.success(render(payload))
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError, AttributeError):
+        return ToolResult.success(reply.text)
 
 
 def _scaffold(

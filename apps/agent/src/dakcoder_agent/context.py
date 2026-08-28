@@ -159,6 +159,19 @@ TOOL_CAPS: dict[str, ToolCap] = {
     "rules_lint": ToolCap(3_000, "head", "pass `paths` to scope the lint to what you changed"),
     "legacy_audit": ToolCap(3_000, "head", "pass `paths` to scope the audit"),
     "go_diagnostics": ToolCap(2_000, "head", "narrow to one file with `path`"),
+    # The review audits. `head` rather than the default `tail` for all four:
+    # they are rendered worst-first, so the head is the part worth keeping —
+    # and the default of tail-truncating a ranked report keeps the least
+    # important findings and drops the N+1.
+    #
+    # The caps are above what the renderers emit, deliberately. A report whose
+    # whole purpose is to survive elision must not be the thing that gets
+    # elided; if one ever exceeds its cap, the renderer needs tightening rather
+    # than the cap raising.
+    "db_roundtrip_audit": ToolCap(2_500, "head", "the worst methods are listed first"),
+    "validation_audit": ToolCap(2_500, "head", "fields are grouped by struct"),
+    "temporal_audit": ToolCap(2_000, "head", "candidates only; no action is implied"),
+    "lib_version_check": ToolCap(1_500, "head", "report only — do not edit go.mod"),
 }
 
 #: Everything not named above. §6.2's "everything else".

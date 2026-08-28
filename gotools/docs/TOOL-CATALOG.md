@@ -62,6 +62,9 @@ Per repository method: database calls, whether any is in a loop, batched, in a t
 {
   "additionalProperties": false,
   "properties": {
+    "healthy": {
+      "type": "integer"
+    },
     "methods": {
       "items": {
         "additionalProperties": false,
@@ -114,10 +117,15 @@ Per repository method: database calls, whether any is in a loop, batched, in a t
     },
     "summary": {
       "type": "string"
+    },
+    "total_scanned": {
+      "type": "integer"
     }
   },
   "required": [
     "methods",
+    "total_scanned",
+    "healthy",
     "summary"
   ],
   "type": "object"
@@ -1560,6 +1568,9 @@ Every request field, its validate tag, and what the tag leaves unbounded. Call w
 {
   "additionalProperties": false,
   "properties": {
+    "bounded": {
+      "type": "integer"
+    },
     "fields": {
       "items": {
         "additionalProperties": false,
@@ -1603,10 +1614,15 @@ Every request field, its validate tag, and what the tag leaves unbounded. Call w
     },
     "summary": {
       "type": "string"
+    },
+    "total_scanned": {
+      "type": "integer"
     }
   },
   "required": [
     "fields",
+    "total_scanned",
+    "bounded",
     "summary"
   ],
   "type": "object"

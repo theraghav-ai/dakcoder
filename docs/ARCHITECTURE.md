@@ -1711,6 +1711,60 @@ The load-bearing assertions, and what each is guarding against:
 
 ## 5. Changelog
 
+### 2026-08-28 — A 705KB JSON line, truncated, read as a broken tool
+
+A review session died after seventeen turns. The planner called `legacy_audit`,
+`rules_lint` and the four new audits, said *"the audits came back truncated"*,
+scoped them, got the same thing, and looped until the no-progress breaker fired
+on `legacy_audit` called three turns running.
+
+Every tool result showed as **one line** in the transcript, and that was the
+whole story. The sidecar answers in JSON, on a single line, and the bridge
+passed it through untouched. Measured against the legacy corpus:
+
+| tool | returned | after |
+|---|---:|---:|
+| `rules_lint` | 705,210 chars — one line, ~176k tokens | 998 tokens |
+| `legacy_audit` | 45,415 chars | 774 tokens |
+| `validation_audit` | 26,626 chars | 1,151 tokens |
+| `db_roundtrip_audit` | 15,059 chars | 213 tokens |
+
+The context manager caps a tool result at a few thousand tokens. **Truncating a
+single-line JSON object leaves a fragment ending mid-string** — unparseable, and
+from the model's side indistinguishable from a broken tool. Text degrades
+honestly under the same cap: the tail goes, the findings stay. So the bridge now
+renders, grouped by rule and worst-first, with an explicit count of what was
+omitted — because the number left out is itself a finding.
+
+Three contributing defects, all mine, all now fixed:
+
+- **No `TOOL_CAPS` entries for the four audits.** They fell to the 2,000-token
+  default with strategy `tail`, which on a report ranked worst-first keeps the
+  least important rows and drops the N+1 the report exists to surface. All four
+  are now `head`, with caps above what the renderers emit.
+- **The audits returned everything.** `db_roundtrip_audit` sent all 84
+  repository methods of one service, 76 of them with verdict `ok` — 15KB of JSON
+  to say eight things. The MCP handlers now return only what needs attention and
+  carry the rest as counts; the CLI keeps `--all`, because a person scrolls.
+- **`lib_version_check` had no overall budget.** It shells out to
+  `go list -m -versions` per module, so on a host that cannot see the GitLab it
+  burned a timeout each in turn — 20 seconds in the failing transcript, and up
+  to three minutes with six modules. One five-second budget for the whole
+  report now, and it degrades to the supersession half, which needs no network.
+
+Also `"8 worth a looks"`, from a `plural()` helper appending "s" to a noun
+phrase. Small, and it was sitting in the model's context.
+
+Two regression tests: one renders a 1,200-violation payload and asserts the
+result is text, names the total, says what was elided, and stays under 8,000
+characters; the other asserts every audit declares a `head` cap, since the
+absence of one is invisible until a report is silently beheaded from the wrong
+end.
+
+**Rebuilt to 0.2.1**: the four `gotools` binaries, the `dakcoder_agent` wheel,
+and `dakcoder-go-0.2.1.vsix`. The gateway is untouched this round and stays at
+0.2.0.
+
 ### 2026-08-28 — The four audits reach the model, and what that cost
 
 The audits added earlier were reachable over MCP and the CLI but not from the

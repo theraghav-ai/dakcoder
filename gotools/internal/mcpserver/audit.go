@@ -2,8 +2,10 @@ package mcpserver
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -30,15 +32,28 @@ type AuditInput struct {
 }
 
 // RoundTripOutput profiles the service's database round trips.
+//
+// Only the methods that need attention. The CLI lists everything behind
+// `--all`, and that is the right default there — a person scrolls. An agent
+// does not: this tool returned all 84 methods of one legacy service, 76 of them
+// with the verdict "ok", which is 15KB of JSON to say eight things. The counts
+// carry what the omitted rows would have said.
 type RoundTripOutput struct {
-	Methods []rules.RoundTripReport `json:"methods"`
-	Summary string                  `json:"summary"`
+	Methods      []rules.RoundTripReport `json:"methods"`
+	TotalScanned int                     `json:"total_scanned"`
+	Healthy      int                     `json:"healthy"`
+	Summary      string                  `json:"summary"`
 }
 
 // ValidationOutput lists request fields with nothing bounding them.
+//
+// Deficient fields only, for the same reason. A service with 400 well-bounded
+// fields and 3 bad ones should send 3 rows and a number, not 403.
 type ValidationOutput struct {
-	Fields  []rules.ValidationReport `json:"fields"`
-	Summary string                   `json:"summary"`
+	Fields       []rules.ValidationReport `json:"fields"`
+	TotalScanned int                      `json:"total_scanned"`
+	Bounded      int                      `json:"bounded"`
+	Summary      string                   `json:"summary"`
 }
 
 // TemporalOutput lists work done on the request path.
@@ -103,17 +118,21 @@ func roundTripHandler(defaultRoot string) mcp.ToolHandlerFor[AuditInput, RoundTr
 		if err != nil {
 			return nil, RoundTripOutput{}, err
 		}
-		methods := rules.RoundTripAudit(ws)
-		var attention int
-		for _, m := range methods {
+		all := rules.RoundTripAudit(ws)
+		needsWork := make([]rules.RoundTripReport, 0, len(all))
+		for _, m := range all {
 			if m.Verdict != "ok" {
-				attention++
+				needsWork = append(needsWork, m)
 			}
 		}
 		return nil, RoundTripOutput{
-			Methods: methods,
-			Summary: plural(len(methods), "repository method") + " touch the database, " +
-				plural(attention, "worth a look") + "; the list is ordered by cost",
+			Methods:      needsWork,
+			TotalScanned: len(all),
+			Healthy:      len(all) - len(needsWork),
+			Summary: fmt.Sprintf(
+				"%d of %s need attention, worst first; the other %d are fine",
+				len(needsWork), plural(len(all), "repository method"), len(all)-len(needsWork),
+			),
 		}, nil
 	}
 }
@@ -124,17 +143,21 @@ func validationHandler(defaultRoot string) mcp.ToolHandlerFor[AuditInput, Valida
 		if err != nil {
 			return nil, ValidationOutput{}, err
 		}
-		fields := rules.ValidationAudit(ws)
-		var unbounded int
-		for _, f := range fields {
+		all := rules.ValidationAudit(ws)
+		unbounded := make([]rules.ValidationReport, 0, len(all))
+		for _, f := range all {
 			if f.Missing != "" {
-				unbounded++
+				unbounded = append(unbounded, f)
 			}
 		}
 		return nil, ValidationOutput{
-			Fields: fields,
-			Summary: plural(len(fields), "request field") + ", " +
-				plural(unbounded, "with nothing bounding it"),
+			Fields:       unbounded,
+			TotalScanned: len(all),
+			Bounded:      len(all) - len(unbounded),
+			Summary: fmt.Sprintf(
+				"%d of %s have nothing bounding them",
+				len(unbounded), plural(len(all), "request field"),
+			),
 		}, nil
 	}
 }
@@ -162,13 +185,26 @@ func libVersionHandler(defaultRoot string) mcp.ToolHandlerFor[AuditInput, LibVer
 		if err != nil {
 			return nil, LibVersionOutput{}, err
 		}
-		res := libversion.Check(ctx, ws, libversion.GoListLister{Dir: ws.Root})
-		return nil, LibVersionOutput{
-			Result:  res,
-			Summary: res.Summary(),
-			Note: "Report only. Do not edit go.mod — tell the user what is available and let " +
-				"them decide. A library bump mid-review turns a review into a regression hunt.",
-		}, nil
+		// One short budget for the whole report, not per module.
+		//
+		// The lookup shells out to `go list -m -versions`, which reaches the
+		// GitLab over the network. On a machine that cannot see it, each module
+		// burns its own timeout in turn — six modules at thirty seconds is three
+		// minutes of an agent turn spent on a tool whose answer is "reports
+		// only". Five seconds total is enough when the registry is reachable and
+		// short enough not to matter when it is not: the supersession half of
+		// the report needs no network and is still produced.
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		res := libversion.Check(ctx, ws, libversion.GoListLister{Dir: ws.Root, Timeout: 5 * time.Second})
+		note := "Report only. Do not edit go.mod — tell the user what is available and let " +
+			"them decide. A library bump mid-review turns a review into a regression hunt."
+		if !res.Reachable {
+			note = "The package registry was not reachable, so only supersession is reported " +
+				"— the 'behind by N' half is missing. " + note
+		}
+		return nil, LibVersionOutput{Result: res, Summary: res.Summary(), Note: note}, nil
 	}
 }
 

@@ -126,3 +126,66 @@ def test_every_sidecar_tool_the_model_is_offered_has_a_handler() -> None:
         f"{missing} are offered to the model as gotools tools but the bridge has "
         "no handler for them"
     )
+
+
+# ── sidecar reports must survive elision ────────────────────────────────────
+
+
+def test_sidecar_reports_render_as_text_not_json() -> None:
+    """The failure that ended a session after seventeen turns.
+
+    `rules_lint` on a legacy service returns 705,000 characters of single-line
+    JSON. The context manager caps a tool result at a few thousand tokens, so
+    what reached the model was a JSON fragment ending mid-string — unparseable,
+    and indistinguishable from a broken tool. It reported the audits as
+    "truncated", scoped the call, got another fragment, and repeated until the
+    loop-breaker stopped it.
+
+    Text degrades honestly under the same cap: the tail is lost and the findings
+    survive. This asserts the bridge renders rather than passes through.
+    """
+    from dakcoder_agent.tools.gotools import Reply, _render_lint, _report
+
+    payload = {
+        "files_scanned": 49,
+        "count": 1650,
+        "violations": [
+            {
+                "rule": "domain-tags",
+                "path": f"core/domain/x{i}.go",
+                "line": i,
+                "message": f"field {i} has no db tag",
+                "fix": "add a db tag",
+            }
+            for i in range(1200)
+        ],
+        "warnings": [],
+    }
+    result = _report(Reply(json.dumps(payload)), lambda p: _render_lint(p, scope_hint="scope it"))
+
+    assert result.ok
+    text = result.content
+    assert text.lstrip()[0] != "{", "a JSON blob truncates into nothing readable"
+    assert "1,200" in text, "the total must survive even though the rows do not"
+    assert "domain-tags" in text
+    assert "not shown" in text, "what was omitted is itself a finding"
+    # Comfortably inside the cap in context.TOOL_CAPS, with room for the elision
+    # marker the context manager would add.
+    assert len(text) < 8_000, f"rendered report is {len(text)} chars; it will be elided"
+
+
+def test_every_audit_declares_a_context_cap() -> None:
+    """A tool with no cap falls to the default, which tail-truncates.
+
+    That is wrong for a ranked report in a way that is easy to miss: tail
+    truncation keeps the least important findings and drops the N+1 the report
+    exists to surface. The four audits were shipped without caps and did exactly
+    that.
+    """
+    from dakcoder_agent.context import TOOL_CAPS
+
+    for name in ("db_roundtrip_audit", "validation_audit", "temporal_audit", "lib_version_check"):
+        assert name in TOOL_CAPS, f"{name} has no cap; it would be tail-truncated"
+        assert TOOL_CAPS[name].strategy == "head", (
+            f"{name} is ranked worst-first, so the head is what must be kept"
+        )

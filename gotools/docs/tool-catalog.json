@@ -20,6 +20,9 @@
       "output_schema": {
         "additionalProperties": false,
         "properties": {
+          "healthy": {
+            "type": "integer"
+          },
           "methods": {
             "items": {
               "additionalProperties": false,
@@ -72,10 +75,15 @@
           },
           "summary": {
             "type": "string"
+          },
+          "total_scanned": {
+            "type": "integer"
           }
         },
         "required": [
           "methods",
+          "total_scanned",
+          "healthy",
           "summary"
         ],
         "type": "object"
@@ -1308,6 +1316,9 @@
       "output_schema": {
         "additionalProperties": false,
         "properties": {
+          "bounded": {
+            "type": "integer"
+          },
           "fields": {
             "items": {
               "additionalProperties": false,
@@ -1351,10 +1362,15 @@
           },
           "summary": {
             "type": "string"
+          },
+          "total_scanned": {
+            "type": "integer"
           }
         },
         "required": [
           "fields",
+          "total_scanned",
+          "bounded",
           "summary"
         ],
         "type": "object"
