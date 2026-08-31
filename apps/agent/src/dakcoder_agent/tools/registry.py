@@ -106,6 +106,12 @@ class ToolSpec:
     #: the model is never offered something that cannot run.
     unavailable: str = ""
     required: tuple[str, ...] = ()
+    #: Parameters the gate may pass and the model may not, and which therefore
+    #: never appear in ``parameters``. The gate is the harness rather than a
+    #: caller: it knows things about the run -- what was already broken before it
+    #: started -- that are not the model's to assert. Putting them in the schema
+    #: would offer the model a way to declare its own violations pre-existing.
+    gate_params: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if not _NAME.match(self.name):
@@ -588,6 +594,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             ),
         ),
         modes=frozenset(),
+        gate_params=frozenset({"baseline"}),
         gate_only=True,
     ),
     ToolSpec(

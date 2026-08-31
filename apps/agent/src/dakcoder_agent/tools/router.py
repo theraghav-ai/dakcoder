@@ -245,7 +245,7 @@ class Router:
             )
 
         try:
-            args = _coerce(spec, arguments)
+            args = _coerce(spec, arguments, gate=gate)
         except _ArgError as exc:
             return ToolResult.failure(str(exc), fix=exc.fix)
 
@@ -656,7 +656,7 @@ class _ArgError(ValueError):
         self.fix = fix
 
 
-def _coerce(spec: ToolSpec, raw: Any) -> dict[str, Any]:
+def _coerce(spec: ToolSpec, raw: Any, *, gate: bool = False) -> dict[str, Any]:
     """Validate model-supplied arguments against the hand-written schema.
 
     Written rather than delegated to ``jsonschema`` for two reasons. The schemas
@@ -699,7 +699,15 @@ def _coerce(spec: ToolSpec, raw: Any) -> dict[str, Any]:
 
     props: Mapping[str, Any] = spec.parameters.get("properties", {})
 
-    unknown = set(raw) - set(props)
+    # Gate-only parameters are accepted from the harness and refused from the
+    # model, which is why they are not in ``props`` at all. The gate passes the
+    # baseline of violations that existed before the run started; a model able to
+    # pass that could declare its own violations pre-existing and clear the gate
+    # by asserting it. Not listed in the "accepts:" hint either, for the same
+    # reason -- naming it is how it gets tried.
+    allowed = set(props) | (set(spec.gate_params) if gate else set())
+
+    unknown = set(raw) - allowed
     if unknown:
         known = ", ".join(props) or "none"
         raise _ArgError(
@@ -717,6 +725,11 @@ def _coerce(spec: ToolSpec, raw: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in raw.items():
         if value is None:
+            continue
+        if key not in props:
+            # A gate parameter: no schema to check it against, and the harness is
+            # not the caller these checks exist to constrain.
+            out[key] = value
             continue
         out[key] = _coerce_one(spec.name, key, value, props[key])
     return out

@@ -486,6 +486,17 @@ export class RunState implements vscode.Disposable {
     for (const path of summary.mutations) this.notePath(path);
     for (const approval of summary.pending_approvals ?? []) {
       this.approvals.set(approval.id, approval);
+      // Raised again, not merely remembered.
+      //
+      // An approval that was already waiting when this window opened the
+      // session has no `tool_pending` frame left to replay -- the transcript
+      // above has been ingested and the approval outlived it. Recording it here
+      // and stopping would put it in this map and nowhere else, so the service
+      // that owns the answer would never learn of it and the card would sit
+      // unanswerable until the runtime timed it out. `present` is keyed by id
+      // and returns early on one it already holds, so re-raising a live
+      // approval is idempotent.
+      this.approvalEmitter.fire(approval);
     }
     this.settleActivity();
     this.scheduleChange();

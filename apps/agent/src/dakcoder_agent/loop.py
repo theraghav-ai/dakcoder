@@ -148,6 +148,21 @@ class _State:
     #: ``mutations_seen`` because that one belongs to ``_stuck`` and is already
     #: up to date by the time ``_narrating`` runs.
     idle_mutations: int = 0
+    #: ``router.mutations`` as of the last trip through ``_route_failure``, so
+    #: an escalation slot is spent on a fix that was attempted rather than on a
+    #: Verifier turn that merely happened.
+    route_mutations: int = 0
+    #: The stage that was blocking last time the ladder ran. When a different
+    #: one blocks, the previous problem was solved and the budget starts over.
+    blocked_stage: str = ""
+    #: Compliance violations already present when the run began, as
+    #: ``rule|path|message`` keys. Taken once, before the first edit; see
+    #: ``_take_baseline``.
+    baseline: frozenset[str] = frozenset()
+    #: Tool-free Planner turns that produced no plan, after the Planner had
+    #: already started reading. One is a turn whose tool call was never emitted;
+    #: two is a Planner with nothing to say. See ``_advance``.
+    planner_idle: int = 0
     #: How many times each path has been read, and the ranges it was read at.
     #: The slice ledger keeps the *context* from growing when a file is read
     #: seven times; it does nothing about the seven turns. Reset for a path when
@@ -347,6 +362,7 @@ class AgentLoop:
         else:
             self.context.set_task(task, acceptance=acceptance)
         self._switch(start)
+        self._take_baseline()
 
         for _ in range(self.max_turns):
             if self.result is not None:
@@ -480,9 +496,25 @@ class AgentLoop:
             )
             return
 
+        # The assistant's own turn goes into context before anything it caused.
+        #
+        # Its calls travel with it. Recording only the prose left every tool
+        # result that followed referring to a ``tool_call_id`` that no message on
+        # the wire declared -- malformed against a strict endpoint, and worse
+        # than malformed as a prompt: the model's entire visible history of
+        # itself became thirty paragraphs of narration with results appearing
+        # beside them unexplained. It was being asked to produce a message shape
+        # it could not see itself ever having produced.
+        #
+        # Appended even when the content is empty, because a turn that is purely
+        # a tool call is exactly the turn whose record matters most.
         if result.chat.content:
-            self.context.append_assistant(result.chat.content)
             yield Event(EventType.ASSISTANT, {"text": result.chat.content})
+        if result.chat.content or result.chat.tool_calls:
+            self.context.append_assistant(
+                result.chat.content or "",
+                tool_calls=tuple(result.chat.tool_calls),
+            )
 
         # A reply cut off by the output budget, mid-tool-call.
         #
@@ -618,13 +650,40 @@ class AgentLoop:
             # call will not be run again. That converts a fatal loop into a
             # recoverable turn, and it costs one tool call rather than a run.
             if self._repeated_once(fingerprint):
-                previous = self.state.last_failure.get(fingerprint, "the same result")
+                # What it returned, or that it never ran -- never one dressed as
+                # the other.
+                #
+                # The ledger ``_repeated_once`` reads records the *intent* to
+                # call, and the two refusal paths below record through it without
+                # dispatching. So the previous occurrence of this fingerprint may
+                # never have executed, in which case there is no result to report
+                # and ``last_failure`` holds nothing. Substituting the words "the
+                # same result" there tells the model the outcome of a call that
+                # has never run, as though it had been observed: it cannot act on
+                # that and cannot check it. Saying which of the two happened costs
+                # one branch.
+                previous = self.state.last_failure.get(fingerprint)
+                if previous is None:
+                    body = (
+                        f"Not run: you asked for {call.name} with exactly these "
+                        "arguments this turn and last, and it was refused both times "
+                        "rather than run — so there is no result from it to show "
+                        "you. Asking a third time will be refused again. Do something "
+                        "different: a different tool, different arguments, or say "
+                        "plainly what is blocking you."
+                    )
+                else:
+                    body = (
+                        f"Not run: you have already called {call.name} with exactly "
+                        f"these arguments this turn and last, and it returned:\n\n"
+                        f"{previous}\n\n"
+                        "Repeating it will return the same thing. Do something "
+                        "different — a different tool, different arguments, or say "
+                        "what is blocking you."
+                    )
                 self.context.append_tool_result(
                     call.name,
-                    f"Not run: you have already called {call.name} with exactly these "
-                    f"arguments this turn and last, and it returned:\n\n{previous}\n\n"
-                    "Repeating it will return the same thing. Do something different — "
-                    "a different tool, different arguments, or say what is blocking you.",
+                    body,
                     tool_call_id=call.id,
                 )
                 yield Event(
@@ -771,6 +830,28 @@ class AgentLoop:
                     tuple(self.router.touched),
                 )
                 return
+            if _refuses_to_plan(text) and not _is_scaffold_plan(text):
+                # Not pinned, whatever it is. A refusal in the task layer is
+                # read by every mode below for the rest of the run.
+                if not self.state.planner_idle:
+                    self.state.planner_idle += 1
+                    self.context.append_tool_result(
+                        "repo_map",
+                        "You are the Planner. You do not write files, and nothing has "
+                        "asked you to: the Coder that runs after you holds write_file "
+                        "and patch_file, and it is the one that will apply this.\n\n"
+                        "So a plan is not blocked by what you can reach. Write the "
+                        "numbered steps, each naming the file it changes and carrying "
+                        "an Accepts: line saying how that step is checked.",
+                    )
+                    return
+                self.result = RunResult(
+                    Outcome.DONE,
+                    "the planner said it could not do the work; nothing was changed",
+                    self.context.turn,
+                    tuple(self.router.touched),
+                )
+                return
             if steps == 0 and not _is_scaffold_plan(text):
                 # A reply with no steps is not a plan, and the Planner is the one
                 # mode positioned to say so: it has read the task and answered it.
@@ -780,6 +861,36 @@ class AgentLoop:
                 # plan is what turned "he how are you doijng" into seventeen turns
                 # — the Coder had no step to execute, so every mode below it fired
                 # in order against a workspace nothing had touched.
+                # A preamble is not a conclusion, and the two look identical
+                # here.
+                #
+                # "Let me see the rest of the handler to match its full shape."
+                # is a turn whose tool call was never emitted. Ending on it
+                # reports ``Done`` for a run that read eight files, wrote
+                # nothing and never produced a plan -- which is exactly what the
+                # field transcript shows twice, at seventeen turns and at
+                # twenty, with the developer left asking "what happened?".
+                #
+                # Told apart by whether the Planner had started work, not by
+                # reading the prose: a greeting or a typo is answered on the
+                # first turn with no tool call behind it, so ``seen_calls`` is
+                # empty and that reply still ends the run in one turn. A Planner
+                # that has been reading the repository and then says something
+                # with no step in it gets one nudge; a second such turn is a
+                # Planner with nothing to say, and ends the run as before.
+                if self.state.seen_calls and not self.state.planner_idle:
+                    self.state.planner_idle += 1
+                    self.context.append_tool_result(
+                        "repo_map",
+                        "You ended that turn with no plan and no tool call, after "
+                        "reading the repository. That is what a turn looks like when "
+                        "the call you were about to make was never sent.\n\n"
+                        "Do one of three things now: call the tool you were about to "
+                        "call; or write the plan as numbered steps, each with an "
+                        "Accepts: line naming how it is checked; or, if the task "
+                        "genuinely needs no change, say so in one line and stop.",
+                    )
+                    return
                 self.result = RunResult(
                     Outcome.DONE,
                     "answered; no plan was needed and nothing was changed",
@@ -825,8 +936,11 @@ class AgentLoop:
         if self.state.last_gate is not None and key == self.state.gate_key:
             # Only reachable on a failing report: a clean one ends the run below.
             report = self.state.last_gate
-            blocker = report.blocked_by.name if report.blocked_by else "the gate"
             yield Event(EventType.GATE, {"kind": "full", "cached": True, **report.as_dict()})
+            if report.ok and (unstarted := self._unstarted_work()):
+                self.context.append_tool_result("go_build", unstarted)
+                return
+            blocker = report.blocked_by.name if report.blocked_by else "the gate"
             self.context.append_tool_result(
                 "go_build",
                 f"The gate was not re-run. Nothing in the workspace has changed since it "
@@ -842,12 +956,22 @@ class AgentLoop:
             self.router,
             self.router.touched,
             dependencies_changed=self.state.dependencies_changed,
+            baseline=self.state.baseline,
         )
         self.state.last_gate = report
         self.state.gate_key = key
         yield Event(EventType.GATE, {"kind": "full", **report.as_dict()})
 
         if report.ok:
+            if unstarted := self._unstarted_work():
+                # Clean because nothing was checked, not because nothing was
+                # wrong. Every path-scoped stage records "nothing in scope" on an
+                # empty change set, so on a repository that already builds this
+                # report is what an unstarted run looks like -- and ending here
+                # reports "nothing needed changing" when all the loop knows is
+                # that nothing was changed.
+                self.context.append_tool_result("go_build", unstarted)
+                return
             self.result = RunResult(
                 Outcome.DONE,
                 self._done_summary(report),
@@ -860,6 +984,69 @@ class AgentLoop:
         self.context.append_tool_result("go_build", report.summary())
         self._switch(Mode.VERIFIER)
 
+    def _unstarted_work(self) -> str:
+        """Why a clean gate is not a finished run, or ``""`` if it is.
+
+        The gate is a function of the files. On an empty change set every
+        path-scoped stage records "nothing in scope" and counts as ok, so on a
+        repository that already builds the report comes back clean -- and the
+        run ended DONE with "nothing needed changing; the gate is clean". The
+        loop knows only that nothing *was* changed. Reporting that nothing
+        *needed* to be is a different claim, and the developer acts on it: the
+        field transcripts end "Done, 17 turns" and "Done, 20 turns" on runs that
+        read eight files, wrote none, and were asked to write two.
+
+        Only when the plan named files. A plan whose steps are checks rather
+        than edits legitimately finishes without writing anything, and this must
+        not turn that into a failure.
+        """
+        if not self.state.plan or self.router.touched:
+            return ""
+        if not _PLAN_EDITS.search(self.state.plan):
+            # The plan asked to look at something, not to change it. A step that
+            # reads, inspects or confirms is finished by reading, and calling that
+            # an unstarted run would turn every investigation into a failure.
+            return ""
+        named = sorted({m.group(0) for m in _PLAN_PATH.finditer(self.state.plan)})
+        if not named:
+            return ""
+        return (
+            "The gate came back clean, and that is not worth anything yet: no file "
+            "has been written this run, so every scoped stage had nothing to check. "
+            "The plan names " + ", ".join(named) + ".\n\n"
+            "This run is not finished, it is not started. Make the first edit, or "
+            "say plainly what is stopping you from making it."
+        )
+
+    def _take_baseline(self) -> None:
+        """Record what was already broken, before this run can break anything.
+
+        Taken once, at the top of the run, because that is the only moment the
+        workspace is definitely untouched -- and correctness here depends
+        entirely on the timing. A snapshot taken later would contain the run's
+        own damage and excuse it.
+
+        The alternative was to keep blocking on it, and that is what shipped: a
+        service with eight handlers predating the contract, every one of them
+        missing ``Routes()``. Scoping the stage to touched files cured seven.
+        The eighth is whichever handler the task is about, so a vertical slice
+        was unshippable by construction -- the gate failed on damage the change
+        did not cause, on every attempt, until the escalation budget ran out and
+        the run was reported ``unverified``.
+
+        Cheap enough to take unconditionally: one sidecar call, measured in
+        hundredths of a second. Failure is not fatal and not reported -- an
+        empty baseline is exactly the behaviour that shipped, so the worst case
+        of not getting one is the status quo.
+        """
+        try:
+            outcome = self.router.run_gate_tool("swagger_check", {})
+        except Exception:  # noqa: BLE001 - a baseline is an optimisation, not a precondition
+            return
+        if isinstance(outcome, ToolResult):
+            keys = outcome.meta.get("violations") or ()
+            self.state.baseline = frozenset(str(k) for k in keys)
+
     def _route_failure(self, verdict: str) -> Iterator[Event]:
         """Coder twice, then the Debugger, then stop.
 
@@ -871,13 +1058,42 @@ class AgentLoop:
         """
         del verdict  # already in context; the routing decision is ours
 
+        # The budget counts fix attempts. It was counting Verifier turns.
+        #
+        # This runs once per tool-free Verifier turn, and every one of them spent
+        # a slot whether or not anything had been tried. In the field transcript
+        # five slots went in eleven turns, of which two were edits -- so "two
+        # Coder attempts, then the Debugger" was exhausted by narration, and the
+        # ladder ran out while the plan still had an unwritten step.
+        #
+        # An attempt is charged when the workspace changed since the last time
+        # round. A Coder that answers a failing gate with prose is not spending
+        # the budget; it is caught by ``_narrating`` after three such turns,
+        # which is a better outcome than a ladder that ends the run early having
+        # never had a fix to judge.
+        report = self.state.last_gate
+        blocker = report.blocked_by.name if report and report.blocked_by else ""
+        if blocker and blocker != self.state.blocked_stage:
+            # A different stage blocks than last time: the previous one was
+            # cleared. Charging this problem for the last one's attempts is how a
+            # run that fixed two things in a row was reported as having failed
+            # three times at the second.
+            self.state.blocked_stage = blocker
+            self.state.attempts = 0
+            self.state.cycles = 0
+
+        attempted = self.router.mutations != self.state.route_mutations
+        self.state.route_mutations = self.router.mutations
+
         if self.state.attempts < MAX_ATTEMPTS:
-            self.state.attempts += 1
+            if attempted:
+                self.state.attempts += 1
             self._switch(Mode.CODER)
             return
 
         if self.state.cycles < MAX_DEBUG_CYCLES:
-            self.state.cycles += 1
+            if attempted:
+                self.state.cycles += 1
             self._switch(Mode.DEBUGGER)
             return
 
@@ -1391,6 +1607,35 @@ def _count_steps(plan: str) -> int:
 #: comparison in ``_unfinished`` to mean anything.
 _PLAN_PATH = re.compile(r"\b[\w./-]+/[\w.-]+\.(?:go|sql|ya?ml)\b")
 
+#: A numbered step that asks for a change rather than a look. Conservative on
+#: purpose: the cost of missing one is the old behaviour, and the cost of a
+#: false positive is telling a developer their finished read-only run failed.
+#: Anchored at the step number so a verb in prose underneath does not count.
+_PLAN_EDITS = re.compile(
+    r"^\s*\d+[.)]\s*[-*>\s]*\**\s*"
+    r"(add|create|write|edit|update|modif|change|register|wire|implement|"
+    r"rename|delete|remove|insert|append|scaffold|generate|refactor|fix)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+#: A reply that says it cannot do the work, rather than saying how it will be
+#: done. Matched only near the start, so a plan that mentions a limitation in
+#: its eighth step is untouched -- what this catches is a refusal standing where
+#: the plan should be.
+#: The first numbered step, which is where the preamble ends.
+_STEP_START = re.compile(r"^\s*\d+[.)]\s", re.MULTILINE)
+
+_REFUSES = re.compile(
+    r"\b(?:i (?:can'?t|cannot|am unable to|do(?:es)? not have|don'?t have|have no)"
+    r"|no (?:write|edit|patch) tools?"
+    r"|physically cannot"
+    r"|not available to me"
+    r"|read-only(?: in this session| toolset))",
+    re.IGNORECASE,
+)
+#: How much of a preamble counts as "where the plan should be".
+_REFUSAL_WINDOW = 400
+
 #: A step in a real plan carries one of these. The Planner is told so.
 _ACCEPTS = re.compile(r"^\s*[-*>\s]*\**\s*Accepts\s*:", re.MULTILINE | re.IGNORECASE)
 
@@ -1421,6 +1666,31 @@ def _asks_the_developer(plan: str) -> bool:
     if _ACCEPTS.search(plan):
         return False
     return plan.count("?") >= MIN_QUESTIONS
+
+
+def _refuses_to_plan(text: str) -> bool:
+    """Whether the Planner said it could not do the work.
+
+    ``_count_steps`` counts numbered lines, and a refusal written as a numbered
+    list of files to paste by hand is numbered. One reached ``set_plan``, which
+    writes into the pinned task layer that sits above the working set and that
+    compaction is forbidden to touch -- so every Coder, Verifier and Debugger
+    turn for the next sixteen turns read, as its plan, "I can't: I have no
+    write tools in this session."
+
+    The belief is also false, which is what makes this worth catching rather
+    than reporting. The Planner is read-only by design; the Coder that follows
+    it holds ``patch_file`` and ``write_file``. Nothing was blocked -- the run
+    talked itself out of starting.
+
+    Read from the preamble only -- the text before the first numbered step. A
+    refusal stands *where the plan should be*, so that is the only place worth
+    looking; a caveat inside step three ("I cannot run the database locally, so
+    this step is checked by the build alone") is part of a plan that exists, and
+    reading it as a refusal would throw away good work for honest prose.
+    """
+    head = _STEP_START.split(text, maxsplit=1)[0]
+    return bool(_REFUSES.search(head[:_REFUSAL_WINDOW]))
 
 
 def _is_scaffold_plan(plan: str) -> bool:

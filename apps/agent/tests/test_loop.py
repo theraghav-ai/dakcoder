@@ -17,7 +17,7 @@ import pytest
 
 from dakcoder_agent.context import ContextManager, Layer, Recap
 from dakcoder_agent.gate import GATE
-from dakcoder_agent.loop import COMPACTION_WINDOW, AgentLoop, Outcome
+from dakcoder_agent.loop import COMPACTION_WINDOW, MAX_ATTEMPTS, AgentLoop, Outcome
 from dakcoder_agent.modes import Mode
 from dakcoder_agent.tools.router import ApprovalRequest, Router
 from dakcoder_shared.envelope import EventType, ToolResult
@@ -101,7 +101,8 @@ def of_type(events, wanted: EventType):
 def test_a_plan_then_a_clean_gate_finishes(router: Router, gated) -> None:
     agent, events = loop_over(
         router,
-        [say("1. Edit handler/user.go\n   Accepts: builds"), say("done")],
+        [say("1. Edit handler/user.go\n   Accepts: builds"), _edit(1), say("done")],
+        approve=lambda _r: True,
     )
     assert agent.result.outcome == Outcome.DONE
     assert "finish" in kinds(events)
@@ -414,7 +415,11 @@ def test_a_greeting_ends_the_run_without_a_plan(router: Router, gated) -> None:
 
 def test_a_numbered_plan_still_reaches_the_coder(router: Router, gated) -> None:
     """The other side of the same branch, so triage cannot quietly widen."""
-    agent, events = loop_over(router, [say("1. Edit handler/user.go"), say("done")])
+    agent, events = loop_over(
+        router,
+        [say("1. Edit handler/user.go"), _edit(1), say("done")],
+        approve=lambda _r: True,
+    )
 
     assert of_type(events, EventType.PLAN) != []
     assert any(e.data.get("kind") == "full" for e in of_type(events, EventType.GATE))
@@ -631,7 +636,12 @@ def test_a_coder_that_actually_works_is_left_alone(router: Router, gated) -> Non
     plan rather than merely saying it back."""
     agent, events = loop_over(
         router,
-        [say("1. Edit handler/user.go\n   Accepts: builds"), say("Edited handler/user.go.")],
+        [
+            say("1. Edit handler/user.go\n   Accepts: builds"),
+            _edit(1),
+            say("Edited handler/user.go."),
+        ],
+        approve=lambda _r: True,
     )
 
     assert [e.data["text"] for e in of_type(events, EventType.ASSISTANT)] == [
@@ -830,7 +840,9 @@ def test_a_plan_that_asks_something_and_still_plans_reaches_the_coder(
         "Is the table really `pensions`? Should the list filter on status? "
         "I have assumed yes to both."
     )
-    agent, events = loop_over(router, [say(plan), say("done")])
+    agent, events = loop_over(
+        router, [say(plan), _edit(1), say("done")], approve=lambda _r: True
+    )
 
     assert of_type(events, EventType.PLAN) != [], "a plan with Accepts lines was read as a question"
     assert agent.result.outcome == Outcome.DONE
@@ -1245,3 +1257,271 @@ def test_nothing_is_reported_missing_when_the_plan_named_no_paths(router: Router
     agent.state.plan = "1. Add the repo function\n2. Add the handler"
 
     assert agent._unfinished() == ""
+
+
+# -- a preamble is not a conclusion ------------------------------------------
+
+
+def test_a_greeting_still_ends_the_run_in_one_turn(router: Router, gated) -> None:
+    """The typo case the no-step branch was written for, unchanged.
+
+    Nothing was read, so there is no investigation to abandon and the reply is
+    the answer. One turn, and the extra Planner turn below must not cost it.
+    """
+    agent, _ = loop_over(router, [say("he how are you doijng")])
+    assert agent.result.outcome == Outcome.DONE
+    assert "no plan was needed" in agent.result.summary
+
+
+def test_a_planner_that_read_the_repo_and_then_said_nothing_is_nudged(
+    router: Router, gated
+) -> None:
+    """The field failure: eight files read, no plan, reported as Done.
+
+    "Let me see the rest of the handler" is a turn whose tool call was never
+    emitted. Ending there reports success for a run that never started, which is
+    what left a developer asking "what happened?" at seventeen turns. It gets one
+    more turn, and here it uses it.
+    """
+    agent, events = loop_over(
+        router,
+        [
+            calls(("read_file", '{"path": "handler/user.go"}')),
+            say("Let me see the rest of the handler to match its full shape."),
+            say("1. Edit handler/user.go\n   Accepts: builds"),
+            _edit(1),
+            say("done"),
+        ],
+        approve=lambda _r: True,
+    )
+    assert of_type(events, EventType.PLAN), (
+        "the run ended on a preamble instead of letting the planner finish"
+    )
+    assert agent.result.outcome == Outcome.DONE
+
+
+def test_the_nudge_is_offered_once_and_not_again(router: Router, gated) -> None:
+    """A second silent turn is a Planner with nothing to say, not a lost call."""
+    agent, events = loop_over(
+        router,
+        [
+            calls(("read_file", '{"path": "handler/user.go"}')),
+            say("Let me look at that."),
+            say("Still looking at it."),
+        ],
+    )
+    assert not of_type(events, EventType.PLAN)
+    assert agent.result.outcome == Outcome.DONE
+    assert "no plan was needed" in agent.result.summary
+
+# -- a clean gate on an untouched repository is not a finished run -----------
+
+
+def test_a_plan_that_asked_for_edits_and_made_none_does_not_finish_done(
+    router: Router, gated
+) -> None:
+    """The gate is a function of the files.
+
+    On an empty change set every scoped stage records "nothing in scope" and
+    counts as ok, so on a repository that already builds the report comes back
+    clean -- and the run ended DONE saying "nothing needed changing". All the
+    loop knows is that nothing *was* changed. The field transcripts end
+    "Done, 17 turns" on runs that were asked to write two files and wrote none.
+    """
+    agent, events = loop_over(
+        router,
+        [say("1. Edit handler/user.go\n   Accepts: builds"), say("All done!")],
+    )
+
+    assert agent.result.outcome != Outcome.DONE, (
+        "a run that wrote nothing reported success"
+    )
+    assert "nothing needed changing" not in agent.result.summary
+    assert of_type(events, EventType.GATE), (
+        "the gate is the harness and still runs; only the verdict changed"
+    )
+
+
+def test_a_plan_that_only_asked_to_look_still_finishes(router: Router, gated) -> None:
+    """A step that reads, inspects or confirms is finished by reading.
+
+    Treating that as an unstarted run would turn every investigation into a
+    failure, which is a worse error than the one above.
+    """
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Confirm handler/user.go compiles\n   Accepts: go build is clean"),
+            say("It compiles."),
+        ],
+    )
+    assert agent.result.outcome == Outcome.DONE
+
+# -- the request the model actually receives ---------------------------------
+
+
+def test_every_tool_result_on_the_wire_names_a_call_the_assistant_made(
+    router: Router, gated
+) -> None:
+    """The invariant that was silently violated on every request.
+
+    A ``role: "tool"`` message carries a ``tool_call_id``. If no assistant
+    message in the same request declares that id, the result is orphaned: a
+    strict OpenAI-compatible endpoint rejects the request outright, and a
+    lenient one is handed a conversation in which results appear beside prose
+    with nothing connecting them. The model is then asked to emit a message
+    shape it cannot see itself ever having emitted.
+    """
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Read handler/user.go"),
+            calls(("read_file", '{"path": "handler/user.go"}')),
+            say("done"),
+        ],
+    )
+
+    wire = agent.context.wire()
+    declared = {
+        call["id"]
+        for message in wire
+        for call in message.get("tool_calls", ())
+    }
+    results = [m for m in wire if m.get("role") == "tool" and m.get("tool_call_id")]
+
+    assert results, "the run made no tool call, so this proves nothing"
+    for message in results:
+        assert message["tool_call_id"] in declared, (
+            f"tool result {message['tool_call_id']} refers to a call no assistant "
+            "message on the wire declares"
+        )
+
+
+def test_a_turn_that_is_only_a_tool_call_is_still_recorded(router: Router, gated) -> None:
+    """The turn whose record matters most.
+
+    A tool call with no prose alongside it used to append nothing at all, so the
+    one kind of turn the model most needs an example of was the one kind that
+    never reached the next request.
+    """
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Read handler/user.go"),
+            calls(("read_file", '{"path": "handler/user.go"}')),
+            say("done"),
+        ],
+    )
+    assert any(m.get("tool_calls") for m in agent.context.wire())
+
+# -- what the escalation budget counts ---------------------------------------
+
+
+def test_prose_does_not_spend_the_escalation_budget(router: Router, gated) -> None:
+    """The budget is "two Coder attempts, then the Debugger". It was counting
+    Verifier turns.
+
+    In the field five slots went in eleven turns, of which two were edits, so
+    the ladder was exhausted by narration and ran out while the plan still had
+    an unwritten step. A Coder answering a failing gate with prose is caught by
+    `_narrating`, which is the right end for it; it must not also consume the
+    budget that exists for attempts that actually changed something.
+    """
+    gated["fail"] = "go_build"
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Edit handler/user.go"),
+            _edit(1),
+            say("done"),
+            say("I will fix the build now"),
+            say("Making the edit"),
+            say("Applying the fix"),
+        ],
+        approve=lambda _r: True,
+    )
+
+    assert agent.result.outcome == Outcome.NO_PROGRESS, (
+        "narration ended the run through the ladder rather than being named"
+    )
+    assert agent.state.attempts <= 1, (
+        f"{agent.state.attempts} attempts charged for one edit and three paragraphs"
+    )
+
+
+def test_a_real_fix_attempt_still_spends_one(router: Router, gated) -> None:
+    """The other side: escalation must still happen for a Coder that is working
+    and still failing, which is what the Debugger exists for."""
+    gated["fail"] = "go_build"
+    agent, _ = loop_over(
+        router,
+        [say("1. Edit handler/user.go"), _edit(1), say("done"), say("the build is broken"),
+         _edit(2), say("fixed"), _edit(3), say("still broken"), _edit(4), say("fixed again"),
+         _edit(5), say("no"), _edit(6), say("x"), _edit(7), say("y"), _edit(8), say("z")],
+        approve=lambda _r: True,
+    )
+    assert agent.result.outcome == Outcome.UNVERIFIED
+    assert agent.state.attempts == MAX_ATTEMPTS, (
+        "the ladder must still escalate for a Coder that is editing and still failing"
+    )
+
+# -- a refusal is not a plan -------------------------------------------------
+
+
+#: The field text, trimmed. Three numbered items, no Accepts line and no
+#: question mark, so every check that existed passed it through.
+_REFUSAL = (
+    "Goal: I can't — I have no write tools in this session. My toolset is "
+    "read-only: repo_map, read_file, search_repo. There is no patch_file or "
+    "write_file available to me, so I physically cannot modify the files.\n\n"
+    "1. repo/postgres/message.go — paste the function after line 510.\n"
+    "2. handler/message.go — paste the handler after line 69.\n"
+    "3. handler/response/message.go — no change.\n"
+)
+
+
+def test_a_refusal_is_never_pinned_as_the_plan(router: Router, gated) -> None:
+    """``set_plan`` writes into the pinned task layer, which sits above the
+    working set and which compaction is forbidden to touch.
+
+    So a refusal that reached it was read as the plan by every Coder, Verifier
+    and Debugger turn for the next sixteen turns. The belief was false as well:
+    the Planner is read-only by design and the Coder after it holds the write
+    tools, so nothing was blocked -- the run talked itself out of starting.
+    """
+    agent, events = loop_over(
+        router,
+        [say(_REFUSAL), say("1. Edit handler/user.go\n   Accepts: builds"), _edit(1), say("done")],
+        approve=lambda _r: True,
+    )
+
+    assert "no write tools" not in agent.state.plan, "the refusal was pinned"
+    plans = of_type(events, EventType.PLAN)
+    assert plans, "the planner never recovered"
+    assert "no write tools" not in plans[0].data["text"]
+
+
+def test_a_refusal_twice_running_ends_the_run(router: Router, gated) -> None:
+    """One correction, not an argument."""
+    second = _REFUSAL.replace("I physically cannot", "I really cannot")
+    agent, _ = loop_over(router, [say(_REFUSAL), say(second)])
+    assert agent.result.outcome == Outcome.DONE
+    assert "could not do the work" in agent.result.summary
+    assert agent.state.plan == ""
+
+
+def test_an_ordinary_plan_is_not_read_as_a_refusal(router: Router, gated) -> None:
+    """The window is the first 400 characters, so a limitation noted in a later
+    step does not cost a real plan its handoff."""
+    plan = (
+        "1. Add handler/pension.go\n   Accepts: go build is clean\n"
+        "2. Wire the route\n   Accepts: GET /pensions answers 200\n"
+        "3. Note that I cannot run the database locally, so step 2 is checked by "
+        "the build alone.\n"
+    )
+    agent, events = loop_over(
+        router, [say(plan), _edit(1), say("done")], approve=lambda _r: True
+    )
+    assert of_type(events, EventType.PLAN), "a real plan was refused for its prose"
+    assert agent.result.outcome == Outcome.DONE
+

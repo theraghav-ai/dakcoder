@@ -485,6 +485,9 @@ def _swagger_check(sidecar: GoTools, inv: Invocation) -> ToolResult:
     """
     blocking: list[str] = []
     advisory: list[str] = []
+    #: Violations that were already there when the run started. Reported, never
+    #: blocked on -- this run did not cause them and cannot be asked to fix them.
+    pre_existing: list[str] = []
 
     # Scoped to what this run touched, like every other lint call in the gate.
     #
@@ -508,11 +511,36 @@ def _swagger_check(sidecar: GoTools, inv: Invocation) -> ToolResult:
         payload = json.loads(reply.text)
     except json.JSONDecodeError:
         payload = {}
+
+    # Scoping cures the seven handlers this run never opened. The baseline cures
+    # the eighth, which is the one the task is about.
+    #
+    # `routes-in-handler` reports at file granularity: "handler declared here has
+    # no Routes() method". Eight legacy handlers predate the contract and every
+    # one of them carries it. A vertical slice *has* to edit one of those files,
+    # and the moment it does, that file is in scope and its pre-existing
+    # violation becomes a blocking one -- permanently, because `touched` is
+    # append-only for the life of the run. The change was correct and could not
+    # be shipped.
+    #
+    # So the gate is told what was already broken before this run began, and
+    # anything on that list is reported rather than blocked. Keyed on rule, path
+    # and message with the line number deliberately left out: inserting a
+    # function moves every violation below it, and a key that moves is a key that
+    # matches nothing.
+    seen = _baseline_keys(inv.arg("baseline"))
+    keys: list[str] = []
     for violation in payload.get("violations") or []:
-        blocking.append(
+        key = _violation_key(violation)
+        keys.append(key)
+        rendered = (
             f"{violation.get('path', '?')}:{violation.get('line', 0)}: "
             f"{violation.get('message', '')} — {violation.get('fix', '')}"
         )
+        if key in seen:
+            pre_existing.append(rendered)
+        else:
+            blocking.append(rendered)
 
     configs = sorted(
         p
@@ -544,6 +572,18 @@ def _swagger_check(sidecar: GoTools, inv: Invocation) -> ToolResult:
             "the reference template, not something this change introduced."
         )
 
+    # Carried on every return, pass or fail, because the caller that needs them
+    # is the one taking the baseline -- and it takes it on a clean repository,
+    # where this returns success and there is nothing to read off the body.
+    meta: dict[str, Any] = {"violations": keys}
+    if pre_existing:
+        advisory.append(
+            f"{len(pre_existing)} handler(s) were already missing Routes() before "
+            "this run started, and are not this change to fix:\n"
+            + "\n".join(f"      {p}" for p in pre_existing)
+        )
+        meta["pre_existing"] = len(pre_existing)
+
     if blocking:
         listed = "\n".join(f"  - {p}" for p in blocking)
         body = f"swagger_check found {len(blocking)} problem(s):\n{listed}"
@@ -552,17 +592,19 @@ def _swagger_check(sidecar: GoTools, inv: Invocation) -> ToolResult:
         return ToolResult.failure(
             body,
             fix="Every route needs .Name(...) — routes without one are skipped silently.",
+            meta=meta,
         )
 
     if advisory:
         return ToolResult.success(
             "swagger_check: routes are named. Not blocking:\n"
             + "\n".join(f"  - {a}" for a in advisory),
-            meta={"advisory": True},
+            meta={**meta, "advisory": True},
         )
     return ToolResult.success(
         f"swagger_check: routes are named and generation is enabled in "
-        f"{len(configs)} config(s)"
+        f"{len(configs)} config(s)",
+        meta=meta,
     )
 
 
@@ -593,6 +635,32 @@ def _has_key(path: Path, key: tuple[str, ...]) -> bool | None:
             return False
         data = data[part]
     return data is not None and data != ""
+
+
+def _violation_key(violation: dict[str, Any]) -> str:
+    """A violation's identity across an edit.
+
+    Rule, path and message; deliberately not the line. Inserting a function
+    moves every violation below it in the file, so a key carrying a line number
+    would stop matching the moment the run did the work it was asked to do --
+    which is exactly when the baseline has to hold.
+    """
+    return "|".join(
+        (
+            str(violation.get("rule", "")),
+            str(violation.get("path", "")),
+            str(violation.get("message", "")),
+        )
+    )
+
+
+def _baseline_keys(raw: Any) -> frozenset[str]:
+    """The keys the gate recorded before this run made its first edit."""
+    if not raw:
+        return frozenset()
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        return frozenset(str(x) for x in raw)
+    return frozenset(part for part in str(raw).split("\x1f") if part)
 
 
 def _list(raw: Any) -> list[str]:

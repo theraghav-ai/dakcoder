@@ -275,7 +275,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     // The session travels with the event: the renderer keys its rows by it, and
     // wire event ids are unique only within one session.
-    state.onDidReceive((event) => chatView.push(event, state.sessionId ?? '')),
+    //
+    // The trees read the same stream. Each one filters for the two or three
+    // event types it cares about, so fanning out here costs three predicate
+    // checks and keeps every surface on one source of truth. Until this was
+    // wired the three `applyEvent` methods had no caller at all, which is why a
+    // finished run kept the `dakcoder.session.running` context value and hid
+    // the Resume action -- the one next step out of an unverified run.
+    state.onDidReceive((event) => {
+      chatView.push(event, state.sessionId ?? '');
+      treeSet.sessions.applyEvent(event);
+      treeSet.quota.applyEvent(event);
+      treeSet.context.applyEvent(event);
+    }),
+    // An approval is raised by the runtime and has to reach the service that
+    // owns the answer.
+    //
+    // `ApprovalService` bootstraps from `present()`: it holds the pending map,
+    // and every other entry point -- the card's Accept/Reject, the changeset
+    // tree, the seven `dakcoder.approval.*` commands, the reconcile poll --
+    // reads that map and returns early when it is empty. Without this
+    // subscription nothing ever put anything in it, so the card drew, Accept
+    // did nothing, and the runtime released the call as a rejection ten minutes
+    // later with no surface ever saying so.
+    state.onDidRequestApproval((approval) =>
+      approvalService.present(approval, state.sessionId ?? undefined),
+    ),
     state.onDidChange(() => {
       chatView.setRunState({
         phase: state.running ? 'running' : 'idle',

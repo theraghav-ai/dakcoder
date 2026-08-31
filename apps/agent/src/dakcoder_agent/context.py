@@ -56,6 +56,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Callable, Iterable, Sequence
 
+from dakcoder_shared.llm import ToolCall
 from dakcoder_shared.tokens import Calibration
 
 from .modes import Mode, ModeConfig, config_for
@@ -135,14 +136,37 @@ class Message:
     #: Set on tool results, so a stale slice can be found and replaced.
     path: str | None = None
     tool_call_id: str | None = None
+    #: The calls an assistant message made, so its own actions survive into the
+    #: next request. Without these every ``role: "tool"`` message that follows
+    #: refers to a ``tool_call_id`` no assistant message on the wire declares.
+    tool_calls: tuple[ToolCall, ...] = ()
     #: Turn this message was appended on, for the recap and the inspector.
     turn: int = 0
 
     def wire(self) -> dict[str, Any]:
-        """Render to the OpenAI chat shape, dropping our own bookkeeping."""
+        """Render to the OpenAI chat shape, dropping our own bookkeeping.
+
+        The assistant's ``tool_calls`` are part of the shape, not bookkeeping.
+        Omitting them left every tool result orphaned -- a ``tool_call_id``
+        matching no call anywhere in the request, which a strict endpoint
+        rejects outright and a lenient one simply cannot make sense of. It also
+        rewrote the model's own history: each of its turns came back as a
+        paragraph of prose, with results appearing beside them unexplained, so
+        the conversation contained no example of the very message shape the
+        model was being asked to produce.
+        """
         out: dict[str, Any] = {"role": str(self.role), "content": self.content}
         if self.tool_call_id:
             out["tool_call_id"] = self.tool_call_id
+        if self.tool_calls:
+            out["tool_calls"] = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.arguments},
+                }
+                for call in self.tool_calls
+            ]
         return out
 
 
@@ -574,8 +598,17 @@ class ContextManager:
         self._turn += 1
         return self._turn
 
-    def append_assistant(self, content: str) -> Message:
-        msg = Message(Role.ASSISTANT, content, Layer.WORKING_SET, source="assistant", turn=self._turn)
+    def append_assistant(
+        self, content: str, *, tool_calls: tuple[ToolCall, ...] = ()
+    ) -> Message:
+        msg = Message(
+            Role.ASSISTANT,
+            content,
+            Layer.WORKING_SET,
+            source="assistant",
+            tool_calls=tool_calls,
+            turn=self._turn,
+        )
         self._working.append(msg)
         return msg
 

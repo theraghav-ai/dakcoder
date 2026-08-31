@@ -60,6 +60,14 @@ class Stage:
     when: Callable[["GateContext"], bool] = lambda _ctx: True
     #: Why it was skipped, when `when` says no.
     skip_reason: str = ""
+    #: Whether a failure here makes every later stage meaningless. True only for
+    #: compilation: ``go vet`` over code that does not compile is pages of
+    #: consequences of the one error the model already has to fix. Nothing else
+    #: in the sequence has that relationship to what follows it -- ``go vet``,
+    #: ``go test`` and ``go mod tidy`` do not depend on the API document being
+    #: complete -- so a failure there stops blocking the run's report on stages
+    #: it has nothing to do with.
+    halts: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +78,12 @@ class GateContext:
     touched: tuple[str, ...]
     #: A greenfield scaffold or a dependency change, which turns on govulncheck.
     dependencies_changed: bool = False
+    #: Compliance violations that were already present when this run began, as
+    #: ``rule|path|message`` keys. Reported by the stages, never blocked on: a
+    #: vertical slice has to edit a legacy handler, and the moment it does, that
+    #: file's pre-existing violation would otherwise become this run's blocker
+    #: and stay one for the life of the run.
+    baseline: frozenset[str] = frozenset()
 
     @property
     def go_files(self) -> tuple[str, ...]:
@@ -240,6 +254,23 @@ def _scoped(ctx: GateContext) -> dict[str, Any] | None:
     return {"paths": ",".join(files)} if files else None
 
 
+def _scoped_with_baseline(ctx: GateContext) -> dict[str, Any] | None:
+    """Scoped like every other lint stage, plus what was already broken.
+
+    Separated from ``_scoped`` rather than folded into it because the other
+    stages have no use for a baseline: ``gofmt`` rewrites what it is given, and
+    ``rules_lint`` is advisory here and already discounts out-of-scope findings
+    itself. Only the blocking compliance stage needs to tell "this run broke it"
+    from "it was broken when we arrived".
+    """
+    args = _scoped(ctx)
+    if args is None:
+        return None
+    if ctx.baseline:
+        args["baseline"] = sorted(ctx.baseline)
+    return args
+
+
 #: Why every Go stage sits out a workspace that is not itself a module, stated
 #: as the environment fact it is — and saying what to do about it, because a
 #: skip reason the developer cannot act on costs the same turn a failure does.
@@ -270,7 +301,14 @@ INNER: tuple[Stage, ...] = (
 # `go_build` would promote `swagger_check` to first blocker and replay the same
 # unclearable ladder under a different stage name.
 GATE: tuple[Stage, ...] = (
-    Stage("go_build", "go_build", lambda ctx: {}, when=_has_go, skip_reason=_NO_MODULE),
+    Stage(
+        "go_build",
+        "go_build",
+        lambda ctx: {},
+        when=_has_go,
+        skip_reason=_NO_MODULE,
+        halts=True,
+    ),
     Stage(
         "govalid_gen",
         "govalid_gen",
@@ -287,6 +325,7 @@ GATE: tuple[Stage, ...] = (
         lambda ctx: {},
         when=_has_go,
         skip_reason=_NO_MODULE,
+        halts=True,
     ),
     Stage("rules_lint", "rules_lint", _scoped, when=_has_go, skip_reason=_NO_MODULE),
     # Scoped, like the other lint stages. Unscoped it reported every legacy
@@ -297,7 +336,7 @@ GATE: tuple[Stage, ...] = (
     Stage(
         "swagger_check",
         "swagger_check",
-        _scoped,
+        _scoped_with_baseline,
         when=_has_go,
         skip_reason=_NO_MODULE,
     ),
@@ -351,9 +390,13 @@ def full_gate(
     touched: Sequence[str],
     *,
     dependencies_changed: bool = False,
+    baseline: frozenset[str] = frozenset(),
 ) -> GateReport:
     """The gate: ordered, fail-fast, authoritative."""
-    return _run(GateContext(router, tuple(touched), dependencies_changed), GATE)
+    return _run(
+        GateContext(router, tuple(touched), dependencies_changed, baseline),
+        GATE,
+    )
 
 
 def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
@@ -384,15 +427,26 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
             StageResult(stage.name, ok, stage.blocking, result.for_model(), elapsed)
         )
 
-        if stage.blocking and not ok:
-            # Fail-fast. Running `go vet` over code that does not compile
-            # produces pages of errors that are all consequences of the one the
-            # model already has to fix.
+        if stage.blocking and not ok and stage.halts:
+            # Fail-fast, but only where "fast" is also "correct". Running
+            # `go vet` over code that does not compile produces pages of errors
+            # that are all consequences of the one the model already has to fix.
             return GateReport(
                 tuple(results),
                 tuple(s.name for s in stages[index + 1 :]),
                 time.monotonic() - started,
             )
+
+        # Everything else that fails is recorded and the sequence carries on.
+        #
+        # The report is still a failure -- `ok` reads the blocked results, not
+        # this loop -- but the developer gets the whole picture rather than one
+        # stage and five dashes. The field transcript ends "blocked at
+        # swagger_check" with go_vet, go_test, go mod tidy, golangci_lint and
+        # govulncheck all "not run", none of which has any dependency on the API
+        # document being complete. Two of those five would have said something
+        # useful about the change that was actually made, and the run finished
+        # `unverified` without ever asking them.
 
     return GateReport(tuple(results), (), time.monotonic() - started)
 

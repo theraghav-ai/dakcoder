@@ -540,6 +540,17 @@ def git_status(inv: Invocation) -> ToolResult:
     return ToolResult.success(done.output or "working tree clean")
 
 
+def _has_diff(output: str) -> bool:
+    """Whether git emitted an actual diff, as opposed to only advice.
+
+    ``diff --git`` opens every diff git produces, including a binary one, and
+    none of git's advisory messages begin with it. Checked per line rather than
+    with ``startswith`` on the whole blob because the advice comes first when
+    both are present.
+    """
+    return any(line.startswith("diff --git") for line in output.splitlines())
+
+
 def git_diff(inv: Invocation) -> ToolResult:
     argv = ["git", "diff"]
     if str(inv.arg("staged", "")).lower() in ("true", "1", "yes"):
@@ -547,6 +558,35 @@ def git_diff(inv: Invocation) -> ToolResult:
     if inv.arg("path"):
         argv += ["--", inv.arg("path")]
     done = run(argv, inv.workspace.root, timeout=60)
+
+    # "No changes" said plainly, rather than left to be inferred from silence.
+    #
+    # ``run`` merges stdout and stderr, which is right for the Go toolchain and
+    # wrong here: git writes the diff to stdout and its advice to stderr. On
+    # Windows a file that differs only in line endings produces the CRLF warning
+    # and no diff at all, so the merged output is one line of advice and
+    # ``_result``'s empty-output fallback never fires -- it only catches output
+    # that is empty, not output that is entirely advice.
+    #
+    # What the model then sees is a successful call whose result contains no
+    # diff and no statement that there is none, which reads as a call that
+    # malfunctioned. It reruns the identical call, the duplicate guard refuses
+    # the second, and the third ends the run for no progress. That is a run lost
+    # to a file with the wrong line endings.
+    #
+    # The advice is kept, labelled as advice, because a CRLF warning is worth
+    # seeing once and worth never mistaking for a result.
+    if done.ok and not _has_diff(done.output):
+        where = f" in {inv.arg('path')}" if inv.arg("path") else ""
+        staged = " staged" if "--cached" in argv else ""
+        body = f"git diff: no{staged} changes{where}"
+        if done.output:
+            body += (
+                "\n\ngit also wrote, which is advice rather than a result:\n"
+                + done.output
+            )
+        return ToolResult.success(body, meta={"argv": done.argv, "empty": True})
+
     return _result(done, what="git diff")
 
 

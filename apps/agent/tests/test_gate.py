@@ -323,3 +323,157 @@ def test_an_advisory_failure_is_reported_even_when_something_blocks(
         "the advisory failure was dropped because something else blocked"
     )
     assert "not blocking" in summary
+
+# -- the baseline ------------------------------------------------------------
+#
+# Scoping the compliance stage to touched files cured seven of the eight legacy
+# handlers. The eighth is whichever one the task is about, so a vertical slice
+# stayed unshippable: the gate blocked on damage the change did not cause, on
+# every attempt, until the escalation budget ran out. These cover the other half.
+
+
+def _configs(workspace: Workspace) -> None:
+    """A configs/ directory, so the absent-config branch is not what blocks."""
+    (workspace.root / "configs").mkdir(parents=True, exist_ok=True)
+    (workspace.root / "configs" / "config.yaml").write_text("app: {}\n", encoding="utf-8")
+
+
+def _violation(path: str, line: int = 12) -> dict:
+    return {
+        "rule": "routes-in-handler",
+        "path": path,
+        "line": line,
+        "message": "handler declared here has no Routes() method",
+        "fix": "add a Routes() []serverRoute.Route method",
+    }
+
+
+def _lint(sidecar, *violations: dict) -> None:
+    sidecar.answer(
+        "rules_lint",
+        json.dumps(
+            {"ok": not violations, "count": len(violations), "violations": list(violations)}
+        ),
+    )
+
+
+def test_a_pre_existing_violation_blocks_when_nothing_has_been_recorded(
+    router: Router, sidecar, workspace: Workspace
+) -> None:
+    """The baseline is taken from this: with no baseline, it blocks."""
+    _configs(workspace)
+    _lint(sidecar, _violation("handler/message.go"))
+    out = router.run_gate_tool("swagger_check", {})
+    assert not out.ok
+    assert out.meta["violations"], "the keys the baseline is made of"
+
+
+def test_a_pre_existing_violation_in_a_touched_file_does_not_block(
+    router: Router, sidecar, workspace: Workspace
+) -> None:
+    """The defect this exists for.
+
+    A full vertical slice *has* to edit a legacy handler, which puts that
+    handler in scope and turns its pre-existing violation into this run's
+    blocker -- permanently, because ``touched`` is append-only.
+    """
+    _configs(workspace)
+    _lint(sidecar, _violation("handler/message.go"))
+
+    baseline = router.run_gate_tool("swagger_check", {}).meta["violations"]
+    after = router.run_gate_tool(
+        "swagger_check", {"paths": "handler/message.go", "baseline": baseline}
+    )
+
+    assert after.ok, "the change was correct and could not be shipped"
+    assert "already missing Routes()" in after.content
+    assert after.meta["pre_existing"] == 1
+
+
+def test_the_baseline_holds_after_the_edit_moves_the_line(
+    router: Router, sidecar, workspace: Workspace
+) -> None:
+    """Inserting a function moves every violation below it.
+
+    A key carrying a line number would stop matching at exactly the moment the
+    run did the work it was asked to do.
+    """
+    _configs(workspace)
+    _lint(sidecar, _violation("handler/message.go", line=12))
+    baseline = router.run_gate_tool("swagger_check", {}).meta["violations"]
+
+    _lint(sidecar, _violation("handler/message.go", line=97))
+    after = router.run_gate_tool(
+        "swagger_check", {"paths": "handler/message.go", "baseline": baseline}
+    )
+    assert after.ok
+
+
+def test_a_violation_this_run_introduced_still_blocks(
+    router: Router, sidecar, workspace: Workspace
+) -> None:
+    """The baseline excuses what was already there and nothing else."""
+    _configs(workspace)
+    _lint(sidecar, _violation("handler/message.go"))
+    baseline = router.run_gate_tool("swagger_check", {}).meta["violations"]
+
+    _lint(sidecar, _violation("handler/message.go"), _violation("handler/pension.go"))
+    after = router.run_gate_tool(
+        "swagger_check",
+        {"paths": "handler/message.go,handler/pension.go", "baseline": baseline},
+    )
+    assert not after.ok, "a handler this run added without Routes() is this run to fix"
+    assert "handler/pension.go" in after.content
+
+
+def test_the_gate_hands_the_baseline_to_the_stage(gate: Recorder, router: Router) -> None:
+    """Threaded end to end, not merely accepted by the signature."""
+    full_gate(router, ["handler/user.go"], baseline=frozenset({"r|handler/user.go|m"}))
+    args = dict(gate.calls)["swagger_check"]
+    assert args["baseline"] == ["r|handler/user.go|m"]
+    assert args["paths"] == "handler/user.go"
+
+def test_the_model_cannot_pass_a_baseline() -> None:
+    """A baseline asserted by the model would clear the gate by claiming its own
+    violations were always there. It is accepted from the harness only."""
+    from dakcoder_agent.tools.registry import get as spec_for
+    from dakcoder_agent.tools.router import _ArgError, _coerce
+
+    spec = spec_for("swagger_check")
+    assert spec is not None
+    assert "baseline" not in spec.parameters.get("properties", {}), (
+        "a gate parameter in the model-facing schema is an invitation"
+    )
+    assert _coerce(spec, {"baseline": ["x"]}, gate=True) == {"baseline": ["x"]}
+    with pytest.raises(_ArgError):
+        _coerce(spec, {"baseline": ["x"]})
+
+# -- what a failure stops, and what it does not ------------------------------
+
+
+def test_a_build_failure_still_stops_everything(gate: Recorder, router: Router) -> None:
+    """The one dependency that is real: `go vet` over code that does not compile
+    is pages of consequences of the error the model already has to fix."""
+    gate.fails("go_build", "handler/user.go:12: undefined: Pension")
+    report = full_gate(router, ["handler/user.go"])
+    assert not report.ok
+    assert "go_vet" in report.not_run
+
+
+def test_a_swagger_failure_does_not_stop_the_stages_it_has_nothing_to_do_with(
+    gate: Recorder, router: Router
+) -> None:
+    """The field transcript ended "blocked at swagger_check" with go_vet,
+    go_test, go mod tidy, golangci_lint and govulncheck all "not run" -- none of
+    which depends on the API document being complete. The run was reported
+    unverified without ever asking the stages that would have judged the change
+    that was actually made."""
+    gate.fails("swagger_check", "handler/user.go has no Routes() method")
+    report = full_gate(router, ["handler/user.go"])
+
+    assert not report.ok, "a blocking failure is still a failure"
+    assert report.blocked_by.name == "swagger_check"
+    assert report.not_run == (), "five stages were abandoned for no reason"
+    assert "go_vet" in gate.order
+    assert "go_mod" in gate.order
+

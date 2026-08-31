@@ -357,3 +357,77 @@ describe('RunState — transient events', () => {
     state.dispose();
   });
 });
+
+
+describe('RunState — raising an approval', () => {
+  /**
+   * The card is drawn by the renderer from the raw event, but the *answer* is
+   * owned by `ApprovalService`, which bootstraps from `present()`. Nothing puts
+   * an approval in front of that service except this emitter, so a silent
+   * emitter is a run that stalls until the runtime times the call out and
+   * records it as a rejection. Both entry points are covered because they fail
+   * independently: one is the live frame, the other is a session reopened after
+   * the frame has gone.
+   */
+  function approvalsRaisedBy(
+    drive: (state: InstanceType<typeof RunState>) => void,
+  ): string[] {
+    const { state } = stateWith([]);
+    const raised: string[] = [];
+    state.onDidRequestApproval((approval) => raised.push(approval.id));
+    drive(state);
+    return raised;
+  }
+
+  it('raises a live tool_pending frame', () => {
+    const raised = approvalsRaisedBy((state) =>
+      feed(state, [
+        event(1, 'tool_pending', {
+          id: 'a1',
+          tool: 'patch_file',
+          arguments: { path: 'handler/message.go' },
+          reason: 'writes a file',
+          paths: ['handler/message.go'],
+          protected: [],
+          unconditional: false,
+        }),
+      ]),
+    );
+    assert.deepEqual(raised, ['a1'], 'nothing would ever ask the developer to answer');
+  });
+
+  it('raises an approval that was already waiting when the session was opened', () => {
+    const raised = approvalsRaisedBy((state) =>
+      state.hydrate({
+        id: 's1',
+        task: 'add a repo function',
+        workspace: '/w',
+        status: 'running',
+        created_at: new Date(0).toISOString(),
+        finished_at: null,
+        summary: '',
+        mutations: [],
+        events: 0,
+        resumable: true,
+        queued: 0,
+        winding_down: false,
+        pending_approvals: [
+          {
+            id: 'a2',
+            tool: 'write_file',
+            arguments: { path: 'repo/postgres/message.go' },
+            reason: 'writes a file',
+            paths: ['repo/postgres/message.go'],
+            protected: [],
+            unconditional: false,
+          },
+        ],
+      }),
+    );
+    assert.deepEqual(
+      raised,
+      ['a2'],
+      'an approval that outlived its frame is unanswerable unless hydrate re-raises it',
+    );
+  });
+});

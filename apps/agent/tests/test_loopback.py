@@ -51,7 +51,16 @@ def scripted(router: Router, workspace):
     for name in ("gofmt", "rules_lint", "go_diagnostics"):
         router.handlers[name] = lambda _inv, _n=name: ToolResult.success(f"{_n}: clean")
 
-    plan = {"turns": [say("1. Edit handler/user.go"), say("done")]}
+    # The coder edits, because the plan says to. A run whose plan names a file
+    # and never writes it is an unstarted run, and the loop says so rather than
+    # reporting the untouched repository's clean gate as success.
+    plan = {
+        "turns": [
+            say("1. Add handler/pension.go"),
+            calls(("write_file", '{"path": "handler/pension.go", "content": "package handler"}')),
+            say("done"),
+        ]
+    }
 
     def build(session, approve):
         context = ContextManager(mode=Mode.PLANNER, system_prompt=system_prompt())
