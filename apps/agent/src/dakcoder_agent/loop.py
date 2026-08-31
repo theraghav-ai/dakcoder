@@ -108,12 +108,7 @@ class _State:
     attempts: int = 0
     #: Debugger cycles.
     cycles: int = 0
-    #: Fingerprints of the last few tool calls, for the no-progress detector.
-    recent: list[str] = field(default_factory=list)
-    #: The last few tool-call-free replies, for the same detector. A separate
-    #: ledger on purpose: `_switch` clears `recent` on every mode change, and a
-    #: run that repeats itself does so *while* advancing modes — planner, coder,
-    #: verifier, debugger, coder — so a shared ledger could never reach three.
+    #: The last few tool-call-free replies, for the repeated-prose detector.
     said: list[str] = field(default_factory=list)
     #: How many times each ``(mode, reply)`` has been seen. ``said`` catches
     #: three identical replies in a row; this catches the same reply coming back
@@ -122,18 +117,31 @@ class _State:
     #: and Verifier alternating, ``said`` holds ``[coder, verifier, coder]`` and
     #: never reaches three of anything.
     echoes: dict[tuple[str, str], int] = field(default_factory=dict)
-    #: Fingerprint counts for the whole run rather than the current mode, reset
-    #: whenever a mutation lands. ``recent`` is cleared by ``_switch``, so a call
-    #: repeated once per trip round a mode cycle is invisible to it.
+    #: How many times each exact call has been asked this run — dispatched or
+    #: answered from a ledger. Cleared when a mutation lands, because repeating
+    #: a call after an edit is re-checking work. Also read as a plain "has this
+    #: run started using tools yet" signal by the Planner's no-step branch.
     seen_calls: dict[str, int] = field(default_factory=dict)
     #: ``router.mutations`` as of the last call, so ``seen_calls`` can be cleared
     #: when something actually changed. Repeating a call after an edit is
     #: re-checking work; repeating it after nothing is a loop.
     mutations_seen: int = 0
     #: What each fingerprinted call last returned, so a repeat can be answered
-    #: with the result rather than by running it again. Bounded by the number of
-    #: distinct calls in a run, which is small.
-    last_failure: dict[str, str] = field(default_factory=dict)
+    #: with the result rather than by running it again — or by ending the run,
+    #: which is what used to happen on the third ask. Bounded by the number of
+    #: distinct calls in a run, which is small. Cleared when a mutation lands.
+    last_results: dict[str, str] = field(default_factory=dict)
+    #: Calls the tools themselves have declared can never succeed as asked — a
+    #: path that does not exist, a pattern that does not parse, a tool that is
+    #: not there. fingerprint -> the tool's one-line reason. Answered before
+    #: dispatch, an unlimited number of times, at the cost of one tool result;
+    #: never counted toward ending the run. Cleared when a mutation lands,
+    #: because a write can create the very path that was missing.
+    dead_ends: dict[str, str] = field(default_factory=dict)
+    #: Consecutive tool-calling turns in which nothing was dispatched — every
+    #: call answered from ``dead_ends`` or ``last_results``. The run ends at
+    #: ``MAX_STALLED_TURNS``. Reset by any dispatched call or mutation.
+    stalled_turns: int = 0
     #: The turn each compaction fired on, for the thrash detector.
     compactions: list[int] = field(default_factory=list)
     #: Consecutive turns in a mode that can write which wrote nothing and called
@@ -254,14 +262,37 @@ MAX_CLOSE_COMPACTIONS = 3
 #: saying I'll make the edit but not actually calling patch_file."*
 MAX_IDLE_EXECUTING = 3
 
+#: How many consecutive tool-calling turns may add nothing new — every call in
+#: them a verbatim repeat or a known dead end, answered from a ledger rather
+#: than dispatched — before the run is ended as making no progress.
+#:
+#: Six, where the old rule was three occurrences of one call across the whole
+#: run. The difference is what is being counted. A repeated call now costs a
+#: cached answer rather than a dispatch, so repetition itself is cheap noise;
+#: what actually ends a run is a *sequence of whole turns* in which the model
+#: asked for nothing it had not already been given. Two field transcripts died
+#: under the old rule on its third identical `search_repo` and its third
+#: missing-path `read_file` — one of them after being told, correctly, what to
+#: do instead. Neither run was looping; both were killed for asking twice too
+#: often.
+MAX_STALLED_TURNS = 6
+
 #: The modes that can write. ``_narrating`` counts idle turns only in these:
 #: the Planner and the Verifier are supposed to end with prose and no tool call,
 #: because that is how they hand on.
 _EXECUTING = frozenset({Mode.CODER, Mode.SCAFFOLDER, Mode.DEBUGGER})
 
 #: How many times one path may be read before the loop answers with what it
-#: already has. Three is enough for read, edit, re-read; the seventh read of one
-#: file in eight turns is the Planner going in circles, which is what it did.
+#: already has instead of dispatching the read again.
+#:
+#: Worth stating what the number buys, because it was raised from 3 and the
+#: trade is real. The run this guard was written for read one file seven times
+#: in eight turns, each at a different line range; ``_stuck`` fingerprints the
+#: whole call, so it saw seven different calls and nothing to object to, and the
+#: Planner stopped for no progress without ever producing a plan. At 10 that run
+#: is no longer caught here -- it is left to ``_narrating`` and the turn budget.
+#: What 10 still catches is the tighter loop: the same file, over and over,
+#: until the context is nothing else.
 MAX_READS = 10
 
 
@@ -609,7 +640,22 @@ class AgentLoop:
     # -- tools ------------------------------------------------------------
 
     def _tool_calls(self, calls: Sequence[ToolCall]) -> Iterator[Event]:
+        # The world changed since the ledgers were written: forget them.
+        #
+        # A mutation invalidates all three at once. The cached result of a
+        # search may now be wrong, a missing path may now exist, and a repeat
+        # is re-checking work rather than looping. Watermarked against
+        # ``router.mutations`` rather than cleared inline so a mutation made
+        # outside this batch — the gate's ``go mod tidy`` writing go.mod — is
+        # noticed too.
+        if self.router.mutations != self.state.mutations_seen:
+            self.state.mutations_seen = self.router.mutations
+            self.state.seen_calls.clear()
+            self.state.last_results.clear()
+            self.state.dead_ends.clear()
+
         mutated = False
+        dispatched = False
 
         for call in calls:
             if self.cancelled():
@@ -620,70 +666,32 @@ class AgentLoop:
                 return
 
             # Fingerprinted from the raw string, not the parsed object. Parsing
-            # can raise on malformed arguments, and a model that sends the same
-            # malformed arguments three turns running is precisely the case the
-            # no-progress detector is for — so it must not be the case that
-            # crashes it.
+            # can raise on malformed arguments, and a model that resends the
+            # same malformed arguments is precisely the case these ledgers
+            # exist for — so it must not be the case that crashes them.
             fingerprint = f"{call.name}:{call.arguments}"
-            if self._stuck(fingerprint):
-                self.result = RunResult(
-                    Outcome.NO_PROGRESS,
-                    f"{call.name} called with identical arguments "
-                    f"{NO_PROGRESS_REPEATS} turns running",
-                    self.context.turn,
-                    tuple(self.router.touched),
-                    self.state.last_gate,
-                )
-                return
 
-            # One warning before the kill.
+            # A known dead end is answered, every time, and is never fatal.
             #
-            # The detector fires on the third identical call and ends the run,
-            # which throws away every turn spent so far and hands the developer
-            # nothing. On the second, the model has repeated itself once and is
-            # still able to act — but only if something tells it so, and until
-            # now nothing did: the tool ran again and returned the same result,
-            # which is precisely the input that produced the repeat.
-            #
-            # So the second identical call is intercepted instead of dispatched.
-            # The model is told what it did, what came back, and that the same
-            # call will not be run again. That converts a fatal loop into a
-            # recoverable turn, and it costs one tool call rather than a run.
-            if self._repeated_once(fingerprint):
-                # What it returned, or that it never ran -- never one dressed as
-                # the other.
-                #
-                # The ledger ``_repeated_once`` reads records the *intent* to
-                # call, and the two refusal paths below record through it without
-                # dispatching. So the previous occurrence of this fingerprint may
-                # never have executed, in which case there is no result to report
-                # and ``last_failure`` holds nothing. Substituting the words "the
-                # same result" there tells the model the outcome of a call that
-                # has never run, as though it had been observed: it cannot act on
-                # that and cannot check it. Saying which of the two happened costs
-                # one branch.
-                previous = self.state.last_failure.get(fingerprint)
-                if previous is None:
-                    body = (
-                        f"Not run: you asked for {call.name} with exactly these "
-                        "arguments this turn and last, and it was refused both times "
-                        "rather than run — so there is no result from it to show "
-                        "you. Asking a third time will be refused again. Do something "
-                        "different: a different tool, different arguments, or say "
-                        "plainly what is blocking you."
-                    )
-                else:
-                    body = (
-                        f"Not run: you have already called {call.name} with exactly "
-                        f"these arguments this turn and last, and it returned:\n\n"
-                        f"{previous}\n\n"
-                        "Repeating it will return the same thing. Do something "
-                        "different — a different tool, different arguments, or say "
-                        "what is blocking you."
-                    )
+            # The tool itself declared this exact call unable to succeed — the
+            # path does not exist, the pattern does not parse — when it first
+            # ran. Asking again cannot change the answer, so the answer is
+            # repeated for the price of one tool result. What it must never do
+            # is end the run: a field transcript died on its third read of a
+            # file that was not there, one turn after being told, correctly,
+            # what to do instead. Being slow to take a hint costs a turn; it is
+            # not a reason to throw away twenty-five.
+            if reason := self.state.dead_ends.get(fingerprint):
+                self.state.seen_calls[fingerprint] = (
+                    self.state.seen_calls.get(fingerprint, 0) + 1
+                )
                 self.context.append_tool_result(
                     call.name,
-                    body,
+                    f"Not run: {call.name} with exactly these arguments is a known "
+                    f"dead end this run — {reason}.\n\n"
+                    "It will fail the same way every time until something in the "
+                    "workspace changes. Act on what does exist: the alternatives "
+                    "named in the earlier result still stand.",
                     tool_call_id=call.id,
                 )
                 yield Event(
@@ -692,7 +700,46 @@ class AgentLoop:
                         "id": call.id,
                         "name": call.name,
                         "ok": False,
-                        "content": f"{call.name} repeated with identical arguments; not re-run",
+                        "content": f"{call.name}: known dead end; answered without re-running",
+                    },
+                )
+                continue
+
+            # An exact repeat while nothing has changed is answered from what it
+            # returned last time.
+            #
+            # Not merely the second consecutive ask — any repeat since the last
+            # mutation. The consecutive version was defeated by alternation in
+            # the field: read A, read B, read A slipped past a tail-of-two check
+            # and the third A ended the run. The result is right here in the
+            # ledger; handing it over again costs nothing and keeps the turn
+            # recoverable. The tools this must not throttle — re-running the
+            # build after an edit, re-reading a file just written — are exactly
+            # the ones a mutation precedes, and the mutation cleared this ledger.
+            if (cached := self.state.last_results.get(fingerprint)) is not None:
+                self.state.seen_calls[fingerprint] = (
+                    self.state.seen_calls.get(fingerprint, 0) + 1
+                )
+                self.context.append_tool_result(
+                    call.name,
+                    f"Not run: you have already called {call.name} with exactly "
+                    "these arguments this run, and nothing in the workspace has "
+                    f"changed since. It returned:\n\n{cached}\n\n"
+                    "That answer still stands. Do something different — a "
+                    "different tool, different arguments, or say plainly what is "
+                    "blocking you.",
+                    tool_call_id=call.id,
+                )
+                yield Event(
+                    EventType.TOOL_RESULT,
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "ok": False,
+                        "content": (
+                            f"{call.name} repeated with identical arguments; "
+                            "answered from the previous result"
+                        ),
                     },
                 )
                 continue
@@ -767,13 +814,22 @@ class AgentLoop:
                     )
 
             assert isinstance(outcome, ToolResult)
+            dispatched = True
             mutated = mutated or bool(outcome.mutations)
             if call.name == "go_mod":
                 self.state.dependencies_changed = True
 
             # Kept so a repeat of this exact call can be answered with what it
             # returned, instead of running it a second time to find out.
-            self.state.last_failure[fingerprint] = outcome.for_model()[:600]
+            self.state.seen_calls[fingerprint] = (
+                self.state.seen_calls.get(fingerprint, 0) + 1
+            )
+            self.state.last_results[fingerprint] = outcome.for_model()[:600]
+            if reason := outcome.meta.get("dead_end"):
+                # The tool has said this exact call can never succeed as asked.
+                # From here on it is answered from the ledger above, forever,
+                # instead of being re-dispatched — or worse, counted.
+                self.state.dead_ends[fingerprint] = str(reason)
 
             # A file that was just written is worth reading again; the ledger of
             # how often it has been read starts over. Without this, the read
@@ -791,6 +847,42 @@ class AgentLoop:
                 EventType.TOOL_RESULT,
                 {"id": call.id, "name": call.name, **outcome.as_dict()},
             )
+
+        # Turn-level progress, judged on the batch rather than on any one call.
+        #
+        # A batch that dispatched nothing — every call in it a verbatim repeat
+        # or a known dead end — moved the run nowhere, however many calls it
+        # held. That is the unit the old detector got wrong twice over: it
+        # counted *calls*, so three identical ones inside a single batch ended
+        # a run in one turn with a message claiming three; and it counted them
+        # *forever*, so the third ask across a whole read-only phase was fatal
+        # no matter what happened in between. Turns without progress is the
+        # thing actually worth ending a run over, so it is the thing counted.
+        if dispatched or mutated:
+            self.state.stalled_turns = 0
+        else:
+            self.state.stalled_turns += 1
+            if self.state.stalled_turns >= MAX_STALLED_TURNS:
+                worst_key, worst_n = max(
+                    self.state.seen_calls.items(),
+                    key=lambda item: item[1],
+                    default=("", 0),
+                )
+                detail = (
+                    f"; {worst_key.split(':', 1)[0]} was asked {worst_n} times"
+                    if worst_n > 1
+                    else ""
+                )
+                self.result = RunResult(
+                    Outcome.NO_PROGRESS,
+                    f"the last {MAX_STALLED_TURNS} tool-calling turns only "
+                    "repeated earlier calls or known dead ends, and added "
+                    f"nothing new{detail}",
+                    self.context.turn,
+                    tuple(self.router.touched),
+                    self.state.last_gate,
+                )
+                return
 
         if mutated:
             yield from self._inner_loop()
@@ -1171,48 +1263,9 @@ class AgentLoop:
         if mode is self.state.mode and mode is self.context.mode and self.context.turn > 0:
             return
         self.state.mode = mode
-        self.state.recent.clear()
         self.context.switch_mode(mode, mode_instruction(mode))
 
     # -- helpers ----------------------------------------------------------
-
-    def _stuck(self, fingerprint: str) -> bool:
-        """Whether this exact call has stopped being an attempt at anything.
-
-        Two ledgers again, for the same reason ``_repeating`` needs two.
-
-        ``recent`` is the consecutive run within one mode, and ``_switch``
-        clears it — which is right for what it measures and blind to a call
-        made once per trip round a mode cycle. ``seen_calls`` counts the whole
-        run, and is cleared the moment a mutation lands: repeating a call after
-        an edit is re-checking work, and repeating it after nothing changed is
-        a loop.
-        """
-        if self.router.mutations != self.state.mutations_seen:
-            self.state.mutations_seen = self.router.mutations
-            self.state.seen_calls.clear()
-
-        self.state.recent.append(fingerprint)
-        del self.state.recent[:-NO_PROGRESS_REPEATS]
-        self.state.seen_calls[fingerprint] = self.state.seen_calls.get(fingerprint, 0) + 1
-
-        consecutive = (
-            len(self.state.recent) == NO_PROGRESS_REPEATS
-            and len(set(self.state.recent)) == 1
-        )
-        return consecutive or self.state.seen_calls[fingerprint] >= NO_PROGRESS_REPEATS
-
-    def _repeated_once(self, fingerprint: str) -> bool:
-        """Whether this exact call was also the previous one.
-
-        Read off the same ledger ``_stuck`` maintains, one repeat earlier. Kept
-        as its own predicate rather than a parameter on ``_stuck`` because the
-        two answer different questions — "is this run over" and "does this turn
-        need an intervention" — and a single function returning a tri-state
-        would make both call sites harder to read than either is now.
-        """
-        tail = self.state.recent[-2:]
-        return len(tail) == 2 and tail[0] == tail[1]
 
     def _unfinished(self) -> str:
         """Files the plan named that were never written.

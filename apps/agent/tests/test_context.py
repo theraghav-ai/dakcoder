@@ -121,9 +121,13 @@ def test_tool_results_are_capped_at_insertion_not_at_display():
 def test_elision_marker_is_machine_readable_and_actionable():
     """An elision the model cannot see is one it treats as absence."""
     cm = manager()
-    huge = "\n".join(f"line {i}" for i in range(5000))
+    # Sized off the cap rather than a literal, so the fixture keeps overflowing
+    # it when the cap is tuned. 5,000 lines was comfortably over a 6,000-token
+    # cap and comfortably under a 48,000-token one.
+    lines = TOOL_CAPS["read_file"].max_tokens
+    huge = "\n".join(f"line {i}" for i in range(lines))
     cm.begin_turn()
-    msg = cm.append_tool_result("read_file", huge, path="handler/user.go", line_range=(1, 5000))
+    msg = cm.append_tool_result("read_file", huge, path="handler/user.go", line_range=(1, lines))
 
     assert "[..." in msg.content and "...]" in msg.content
     assert "handler/user.go" in msg.content

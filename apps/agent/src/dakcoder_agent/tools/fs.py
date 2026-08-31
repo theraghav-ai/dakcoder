@@ -334,9 +334,12 @@ def search_repo(inv: Invocation) -> ToolResult:
     try:
         rx = re.compile(pattern)
     except re.error as exc:
+        # Deterministic: the same pattern will fail to parse the same way, so
+        # a repeat is answered from the loop's ledger rather than re-parsed.
         return ToolResult.failure(
             f"{pattern!r} is not a valid regular expression: {exc}.",
             fix="Escape the special characters, or search for a plain substring.",
+            meta={"dead_end": f"the pattern {pattern!r} does not parse"},
         )
 
     glob = inv.arg("glob") or ""
@@ -366,10 +369,22 @@ def search_repo(inv: Invocation) -> ToolResult:
             break
 
     if not hits:
-        return ToolResult.success(
-            f"no matches for {pattern!r} in {scanned} files",
-            meta={"scanned": scanned},
-        )
+        # Zero hits with somewhere to go next, not zero hits full stop.
+        #
+        # A one-line "no matches" is correct and useless: in the field a model
+        # answered it by re-phrasing the same search until the run died. What
+        # it lacked was anything to aim the next search at, so the answer now
+        # carries the workspace's own top level — the model can see what the
+        # repository actually contains and search inside something real.
+        top = _top_level(root)
+        body = f"no matches for {pattern!r} in {scanned} files."
+        if top:
+            body += (
+                "\n\nThe workspace's top level, for aiming the next search:\n"
+                + "\n".join(f"  {entry}" for entry in top)
+                + "\nLoosen the pattern, or scope a new one with glob."
+            )
+        return ToolResult.success(body, meta={"scanned": scanned})
 
     header = f"{len(hits)} match(es) in {scanned} files"
     if truncated:
@@ -379,6 +394,24 @@ def search_repo(inv: Invocation) -> ToolResult:
         truncated=truncated,
         meta={"scanned": scanned, "hits": len(hits)},
     )
+
+
+def _top_level(root: Path) -> list[str]:
+    """The workspace's first level, directories first, prune list applied."""
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except OSError:
+        return []
+    shown: list[str] = []
+    for entry in entries:
+        if entry.is_dir():
+            if entry.name not in PRUNE:
+                shown.append(f"{entry.name}/")
+        elif entry.suffix.lower() in TEXT_SUFFIXES:
+            shown.append(entry.name)
+        if len(shown) >= 15:
+            break
+    return shown
 
 
 def _walk(root: Path):

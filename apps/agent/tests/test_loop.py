@@ -17,7 +17,14 @@ import pytest
 
 from dakcoder_agent.context import ContextManager, Layer, Recap
 from dakcoder_agent.gate import GATE
-from dakcoder_agent.loop import COMPACTION_WINDOW, MAX_ATTEMPTS, AgentLoop, Outcome
+from dakcoder_agent.loop import (
+    COMPACTION_WINDOW,
+    MAX_ATTEMPTS,
+    MAX_READS,
+    MAX_STALLED_TURNS,
+    AgentLoop,
+    Outcome,
+)
 from dakcoder_agent.modes import Mode
 from dakcoder_agent.tools.router import ApprovalRequest, Router
 from dakcoder_shared.envelope import EventType, ToolResult
@@ -231,13 +238,27 @@ def test_failure_escalates_coder_twice_then_the_debugger(router: Router, gated) 
 # ── stop conditions ─────────────────────────────────────────────────────────
 
 
-def test_the_same_call_three_turns_running_stops_the_run(router: Router, gated) -> None:
-    """The loop can see this when the model cannot. Without it a stuck run burns
-    the whole token budget arriving at the same place."""
+def test_a_run_that_only_repeats_itself_still_ends(router: Router, gated) -> None:
+    """The backstop, recalibrated from calls to turns.
+
+    The loop can see a stall when the model cannot; without a backstop a stuck
+    run burns the whole token budget arriving at the same place. But the unit is
+    whole turns that dispatched nothing — every call in them answered from a
+    ledger — not the third occurrence of one call, which two field transcripts
+    showed ending runs that were answering cheap questions, not looping.
+    """
     repeat = calls(("read_file", '{"path": "handler/user.go"}'))
-    agent, _ = loop_over(router, [say("1. Read it"), repeat, repeat, repeat, repeat])
+    agent, events = loop_over(
+        router, [say("1. Read it")] + [repeat] * (MAX_STALLED_TURNS + 2)
+    )
+
     assert agent.result.outcome == Outcome.NO_PROGRESS
-    assert "read_file" in agent.result.summary
+    assert "nothing new" in agent.result.summary
+    assert "read_file" in agent.result.summary, "the summary names the repeated call"
+    dispatched = [
+        e for e in of_type(events, EventType.TOOL_CALL) if e.data["name"] == "read_file"
+    ]
+    assert len(dispatched) == 1, "every repeat after the first was answered, not re-run"
 
 
 def test_two_different_calls_are_not_no_progress(router: Router, gated) -> None:
@@ -667,36 +688,46 @@ def test_a_coder_that_calls_a_tool_is_left_alone(router: Router, gated) -> None:
 # ── the two loops that killed real sessions ─────────────────────────────────
 
 
-def test_a_repeated_call_is_answered_before_the_run_is_killed(router: Router, gated) -> None:
-    """The second identical call is intercepted; only the third ends the run.
+def test_a_repeated_call_is_answered_and_three_is_not_fatal(router: Router, gated) -> None:
+    """Every repeat is answered from what the call returned; none of them ends
+    the run.
 
-    Two sessions died here. The detector fired on the third identical call and
-    ended the run, throwing away every turn spent so far — but nothing had told
-    the model it was repeating itself, because the tool simply ran again and
-    returned the same thing, which is the input that produced the repeat.
+    Two sessions died on the third identical call — one of them with the three
+    asks spread across a whole read-only phase, five different calls in
+    between. Repetition is now cheap noise: the cached answer is handed back
+    and only a stretch of turns that dispatch *nothing* ends the run.
     """
     same = ("read_file", '{"path":"handler/user.go"}')
-    agent, events = loop_over(router, [calls(same), calls(same), calls(same)], mode=Mode.CODER)
+    agent, events = loop_over(
+        router, [calls(same), calls(same), calls(same), say("done")], mode=Mode.CODER
+    )
 
     results = [e.data for e in of_type(events, EventType.TOOL_RESULT)]
-    intercepted = [r for r in results if "not re-run" in str(r.get("content", ""))]
-    assert intercepted, "the second identical call must be answered, not dispatched again"
-    assert intercepted[0]["ok"] is False
-
-    # The third still ends the run: a model that ignores the intervention is
-    # genuinely stuck, and the detector is still the backstop.
-    assert agent.result.outcome == Outcome.NO_PROGRESS
+    answered = [
+        r for r in results if "answered from the previous result" in str(r.get("content", ""))
+    ]
+    assert len(answered) == 2, "both repeats answered from the ledger"
+    assert all(r["ok"] is False for r in answered)
+    assert agent.result.outcome != Outcome.NO_PROGRESS, (
+        "three identical calls ended the run again"
+    )
 
 
 def test_the_intervention_carries_what_the_call_returned(router: Router, gated) -> None:
     """Telling the model "you repeated yourself" without saying what came back
-    leaves it exactly as stuck as it was."""
+    leaves it exactly as stuck as it was.
+
+    A missing path is the sharper case: the tool declares it a dead end, and
+    the repeat is answered from that declaration rather than re-dispatched.
+    """
     missing = ("read_file", '{"path":"handler/does_not_exist.go"}')
     _agent, events = loop_over(router, [calls(missing), calls(missing)], mode=Mode.CODER)
 
     results = [e.data for e in of_type(events, EventType.TOOL_RESULT)]
-    intercepted = [r for r in results if "not re-run" in str(r.get("content", ""))]
-    assert intercepted, "expected an interception"
+    answered = [r for r in results if "known dead end" in str(r.get("content", ""))]
+    assert answered, "the repeat of a declared dead end is answered from the ledger"
+    dispatched = [e for e in of_type(events, EventType.TOOL_CALL)]
+    assert len(dispatched) == 1, "a dead end is never re-dispatched"
 
 
 def test_a_truncated_tool_call_is_not_reported_as_bad_json(router: Router, gated) -> None:
@@ -909,14 +940,17 @@ def test_the_gate_is_not_re_run_against_an_unchanged_workspace(
     )
 
 
-def test_the_same_call_across_mode_switches_is_still_no_progress(
+def test_the_same_call_across_mode_switches_is_answered_not_rerun(
     router: Router, gated
 ) -> None:
-    """`_switch` clears `recent`, so a call made once per trip round the ladder
-    resets the detector every time and can repeat forever."""
+    """A call made once per trip round the ladder must not dispatch fresh each
+    time — that was the hole a mode-scoped ledger left, and a call repeated on
+    every cycle could once loop forever. The ledger survives mode switches, so
+    every later ask is answered from the first result.
+    """
     gated["fail"] = "go_build"
     read = ("read_file", '{"path": "handler/user.go"}')
-    agent, _ = loop_over(
+    agent, events = loop_over(
         router,
         [
             say("1. Read handler/user.go\n   Accepts: builds"),
@@ -928,8 +962,11 @@ def test_the_same_call_across_mode_switches_is_still_no_progress(
         ],
     )
 
-    assert agent.result.outcome == Outcome.NO_PROGRESS
-    assert "read_file" in agent.result.summary
+    dispatched = [
+        e for e in of_type(events, EventType.TOOL_CALL) if e.data["name"] == "read_file"
+    ]
+    assert len(dispatched) == 1, "the ladder repeats were re-dispatched"
+    assert agent.result is not None, "the run must still terminate"
 
 
 def test_a_call_repeated_after_an_edit_is_re_checking_not_looping(
@@ -980,7 +1017,7 @@ def test_reading_the_same_file_every_few_turns_is_no_progress(
     other = ("read_file", '{"path": "handler/message.go"}')
     agent, _ = loop_over(
         router,
-        [calls(same, other), calls(other, same), calls(same)],
+        [calls(same, other)] + [calls(other, same)] * MAX_STALLED_TURNS + [calls(same)],
         mode=Mode.PLANNER,
     )
 
@@ -1158,18 +1195,23 @@ def test_a_coder_that_only_talks_about_editing_is_stopped(router: Router, gated)
     assert agent.context.turn < 10, "it was allowed to narrate for ten turns"
 
 
-def test_the_fourth_read_of_one_file_is_answered_not_run(router: Router, gated) -> None:
+def test_reading_one_file_past_the_limit_is_answered_not_run(
+    router: Router, gated
+) -> None:
     """The Planner read repo/postgres/message.go seven times in eight turns.
 
     Every read used a different line range, so `_stuck` — which fingerprints the
     whole call — saw seven different calls. The slice ledger kept the context
     from growing and did nothing about the turns, and the run stopped for no
     progress without ever producing a plan.
+
+    Counted off `MAX_READS` rather than a literal, so the test follows the limit
+    when it is tuned instead of pinning the value it happened to be written at.
     """
     reads = [
         calls(("read_file", '{"path": "repo/postgres/message.go", "start": %d, "end": %d}'
                % (i * 60, i * 60 + 120)))
-        for i in range(6)
+        for i in range(MAX_READS + 2)
     ]
     _, events = loop_over(router, reads + [say("done")])
 
@@ -1177,7 +1219,7 @@ def test_the_fourth_read_of_one_file_is_answered_not_run(router: Router, gated) 
         e for e in of_type(events, EventType.TOOL_RESULT)
         if "already read" in str(e.data.get("content", ""))
     ]
-    assert refused, "the sixth read of one file was dispatched"
+    assert refused, f"read {MAX_READS + 2} times with a limit of {MAX_READS}, none refused"
 
 
 def test_re_reading_a_file_you_just_wrote_is_allowed(router: Router, gated) -> None:
@@ -1523,5 +1565,102 @@ def test_an_ordinary_plan_is_not_read_as_a_refusal(router: Router, gated) -> Non
         router, [say(plan), _edit(1), say("done")], approve=lambda _r: True
     )
     assert of_type(events, EventType.PLAN), "a real plan was refused for its prose"
+    assert agent.result.outcome == Outcome.DONE
+
+# ── the two screenshots ──────────────────────────────────────────────────────
+#
+# Both field transcripts that motivated the ledger design, reduced. The first:
+# a Planner searching for something that was not there, killed on its third
+# identical `search_repo` with four other searches in between. The second: a
+# Planner alternating two missing paths — A, B, A — killed on the third ask one
+# turn after being told, correctly, what to do instead.
+
+
+def test_identical_searches_far_apart_do_not_end_the_run(router: Router, gated) -> None:
+    def search(pattern: str):
+        return calls(("search_repo", '{"pattern": "%s"}' % pattern))
+
+    agent, events = loop_over(
+        router,
+        [
+            search("^func Test"),
+            search("^func New"),
+            search("^func Test"),
+            search("^func Handle"),
+            search("^func Test"),
+            say("1. Confirm handler/user.go compiles\n   Accepts: builds"),
+            say("It compiles."),
+        ],
+    )
+
+    assert agent.result.outcome == Outcome.DONE, (
+        f"the run died of repetition again: {agent.result.summary}"
+    )
+    dispatched = [
+        e.data["arguments"] for e in of_type(events, EventType.TOOL_CALL)
+        if e.data["name"] == "search_repo"
+    ]
+    assert len(dispatched) == 3, "each distinct search once; every repeat answered"
+
+
+def test_alternating_missing_paths_do_not_end_the_run(router: Router, gated) -> None:
+    a = ("read_file", '{"path": "handler/webhook.go"}')
+    b = ("read_file", '{"path": "handler/webhook_handler.go"}')
+    agent, events = loop_over(
+        router,
+        [
+            calls(a), calls(b), calls(a), calls(a),
+            say("1. Confirm handler/user.go compiles\n   Accepts: builds"),
+            say("Neither file exists; the handler is handler/user.go."),
+        ],
+    )
+
+    assert agent.result.outcome == Outcome.DONE, (
+        f"the run died on a missing path again: {agent.result.summary}"
+    )
+    dispatched = [e for e in of_type(events, EventType.TOOL_CALL)]
+    assert len(dispatched) == 2, "each missing path probed exactly once"
+    answered = [
+        e.data for e in of_type(events, EventType.TOOL_RESULT)
+        if "known dead end" in str(e.data.get("content", ""))
+    ]
+    assert len(answered) == 2, "the later asks were answered from the dead-end ledger"
+
+
+def test_a_batch_of_identical_calls_does_not_end_the_run_in_one_turn(
+    router: Router, gated
+) -> None:
+    """Three identical calls in ONE assistant turn once killed the run at turn
+    one, with a message claiming three turns."""
+    same = ("search_repo", '{"pattern": "^func Test"}')
+    batch = calls(same, same, same)
+    agent, events = loop_over(
+        router,
+        [batch, say("1. Confirm handler/user.go compiles\n   Accepts: builds"), say("ok")],
+    )
+
+    assert agent.result.outcome == Outcome.DONE
+    dispatched = [e for e in of_type(events, EventType.TOOL_CALL)]
+    assert len(dispatched) == 1, "one dispatch; two in-batch repeats answered"
+
+
+def test_a_write_reopens_a_dead_end(router: Router, gated) -> None:
+    """A missing path is a dead end only until something can create it. The
+    ledgers clear when a mutation lands, so the read after the write runs."""
+    read = ("read_file", '{"path": "handler/pension.go"}')
+    write = ("write_file", '{"path": "handler/pension.go", "content": "package handler"}')
+    agent, events = loop_over(
+        router,
+        [say("1. Add handler/pension.go\n   Accepts: builds"), calls(read), calls(write), calls(read), say("done")],
+        approve=lambda _r: True,
+    )
+
+    reads = [
+        e.data for e in of_type(events, EventType.TOOL_RESULT)
+        if e.data.get("name") == "read_file"
+    ]
+    assert len(reads) == 2
+    assert reads[0]["ok"] is False, "the file did not exist yet"
+    assert reads[1]["ok"] is True, "after the write, the re-read must really run"
     assert agent.result.outcome == Outcome.DONE
 

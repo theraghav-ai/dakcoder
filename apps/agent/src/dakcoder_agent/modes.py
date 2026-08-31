@@ -83,32 +83,37 @@ class ModeConfig:
 #: The prompt budget every mode gets. One number, because five copies of it is
 #: how the Planner came to have a different one that nobody noticed.
 #:
-#: It was 24,000 for the Planner and 32,768 for the rest, and the Planner's was
-#: what a seventy-one-turn session died on: compaction retains to
-#: ``budget * 0.35`` minus the pinned head, which at 24,000 left about 5.3k for
-#: the working set, against a ``read_file`` capped at 6,000. The mode could not
-#: keep one of the files it had just read, so it read them again, and again.
-#: At 32,768 the floor is ~6.9k, which clears a whole file read, and the
-#: threshold is ~22.9k, which is above what an orienting turn costs.
+#: 245,760 — the model's own window, minus room to answer. The endpoint serves
+#: Qwen3.8-27B at ``max_model_len`` 262,144 (asserted by the gateway probe),
+#: prompt and completion share it, and the largest completion budget below is
+#: 6,144; the remaining ~10k is headroom for template overhead and estimator
+#: error, so a full prompt cannot push the answer out of the window.
 #:
-#: **65,536 was measured and rejected**, so that it does not have to be measured
-#: again. It buys a ~18.4k retention floor and drops compaction from eight times
-#: in twenty-five turns to twice — and it costs, on the same simulated run:
+#: This supersedes 32,768, and the history is worth keeping because both of the
+#: old numbers were load-bearing:
 #:
-#:     P95 prompt per turn      21,621  ->  44,004   (§5.3 target 24,000)
-#:     effective prefill       142,258  -> 531,377   (§5.3 target 180,000)
-#:     raw prefill             347,601  -> 818,311
+#: It was 24,000 for the Planner once, and that killed a seventy-one-turn run:
+#: compaction retains to ``budget * 0.35``, which at 24,000 could not hold one
+#: capped file read, so the mode re-read the same files forever. 32,768 fixed
+#: that case and was chosen against §5.3's cost targets (P95 prompt <= 24k,
+#: effective prefill <= 180k); 65,536 was measured then and rejected for
+#: breaching them.
 #:
-#: Three §5.3 cost targets, all breached, for a floor the failure did not need.
-#: There is no tuning that recovers them either: dropping ``compact_at`` far
-#: enough to hold the old P95 puts compaction back to seventeen or more, and
-#: lowering ``retain_pct`` barely registers because at 65,536 compaction hardly
-#: fires. The cost follows the budget.
+#: What changed the decision is the field evidence: at 32,768 real runs
+#: compacted at ~23k, the recap evicted the very answers the model was working
+#: from, the model re-asked for them, and the repeat detector ended the run.
+#: Two transcripts died exactly this way. A budget that routinely destroys the
+#: working set of an ordinary task is mispriced however good its prefill
+#: numbers look, so the ceiling now defers to the model's window and the §5.3
+#: targets are re-baselined in ``test_budget_regression.py`` with the measured
+#: cost of this decision recorded next to them.
 #:
-#: So the ceiling is not the lever. ``_thrashing`` in loop.py is what catches a
-#: task genuinely too large for this, and it says so in a sentence rather than
-#: spending seventy-one turns finding out.
-PROMPT_BUDGET = 32_768
+#: The cost profile to keep in mind: the budget is a ceiling, not an
+#: allocation. Short runs are unchanged. Long runs now accumulate instead of
+#: compacting, so their per-turn prefill grows with the run; prefix caching
+#: absorbs most of it, and ``_thrashing`` still catches a working set that
+#: genuinely will not fit.
+PROMPT_BUDGET = 245_760
 
 MODES: dict[Mode, ModeConfig] = {
     # Reversed from the earlier plan. The spike found no quality gain on

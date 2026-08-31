@@ -182,7 +182,21 @@ class ToolCap:
     recover: str = ""
 
 
-#: Per-tool caps. The numbers are Part A §6.2's.
+#: Per-tool caps. The shapes and strategies are Part A §6.2's; the numbers
+#: were re-based when the prompt budget moved from 32,768 to the model window.
+#:
+#: At 32,768 a 6,000-token ``read_file`` cap was 18% of the budget and the
+#: elision marker's advice — "re-read the file with a narrower line range" —
+#: was survival. At 245,760 the same cap is 2.4%, and that advice *instructed*
+#: the sliced re-reading loop two field transcripts died of. The caps below
+#: still exist (an unbounded tool result is how one call eats a context), but
+#: they are sized so an ordinary artefact — a whole Go file, a whole build log,
+#: a whole search — lands intact.
+#:
+#: The four review audits and ``lib_version_check`` are deliberately NOT
+#: raised: their caps sit above what their renderers emit by design, and the
+#: comment on them below still holds — if one ever exceeds its cap, the
+#: renderer needs tightening rather than the cap raising.
 #:
 #: `go_build` and friends get the special strategy for a reason worth stating:
 #: their error lines are the single most useful thing in the whole context, and
@@ -190,15 +204,15 @@ class ToolCap:
 #: `file:line:col` messages the agent needs while keeping the package list it
 #: does not.
 TOOL_CAPS: dict[str, ToolCap] = {
-    "read_file": ToolCap(6_000, "head", "re-read the file with a narrower line range"),
-    "repo_map": ToolCap(4_000, "head", 'call repo_map(package="<dir>") for one package in full'),
-    "search_repo": ToolCap(2_000, "head", "narrow the pattern or pass a glob"),
-    "go_build": ToolCap(4_000, "errors", "fix the reported errors and re-run"),
-    "go_vet": ToolCap(4_000, "errors", "fix the reported findings and re-run"),
-    "go_test": ToolCap(4_000, "errors", "re-run with a package pattern to narrow the output"),
-    "rules_lint": ToolCap(3_000, "head", "pass `paths` to scope the lint to what you changed"),
-    "legacy_audit": ToolCap(3_000, "head", "pass `paths` to scope the audit"),
-    "go_diagnostics": ToolCap(2_000, "head", "narrow to one file with `path`"),
+    "read_file": ToolCap(48_000, "head", "re-read the file with a narrower line range"),
+    "repo_map": ToolCap(16_000, "head", 'call repo_map(package="<dir>") for one package in full'),
+    "search_repo": ToolCap(16_000, "head", "narrow the pattern or pass a glob"),
+    "go_build": ToolCap(12_000, "errors", "fix the reported errors and re-run"),
+    "go_vet": ToolCap(12_000, "errors", "fix the reported findings and re-run"),
+    "go_test": ToolCap(12_000, "errors", "re-run with a package pattern to narrow the output"),
+    "rules_lint": ToolCap(8_000, "head", "pass `paths` to scope the lint to what you changed"),
+    "legacy_audit": ToolCap(8_000, "head", "pass `paths` to scope the audit"),
+    "go_diagnostics": ToolCap(8_000, "head", "narrow to one file with `path`"),
     # The review audits. `head` rather than the default `tail` for all four:
     # they are rendered worst-first, so the head is the part worth keeping —
     # and the default of tail-truncating a ranked report keeps the least
@@ -215,7 +229,7 @@ TOOL_CAPS: dict[str, ToolCap] = {
 }
 
 #: Everything not named above. §6.2's "everything else".
-DEFAULT_TOOL_CAP = ToolCap(2_000, "tail", "call the tool again with narrower arguments")
+DEFAULT_TOOL_CAP = ToolCap(8_000, "tail", "call the tool again with narrower arguments")
 
 #: The recap's allocation from §6.1. Reserved when deciding how much of the
 #: working set to retain, because the recap grows as history is evicted and

@@ -5,10 +5,25 @@ work is deferred as 'optimisation' and the agent ships slow", and its mitigation
 is exactly this file: the targets are asserted, so the regression is a red build
 rather than a slow agent nobody can quite explain.
 
-The targets, from §5.3:
+The targets were §5.3's, set for a 32,768-token ceiling:
 
     prompt tokens, P95, coder turn        <= 24,000   (frontend agent: ~68,000)
     total prefill for a 25-turn task      <= 180,000  (frontend agent: ~1.25M)
+
+**Re-baselined 2026-08-31 for PROMPT_BUDGET = 245,760** — a deliberate policy
+change, not drift. At 32,768 real runs compacted at ~23k, the recap evicted the
+answers the model was working from, and the repeat detector ended the run; two
+field transcripts died exactly this way. The ceiling now defers to the model's
+own window, and this gate's job changes with it: it no longer holds the line at
+§5.3's numbers, it pins the *measured cost of the new policy* so an accidental
+regression (a cap dropped, the ledger broken, the budget quietly shrunk) is
+still a red build. Measured on this simulation at the new budget and caps:
+
+    P95 prompt   113,961   ->  target 128,000
+    novel total  846,221   ->  target 1,000,000
+    compactions        0   ->  target <= 2 (compaction returning here means the
+                               budget shrank back, which is the very regression
+                               this file exists to catch)
 
 The prefill target needs reading carefully. §5.3 writes it as
 "<= 180k (cap + compaction + **prefix reuse**)", and the row beneath it marks
@@ -49,8 +64,8 @@ from dakcoder_agent import ContextManager, Mode, Recap
 from dakcoder_shared.tokens import estimate_tokens
 
 TURNS = 25
-P95_PROMPT_TOKENS = 24_000
-TOTAL_PREFILL = 180_000
+P95_PROMPT_TOKENS = 128_000
+TOTAL_PREFILL = 1_000_000
 
 # ~1,200 tokens, per §6.1's system-prompt allocation.
 SYSTEM_PROMPT = (
@@ -255,10 +270,13 @@ def test_compaction_is_rare_because_each_one_invalidates_a_prefix():
     read_file results already exceed the threshold it had just compacted below.
     """
     _, _, snapshot = _run_managed()
-    # Currently 8. The bound is the anti-thrashing floor rather than a ratchet:
-    # a knife-edge assertion flaps on every content change and gets relaxed by
-    # whoever it flaps on, which is how a gate stops being one.
-    assert snapshot["compactions"] <= TURNS // 2, (
+    # Zero at the 245,760 budget — this task's working set peaks around 115k
+    # against a ~172k threshold. Bounded at two rather than zero because a
+    # knife-edge assertion flaps on every content change and gets relaxed by
+    # whoever it flaps on; but compaction *returning* here is the loudest
+    # available signal that the budget shrank back toward the ceiling that was
+    # killing runs, so the bound is deliberately tight.
+    assert snapshot["compactions"] <= 2, (
         f"{snapshot['compactions']} compactions in {TURNS} turns is thrashing; "
         "each one costs a full prefill of everything below the recap"
     )
@@ -284,10 +302,19 @@ def test_the_managed_run_is_dramatically_cheaper_than_the_unmanaged_one():
         f"\n  compactions={snapshot['compactions']}  stale_slices={snapshot['stale_slices']}"
     )
 
-    assert ratio >= 5.0, (
-        f"context management is only saving {ratio:.1f}x; §5.2 puts the unmanaged "
-        "cost at roughly 1.25M tokens for this shape of task, so something has "
-        "stopped working"
+    # 2.2x raw at the 245,760 budget, down from ~14x at 32,768 — deliberately.
+    # Most of the old saving was truncation: capped tool results are cheap to
+    # re-send and expensive to act on, and the sliced re-reading they caused is
+    # what killed runs. What remains is the saving the design still promises —
+    # the slice ledger deduplicating re-reads — plus prefix reuse, asserted
+    # separately because it is the half a broken ledger would not fake.
+    assert ratio >= 1.8, (
+        f"context management is only saving {ratio:.1f}x raw; the slice ledger "
+        "has stopped deduplicating re-reads"
+    )
+    assert u_total / n_total >= 4.0, (
+        f"only {u_total / n_total:.1f}x with prefix reuse; the novel-token count "
+        "has grown out of proportion to the content"
     )
 
 
@@ -302,11 +329,21 @@ def test_growth_is_bounded_rather_than_linear():
     managed, _, _ = _run_managed()
     unmanaged = _run_unmanaged()
 
-    first_half = statistics.mean(managed[: TURNS // 2])
-    second_half = statistics.mean(managed[TURNS // 2 :])
-    assert second_half <= first_half * 1.6, (
-        f"managed context grew {second_half / first_half:.1f}x between the first and "
-        "second half of the run; it should plateau, not climb"
+    # At 245,760 the plateau moved: a 25-turn task no longer brushes the
+    # ceiling, so within the run the managed curve still climbs — what bounds
+    # it now is the working set. The property worth pinning is that the whole
+    # task completes *under the compaction threshold* on content the unmanaged
+    # baseline pushes far past it: the managed cost is set by the distinct
+    # artefacts touched, the unmanaged cost by the number of turns taken.
+    threshold = ContextManager(mode=Mode.CODER, system_prompt=SYSTEM_PROMPT).budget * 0.70
+    assert max(managed) <= threshold, (
+        f"peak managed prompt {max(managed):,.0f} crossed the compaction "
+        f"threshold {threshold:,.0f}; the slice ledger has stopped bounding the "
+        "working set"
+    )
+    assert max(unmanaged) > threshold, (
+        "the unmanaged baseline fits under the threshold, so it is not "
+        "modelling the problem"
     )
 
     u_first = statistics.mean(unmanaged[: TURNS // 2])

@@ -247,7 +247,12 @@ class Router:
         try:
             args = _coerce(spec, arguments, gate=gate)
         except _ArgError as exc:
-            return ToolResult.failure(str(exc), fix=exc.fix)
+            # Deterministic for these exact arguments: the same string will
+            # fail the same validation every time, so the loop may answer a
+            # repeat from its ledger instead of validating it again.
+            return ToolResult.failure(
+                str(exc), fix=exc.fix, meta={"dead_end": f"the arguments are invalid ({exc})"}
+            )
 
         try:
             args, paths = self._confine(spec, args)
@@ -300,6 +305,10 @@ class Router:
         """
         available = self.schemas_for(mode)
         candidates = [s["function"]["name"] for s in available]
+        # Deterministic: a name that is in no registry will not appear in one
+        # by being asked for again. (A tool that exists but is hidden from this
+        # mode takes a different path and is deliberately NOT a dead end — a
+        # mode switch can make it callable.)
 
         # Habits from other harnesses and from the shell, mapped explicitly.
         # None of these are textually close to the right answer, so edit distance
@@ -479,19 +488,77 @@ class Router:
         """
         wanted = self._relative(missing)
         suggestions = self._nearest(wanted)
+        dead = {"dead_end": f"{wanted} does not exist"}
 
         if not suggestions:
+            # "Go look" was ignored three turns running in the field, because it
+            # gave the model nothing to look *for*. So the answer carries the
+            # looking already done: the nearest directory that does exist, and
+            # what is actually in it. A guess with no near-miss is usually a
+            # right directory holding none of the imagined file — listing it is
+            # the one-turn correction the suggestion list provides everywhere
+            # else.
+            where, present = self._whats_there(wanted)
+            if present:
+                listed = "\n".join(f"  {p}" for p in present)
+                return ToolResult.failure(
+                    f"{spec.name}: {wanted} does not exist, and nothing in the "
+                    f"workspace has a similar name. What is actually in "
+                    f"{where}:\n{listed}",
+                    fix="Read one of these, or call repo_map for the full layout. "
+                    "The missing path will not appear by asking again.",
+                    meta=dead,
+                )
             return ToolResult.failure(
                 f"{spec.name}: {wanted} does not exist, and nothing in the workspace "
                 "has a similar name.",
                 fix="Call repo_map to see what is actually here before reading again. "
                 "Do not retry this path.",
+                meta=dead,
             )
         listed = "\n".join(f"  {p}" for p in suggestions)
         return ToolResult.failure(
             f"{spec.name}: {wanted} does not exist. The closest files that do:\n{listed}",
             fix=f"Read one of those, or call repo_map. Do not retry {wanted}.",
+            meta=dead,
         )
+
+    #: How many entries of the nearest real directory to show for a guess that
+    #: matched nothing. Enough to orient; short of pasting a tree.
+    _LISTING = 15
+
+    def _whats_there(self, wanted: str) -> tuple[str, list[str]]:
+        """The nearest existing ancestor directory of a missing path, listed.
+
+        Walks up from the guess until something real is found, flooring at the
+        workspace root, and returns (where, entries) with directories first and
+        marked with a trailing slash. Both empty when even the root cannot be
+        listed, in which case the caller falls back to the bare message.
+        """
+        root = self.workspace.root
+        current = (root / wanted).parent
+        for _ in range(32):
+            try:
+                if current.is_dir():
+                    break
+            except OSError:
+                return "", []
+            if current == current.parent or root not in (*current.parents, current):
+                current = root
+                break
+            current = current.parent
+        try:
+            entries = sorted(
+                current.iterdir(), key=lambda p: (p.is_file(), p.name.lower())
+            )
+        except OSError:
+            return "", []
+        shown: list[str] = []
+        for entry in entries[: self._LISTING]:
+            rel = self._relative(str(entry))
+            shown.append(f"{rel}/" if entry.is_dir() else rel)
+        where = self._relative(str(current))
+        return (where if where not in (".", "") else "the workspace root"), shown
 
     def _relative(self, path: str) -> str:
         """Render a path relative to the workspace, falling back to the name."""
