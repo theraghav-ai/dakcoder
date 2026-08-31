@@ -262,7 +262,7 @@ _EXECUTING = frozenset({Mode.CODER, Mode.SCAFFOLDER, Mode.DEBUGGER})
 #: How many times one path may be read before the loop answers with what it
 #: already has. Three is enough for read, edit, re-read; the seventh read of one
 #: file in eight turns is the Planner going in circles, which is what it did.
-MAX_READS = 3
+MAX_READS = 10
 
 
 class AgentLoop:

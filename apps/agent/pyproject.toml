@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dakcoder-agent"
-version = "0.2.3"
+version = "0.2.4"
 description = "The dakcoder agent loop, tool router and context manager"
 requires-python = ">=3.11"
 dependencies = ["dakcoder-shared", "fastapi>=0.110", "uvicorn>=0.30"]
