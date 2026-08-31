@@ -312,7 +312,7 @@
     },
     {
       "name": "legacy_audit",
-      "description": "Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating.",
+      "description": "Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating; then search_docs 'legacy migration' and follow that SOP.",
       "parameters": {
         "type": "object",
         "properties": {

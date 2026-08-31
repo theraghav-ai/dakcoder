@@ -68,11 +68,21 @@ tool-catalog: build ## Write contract C1 — the published tool schemas
 tool-catalog-check: build ## Fail if the committed catalogue is stale
 	@./$(BINARY)$(shell go env GOEXE) tool-catalog --check
 
+# Written twice on purpose. packages/knowledge is the source-tree copy that
+# search_docs finds by walking up from a checkout; the copy under
+# apps/agent/src/dakcoder_agent/knowledge ships inside the wheel, because the
+# deployed runtime has a venv rather than a checkout and a knowledge base that
+# exists only in git is one the agent answers "not installed" about. Both are
+# generated, both are committed, and knowledge-check holds them in lockstep.
+PACKAGED_KB := ../apps/agent/src/dakcoder_agent/knowledge
+
 knowledge: build ## Build the agent's knowledge base from skill.md / SOP.md
 	@./$(BINARY)$(shell go env GOEXE) knowledge --docs $(TEMPLATE)
+	@./$(BINARY)$(shell go env GOEXE) knowledge --docs $(TEMPLATE) --out $(PACKAGED_KB)
 
 knowledge-check: build ## Fail if the committed knowledge base is stale
 	@./$(BINARY)$(shell go env GOEXE) knowledge --docs $(TEMPLATE) --check
+	@./$(BINARY)$(shell go env GOEXE) knowledge --docs $(TEMPLATE) --out $(PACKAGED_KB) --check
 
 bench: ## Benchmark the analyser against the real corpora
 	go test -run '^$$' -bench . -benchmem ./internal/rules/

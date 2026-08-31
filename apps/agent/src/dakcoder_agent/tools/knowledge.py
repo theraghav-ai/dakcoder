@@ -198,9 +198,21 @@ def _corpus(root: str) -> Corpus:
 
 
 def _knowledge_root(explicit: Path | None = None) -> Path | None:
+    """Where the knowledge base lives, in the three places it can.
+
+    Explicit wins. Then the copy installed inside the package itself — the
+    deployed case, where the runtime is a wheel in a venv and there is no
+    checkout to walk. Then the checkout walk for ``packages/knowledge``, which
+    is where a developer's ``make knowledge`` writes first. The two committed
+    copies are generated together and held identical by ``knowledge-check``,
+    so which one is found never changes an answer.
+    """
     if explicit and explicit.is_dir():
         return explicit
     here = Path(__file__).resolve()
+    packaged = here.parents[1] / "knowledge"
+    if (packaged / "SKILL.md").is_file():
+        return packaged
     for parent in here.parents:
         candidate = parent / "packages" / "knowledge"
         if candidate.is_dir():

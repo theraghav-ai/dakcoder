@@ -320,7 +320,8 @@ _SPECS: tuple[ToolSpec, ...] = (
         name="legacy_audit",
         description=(
             "Detect pre-template patterns in an existing service: routes.go, gin, "
-            "hand-rolled SQL builders, manual validation. Run before migrating."
+            "hand-rolled SQL builders, manual validation. Run before migrating; "
+            "then search_docs 'legacy migration' and follow that SOP."
         ),
         parameters=_obj(
             paths=_str("Comma-separated paths to audit. Omit for the whole workspace."),

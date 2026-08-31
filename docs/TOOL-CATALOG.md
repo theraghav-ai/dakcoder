@@ -15,10 +15,10 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 
 | Mode | Tools | Schema cost |
 |---|---|---|
-| **planner** | 13 | ~1,414 tokens |
+| **planner** | 13 | ~1,428 tokens |
 | **scaffolder** | 11 | ~1,313 tokens |
 | **coder** | 17 | ~1,992 tokens |
-| **verifier** | 11 | ~1,203 tokens |
+| **verifier** | 11 | ~1,217 tokens |
 | **debugger** | 19 | ~2,203 tokens |
 
 ## The catalogue
@@ -32,7 +32,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `go_symbols` | CDPV |  |  | gopls | Find a symbol's definition, references or package API through gopls. Use this rather than searching for a name textually. _(not yet available: gopls is not yet wired (Part A section 8.3). Use search_repo, or go_build for type errors.)_ |
 | `go_diagnostics` | CDV |  |  | gopls | Type-check the workspace incrementally and report errors. This is the fast inner-loop signal; run it after every edit batch. _(not yet available: gopls is not yet wired (Part A section 8.3). Use go_build, which is authoritative but takes about four seconds.)_ |
 | `rules_lint` | CDPV |  |  | gotools | Check Go against the n-api-template contract: layer boundaries, handler signatures, repository idiom, FX registration. Pass paths to scope it. |
-| `legacy_audit` | PV |  |  | gotools | Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating. |
+| `legacy_audit` | PV |  |  | gotools | Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating; then search_docs 'legacy migration' and follow that SOP. |
 | `db_roundtrip_audit` | PV |  |  | gotools | Profile every repository method: database calls, any inside a loop, batched, in a transaction, with a verdict. Worst first. Use before optimising by eye. |
 | `validation_audit` | CPV |  |  | gotools | List every request field, its validate tag, and what the tag leaves unbounded. `required` alone means only 'not empty', so a 10MB string passes. |
 | `temporal_audit` | P |  |  | gotools | List inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only — it makes no recommendation. |
@@ -128,7 +128,7 @@ Check Go against the n-api-template contract: layer boundaries, handler signatur
 
 ### `legacy_audit`
 
-Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating.
+Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating; then search_docs 'legacy migration' and follow that SOP.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
