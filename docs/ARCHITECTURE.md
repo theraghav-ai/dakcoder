@@ -1711,6 +1711,170 @@ The load-bearing assertions, and what each is guarding against:
 
 ## 5. Changelog
 
+### 2026-09-01 — A question is not a plan
+
+Reported from a pilot session and, on the face of it, the same failure as the
+three entries below: *Stopped — no progress*, nineteen turns. It is not. Running
+the identical prompt against the committed pre-fix code reproduces it exactly —
+`no_progress`, the same Verifier↔Coder ping-pong, the same unrequested edits —
+so nothing here was introduced by that work. `no_progress` is a shared exit, not
+a bug; this is the fifth distinct cause of it, and the first one that was never
+about the loop going in circles.
+
+**What was asked.** *"explain me this bootstrapper used in this code. also tell
+how it deviates from the new template"*. A question.
+
+**What happened.** The Planner answered it, well, in ten numbered paragraphs:
+
+```
+**1. `Fxvalidator`** — `fx.Invoke(handler.NewValidatorService)`. Runs once at
+startup and registers the custom go-playground validators…
+```
+
+`_count_steps` counts anything shaped like a numbered item, which is the right
+thing for recognising a plan and the wrong thing for telling one from an answer.
+Ten steps, so `_advance` pinned the explanation as the plan and entered the
+Coder.
+
+What the Coder does next is the part that matters, and the two transcripts
+disagree about it in a way that is worth recording. In the pilot's, it had
+nothing to execute and re-ran the Planner's entire survey — `repo_map`,
+`bootstrapper.go`, `main.go`, `routes.go`, `fx.Annotate` — six turns of ledger
+answers to a no-progress stop. In the reproduction it went looking for work
+instead, found a `json\t:` typo in `core/domain/transferentry.go` — a file
+nobody had mentioned — and started editing it, then ping-ponged Verifier→Coder
+on `patch_file` for eight turns. **The second is the worse outcome and the
+harder one to notice**: a run that answers a question by changing code has done
+something no one asked for, and the transcript reads as progress.
+
+**The fix is a discriminator, and it takes both halves.** The reply test alone
+was tried first and is too strong: `1. Read handler/user.go` is a legitimate
+one-step plan that reads exactly like a description, and ten tests drive the
+Coder through plans of that shape. Ten of them failed. What separates the two is
+not the answer but the question.
+
+So `_is_explanation(task, text)` requires that
+
+- the **task** asks only to be told something — `explain`, `describe`, `what
+  is`, `how does`, `why`, `summarise` — and asks for no change. That second
+  clause settles the mixed case on its own: *"explain the bootstrapper then
+  migrate it"* is a migration with a preamble.
+- the **reply** proposes nothing executable: no step that asks for a change, no
+  `Accepts:` line — which the Planner's own instruction requires of every step —
+  and not the scaffolder's one-liner, which is a plan carrying neither.
+
+Measured against the field explanation, two real plans and five constructed
+cases, this splits them 8/8. It errs toward executing, deliberately: a false
+positive costs a run that ends with its answer on screen, which the developer
+continues with "go"; the behaviour without it costs edits to files nobody
+mentioned.
+
+**Verified live**, same gateway and model:
+
+| Task | Before | After |
+|---|---|---|
+| "explain this bootstrapper…" | `no_progress` @19, files edited | `done` @6, **nothing touched** |
+| "add a GET /v1/products/{id} route" | `exhausted` @40 | `done` @36, 9 files, gate clean |
+
+The second row is the regression that mattered — a discriminator that quietly
+stops real work would be worse than the bug. It is also the first end-to-end
+clean finish this workspace has produced: domain, DDL, repository, response,
+handler, request DTO, generated validator and the FX registration, with the gate
+green over all of it.
+
+### 2026-09-01 — The three caveats, closed, and the fourth they were hiding
+
+The two entries below left three things recorded rather than fixed. All three
+are fixed here, and clearing the first two surfaced a fourth that had been
+behind them the whole time.
+
+**A mode with no stopping condition, for the third time.** The Planner ceiling
+was the first; the Coder is the second. `_narrating` catches a writing mode that
+*talks* instead of editing, because it counts turns that called nothing — so a
+Coder calling `read_file` every turn walks past it, which is what run B did for
+twenty-six turns with `stalled_turns` at zero and no edit at the end of it.
+
+`EXECUTING_RESEARCH_NUDGE` and `_LIMIT` are the Planner's thresholds one mode
+down: at twelve tool-calling turns without a mutation the mode is told to make
+the smallest change that advances the step, and at sixteen the *lookup* tools
+are withdrawn for one turn. Verification is deliberately not withdrawn — a
+Debugger re-running `go_build` between hypotheses is working, not stalling, and
+taking the gates from the mode whose job is to run them would break the one loop
+that is supposed to iterate without editing. A mutation clears the counter, so
+the ordinary read-edit-read cycle never approaches either threshold.
+
+**A clean gate on half a plan is not a finished run.** The gate is a function of
+the files that changed, so it has nothing to say about the ones that did not: a
+run that applied step one of four passes it exactly as a finished run does. Run
+D ended DONE with *"2 file(s) changed and the gate is clean"* having written the
+domain model and neither the repository nor the handler — a struct nothing
+constructs and a route nobody can call.
+
+`_unfinished` already existed to say this and was **called on one path only**,
+the UNVERIFIED one, so a run that reached a clean gate never consulted it. It is
+wired into the clean-gate branch now, bounded at `MAX_UNFINISHED_NUDGES` — the
+model may have decided a step was unnecessary, and this reads paths out of
+prose, so it is not the arbiter of who is right. After two nudges the gap goes
+in the DONE headline rather than a footnote after it.
+
+Two defects underneath it, both of which had to be fixed for the check to mean
+anything:
+
+- `_PLAN_EDITS` is anchored at the step number, and plans put the file first:
+  ``1. **`core/domain/product.go`** — add the Product struct``. That shape
+  matched nothing, so a four-step plan read as an *investigation* and never
+  reached the check at all. A path is now allowed between the number and the
+  verb — a path only, because widening it to "anything up to a verb" is how
+  "Confirm the handler needs no change" becomes an edit step.
+- Paths were collected from the whole plan, so ``mirroring core/domain/user.go``
+  counted as a target. `_plan_targets` takes **one target per edit step, the
+  first path it names**: plans are written file-first, reasoning-after, so every
+  later path is a reference, an example, or a neighbour to copy. Telling a
+  finished run it forgot to write a file it was only asked to look at is worse
+  than not checking.
+
+**The pre-existing test failure was a real regression nobody had noticed.**
+`test_a_comma_separated_path_list_becomes_an_array` did
+`json.loads(out.content)["files_scanned"]`, and `rules_lint` stopped returning
+raw JSON the day `_render_lint` landed — rendering is lossy by design, but it
+was discarding the machine-readable half entirely. `_report` now keeps the
+counts in `meta`, which is where a number a caller might branch on belongs, and
+the test reads them from there. The whole suite passes, slow and integration
+included, for the first time in this work.
+
+**And the fourth, which the first two were hiding.** With the Coder no longer
+grazing and the plan check in place, a live run routed to the Scaffolder instead
+and died `no_progress` at turn 39 in a way none of the earlier runs had reached.
+
+`resource_scaffold` wrote its seven files. The model then tried to `patch_file`
+one of them and was correctly told that belongs to the Coder — and could not get
+there, because `_advance` hands a writing mode on only when it ends a turn
+calling nothing, and this one never did. Re-scaffolding was the only writing
+move its mode had left, so it spent its last fifteen turns guessing an overwrite
+flag that does not exist: `replace`, `clean`, `reset`, `fresh`, `recreate`, each
+a different fingerprint, each dispatched, each rejected.
+
+The Scaffolder is one-shot by construction — its own instruction is *"produce a
+spec, not code"*, and the templates write the files — so a successful scaffold
+now ends the phase. The switch happens before `begin_turn`, so the turn is
+announced as the mode it will actually dispatch. A *rejected* spec is not a
+finished phase and leaves the mode where it is, able to send a corrected one.
+
+The executing ceiling would have caught this eventually and missed by one turn,
+which is the honest argument for handling it at the source rather than tuning a
+threshold until it covers a case it was not written for.
+
+**Verified live**, same gateway and model. The run that died at 39:
+
+| | Before | After |
+|---|---|---|
+| outcome | `no_progress` @39 | `exhausted` @40 |
+| mode path | `planner → scaffolder`, stuck | `planner@1 → scaffolder@14 → coder@17 → verifier@37` |
+| files | domain + DDL only | the whole resource: domain, DDL, repository, response, handler, request DTO, generated validator, FX registration |
+
+`exhausted` there is the turn budget, not a loop: the Verifier was still working
+on a pre-existing `go.mod` discrepancy when it ran out.
+
 ### 2026-09-01 — The six fixes, and what each one moved
 
 The diagnosis below, acted on. Verified the way it was found: live runs against
@@ -1824,7 +1988,7 @@ turn 14 and run C at turn 13, neither reaching the limit.
 — one of the two copies `_knowledge_root` describes as held identical — was
 empty. The target writes both from one generator run, so they cannot disagree.
 
-**Still open.** The Coder inherits the Planner's old shape: run B spent 26 turns
+**Since closed** (see the entry above). The Coder inherits the Planner's old shape: run B spent 26 turns
 reading without an edit, which no detector sees because it calls a tool every
 turn. Run D reported `done` after step 1 of its plan, with a clean gate on a
 partial change — the gate checks what was written, not what the plan said would

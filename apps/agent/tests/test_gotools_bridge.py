@@ -138,7 +138,11 @@ def test_a_comma_separated_path_list_becomes_an_array(live_router: Router) -> No
         "rules_lint", {"paths": "handler/user.go"}, mode=Mode.CODER
     )
     assert out.ok
-    assert json.loads(out.content)["files_scanned"] > 0
+    # Read off `meta`, not by parsing the content. `rules_lint` returns a
+    # rendered digest — the raw JSON stopped being the content the day
+    # `_render_lint` landed, and this assertion went on parsing prose as JSON
+    # and failing for it. The counts the sidecar reported are in `meta` now.
+    assert out.meta["files_scanned"] > 0
 
 
 def test_repo_map_respects_its_token_budget(live_router: Router) -> None:

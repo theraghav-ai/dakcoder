@@ -202,6 +202,22 @@ class _State:
     #: repeating it every turn would be the accumulating pattern that
     #: ``ContextManager.discard`` exists to keep out of the transcript.
     planner_nudged: bool = False
+    #: Consecutive tool-calling turns in a writing mode that wrote nothing, and
+    #: whether that mode has been told. Cleared by a mutation. See
+    #: ``EXECUTING_RESEARCH_NUDGE``.
+    executing_research: int = 0
+    executing_nudged: bool = False
+    #: How many times a clean gate has been refused because the plan's edit
+    #: steps named files nothing wrote. See ``MAX_UNFINISHED_NUDGES``.
+    unfinished_nudges: int = 0
+    #: Whether a scaffold has run and written files. The Scaffolder is one-shot;
+    #: this is what lets it hand on. See ``_SCAFFOLD_TOOLS``.
+    scaffolded: bool = False
+    #: ``router.mutations`` as of the last time ``executing_research`` was
+    #: cleared. Its own watermark for the reason ``idle_mutations`` has one: a
+    #: counter shared with ``_stuck`` is already synced by the time this runs,
+    #: so every edit would be invisible here.
+    research_mutations: int = 0
     #: How many times each path has been read, and the ranges it was read at.
     #: The slice ledger keeps the *context* from growing when a file is read
     #: seven times; it does nothing about the seven turns. Reset for a path when
@@ -327,6 +343,55 @@ MAX_STALLED_TURNS = 6
 #: does not take forty.
 PLANNER_RESEARCH_NUDGE = 12
 PLANNER_RESEARCH_LIMIT = 16
+
+#: The same ceiling one mode down, for a writing mode that has stopped writing.
+#:
+#: ``_narrating`` already catches a Coder that talks instead of editing, but it
+#: counts turns that called *nothing*, so a Coder that calls `read_file` every
+#: turn walks past it — which is what run B did on 2026-09-01, twenty-six turns
+#: of reading a service's handlers with `stalled_turns` at zero the whole way
+#: and not one edit at the end of it. The gap is the same one the Planner had:
+#: a mode with no stopping condition except the turn budget.
+#:
+#: Reset by a mutation rather than by a tool call, because the thing being
+#: measured is writing, not activity.
+EXECUTING_RESEARCH_NUDGE = 12
+EXECUTING_RESEARCH_LIMIT = 16
+
+#: How many times a clean gate on a half-applied plan sends the Coder back.
+#:
+#: Two, because the second one is the useful one and the third would be a loop.
+#: The first can be answered by simply doing the next step; the second catches
+#: the run that came back, wrote something else, and still left a target
+#: untouched. After that the gap is reported rather than argued about — the
+#: model may have decided a step was unnecessary, and this reads paths out of
+#: prose, so it is not the arbiter of who is right.
+MAX_UNFINISHED_NUDGES = 2
+
+#: The tools that end the Scaffolder's job. One succeeds and the phase is over:
+#: the mode's whole instruction is "produce a spec, not code", the templates
+#: write the files, and everything after that is ordinary editing.
+#:
+#: It had no way to say so. ``_advance`` hands a writing mode on only when it
+#: ends a turn calling nothing, and a Scaffolder that keeps calling tools never
+#: gets there — so a field run scaffolded its seven files, tried to `patch_file`
+#: one of them, was correctly told that belongs to the Coder, and spent its
+#: remaining fifteen turns guessing an overwrite flag for `resource_scaffold`
+#: (`replace`, `clean`, `reset`, `fresh`, `recreate`) because re-scaffolding was
+#: the only writing move its mode had left.
+_SCAFFOLD_TOOLS = frozenset({"resource_scaffold", "project_scaffold"})
+
+#: The tools withdrawn at ``EXECUTING_RESEARCH_LIMIT`` — the ones whose whole
+#: purpose is looking something up.
+#:
+#: Verification is deliberately not here. A Debugger re-running ``go_build``
+#: between hypotheses is working, not stalling, and an identical re-run is
+#: already answered from the repeat ledger; taking the gates away from the mode
+#: whose job is to run them would break the one loop that is supposed to
+#: iterate without editing.
+_LOOKUP_TOOLS = frozenset(
+    {"repo_map", "read_file", "search_repo", "search_docs", "playbook", "git_blame"}
+)
 
 #: The modes that can write. ``_narrating`` counts idle turns only in these:
 #: the Planner and the Verifier are supposed to end with prose and no tool call,
@@ -492,6 +557,22 @@ class AgentLoop:
             self.context.pin_directive(correction)
             yield Event(EventType.STEER, {"text": correction, "turn": self.context.turn})
 
+        # The scaffold has run, so the Scaffolder is finished whether or not it
+        # has noticed. Everything from here is editing what the templates wrote,
+        # and the tools for that live one mode down. Before `begin_turn`, so the
+        # turn is announced as the mode it will actually dispatch.
+        if self.state.mode is Mode.SCAFFOLDER and self.state.scaffolded:
+            self._switch(Mode.CODER)
+            self.context.append_tool_result(
+                "resource_scaffold",
+                "The scaffold has run and its files are in the workspace, so that "
+                "phase is over — you are the Coder now, and `patch_file` is "
+                "available.\n\n"
+                "Do not scaffold again: it is not idempotent and there is no "
+                "overwrite flag. Edit what it wrote, and finish the steps it did "
+                "not cover.",
+            )
+
         turn = self.context.begin_turn()
         yield Event(
             EventType.TURN_START,
@@ -528,6 +609,36 @@ class AgentLoop:
                     "real file and carrying an Accepts: line saying how you will know "
                     "it worked. If the task is too large for eight steps, plan the "
                     "first slice of it and say what you left out.",
+                )
+
+        # The same thing for a mode that can write and has not. A mutation
+        # clears it, so the ordinary read-edit-read cycle never reaches either
+        # threshold; what does reach them is a Coder reading a whole service.
+        if self.state.mode in _EXECUTING:
+            if self.router.mutations != self.state.research_mutations:
+                self.state.research_mutations = self.router.mutations
+                self.state.executing_research = 0
+                self.state.executing_nudged = False
+            elif self.state.executing_research >= EXECUTING_RESEARCH_LIMIT:
+                # Lookups withdrawn, writing and verification left in place, so
+                # the only moves available are the ones that finish the step.
+                tools = [
+                    s for s in tools if s["function"]["name"] not in _LOOKUP_TOOLS
+                ]
+            elif (
+                self.state.executing_research >= EXECUTING_RESEARCH_NUDGE
+                and not self.state.executing_nudged
+            ):
+                self.state.executing_nudged = True
+                self.context.append_tool_result(
+                    "read_file",
+                    f"You have called {self.state.executing_research} turns' worth of "
+                    "tools in this phase and changed no file. Reading more of the "
+                    "service will not make the first edit easier to write.\n\n"
+                    "Make the smallest change that advances the current step now — "
+                    "`patch_file` with a unique anchor from something you have "
+                    "already read. If the step cannot be done as specified, say "
+                    "which one and why, in one line, instead of reading further.",
                 )
 
         self.context.observe_tool_schemas(estimate_tokens(json.dumps(tools)))
@@ -667,6 +778,8 @@ class AgentLoop:
         if result.chat.tool_calls:
             if self.state.mode is Mode.PLANNER:
                 self.state.planner_research += 1
+            elif self.state.mode in _EXECUTING:
+                self.state.executing_research += 1
             yield from self._tool_calls(result.chat.tool_calls, assistant_msg)
             return
 
@@ -975,6 +1088,8 @@ class AgentLoop:
             mutated = mutated or bool(outcome.mutations)
             if call.name == "go_mod":
                 self.state.dependencies_changed = True
+            if call.name in _SCAFFOLD_TOOLS and outcome.ok and outcome.mutations:
+                self.state.scaffolded = True
 
             # Kept so a repeat of this exact call can be answered with what it
             # returned, instead of running it a second time to find out.
@@ -1180,6 +1295,27 @@ class AgentLoop:
                     tuple(self.router.touched),
                 )
                 return
+            if _is_explanation(self.context.task_text, text):
+                # Numbered, and not a plan. "Explain this bootstrapper and how
+                # it deviates from the template" is answered in numbered
+                # paragraphs, and counting them as steps sent the answer to the
+                # Coder — which had nothing to execute and either re-ran the
+                # Planner's survey to a no-progress stop or went looking for
+                # work and edited a file nobody had mentioned.
+                #
+                # The answer is already on screen; the run is over. If the
+                # developer wanted the change as well, "go" arrives as a
+                # follow-up on this transcript, which is what `continued` is
+                # for and how the clarifying-question path already behaves.
+                self.result = RunResult(
+                    Outcome.DONE,
+                    "answered the question; the reply describes the code rather than "
+                    "proposing a change, so nothing was executed and nothing was "
+                    'touched. Reply "go" if you want the changes it implies made',
+                    self.context.turn,
+                    tuple(self.router.touched),
+                )
+                return
             self.state.plan = text
             self.context.set_plan(text)
             yield Event(EventType.PLAN, {"text": text, "steps": steps})
@@ -1253,6 +1389,37 @@ class AgentLoop:
                 # reports "nothing needed changing" when all the loop knows is
                 # that nothing was changed.
                 self.context.append_tool_result("go_build", unstarted)
+                return
+            if (missing := self._unwritten_targets()) and (
+                self.state.unfinished_nudges < MAX_UNFINISHED_NUDGES
+            ):
+                # A clean gate on half a plan.
+                #
+                # The gate is a function of the files that changed, so it has
+                # nothing to say about the ones that did not — a run that
+                # applied step one of four passes it exactly as a finished run
+                # does. That is how a field run ended DONE with "2 file(s)
+                # changed and the gate is clean" having written the domain model
+                # and neither the repository nor the handler, which is a struct
+                # nothing constructs and a route nobody can call.
+                #
+                # Bounded, and the bound matters more than the nudge: a step the
+                # model has decided against, or a path this reads out of the
+                # plan that was never a target, must cost two turns and then be
+                # reported honestly — not loop until the turn budget ends.
+                self.state.unfinished_nudges += 1
+                self.context.append_tool_result(
+                    "go_build",
+                    "The gate is clean, and it only checked what you changed — it "
+                    "cannot see a step you have not started. Your plan set out to "
+                    "write " + ", ".join(missing) + ", and "
+                    f"{'none of those files has' if len(missing) > 1 else 'that file has not'}"
+                    " been written this run.\n\n"
+                    "Carry on with the next step. If one of those is no longer "
+                    "needed — the plan changed, or it was never a file you meant to "
+                    "write — say which and why in one line, and finish the rest.",
+                )
+                self._switch(Mode.CODER)
                 return
             self.result = RunResult(
                 Outcome.DONE,
@@ -1471,18 +1638,26 @@ class AgentLoop:
         never learns which step it is on — a step is prose, and the only
         machine-checkable thing in it is the paths it names.
         """
-        if not self.state.plan:
-            return ""
-        named = {m.group(0) for m in _PLAN_PATH.finditer(self.state.plan)}
-        missing = sorted(named - set(self.router.touched))
-        if not missing or len(missing) == len(named):
-            # All of them missing means the plan named files by some convention
-            # this does not read, and reporting every path as unwritten would be
-            # noise dressed as a finding.
-            return ""
         return (
             ". The plan named files this run never wrote: " + ", ".join(missing)
+            if (missing := self._unwritten_targets())
+            else ""
         )
+
+    def _unwritten_targets(self) -> list[str]:
+        """Targets of the plan's edit steps that no file change reached.
+
+        Empty when the plan named none, when every one was written, or when
+        *none* was — the last because a plan naming its files by some convention
+        this does not read would otherwise report all of them, which is noise
+        dressed as a finding, and because a run that wrote nothing at all is
+        ``_unstarted_work``'s to describe rather than this one's.
+        """
+        if not self.state.plan:
+            return []
+        targets = _plan_targets(self.state.plan)
+        missing = [p for p in targets if p not in set(self.router.touched)]
+        return [] if len(missing) == len(targets) else missing
 
     def _re_reading(self, call: ToolCall) -> list[str]:
         """The ranges a path has already been read at, once that is too many.
@@ -1785,6 +1960,18 @@ class AgentLoop:
         if not verified:
             reason = report.results[0].skipped if report.results else "no applicable stage"
             return f"{len(files)} file(s) changed, but the gate did not run ({reason}):\n{listed}"
+        # The gap goes in the headline, not in a footnote after it. Reaching
+        # here with targets outstanding means the run was asked twice to finish
+        # them and did not, so "the gate is clean" on its own is the overclaim
+        # D-42 refuses from the model, made by the loop instead: every stage
+        # that passed was scoped to the files that changed.
+        if missing := self._unwritten_targets():
+            return (
+                f"{len(files)} file(s) changed and the gate is clean, but the plan is "
+                f"not finished — it set out to write {', '.join(missing)}, and "
+                f"{'those were' if len(missing) > 1 else 'that was'} never written:\n"
+                f"{listed}"
+            )
         return f"{len(files)} file(s) changed and the gate is clean:\n{listed}"
 
 
@@ -1914,10 +2101,40 @@ _PLAN_PATH = re.compile(r"\b[\w./-]+/[\w.-]+\.(?:go|sql|ya?ml)\b")
 #: Anchored at the step number so a verb in prose underneath does not count.
 _PLAN_EDITS = re.compile(
     r"^\s*\d+[.)]\s*[-*>\s]*\**\s*"
+    # The step may lead with the file it is about before it says what to do:
+    # ``1. **`core/domain/product.go`** — add the Product struct``. That shape
+    # matched nothing, so a four-step plan read as an investigation and the run
+    # that applied one step of it reported DONE. Only a path is allowed here,
+    # not arbitrary prose — widening this to "anything up to a verb" is how
+    # "Confirm the handler needs no change" becomes an edit step.
+    r"(?:[`*\"']*[\w./-]+\.(?:go|sql|ya?ml)[`*\"']*\s*[-—–:]+\s*)?"
     r"(add|create|write|edit|update|modif|change|register|wire|implement|"
     r"rename|delete|remove|insert|append|scaffold|generate|refactor|fix)",
     re.MULTILINE | re.IGNORECASE,
 )
+
+
+def _plan_targets(plan: str) -> list[str]:
+    """The files the plan's *edit* steps set out to write, in plan order.
+
+    One target per step, and it is the first path the step names. Plans are
+    written with the file first and the reasoning after — ``1. **product.go** —
+    add the struct, mirroring core/domain/user.go`` — so every path after the
+    first is a reference, an example or a neighbour to copy. Counting those as
+    targets tells a finished run it forgot to write a file it was only asked to
+    look at, which is worse than not checking at all.
+
+    Steps that ask for a look rather than a change contribute nothing: a plan
+    whose steps are checks is finished without writing anything.
+    """
+    targets: list[str] = []
+    for step in _STEP_START.split(plan):
+        if not _PLAN_EDITS.search("1. " + step.lstrip()):
+            continue
+        if found := _PLAN_PATH.search(step):
+            if found.group(0) not in targets:
+                targets.append(found.group(0))
+    return targets
 
 #: A reply that says it cannot do the work, rather than saying how it will be
 #: done. Matched only near the start, so a plan that mentions a limitation in
@@ -1992,6 +2209,76 @@ def _refuses_to_plan(text: str) -> bool:
     """
     head = _STEP_START.split(text, maxsplit=1)[0]
     return bool(_REFUSES.search(head[:_REFUSAL_WINDOW]))
+
+
+#: An ``Accepts:`` line — the acceptance criterion the Planner is told to put on
+#: every step. Allowed a little leading decoration, and nothing else: it has to
+#: be the start of a line, or the word appearing in prose would count.
+_ACCEPTS = re.compile(r"^[ \t]{0,6}[-*>]?[ \t]*\**\s*Accepts\s*:", re.MULTILINE | re.IGNORECASE)
+
+
+#: A task that asks to be told something. Anchored loosely — these turn up
+#: anywhere in a sentence ("also tell how it deviates") — because this is only
+#: half the test and the other half is what the Planner actually produced.
+_ASKS_TO_BE_TOLD = re.compile(
+    r"\b(explain|describe|walk me through|tell me|what (is|are|does|do)|"
+    r"how (is|are|does|do|did)|why (is|are|does|do|did)|summari[sz]e)\b",
+    re.IGNORECASE,
+)
+
+#: A task that asks for the code to change. Its presence settles the question on
+#: its own: "explain the bootstrapper, then migrate it" is work with a preamble.
+_ASKS_FOR_WORK = re.compile(
+    r"\b(add|create|write|implement|fix|migrate|convert|port|update|change|"
+    r"modify|refactor|rename|delete|remove|register|wire|scaffold|generate|"
+    r"build|make it|do it|go ahead)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_explanation(task: str, text: str) -> bool:
+    """Whether a numbered Planner reply describes something rather than proposing work.
+
+    ``_count_steps`` counts anything shaped like a numbered item, which is the
+    right thing for recognising a plan and the wrong thing for telling one from
+    an answer. Asked to *explain* a bootstrapper and say how it deviates from the
+    template, the Planner produced exactly what was wanted — ten numbered
+    paragraphs, ``**1. `Fxvalidator`** — `fx.Invoke(...)`. Runs once at
+    startup`` — and the loop read ten steps, pinned the explanation as the plan
+    and entered the Coder.
+
+    What the Coder does there is the part that matters. In one transcript it had
+    nothing to execute and re-ran the Planner's whole survey, six turns of
+    ledger answers to no progress. In another it went looking for work, found a
+    ``json\\t:`` typo in a domain model nobody had mentioned, and started editing
+    a file the developer had asked only to have explained. The second is the
+    worse outcome and the harder one to notice.
+
+    Both halves have to agree, because neither is sufficient alone.
+
+    *The task asked only to be told something.* A request that also asks for a
+    change is work with a preamble, and ``_ASKS_FOR_WORK`` settles that on its
+    own — "explain the bootstrapper, then migrate it" is a migration.
+
+    *The reply proposes nothing executable.* No step that asks for a change, no
+    ``Accepts:`` line — which the Planner's own instruction requires of every
+    step — and not the scaffolder's one-liner, which is a plan carrying neither.
+
+    The reply test alone was tried first and is too strong: ``1. Read
+    handler/user.go`` is a legitimate one-step plan that reads exactly like a
+    description, and ten tests drive the Coder through plans of that shape. What
+    tells the two apart is not the answer but the question.
+
+    A false positive costs a run that ends with its answer on screen, which the
+    developer continues with "go"; the behaviour without it costs unrequested
+    edits to files nobody mentioned. That asymmetry is why this errs toward
+    executing, and why both halves must agree before it does not.
+    """
+    if not _ASKS_TO_BE_TOLD.search(task) or _ASKS_FOR_WORK.search(task):
+        return False
+    return not (
+        _PLAN_EDITS.search(text) or _ACCEPTS.search(text) or _is_scaffold_plan(text)
+    )
 
 
 def _is_scaffold_plan(plan: str) -> bool:

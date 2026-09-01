@@ -20,6 +20,7 @@ from dakcoder_agent.context import ContextManager, Layer, Recap
 from dakcoder_agent.gate import GATE
 from dakcoder_agent.loop import (
     COMPACTION_WINDOW,
+    EXECUTING_RESEARCH_LIMIT,
     MAX_ATTEMPTS,
     MAX_READS,
     MAX_STALLED_TURNS,
@@ -143,6 +144,63 @@ def test_a_plan_naming_the_scaffolder_routes_there(router: Router, gated) -> Non
     )
     assert "write_file" in client.seen_tools[1]
     assert "patch_file" not in client.seen_tools[1], "the Scaffolder does not patch"
+
+
+def test_the_scaffolder_hands_on_once_its_scaffold_has_run(router: Router, sidecar, gated) -> None:
+    """The Scaffolder is one-shot, and had no way to say so.
+
+    `_advance` hands a writing mode on only when it ends a turn calling nothing,
+    and a Scaffolder that keeps calling tools never gets there. A field run
+    scaffolded its seven files, tried to patch one, was correctly told that
+    belongs to the Coder, and spent its last fifteen turns guessing an overwrite
+    flag for `resource_scaffold` because re-scaffolding was the only writing
+    move its mode had left.
+    """
+    sidecar.answer(
+        "resource_scaffold",
+        json.dumps({"files": [{"path": "handler/product.go", "action": "create"}]}),
+    )
+    context = ContextManager(mode=Mode.PLANNER, system_prompt="s")
+    client = ScriptedClient(
+        [
+            say("1. Call resource_scaffold with the Product spec"),
+            calls(("resource_scaffold", '{"spec": "{}"}')),
+            calls(("resource_scaffold", '{"spec": "{}", "replace": true}')),
+            say("done"),
+        ]
+    )
+    agent = AgentLoop(context, client, router, approve=lambda _r: True)
+    list(agent.run("t"))
+
+    assert agent.state.scaffolded, "the scaffold wrote files and was not recorded"
+    after = client.seen_tools[2]
+    assert "patch_file" in after, (
+        "the turn after a successful scaffold must be the Coder's — editing what "
+        "the templates wrote is the whole of what follows"
+    )
+    assert "resource_scaffold" not in after, "the Scaffolder's tools outlived its phase"
+
+
+def test_a_scaffolder_that_wrote_nothing_stays_put(router: Router, sidecar, gated) -> None:
+    """A rejected spec is not a finished phase. Handing on there would take the
+    scaffolder's tools away at the moment it is being told to fix its spec."""
+    sidecar.answer("resource_scaffold", "spec rejected: name is required", is_error=True)
+    context = ContextManager(mode=Mode.PLANNER, system_prompt="s")
+    client = ScriptedClient(
+        [
+            say("1. Call resource_scaffold with the Product spec"),
+            calls(("resource_scaffold", '{"spec": "{}"}')),
+            calls(("resource_scaffold", '{"spec": "{\"name\": \"Product\"}"}')),
+            say("done"),
+        ]
+    )
+    agent = AgentLoop(context, client, router, approve=lambda _r: True)
+    list(agent.run("t"))
+
+    assert not agent.state.scaffolded
+    assert "resource_scaffold" in client.seen_tools[2], (
+        "a rejected spec must leave the mode able to send a corrected one"
+    )
 
 
 def test_a_plan_that_only_describes_a_resource_in_prose_goes_to_the_coder(
@@ -1309,6 +1367,100 @@ def test_the_summary_names_plan_files_the_run_never_wrote(router: Router, gated)
     assert "repo/postgres/message.go" not in summary, "a file that was written was called missing"
 
 
+def test_a_coder_that_only_reads_loses_its_lookup_tools(router: Router, gated) -> None:
+    """The Planner's gap, one mode down.
+
+    `_narrating` counts turns that called *nothing*, so a Coder calling
+    `read_file` every turn walks past it — twenty-six turns of reading a
+    service's handlers with `stalled_turns` at zero and not one edit.
+    """
+    # Distinct lookups, so nothing is intercepted and `stalled_turns` stays at
+    # zero — the exact shape that walked past every existing detector.
+    reads = [
+        calls(("search_repo", '{"pattern": "func Handler%d"}' % i)) for i in range(20)
+    ]
+    agent, _ = loop_over(router, reads + [say("done")], mode=Mode.CODER)
+
+    offered = agent.client.seen_tools
+    assert "read_file" in offered[0], "the Coder starts with its lookup tools"
+    withdrawn = [i for i, names in enumerate(offered) if "read_file" not in names]
+    assert withdrawn, "a Coder that never edits kept its lookup tools forever"
+    at = withdrawn[0]
+    assert at >= EXECUTING_RESEARCH_LIMIT, "withdrawn before the limit"
+    assert "patch_file" in offered[at], "writing must stay available"
+    assert "go_build" in offered[at], "verification must stay available"
+
+
+def test_an_edit_gives_the_coder_its_tools_back(router: Router, gated) -> None:
+    """A mutation clears the counter, so the ordinary read-edit-read cycle
+    never approaches either threshold."""
+    body = json.dumps("package handler\n")
+    script = [calls(("search_repo", '{"pattern": "func Early%d"}' % i)) for i in range(14)]
+    script.append(calls(("write_file", '{"path": "handler/pension.go", "content": ' + body + "}")))
+    script += [
+        calls(("search_repo", '{"pattern": "func Late%d"}' % i)) for i in range(10)
+    ]
+    script.append(say("done"))
+
+    agent, _ = loop_over(router, script, mode=Mode.CODER, approve=lambda _r: True)
+
+    assert all("read_file" in names for names in agent.client.seen_tools), (
+        "an edit must reset the ceiling; a run that writes never loses its reads"
+    )
+
+
+def test_a_clean_gate_on_half_a_plan_is_not_done(router: Router, gated) -> None:
+    """The gate is a function of the files that changed, so it has nothing to
+    say about the ones that did not. A field run wrote the domain model, skipped
+    the repository and the handler, and reported "2 file(s) changed and the gate
+    is clean" — a struct nothing constructs and a route nobody can call.
+    """
+    context = ContextManager(mode=Mode.CODER, system_prompt="s")
+    agent = AgentLoop(context, ScriptedClient([]), router)
+    agent.state.plan = (
+        "1. **`core/domain/product.go`** — add the Product struct, mirroring "
+        "core/domain/user.go\n   Accepts: builds\n"
+        "2. **`repo/postgres/product.go`** — add the repository\n   Accepts: builds\n"
+        "3. **`handler/product.go`** — add the handler\n   Accepts: builds\n"
+    )
+    router.touched.append("core/domain/product.go")
+
+    missing = agent._unwritten_targets()
+    assert missing == ["repo/postgres/product.go", "handler/product.go"]
+    assert "core/domain/user.go" not in missing, (
+        "a file the step said to mirror is a reference, not a target"
+    )
+    assert "core/domain/product.go" not in missing, "a written target was called missing"
+
+
+def test_a_finished_plan_is_done(router: Router, gated) -> None:
+    """Every target written means nothing to report; the check must not make a
+    complete run look partial."""
+    context = ContextManager(mode=Mode.CODER, system_prompt="s")
+    agent = AgentLoop(context, ScriptedClient([]), router)
+    agent.state.plan = (
+        "1. **`core/domain/product.go`** — add the struct\n"
+        "2. **`repo/postgres/product.go`** — add the repository\n"
+    )
+    router.touched.extend(["core/domain/product.go", "repo/postgres/product.go"])
+
+    assert agent._unwritten_targets() == []
+    assert agent._unfinished() == ""
+
+
+def test_a_read_only_plan_leaves_nothing_outstanding(router: Router, gated) -> None:
+    """A plan whose steps are checks is finished by checking. Reporting its
+    paths as unwritten would turn every investigation into a failure."""
+    context = ContextManager(mode=Mode.CODER, system_prompt="s")
+    agent = AgentLoop(context, ScriptedClient([]), router)
+    agent.state.plan = (
+        "1. Confirm repo/postgres/user.go takes its timeout from config\n"
+        "2. Check handler/user.go returns 404 on pgx.ErrNoRows\n"
+    )
+
+    assert agent._unwritten_targets() == []
+
+
 def test_nothing_is_reported_missing_when_the_plan_named_no_paths(router: Router) -> None:
     """A plan that names its files by some other convention would otherwise have
     every path reported unwritten, which is noise dressed as a finding."""
@@ -1320,6 +1472,61 @@ def test_nothing_is_reported_missing_when_the_plan_named_no_paths(router: Router
 
 
 # -- a preamble is not a conclusion ------------------------------------------
+
+
+#: Abridged from the field transcript that prompted the guard, keeping the
+#: shape that matters: numbered, bolded, descriptive, no Accepts: line.
+EXPLANATION = (
+    "## What the bootstrapper does\n\n"
+    "**1. `Fxvalidator`** — `fx.Invoke(handler.NewValidatorService)`. Runs once at "
+    "startup and registers the custom validators.\n\n"
+    "**2. `FxRepo`** — plain `fx.Provide` of all nine repository constructors.\n\n"
+    "**3. `FxHandler`** — `fx.Provide` of all eight handler constructors.\n"
+)
+
+
+def test_an_explanation_is_answered_not_executed(router: Router, gated) -> None:
+    """Numbered, and not a plan.
+
+    Asked to explain a bootstrapper and say how it deviates, the Planner
+    produced ten numbered paragraphs. `_count_steps` read ten steps, the loop
+    pinned the answer as the plan and entered the Coder — which had nothing to
+    execute. One field transcript re-ran the Planner's whole survey to a
+    no-progress stop; another went looking for work, found a `json\t:` typo in a
+    domain model nobody had mentioned, and edited it.
+    """
+    context = ContextManager(mode=Mode.PLANNER, system_prompt="s")
+    client = ScriptedClient([say(EXPLANATION), say("still here")])
+    agent = AgentLoop(context, client, router)
+    list(agent.run("explain me this bootstrapper and how it deviates from the template"))
+
+    assert agent.result.outcome is Outcome.DONE
+    assert agent.state.mode is Mode.PLANNER, "an answer must not enter a writing mode"
+    assert not router.touched, "a question was answered by editing files"
+    assert client.calls == 1, "the run continued past the answer"
+
+
+def test_explaining_and_then_changing_is_still_work(router: Router, gated) -> None:
+    """"Explain the bootstrapper, then migrate it" is a migration with a
+    preamble. The request for a change settles it whatever the reply looks
+    like."""
+    context = ContextManager(mode=Mode.PLANNER, system_prompt="s")
+    client = ScriptedClient([say(EXPLANATION), say("done")])
+    agent = AgentLoop(context, client, router)
+    list(agent.run("explain the bootstrapper then migrate it to the n-api template"))
+
+    assert agent.state.mode is not Mode.PLANNER, "work was answered as a question"
+
+
+def test_a_plan_for_a_change_is_never_read_as_an_explanation(router: Router, gated) -> None:
+    """The guard errs toward executing: a one-step read plan under a task that
+    asks for work is a plan, and ten tests drive the Coder through that shape."""
+    context = ContextManager(mode=Mode.PLANNER, system_prompt="s")
+    client = ScriptedClient([say("1. Read handler/user.go"), say("done")])
+    agent = AgentLoop(context, client, router)
+    list(agent.run("Add a Pension resource"))
+
+    assert agent.state.mode is not Mode.PLANNER
 
 
 def test_a_greeting_still_ends_the_run_in_one_turn(router: Router, gated) -> None:

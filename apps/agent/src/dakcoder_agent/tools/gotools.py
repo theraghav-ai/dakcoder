@@ -778,12 +778,25 @@ def _render_rows(
     return "\n".join(out)
 
 
+#: Scalar report facts worth keeping after rendering. Counts and flags only —
+#: the finding lists themselves are what the renderer exists to compress, and
+#: copying them into ``meta`` would put the whole payload back in memory for
+#: every call.
+_REPORT_FACTS = ("files_scanned", "count", "ok", "generation", "est_tokens")
+
+
 def _report(reply: Reply, render) -> ToolResult:
     """Turn a sidecar report into readable text, never raising on shape.
 
     A renderer that throws on an unexpected payload would turn a working tool
     into a bridge error, which is the failure this whole path exists to avoid.
     The raw JSON is the fallback: worse to read, but not a lie.
+
+    The counts survive in ``meta``. Rendering is lossy by design — that is the
+    point of it — but it was throwing away the machine-readable half entirely,
+    so anything downstream that wanted ``files_scanned`` had to parse the prose
+    back, and the one test that did broke silently the day the renderer landed.
+    Numbers a caller might branch on belong beside the text, not inside it.
     """
     if reply.is_error:
         return ToolResult.failure(reply.text, fix="Correct the arguments and call the tool again.")
@@ -791,9 +804,15 @@ def _report(reply: Reply, render) -> ToolResult:
         payload = json.loads(reply.text)
         if not isinstance(payload, Mapping):
             raise ValueError("not an object")
-        return ToolResult.success(render(payload))
+        rendered = render(payload)
     except (json.JSONDecodeError, ValueError, TypeError, KeyError, AttributeError):
         return ToolResult.success(reply.text)
+
+    meta = {k: payload[k] for k in _REPORT_FACTS if k in payload}
+    for key in ("violations", "out_of_scope", "warnings"):
+        if isinstance(payload.get(key), list):
+            meta[key] = len(payload[key])
+    return ToolResult.success(rendered, meta=meta)
 
 
 def _scaffold(
