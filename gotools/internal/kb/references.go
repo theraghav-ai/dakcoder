@@ -137,11 +137,10 @@ var References = []Reference{
 		Slug:    "request-dto",
 		Title:   "Request DTOs and validation",
 		Purpose: "adding or changing a request payload, a path parameter, or a query filter",
-		Intro: "Every request struct lives in `handler/request.go`, and validation comes from " +
-			"`validate` tags plus generated code.\n\n" +
+		Intro: "Every request struct lives in `handler/request/request.go`, package `request`, and " +
+			"validation comes from `validate` tags plus generated code.\n\n" +
 			"The location is not bureaucracy. `govalid` is run as `govalid ./request.go` from " +
-			"the handler directory, so a request struct in any other file never gets a " +
-			"generated validator — and the failure is silent: input reaches the handler " +
+			"`handler/request/`, so a request struct in any other file never gets a generated validator — and the failure is silent: input reaches the handler " +
 			"unvalidated.\n\n" +
 			"Running `govalid` is not optional either. The framework returns **422** for any " +
 			"non-GET route whose request DTO has no generated `Validate()` method, so a fresh " +
@@ -153,6 +152,12 @@ var References = []Reference{
 			"Enforced by `request-dto`, `request-validate-depth` and `validator-generated`; " +
 			"listed field by field by `gotools validation-audit`.",
 		Corrections: []string{
+			"skill.md and SOP.md place request structs in a flat `handler/request.go` inside " +
+				"`package handler`. The canonical location is `handler/request/request.go` in " +
+				"its own `package request` — the layout the migration SOP converges every " +
+				"service on (see @skill:legacy-migration), imported as " +
+				"`request \"<module>/handler/request\"`. Where the extracted text below says " +
+				"`handler/request.go`, read `handler/request/request.go`.",
 			"skill.md's worked example gives request DTOs a `ToDomain()` converter. No such " +
 				"method exists anywhere in the template; handlers pass fields positionally to " +
 				"the repository (plan.md §6). Do not add one.",
@@ -260,6 +265,8 @@ var References = []Reference{
 			"In practice, prefer `resource_scaffold`: it emits the same seven files " +
 			"deterministically, already corrected, and wires the FX registration.",
 		Corrections: []string{
+			"The example adds its DTOs to a flat `handler/request.go`. The canonical location " +
+				"is `handler/request/request.go`, package `request` — see @skill:request-dto.",
 			"The repository uses `sq.Insert(...).PlaceholderFormat(sq.Dollar)`. Use " +
 				"`dblib.Psql` — see @skill:repository-pattern.",
 			"The request DTOs have a `ToDomain()` method. No such method exists in the " +

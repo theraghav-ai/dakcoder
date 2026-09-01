@@ -255,7 +255,7 @@ const contractSummary = "```\n" +
 	"  `pgx.RowToStructByName[domain.X]`. A zero-row write returns `pgx.ErrNoRows`.\n" +
 	"- Responses embed `port.StatusCodeAndMessage` with `json:\",inline\"` and take their\n" +
 	"  status from the predefined `port.*Success` constants.\n" +
-	"- Request structs live in `handler/request.go` and nowhere else, because `govalid`\n" +
+	"- Request structs live in `handler/request/request.go` (package `request`), because `govalid`\n" +
 	"  reads only that file. Run it, or every non-GET route answers 422.\n" +
 	"- Repositories go into `FxRepo` as plain providers; handlers go into `FxHandler`\n" +
 	"  wrapped in `fx.Annotate` with `fx.As` and `fx.ResultTags`. Use `fx_wire`.\n" +

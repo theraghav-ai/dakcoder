@@ -90,7 +90,7 @@ EXPECTED_FILES = {
     "repo/postgres/pension.go",
     "handler/response/pension.go",
     "handler/pension.go",
-    "handler/request.go",
+    "handler/request/request.go",
     "bootstrap/bootstrapper.go",
 }
 

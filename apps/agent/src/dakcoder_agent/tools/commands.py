@@ -425,21 +425,24 @@ def _read_mod(root: Path) -> str:
 def govalid_gen(inv: Invocation) -> ToolResult:
     """Regenerate the request validators.
 
-    Run from ``handler/`` against ``request.go``, which is where the reference
-    template's generated files say they came from. Getting the working directory
-    wrong here produces validators in the wrong package, which compiles far
-    enough to be confusing.
+    Run from ``handler/request/`` against ``request.go`` — the canonical DTO
+    location (``package request``), which is where the migration SOP converges
+    every service and where the generated files say they came from. Getting the
+    working directory wrong here produces validators in the wrong package,
+    which compiles far enough to be confusing.
     """
-    handler = inv.workspace.root / "handler"
+    handler = inv.workspace.root / "handler" / "request"
     if not handler.is_dir():
         return ToolResult.failure(
-            "there is no handler/ directory, so there are no request DTOs to generate from.",
+            "there is no handler/request/ directory, so there are no request DTOs "
+            "to generate from.",
             fix="Check the working directory with repo_map.",
         )
     if not (handler / "request.go").is_file():
         return ToolResult.failure(
-            "handler/request.go does not exist.",
-            fix="Request DTOs live in handler/request.go; create it before generating.",
+            "handler/request/request.go does not exist.",
+            fix="Request DTOs live in handler/request/request.go (package request); "
+            "create it before generating.",
         )
 
     if shutil.which("govalid") is None:

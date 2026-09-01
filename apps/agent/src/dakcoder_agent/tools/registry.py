@@ -526,7 +526,7 @@ _SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="govalid_gen",
         description=(
-            "Regenerate handler/request_*_validator.go from the request structs. Run it "
+            "Regenerate handler/request/request_*_validator.go from the request structs. Run it "
             "whenever a validate tag changes; never hand-edit the generated files."
         ),
         parameters=_obj(),

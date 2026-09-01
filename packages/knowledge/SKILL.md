@@ -32,7 +32,7 @@ configs/         one file per environment
   `pgx.RowToStructByName[domain.X]`. A zero-row write returns `pgx.ErrNoRows`.
 - Responses embed `port.StatusCodeAndMessage` with `json:",inline"` and take their
   status from the predefined `port.*Success` constants.
-- Request structs live in `handler/request.go` and nowhere else, because `govalid`
+- Request structs live in `handler/request/request.go` (package `request`), because `govalid`
   reads only that file. Run it, or every non-GET route answers 422.
 - Repositories go into `FxRepo` as plain providers; handlers go into `FxHandler`
   wrapped in `fx.Annotate` with `fx.As` and `fx.ResultTags`. Use `fx_wire`.

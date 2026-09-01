@@ -1,0 +1,35 @@
+package request
+
+import (
+	"time"
+
+	"gitlab.cept.gov.in/it-2.0/pension-api/core/port"
+)
+
+// CreatePensionRequest is the payload to create a pension.
+type CreatePensionRequest struct {
+	PPONumber    string    `json:"ppo_number" validate:"required"`
+	Amount       float64   `json:"amount" validate:"required"`
+	Status       string    `json:"status" validate:"oneof=active suspended closed"`
+	SanctionDate time.Time `json:"sanction_date" validate:"required"`
+}
+
+// UpdatePensionRequest is the payload to update a pension. Every field is
+// optional — an omitted field leaves its column unchanged.
+type UpdatePensionRequest struct {
+	ID           int64     `uri:"id" validate:"required"`
+	PPONumber    string    `json:"ppo_number" validate:"omitempty"`
+	Amount       float64   `json:"amount" validate:"omitempty"`
+	Status       string    `json:"status" validate:"omitempty,oneof=active suspended closed"`
+	SanctionDate time.Time `json:"sanction_date" validate:"omitempty"`
+}
+
+// PensionIDUri binds the :id path parameter.
+type PensionIDUri struct {
+	ID int64 `uri:"id" validate:"required"`
+}
+
+type ListPensionsParams struct {
+	port.MetadataRequest
+	Status string `form:"status" validate:"omitempty"`
+}

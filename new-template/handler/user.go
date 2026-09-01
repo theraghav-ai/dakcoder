@@ -2,6 +2,7 @@ package handler
 
 import (
 	"pisapi/core/port"
+	request "pisapi/handler/request"
 	resp "pisapi/handler/response"
 	repo "pisapi/repo/postgres"
 
@@ -30,7 +31,7 @@ func (h *UserHandler) Routes() []serverRoute.Route {
 	}
 }
 
-func (h *UserHandler) CreateUser(sctx *serverRoute.Context, req CreateUserRequest) (*resp.UserCreateResponse, error) {
+func (h *UserHandler) CreateUser(sctx *serverRoute.Context, req request.CreateUserRequest) (*resp.UserCreateResponse, error) {
 	u, err := h.svc.CreateUser(sctx.Ctx, req.FirstName, req.LastName, req.Age, req.City, req.Email)
 	if err != nil {
 		log.Error(sctx.Ctx, "Error creating user: %v", err)
@@ -61,7 +62,7 @@ func (h *UserHandler) ListUsers(sctx *serverRoute.Context, _ struct{}) (*resp.Us
 	return r, nil
 }
 
-func (h *UserHandler) GetUserByID(sctx *serverRoute.Context, req UserIDUri) (*resp.UserFetchResponse, error) {
+func (h *UserHandler) GetUserByID(sctx *serverRoute.Context, req request.UserIDUri) (*resp.UserFetchResponse, error) {
 	u, err := h.svc.GetUserByID(sctx.Ctx, req.ID)
 	if err != nil {
 		log.Error(sctx.Ctx, "Error fetching user by ID: %v", err)
@@ -74,7 +75,7 @@ func (h *UserHandler) GetUserByID(sctx *serverRoute.Context, req UserIDUri) (*re
 	return r, nil
 }
 
-func (h *UserHandler) UpdateUserByID(sctx *serverRoute.Context, req UpdateUserRequest) (*resp.UserFetchResponse, error) {
+func (h *UserHandler) UpdateUserByID(sctx *serverRoute.Context, req request.UpdateUserRequest) (*resp.UserFetchResponse, error) {
 	var firstNamePtr, lastNamePtr, cityPtr, emailPtr *string
 	var agePtr *int
 
@@ -106,7 +107,7 @@ func (h *UserHandler) UpdateUserByID(sctx *serverRoute.Context, req UpdateUserRe
 	return r, nil
 }
 
-func (h *UserHandler) DeleteUserByID(sctx *serverRoute.Context, req UserIDUri) (*resp.UserDeleteResponse, error) {
+func (h *UserHandler) DeleteUserByID(sctx *serverRoute.Context, req request.UserIDUri) (*resp.UserDeleteResponse, error) {
 	err := h.svc.DeleteUserByID(sctx.Ctx, req.ID)
 	if err != nil {
 		log.Error(sctx.Ctx, "Error deleting user by ID: %v", err)

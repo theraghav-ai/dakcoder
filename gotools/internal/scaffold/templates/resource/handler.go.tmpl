@@ -43,7 +43,7 @@ func (h *{{.R.HandlerType}}) Routes() []serverRoute.Route {
 	}
 }
 {{if .R.Has "create"}}
-func (h *{{.R.HandlerType}}) {{.R.HandlerCreate}}(sctx *serverRoute.Context, req {{.R.CreateReq}}) (*resp.{{.R.CreateResp}}, error) {
+func (h *{{.R.HandlerType}}) {{.R.HandlerCreate}}(sctx *serverRoute.Context, req request.{{.R.CreateReq}}) (*resp.{{.R.CreateResp}}, error) {
 	{{.R.Var}}, err := h.svc.{{.R.RepoCreate}}(sctx.Ctx, {{selargs "req." .R.CreateParams}})
 	if err != nil {
 		log.Error(sctx.Ctx, "Error creating {{.R.Var}}: %v", err)
@@ -59,7 +59,7 @@ func (h *{{.R.HandlerType}}) {{.R.HandlerCreate}}(sctx *serverRoute.Context, req
 {{end}}
 {{- if .R.Has "list"}}
 {{- if .R.UseListParams}}
-func (h *{{.R.HandlerType}}) {{.R.HandlerList}}(sctx *serverRoute.Context, req {{.R.ListParams}}) (*resp.{{.R.ListResp}}, error) {
+func (h *{{.R.HandlerType}}) {{.R.HandlerList}}(sctx *serverRoute.Context, req request.{{.R.ListParams}}) (*resp.{{.R.ListResp}}, error) {
 {{- range .R.ListFilters}}
 	var {{.Var}}Filter *{{.GoType}}
 	if {{.ZeroTest}} {
@@ -100,7 +100,7 @@ func (h *{{.R.HandlerType}}) {{.R.HandlerList}}(sctx *serverRoute.Context, _ str
 {{- end}}
 {{end}}
 {{- if .R.Has "get"}}
-func (h *{{.R.HandlerType}}) {{.R.HandlerGet}}(sctx *serverRoute.Context, req {{.R.IDUri}}) (*resp.{{.R.FetchResp}}, error) {
+func (h *{{.R.HandlerType}}) {{.R.HandlerGet}}(sctx *serverRoute.Context, req request.{{.R.IDUri}}) (*resp.{{.R.FetchResp}}, error) {
 	{{.R.Var}}, err := h.svc.{{.R.RepoGet}}(sctx.Ctx, req.ID)
 	if err != nil {
 		log.Error(sctx.Ctx, "Error fetching {{.R.Var}} by ID: %v", err)
@@ -114,7 +114,7 @@ func (h *{{.R.HandlerType}}) {{.R.HandlerGet}}(sctx *serverRoute.Context, req {{
 }
 {{end}}
 {{- if .R.Has "update"}}
-func (h *{{.R.HandlerType}}) {{.R.HandlerUpdate}}(sctx *serverRoute.Context, req {{.R.UpdateReq}}) (*resp.{{.R.UpdateResp}}, error) {
+func (h *{{.R.HandlerType}}) {{.R.HandlerUpdate}}(sctx *serverRoute.Context, req request.{{.R.UpdateReq}}) (*resp.{{.R.UpdateResp}}, error) {
 {{- range .R.UpdateParams}}
 	var {{.Name}} {{.Type}}
 {{- if .AlwaysSet}}
@@ -141,7 +141,7 @@ func (h *{{.R.HandlerType}}) {{.R.HandlerUpdate}}(sctx *serverRoute.Context, req
 }
 {{end}}
 {{- if .R.Has "delete"}}
-func (h *{{.R.HandlerType}}) {{.R.HandlerDelete}}(sctx *serverRoute.Context, req {{.R.IDUri}}) (*resp.{{.R.DeleteResp}}, error) {
+func (h *{{.R.HandlerType}}) {{.R.HandlerDelete}}(sctx *serverRoute.Context, req request.{{.R.IDUri}}) (*resp.{{.R.DeleteResp}}, error) {
 	err := h.svc.{{.R.RepoDelete}}(sctx.Ctx, req.ID)
 	if err != nil {
 		log.Error(sctx.Ctx, "Error deleting {{.R.Var}} by ID: %v", err)

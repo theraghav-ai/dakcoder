@@ -380,7 +380,7 @@ func (r *UserRepository) Del(ctx context.Context) error {
 			name: "request-dto/missing validate tag",
 			rule: "request-dto",
 			files: map[string]string{
-				"handler/request.go": "package handler\n\ntype CreateUserRequest struct {\n\tName string `json:\"name\"`\n}\n",
+				"handler/request/request.go": "package request\n\ntype CreateUserRequest struct {\n\tName string `json:\"name\"`\n}\n",
 			},
 			wantN:   1,
 			wantSub: "will not be validated",
@@ -520,7 +520,7 @@ func doThing() error { return nil }
 			name: "legacy-manual-validation/binding tag",
 			rule: "legacy-manual-validation",
 			files: map[string]string{
-				"handler/request.go": "package handler\n\ntype Req struct {\n\tName string `json:\"name\" binding:\"required\"`\n}\n",
+				"handler/request/request.go": "package request\n\ntype Req struct {\n\tName string `json:\"name\" binding:\"required\"`\n}\n",
 			},
 			wantN:   1,
 			wantSub: "govalid reads validate",

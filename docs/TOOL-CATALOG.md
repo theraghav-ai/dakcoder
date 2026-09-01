@@ -16,10 +16,10 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | Mode | Tools | Schema cost |
 |---|---|---|
 | **planner** | 13 | ~1,428 tokens |
-| **scaffolder** | 11 | ~1,313 tokens |
-| **coder** | 17 | ~1,992 tokens |
+| **scaffolder** | 11 | ~1,315 tokens |
+| **coder** | 17 | ~1,994 tokens |
 | **verifier** | 11 | ~1,217 tokens |
-| **debugger** | 19 | ~2,203 tokens |
+| **debugger** | 19 | ~2,205 tokens |
 
 ## The catalogue
 
@@ -45,7 +45,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `resource_scaffold` | S | ✓ | **always** | gotools | Write a whole CRUD resource — domain, DDL, repository, DTOs, handler — from a field spec. Produce the spec; the templates produce the code. |
 | `project_scaffold` | S | ✓ | **always** | gotools | Create a new n-api-template service in an empty directory, with configs, bootstrap and one working resource. Credential fields are left empty. |
 | `fx_wire` | CDS | ✓ |  | gotools | Register a repository or handler in bootstrap/bootstrapper.go with the right annotations. Run this after adding either, or FX fails at startup. |
-| `govalid_gen` | CDS | ✓ |  | agent | Regenerate handler/request_*_validator.go from the request structs. Run it whenever a validate tag changes; never hand-edit the generated files. |
+| `govalid_gen` | CDS | ✓ |  | agent | Regenerate handler/request/request_*_validator.go from the request structs. Run it whenever a validate tag changes; never hand-edit the generated files. |
 | `go_build` | CDV |  |  | agent | Build every package. This is the authoritative signal: nothing is done until it is clean, whatever the other tools say. |
 | `go_vet` | D |  |  | agent | Run go vet over the workspace. Gate only — it takes about thirty seconds, so never run it in the edit loop. |
 | `go_test` | D |  |  | agent | Run tests. Pass pattern to scope to one package when output is large. |
@@ -230,7 +230,7 @@ Register a repository or handler in bootstrap/bootstrapper.go with the right ann
 
 ### `govalid_gen`
 
-Regenerate handler/request_*_validator.go from the request structs. Run it whenever a validate tag changes; never hand-edit the generated files.
+Regenerate handler/request/request_*_validator.go from the request structs. Run it whenever a validate tag changes; never hand-edit the generated files.
 
 _No parameters._
 

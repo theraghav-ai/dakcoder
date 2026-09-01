@@ -99,7 +99,7 @@ def _summariser(messages) -> Recap:
         goal="add Pension resource with CRUD and a status filter",
         plan_step="6 of 8 — wiring FxHandler",
         files_created=("core/domain/pension.go", "repo/postgres/pension.go"),
-        files_modified=("handler/request.go", "bootstrap/bootstrapper.go"),
+        files_modified=("handler/request/request.go", "bootstrap/bootstrapper.go"),
         decisions=("table = pensions (user-confirmed)",),
         verified=("gofmt clean, go build clean at turn 12",),
         open_items=("rules_lint fx-registration — handler present but missing ResultTags",),

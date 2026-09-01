@@ -86,7 +86,7 @@ def test_validators_are_regenerated_then_the_build_is_rechecked(
     """Regenerating against a renamed field breaks the build, and that break is
     the signal — not an accident to be tolerated."""
     assert gate.order == []
-    full_gate(router, ["handler/request.go"])
+    full_gate(router, ["handler/request/request.go"])
     assert gate.order.count("go_build") == 2
     assert gate.order.index("govalid_gen") < gate.order.index("go_build", 1)
 

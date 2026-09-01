@@ -7,12 +7,12 @@ import (
 	"gitlab.cept.gov.in/it-2.0/dakcoder/gotools/internal/workspace"
 )
 
-const requestFile = "handler/request.go"
+const requestFile = "handler/request/request.go"
 
 // RequestDTO enforces where request structs live and that they are validatable.
 //
 // The location requirement is not bureaucracy: govalid is run as
-// `govalid ./request.go` from the handler directory, so a request struct in any
+// `govalid ./request.go` from handler/request/, so a request struct in any
 // other file simply never gets a generated validator — and the failure is
 // silent. Input reaches the handler unvalidated.
 //
@@ -22,7 +22,7 @@ const requestFile = "handler/request.go"
 var RequestDTO = Rule{
 	ID:       "request-dto",
 	Severity: SeverityError,
-	Summary:  "request structs live in handler/request.go and carry validate tags",
+	Summary:  "request structs live in handler/request/request.go and carry validate tags",
 	Citation: "SOP.md §Validation; skill.md §Request DTO Pattern",
 	Check: func(p *Pass) {
 		for _, f := range p.WS.FilesIn(workspace.LayerHandler) {

@@ -19,6 +19,7 @@ In practice, prefer `resource_scaffold`: it emits the same seven files determini
 
 The document below is reproduced as written. These parts of it are wrong:
 
+- The example adds its DTOs to a flat `handler/request.go`. The canonical location is `handler/request/request.go`, package `request` — see @skill:request-dto.
 - The repository uses `sq.Insert(...).PlaceholderFormat(sq.Dollar)`. Use `dblib.Psql` — see @skill:repository-pattern.
 - The request DTOs have a `ToDomain()` method. No such method exists in the template — see @skill:request-dto.
 - The list handler builds `port.MetaDataResponse` with fields that do not exist, and the handler imports `pgx` — see @skill:response-dto and @skill:handler-pattern.

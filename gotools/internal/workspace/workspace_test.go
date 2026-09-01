@@ -19,17 +19,18 @@ func write(t *testing.T, root, rel, body string) {
 
 func TestClassify(t *testing.T) {
 	cases := map[string]Layer{
-		"main.go":                   LayerMain,
-		"core/domain/user.go":       LayerDomain,
-		"core/port/response.go":     LayerPort,
-		"repo/postgres/user.go":     LayerRepo,
-		"repo/ecms/file.go":         LayerRepo,
-		"handler/user.go":           LayerHandler,
-		"handler/request.go":        LayerHandler,
-		"handler/response/user.go":  LayerResponse,
-		"bootstrap/bootstrapper.go": LayerBootstrap,
-		"routes/routes.go":          LayerRoutes,
-		"internal/thing/thing.go":   LayerOther,
+		"main.go":                    LayerMain,
+		"core/domain/user.go":        LayerDomain,
+		"core/port/response.go":      LayerPort,
+		"repo/postgres/user.go":      LayerRepo,
+		"repo/ecms/file.go":          LayerRepo,
+		"handler/user.go":            LayerHandler,
+		"handler/request.go":         LayerHandler,
+		"handler/request/request.go": LayerHandler,
+		"handler/response/user.go":   LayerResponse,
+		"bootstrap/bootstrapper.go":  LayerBootstrap,
+		"routes/routes.go":           LayerRoutes,
+		"internal/thing/thing.go":    LayerOther,
 	}
 	for rel, want := range cases {
 		t.Run(rel, func(t *testing.T) {

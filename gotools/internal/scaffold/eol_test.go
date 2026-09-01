@@ -105,12 +105,12 @@ func TestApplyLeavesModifiedContentAlone(t *testing.T) {
 
 	patched := "package handler\r\n\r\ntype CreatePensionRequest struct{}\r\n"
 	res := &Result{}
-	res.add("handler/request.go", ActionModify, patched)
+	res.add("handler/request/request.go", ActionModify, patched)
 
 	if err := Apply(root, res); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	got, err := os.ReadFile(filepath.Join(root, "handler", "request.go"))
+	got, err := os.ReadFile(filepath.Join(root, "handler", "request", "request.go"))
 	if err != nil {
 		t.Fatal(err)
 	}

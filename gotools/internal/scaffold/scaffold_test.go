@@ -328,7 +328,7 @@ func TestListWithoutFiltersMatchesTheReferenceShape(t *testing.T) {
 	if !strings.Contains(handler, "ListPensions(sctx *serverRoute.Context, _ struct{})") {
 		t.Error("an unfiltered list should take _ struct{}, as the reference ListUsers does")
 	}
-	request := fileNamed(t, res, "handler/request.go")
+	request := fileNamed(t, res, "handler/request/request.go")
 	if !strings.Contains(request, "func (p *ListPensionsParams) Validate() error") {
 		t.Error("ListPensionsParams with no tagged fields needs a hand-written Validate()")
 	}
@@ -344,12 +344,12 @@ func TestListWithFiltersOmitsTheManualValidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scaffold: %v", err)
 	}
-	request := fileNamed(t, res, "handler/request.go")
+	request := fileNamed(t, res, "handler/request/request.go")
 	if strings.Contains(request, "func (p *ListPensionsParams) Validate() error") {
 		t.Error("govalid generates Validate() for a filtered params struct; a hand-written one would be a duplicate method")
 	}
 	handler := fileNamed(t, res, "handler/pension.go")
-	if !strings.Contains(handler, "ListPensions(sctx *serverRoute.Context, req ListPensionsParams)") {
+	if !strings.Contains(handler, "ListPensions(sctx *serverRoute.Context, req request.ListPensionsParams)") {
 		t.Error("a filtered list should bind the params struct")
 	}
 }
@@ -360,7 +360,7 @@ func TestListWithFiltersOmitsTheManualValidate(t *testing.T) {
 func TestModificationsPreserveLineEndings(t *testing.T) {
 	root := copyTree(t, corpusRoot(t, "new-template"))
 
-	before, err := os.ReadFile(filepath.Join(root, "handler", "request.go"))
+	before, err := os.ReadFile(filepath.Join(root, "handler", "request", "request.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +372,7 @@ func TestModificationsPreserveLineEndings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scaffold: %v", err)
 	}
-	for _, path := range []string{"handler/request.go", "bootstrap/bootstrapper.go"} {
+	for _, path := range []string{"handler/request/request.go", "bootstrap/bootstrapper.go"} {
 		content := fileNamed(t, res, path)
 		if !strings.Contains(content, "\r\n") {
 			t.Errorf("%s lost its CRLF line endings", path)

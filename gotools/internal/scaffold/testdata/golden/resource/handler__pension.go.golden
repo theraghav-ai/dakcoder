@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"pisapi/core/port"
+	request "pisapi/handler/request"
 	resp "pisapi/handler/response"
 	repo "pisapi/repo/postgres"
 
@@ -43,7 +44,7 @@ func (h *PensionHandler) Routes() []serverRoute.Route {
 	}
 }
 
-func (h *PensionHandler) CreatePension(sctx *serverRoute.Context, req CreatePensionRequest) (*resp.PensionCreateResponse, error) {
+func (h *PensionHandler) CreatePension(sctx *serverRoute.Context, req request.CreatePensionRequest) (*resp.PensionCreateResponse, error) {
 	pension, err := h.svc.CreatePension(sctx.Ctx, req.PPONumber, req.Amount, req.Status, req.SanctionDate)
 	if err != nil {
 		log.Error(sctx.Ctx, "Error creating pension: %v", err)
@@ -57,7 +58,7 @@ func (h *PensionHandler) CreatePension(sctx *serverRoute.Context, req CreatePens
 	return r, nil
 }
 
-func (h *PensionHandler) ListPensions(sctx *serverRoute.Context, req ListPensionsParams) (*resp.PensionsListResponse, error) {
+func (h *PensionHandler) ListPensions(sctx *serverRoute.Context, req request.ListPensionsParams) (*resp.PensionsListResponse, error) {
 	var statusFilter *string
 	if req.Status != "" {
 		statusFilter = &req.Status
@@ -78,7 +79,7 @@ func (h *PensionHandler) ListPensions(sctx *serverRoute.Context, req ListPension
 	return r, nil
 }
 
-func (h *PensionHandler) GetPensionByID(sctx *serverRoute.Context, req PensionIDUri) (*resp.PensionFetchResponse, error) {
+func (h *PensionHandler) GetPensionByID(sctx *serverRoute.Context, req request.PensionIDUri) (*resp.PensionFetchResponse, error) {
 	pension, err := h.svc.GetPensionByID(sctx.Ctx, req.ID)
 	if err != nil {
 		log.Error(sctx.Ctx, "Error fetching pension by ID: %v", err)
@@ -91,7 +92,7 @@ func (h *PensionHandler) GetPensionByID(sctx *serverRoute.Context, req PensionID
 	return r, nil
 }
 
-func (h *PensionHandler) UpdatePensionByID(sctx *serverRoute.Context, req UpdatePensionRequest) (*resp.PensionUpdateResponse, error) {
+func (h *PensionHandler) UpdatePensionByID(sctx *serverRoute.Context, req request.UpdatePensionRequest) (*resp.PensionUpdateResponse, error) {
 	var ppoNumber *string
 	if req.PPONumber != "" {
 		ppoNumber = &req.PPONumber
@@ -121,7 +122,7 @@ func (h *PensionHandler) UpdatePensionByID(sctx *serverRoute.Context, req Update
 	return r, nil
 }
 
-func (h *PensionHandler) DeletePensionByID(sctx *serverRoute.Context, req PensionIDUri) (*resp.PensionDeleteResponse, error) {
+func (h *PensionHandler) DeletePensionByID(sctx *serverRoute.Context, req request.PensionIDUri) (*resp.PensionDeleteResponse, error) {
 	err := h.svc.DeletePensionByID(sctx.Ctx, req.ID)
 	if err != nil {
 		log.Error(sctx.Ctx, "Error deleting pension by ID: %v", err)

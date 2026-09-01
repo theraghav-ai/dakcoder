@@ -12,9 +12,9 @@ sources:
 > **Generated.** Do not edit — run `make knowledge` and commit the result.
 > Assembled from the reference template, so it cannot drift from what the linter enforces.
 
-Every request struct lives in `handler/request.go`, and validation comes from `validate` tags plus generated code.
+Every request struct lives in `handler/request/request.go`, package `request`, and validation comes from `validate` tags plus generated code.
 
-The location is not bureaucracy. `govalid` is run as `govalid ./request.go` from the handler directory, so a request struct in any other file never gets a generated validator — and the failure is silent: input reaches the handler unvalidated.
+The location is not bureaucracy. `govalid` is run as `govalid ./request.go` from `handler/request/`, so a request struct in any other file never gets a generated validator — and the failure is silent: input reaches the handler unvalidated.
 
 Running `govalid` is not optional either. The framework returns **422** for any non-GET route whose request DTO has no generated `Validate()` method, so a fresh resource fails before it reaches your code until the validators exist.
 
@@ -26,6 +26,7 @@ Enforced by `request-dto`, `request-validate-depth` and `validator-generated`; l
 
 The document below is reproduced as written. These parts of it are wrong:
 
+- skill.md and SOP.md place request structs in a flat `handler/request.go` inside `package handler`. The canonical location is `handler/request/request.go` in its own `package request` — the layout the migration SOP converges every service on (see @skill:legacy-migration), imported as `request "<module>/handler/request"`. Where the extracted text below says `handler/request.go`, read `handler/request/request.go`.
 - skill.md's worked example gives request DTOs a `ToDomain()` converter. No such method exists anywhere in the template; handlers pass fields positionally to the repository (plan.md §6). Do not add one.
 - skill.md teaches only `required` and `omitempty`, which is why so much production code carries nothing else. The vocabulary you actually need:
 

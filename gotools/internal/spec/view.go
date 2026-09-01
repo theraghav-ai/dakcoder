@@ -221,7 +221,7 @@ func (r Resource) HasTimeField() bool {
 	return false
 }
 
-// NeedsTimeInRequest reports whether handler/request.go needs the time import,
+// NeedsTimeInRequest reports whether handler/request/request.go needs the time import,
 // which happens when a field is a timestamp the client supplies.
 func (r Resource) NeedsTimeInRequest() bool {
 	return r.HasTimeField() && (r.Has("create") || r.Has("update"))

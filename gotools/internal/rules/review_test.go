@@ -126,7 +126,7 @@ func TestSensitiveMatchingIsWholeWord(t *testing.T) {
 }
 
 func TestRequestValidateDepth(t *testing.T) {
-	req := `package handler
+	req := `package request
 
 type CreateUserRequest struct {
 	Name    string ` + "`json:\"name\" validate:\"required\"`" + `
@@ -135,7 +135,7 @@ type CreateUserRequest struct {
 	Bounded string ` + "`json:\"bounded\" validate:\"required,max=64\"`" + `
 }
 `
-	got := lint(t, RequestValidateDepth.ID, map[string]string{"handler/request.go": req})
+	got := lint(t, RequestValidateDepth.ID, map[string]string{"handler/request/request.go": req})
 	if len(got) != 1 {
 		t.Fatalf("only the unbounded string should be reported; got %d: %v", len(got), got)
 	}

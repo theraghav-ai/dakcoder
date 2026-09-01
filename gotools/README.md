@@ -120,7 +120,7 @@ wrote 7 file(s):
   create repo/postgres/pension.go                 4885 bytes
   create handler/response/pension.go              2152 bytes
   create handler/pension.go                       4268 bytes
-  modify handler/request.go                       1910 bytes
+  modify handler/request/request.go                       1910 bytes
   modify bootstrap/bootstrapper.go                 678 bytes
 
 next:
@@ -351,7 +351,7 @@ outside `repo/`"). We keep what `go/analysis` gets right — one parse,
 declarative rule metadata, positional reporting — and drop the per-package unit
 of work.
 
-**Byte-level patching, not AST re-printing.** `handler/request.go` and
+**Byte-level patching, not AST re-printing.** `handler/request/request.go` and
 `bootstrap/bootstrapper.go` are edited in place at offsets the AST located.
 Re-printing would lose comments — `go/printer` places them by token offsets that
 AST mutation invalidates — and would rewrite every line of the file, because the
@@ -512,7 +512,7 @@ asserting they have not moved.
    still pass. If the linter now rejects the scaffolder, decide which of the two
    is wrong before touching either.
 
-The snapshots for `handler/request.go` and `bootstrap/bootstrapper.go` carry the
+The snapshots for `handler/request/request.go` and `bootstrap/bootstrapper.go` carry the
 reference template's own content, so they also fail when `new-template` changes
 underneath us. That coupling is deliberate — it is the local half of the
 rules-to-doc drift check the plan asks for.

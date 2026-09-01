@@ -34,7 +34,7 @@ _FILES: dict[str, str] = {
         "func New() *UserHandler { return nil }\r\n\r\n"
         "func (h *UserHandler) Routes() {}\r\n"
     ),
-    "handler/request.go": "package handler\r\n\r\ntype CreateUserRequest struct{}\r\n",
+    "handler/request/request.go": "package request\r\n\r\ntype CreateUserRequest struct{}\r\n",
     "bootstrap/bootstrapper.go": "package bootstrap\r\n\r\nvar FxRepo = 1\r\n",
     "configs/app.yaml": "app:\n  name: pisapi\n",
     "db/users.sql": "CREATE TABLE users (id serial4 PRIMARY KEY);\n",

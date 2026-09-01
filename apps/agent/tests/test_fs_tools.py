@@ -64,7 +64,7 @@ def test_a_patch_anchor_written_with_lf_matches_a_crlf_file(router: Router) -> N
     """The model never emits \\r\\n. If matching were byte-exact, no patch would
     ever apply to the reference template."""
     assert run(
-        router, "patch_file", path="handler/request.go", old="type CreateUserRequest struct{}", new="type CreateUserRequest struct{ Name string }"
+        router, "patch_file", path="handler/request/request.go", old="type CreateUserRequest struct{}", new="type CreateUserRequest struct{ Name string }"
     ).ok
 
 

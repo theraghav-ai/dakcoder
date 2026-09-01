@@ -29,7 +29,7 @@ const (
 
 // Workspace-relative paths the resource scaffolder touches.
 const (
-	requestFile = "handler/request.go"
+	requestFile = "handler/request/request.go"
 )
 
 // ResourceOptions configures a resource scaffold.
@@ -56,7 +56,7 @@ type ResourceOptions struct {
 //	create  repo/postgres/<name>.go
 //	create  handler/response/<name>.go
 //	create  handler/<name>.go
-//	modify  handler/request.go              (DTOs appended)
+//	modify  handler/request/request.go      (DTOs appended)
 //	modify  bootstrap/bootstrapper.go       (FX registration, via fxwire)
 //
 // The spec is normalised and validated first; nothing is rendered from an
@@ -131,6 +131,7 @@ func Resource(root string, s spec.Resource, opts ResourceOptions) (*Result, erro
 	// handler/<name>.go
 	handlerImports := []imp{
 		{Path: module + "/core/port"},
+		{Alias: "request", Path: module + "/handler/request"},
 		{Alias: "resp", Path: module + "/handler/response"},
 		{Alias: "repo", Path: module + "/repo/postgres"},
 		{Alias: "log", Path: pkgLog},
@@ -147,7 +148,7 @@ func Resource(root string, s spec.Resource, opts ResourceOptions) (*Result, erro
 	}
 	res.add("handler/"+normalised.FileStem()+".go", ActionCreate, content)
 
-	// handler/request.go — appended to, or created.
+	// handler/request/request.go — appended to, or created.
 	requestContent, err := patchRequestFile(root, module, normalised, d)
 	if err != nil {
 		return nil, err
@@ -181,13 +182,13 @@ func Resource(root string, s spec.Resource, opts ResourceOptions) (*Result, erro
 	return res, nil
 }
 
-// patchRequestFile appends the resource's DTOs to handler/request.go, creating
-// the file if the service does not have one yet.
+// patchRequestFile appends the resource's DTOs to handler/request/request.go,
+// creating the file (and its directory) if the service does not have one yet.
 //
 // Appending rather than rewriting is deliberate: request.go accumulates every
 // resource's DTOs, so it is the one generated file a developer's own edits
 // share space with. SOP.md §Validation requires all request structs to live
-// here — govalid is run as `govalid ./request.go`, and a struct anywhere else
+// here — govalid is run as `govalid ./request.go` from handler/request/, and a struct anywhere else
 // silently never gets a validator, which means input reaches the handler
 // unvalidated with nothing to show for it.
 func patchRequestFile(root, module string, r spec.Resource, d data) (string, error) {
@@ -211,7 +212,7 @@ func patchRequestFile(root, module string, r spec.Resource, d data) (string, err
 		if r.NeedsTimeInRequest() {
 			imports = append(imports, imp{Path: "time"})
 		}
-		header := "package handler\n"
+		header := "package request\n"
 		if block := renderImports(module, imports); block != "" {
 			header += "\n" + block + "\n"
 		}
@@ -275,7 +276,7 @@ func declaredTypeNames(r spec.Resource) []string {
 
 // addResourceNotes records the steps the scaffolder deliberately does not take.
 func addResourceNotes(res *Result, r spec.Resource) {
-	res.note("run `govalid ./request.go` from handler/ — the framework returns 422 for any non-GET route whose request DTO has no generated Validate()")
+	res.note("run `govalid ./request.go` from handler/request/ — the framework returns 422 for any non-GET route whose request DTO has no generated Validate()")
 	res.note("apply db/%s.sql to your database; the agent never runs DDL, because it is the one action git cannot undo", r.TableFileStem())
 	res.note("verify with: go build ./... && gotools lint")
 	if r.Has("create") || r.Has("update") {

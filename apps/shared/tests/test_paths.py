@@ -178,7 +178,7 @@ def test_structural_and_generated_paths_need_approval(rel: str) -> None:
         "handler/response/user.go",
         "core/domain/user.go",
         "repo/postgres/user.go",
-        "handler/request.go",
+        "handler/request/request.go",
         "README.md",
     ],
 )
@@ -194,5 +194,5 @@ def test_ordinary_source_does_not(rel: str) -> None:
 def test_the_request_dto_file_itself_is_editable_but_its_validator_is_not() -> None:
     """The distinction the whole generated-code rule rests on: edit the source
     of truth, regenerate the output. Editing the output is silently reverted."""
-    assert not is_protected("handler/request.go")
-    assert is_protected("handler/request_useriduri_validator.go")
+    assert not is_protected("handler/request/request.go")
+    assert is_protected("handler/request/request_useriduri_validator.go")
