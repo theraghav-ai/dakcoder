@@ -465,3 +465,61 @@ def test_courtesy_does_not_latch_write_authorisation_for_the_session():
         assert _asks_for_work("explain the bootstrapper", (courtesy,)) is False, courtesy
     for affirmative in ["go", "go ahead", "yes", "do it", "proceed", "ok"]:
         assert _asks_for_work("explain the bootstrapper", (affirmative,)) is True, affirmative
+
+
+# ── a question stays a question however its answer is phrased ───────────────
+
+
+#: The Planner's real answer to "how does it deviate from the new template".
+#: Naming a deviation means naming the change it implies, so the answer is
+#: indistinguishable from a plan by any regex over prose: `_PLAN_EDITS` matches
+#: "4. Register" and `_ACCEPTS` matches the line under it.
+DEVIATION_ANSWER = """## What the bootstrapper does
+
+1. `Fxvalidator` invokes handler.NewValidatorService.
+2. `FxRepo` provides all nine repositories.
+
+## How it deviates from the new template
+
+4. Register the eight handlers with fx.Annotate instead of plain fx.Provide.
+   Accepts: rules_lint(only=fx-registration) returns 0 findings
+5. Remove the TransferentryRepoInstance package-level global.
+"""
+
+REAL_PLAN = "1. `core/domain/employee.go` - add the struct.\n   Accepts: go build passes\n"
+
+
+@pytest.mark.parametrize("reply", [DEVIATION_ANSWER, REAL_PLAN, VERB_FIRST_ANSWER, BOLD_ANSWER],
+                         ids=["deviation", "plan-shaped", "verb-first", "bold"])
+@pytest.mark.parametrize("task", READ_ONLY_TASKS + [
+    "explain the bootsrapper used in this code. also tell how it deviates from new template",
+    "describe the create and update handlers",
+    "explain how the routes are registered",
+])
+def test_a_question_is_answered_whatever_the_reply_looks_like(task, reply):
+    """The field failure the reply test could not survive.
+
+    Asked to explain the bootstrapper and say how it deviates, the Planner
+    answered exactly that -- and the run went off to migrate a hundred routes,
+    ending blocked on a pre-existing go_vet failure, with the explanation the
+    developer wanted replaced on screen by a plan they never asked for.
+    """
+    from dakcoder_agent.loop import _is_explanation
+
+    assert _is_explanation(task, reply) is True
+
+
+@pytest.mark.parametrize("task", WORK_TASKS + [
+    "explain the bootstrapper then migrate it to the n-api template",
+    "explain the bootstrapper, then migrate it to the new template",
+    "check the handler then write unit tests",
+    "look at routes.go and add pagination",
+])
+def test_a_request_for_work_is_never_answered_whatever_the_reply_looks_like(task):
+    """The other side, and the reason dropping the reply test is safe: the work
+    test carries the whole judgement now, so it has to catch the preamble form.
+    """
+    from dakcoder_agent.loop import _is_explanation
+
+    assert _is_explanation(task, DEVIATION_ANSWER) is False
+    assert _is_explanation(task, REAL_PLAN) is False

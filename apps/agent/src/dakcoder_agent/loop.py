@@ -2697,48 +2697,44 @@ def _is_read_only_task(task: str, directives: Sequence[str] = ()) -> bool:
 
 
 def _is_explanation(task: str, text: str, directives: Sequence[str] = ()) -> bool:
-    """Whether a numbered Planner reply describes something rather than proposing work.
+    """Whether this run should answer the question rather than execute anything.
 
-    ``_count_steps`` counts anything shaped like a numbered item, which is the
-    right thing for recognising a plan and the wrong thing for telling one from
-    an answer. Asked to *explain* a bootstrapper and say how it deviates from the
-    template, the Planner produced exactly what was wanted — ten numbered
-    paragraphs, ``**1. `Fxvalidator`** — `fx.Invoke(...)`. Runs once at
-    startup`` — and the loop read ten steps, pinned the explanation as the plan
-    and entered the Coder.
+    Decided entirely by what was asked. ``text`` -- the Planner's reply -- is
+    accepted for the call sites and for the tests, and deliberately ignored.
 
-    What the Coder does there is the part that matters. In one transcript it had
-    nothing to execute and re-ran the Planner's whole survey, six turns of
-    ledger answers to no progress. In another it went looking for work, found a
-    ``json\\t:`` typo in a domain model nobody had mentioned, and started editing
-    a file the developer had asked only to have explained. The second is the
-    worse outcome and the harder one to notice.
+    It used to be half the test, and it was the half that broke. Asked to
+    "explain the bootsrapper used in this code. also tell how it deviates from
+    new template", the Planner answered exactly that: a description, then the
+    deviations. But naming a deviation means naming the change it implies, so
+    the answer read
 
-    Both halves have to agree, because neither is sufficient alone.
+        4. Register the eight handlers with fx.Annotate instead of fx.Provide.
+           Accepts: rules_lint(only=fx-registration) returns 0 findings
 
-    *The task asked only to be told something.* A request that also asks for a
-    change is work with a preamble, and ``_ASKS_FOR_WORK`` settles that on its
-    own — "explain the bootstrapper, then migrate it" is a migration.
+    ``_PLAN_EDITS`` matched ``4. Register``, ``_ACCEPTS`` matched the line under
+    it, the reply was pinned as a plan, and the run went off to migrate a
+    hundred routes nobody had asked it to touch -- ending blocked on a
+    pre-existing ``go_vet`` failure, with the explanation the developer actually
+    wanted replaced on screen by a plan they never asked for.
 
-    *The reply proposes nothing executable.* No step that asks for a change, no
-    ``Accepts:`` line — which the Planner's own instruction requires of every
-    step — and not the scaffolder's one-liner, which is a plan carrying neither.
+    No wording fixes that, because the reply was *right*. A description of a
+    deviation is indistinguishable from a proposal to remove it, and no regex
+    over prose can separate them. The only sound reading is that a question
+    stays a question however its answer is phrased.
 
-    The reply test alone was tried first and is too strong: ``1. Read
-    handler/user.go`` is a legitimate one-step plan that reads exactly like a
-    description, and ten tests drive the Coder through plans of that shape. What
-    tells the two apart is not the answer but the question.
+    What makes dropping the reply test safe is that the work test is now the
+    strong one. ``_asks_for_work`` catches the compound request -- "review the
+    handler and fix the vet errors", "explain the bootstrapper then migrate it"
+    -- at 8 of 8, with 0 false positives across 18 read-only phrasings, and
+    ``_SAYS_GO`` catches the "go" that turns an answered question into work. If
+    either fires the task is not read-only and this returns False.
 
-    A false positive costs a run that ends with its answer on screen, which the
-    developer continues with "go"; the behaviour without it costs unrequested
-    edits to files nobody mentioned. That asymmetry is why this errs toward
-    executing, and why both halves must agree before it does not.
+    The asymmetry still holds and still points this way. A false positive costs
+    one word: the answer is on screen and "go" starts the work. A false negative
+    costs unrequested edits to files nobody mentioned, found later in a diff.
     """
-    if not _ASKS_TO_BE_TOLD.search(task) or _ASKS_FOR_WORK.search(task):
-        return False
-    return not (
-        _PLAN_EDITS.search(text) or _ACCEPTS.search(text) or _is_scaffold_plan(text)
-    )
+    del text  # deliberately unconsulted; see above.
+    return _is_read_only_task(task, directives)
 
 
 def _is_scaffold_plan(plan: str) -> bool:
