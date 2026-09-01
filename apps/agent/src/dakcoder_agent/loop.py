@@ -717,17 +717,31 @@ class AgentLoop:
             # build after an edit, re-reading a file just written — are exactly
             # the ones a mutation precedes, and the mutation cleared this ledger.
             if (cached := self.state.last_results.get(fingerprint)) is not None:
-                self.state.seen_calls[fingerprint] = (
-                    self.state.seen_calls.get(fingerprint, 0) + 1
-                )
-                self.context.append_tool_result(
-                    call.name,
+                asks = self.state.seen_calls.get(fingerprint, 0) + 1
+                self.state.seen_calls[fingerprint] = asks
+                body = (
                     f"Not run: you have already called {call.name} with exactly "
                     "these arguments this run, and nothing in the workspace has "
                     f"changed since. It returned:\n\n{cached}\n\n"
                     "That answer still stands. Do something different — a "
                     "different tool, different arguments, or say plainly what is "
-                    "blocking you.",
+                    "blocking you."
+                )
+                if asks >= 3:
+                    # The polite version was ignored twice. Before the stall
+                    # counter ends the run, say exactly what is at stake -- a
+                    # model that keeps asking is usually treating the echo as a
+                    # failed call, so name it as the answer it is.
+                    body += (
+                        f"\n\nThis is ask number {asks} for this exact call. The "
+                        "answer above IS the result — the call succeeded when it "
+                        "ran and will not be dispatched again while nothing "
+                        "changes. Turns that only repeat earlier calls end the "
+                        "run; use the answer, or move to the next step."
+                    )
+                self.context.append_tool_result(
+                    call.name,
+                    body,
                     tool_call_id=call.id,
                 )
                 yield Event(
@@ -824,7 +838,13 @@ class AgentLoop:
             self.state.seen_calls[fingerprint] = (
                 self.state.seen_calls.get(fingerprint, 0) + 1
             )
-            self.state.last_results[fingerprint] = outcome.for_model()[:600]
+            # Uncapped save for a capped context: ``append_tool_result`` applies
+            # the per-tool insertion caps when an echo is played back, so what
+            # is stored here only bounds memory. The old 600-character cut
+            # replayed a rich first answer as a stub -- and a model handed a
+            # worse answer than the one it remembered getting kept asking for
+            # the original, seven times in one field run.
+            self.state.last_results[fingerprint] = outcome.for_model()[:6000]
             if reason := outcome.meta.get("dead_end"):
                 # The tool has said this exact call can never succeed as asked.
                 # From here on it is answered from the ledger above, forever,

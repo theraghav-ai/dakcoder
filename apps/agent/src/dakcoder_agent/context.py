@@ -163,11 +163,46 @@ class Message:
                 {
                     "id": call.id,
                     "type": "function",
-                    "function": {"name": call.name, "arguments": call.arguments},
+                    "function": {
+                        "name": call.name,
+                        "arguments": _parseable_arguments(call.arguments),
+                    },
                 }
                 for call in self.tool_calls
             ]
         return out
+
+
+def _parseable_arguments(arguments: str) -> str:
+    """The call's arguments, guaranteed to parse as a JSON object.
+
+    vLLM's chat renderer runs ``json.loads`` over every recorded tool call's
+    arguments before templating, so ONE unparseable string in history rejects
+    every subsequent request with a 400 -- including a plain "hi", because the
+    poisoned message is still there. The field case was a reply cut off by the
+    output budget mid-call: arguments arrived as the bare character ``{``, the
+    loop (correctly) told the model about the truncation and never dispatched
+    the call, but the recorded message re-sent ``{`` on every turn thereafter
+    and the endpoint refused them all. json.loads("{") raises the exact error
+    the server logged: "Expecting property name enclosed in double quotes:
+    line 1 column 2 (char 1)".
+
+    Sanitised at render time rather than at append time, deliberately: the
+    ledger keeps what the model actually sent (the loop's own bookkeeping
+    fingerprints the raw string), and a session that already recorded a
+    truncated call before this fix heals itself on its next request instead of
+    staying bricked.
+
+    The substitute is ``{}``, not a repair attempt. The tool result beside the
+    call already tells the model the call was cut off and never ran; inventing
+    completed-looking arguments would put words in its mouth.
+    """
+    try:
+        if isinstance(json.loads(arguments), dict):
+            return arguments
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return "{}"
 
 
 @dataclass(frozen=True, slots=True)

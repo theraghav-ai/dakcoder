@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+import json
 import re
 
 import pytest
@@ -1663,4 +1664,100 @@ def test_a_write_reopens_a_dead_end(router: Router, gated) -> None:
     assert reads[0]["ok"] is False, "the file did not exist yet"
     assert reads[1]["ok"] is True, "after the write, the re-read must really run"
     assert agent.result.outcome == Outcome.DONE
+
+# ── the request that poisoned every request after it ─────────────────────────
+
+
+def test_a_truncated_tool_call_does_not_poison_the_wire(router: Router, gated) -> None:
+    """One unparseable arguments string in history rejects every later request.
+
+    vLLM's chat renderer runs json.loads over every recorded tool call's
+    arguments. A reply cut off by the output budget left arguments as the bare
+    character "{"; recording it verbatim meant every subsequent request — a
+    plain "hi" included — came back 400 with "Expecting property name enclosed
+    in double quotes", and the session was bricked. The wire must never carry
+    arguments the endpoint cannot parse.
+    """
+    truncated = ChatResult(
+        tool_calls=[ToolCall(id="t1", name="repo_map", arguments="{")],
+        finish_reason="length",
+        usage=Usage(prompt_tokens=100),
+    )
+    agent, _ = loop_over(
+        router,
+        [truncated, say("1. Confirm handler/user.go compiles\n   Accepts: builds"), say("ok")],
+    )
+
+    for message in agent.context.wire():
+        for call in message.get("tool_calls", ()):
+            arguments = call["function"]["arguments"]
+            parsed = json.loads(arguments)  # the render-time check vLLM applies
+            assert isinstance(parsed, dict), f"non-object arguments on the wire: {arguments!r}"
+
+
+def test_wellformed_arguments_reach_the_wire_untouched(router: Router, gated) -> None:
+    """Sanitising must not rewrite what was never broken."""
+    agent, _ = loop_over(
+        router,
+        [
+            say("1. Read handler/user.go"),
+            calls(("read_file", '{"path": "handler/user.go"}')),
+            say("done"),
+        ],
+    )
+    recorded = [
+        call["function"]["arguments"]
+        for message in agent.context.wire()
+        for call in message.get("tool_calls", ())
+    ]
+    assert '{"path": "handler/user.go"}' in recorded
+
+
+# ── the echo is the answer, not a stub of it ─────────────────────────────────
+
+
+def test_the_cached_echo_carries_the_whole_result(router: Router, gated) -> None:
+    """The old 600-character cut replayed a rich first answer as a stub, and a
+    model handed a worse answer than the one it remembered kept asking for the
+    original — seven times in one field run."""
+    filler = "".join(f"line about item {i} in the middle of the file\n" for i in range(30))
+    content = "package handler\n" + filler + "// MARKER-AT-THE-END\n"
+    agent, events = loop_over(
+        router,
+        [
+            say("1. Add handler/pension.go\n   Accepts: builds"),
+            calls(("write_file", '{"path": "handler/pension.go", "content": ' + json.dumps(content) + "}")),
+            calls(("read_file", '{"path": "handler/pension.go"}')),
+            calls(("read_file", '{"path": "handler/pension.go"}')),
+            say("done"),
+        ],
+        approve=lambda _r: True,
+    )
+
+    echoes = [
+        m for m in agent.context.build()
+        if "That answer still stands" in m.content
+    ]
+    assert echoes, "the repeated read was not answered from the ledger"
+    assert "MARKER-AT-THE-END" in echoes[0].content, (
+        "the echo truncated the result; the model is being handed a stub of "
+        "the answer it remembers getting"
+    )
+
+
+def test_the_third_ask_is_told_what_is_at_stake(router: Router, gated) -> None:
+    """Two polite echoes, then the plain version: the answer above is the
+    result, and turns that only repeat end the run."""
+    same = ("search_repo", '{"pattern": "^func"}')
+    agent, _ = loop_over(
+        router,
+        [calls(same), calls(same), calls(same), say("moving on"),
+         say("1. Confirm handler/user.go compiles\n   Accepts: builds"), say("ok")],
+    )
+    warned = [
+        m for m in agent.context.build()
+        if "ask number 3" in m.content
+    ]
+    assert warned, "the third identical ask got the same polite echo as the first"
+    assert "will not be dispatched again" in warned[0].content
 
