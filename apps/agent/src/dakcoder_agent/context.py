@@ -661,6 +661,33 @@ class ContextManager:
         self._working.append(msg)
         return msg
 
+    def discard(self, *messages: Message) -> int:
+        """Remove exact working-set messages, for superseded intercept pairs.
+
+        §6.4's append-only rule exists to protect the cacheable prefix, and
+        this is a deliberate, narrow exception to it — the same trade the slice
+        ledger already makes when it collapses a superseded read. What it buys
+        was measured against the live endpoint: two identical (tool-call →
+        "not run") pairs in history flip Qwen3.8-27B from moving on 5/5 to
+        repeating the call 5/5, at temperature 0.1, regardless of what the
+        intercept text says. The transcript is a stronger instruction than any
+        instruction, so the transcript must not accumulate the pattern.
+
+        Removal is by identity, from the working set only; the pinned head is
+        untouchable. A message already evicted by compaction is simply not
+        found, which is fine — compaction removed the pattern too. The prefix
+        invalidated is the tail below the removed pair, which is at most a few
+        messages old by construction.
+        """
+        removed = 0
+        for message in messages:
+            try:
+                self._working.remove(message)
+                removed += 1
+            except ValueError:
+                pass
+        return removed
+
     def append_user(self, content: str) -> Message:
         """A follow-up or a steering message from the developer mid-run."""
         msg = Message(Role.USER, content, Layer.WORKING_SET, source="user", turn=self._turn)

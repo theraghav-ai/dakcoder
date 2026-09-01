@@ -142,6 +142,22 @@ class _State:
     #: call answered from ``dead_ends`` or ``last_results``. The run ends at
     #: ``MAX_STALLED_TURNS``. Reset by any dispatched call or mutation.
     stalled_turns: int = 0
+    #: The most recent (single-call reply -> result) pair per (tool, exact
+    #: result content) — dispatched calls, not intercepts. A model probing with
+    #: slightly different arguments gets a different fingerprint every time, so
+    #: every probe dispatches; when the answers come back byte-identical the
+    #: pairs are the same few-shot pattern the intercept collapse exists to
+    #: remove, built out of successes. Superseding an identical-result pair
+    #: loses nothing: the surviving copy carries the same bytes.
+    dup_results: dict[str, list[Message]] = field(default_factory=dict)
+    #: The context messages of the most recent intercept per fingerprint — the
+    #: repeated assistant call and the ledger answers it drew — so the next
+    #: repeat can supersede them instead of stacking beside them. Measured on
+    #: the live endpoint: ONE such pair in history and the model moves on 5/5;
+    #: TWO and it repeats the call 5/5 forever, whatever the answer says. The
+    #: accumulated pairs are a few-shot pattern, and the pattern outweighs the
+    #: prose. See ``ContextManager.discard``.
+    intercepts: dict[str, list[Message]] = field(default_factory=dict)
     #: The turn each compaction fired on, for the thrash detector.
     compactions: list[int] = field(default_factory=list)
     #: Consecutive turns in a mode that can write which wrote nothing and called
@@ -544,8 +560,9 @@ class AgentLoop:
         # a tool call is exactly the turn whose record matters most.
         if result.chat.content:
             yield Event(EventType.ASSISTANT, {"text": result.chat.content})
+        assistant_msg: Message | None = None
         if result.chat.content or result.chat.tool_calls:
-            self.context.append_assistant(
+            assistant_msg = self.context.append_assistant(
                 result.chat.content or "",
                 tool_calls=tuple(result.chat.tool_calls),
             )
@@ -586,7 +603,7 @@ class AgentLoop:
             return
 
         if result.chat.tool_calls:
-            yield from self._tool_calls(result.chat.tool_calls)
+            yield from self._tool_calls(result.chat.tool_calls, assistant_msg)
             return
 
         if why := self._narrating():
@@ -642,7 +659,9 @@ class AgentLoop:
 
     # -- tools ------------------------------------------------------------
 
-    def _tool_calls(self, calls: Sequence[ToolCall]) -> Iterator[Event]:
+    def _tool_calls(
+        self, calls: Sequence[ToolCall], assistant_msg: Message | None = None
+    ) -> Iterator[Event]:
         # The world changed since the ledgers were written: forget them.
         #
         # A mutation invalidates all three at once. The cached result of a
@@ -656,9 +675,40 @@ class AgentLoop:
             self.state.seen_calls.clear()
             self.state.last_results.clear()
             self.state.dead_ends.clear()
+            self.state.intercepts.clear()
+            self.state.dup_results.clear()
 
         mutated = False
         dispatched = False
+
+        # Whether this whole reply is one fingerprint asked again — the only
+        # shape it is safe to supersede wholesale. A reply that also said
+        # something, or also called something else, keeps its place in history;
+        # removing it would lose the prose or orphan the other calls' results.
+        def sole_fingerprint(fp: str) -> bool:
+            return (
+                assistant_msg is not None
+                and not assistant_msg.content
+                and all(f"{c.name}:{c.arguments}" == fp for c in assistant_msg.tool_calls)
+            )
+
+        def collapse(fp: str, echo: Message) -> None:
+            """Supersede the previous intercept pair for ``fp`` with this one.
+
+            Keeps at most one (repeated call -> ledger answer) pair per
+            fingerprint in the working set. The pair being replaced is removed
+            whole — assistant message and its answers together — so no tool
+            result is ever left pointing at a call the wire no longer carries.
+            """
+            prior = self.state.intercepts.get(fp)
+            if prior and (not prior or prior[0] is not assistant_msg):
+                self.context.discard(*prior)
+                self.state.intercepts.pop(fp, None)
+            if sole_fingerprint(fp):
+                pair = self.state.intercepts.setdefault(fp, [])
+                if not pair:
+                    pair.append(assistant_msg)
+                pair.append(echo)
 
         for call in calls:
             if self.cancelled():
@@ -688,7 +738,7 @@ class AgentLoop:
                 self.state.seen_calls[fingerprint] = (
                     self.state.seen_calls.get(fingerprint, 0) + 1
                 )
-                self.context.append_tool_result(
+                echo = self.context.append_tool_result(
                     call.name,
                     f"Not run: {call.name} with exactly these arguments is a known "
                     f"dead end this run — {reason}.\n\n"
@@ -697,6 +747,7 @@ class AgentLoop:
                     "named in the earlier result still stand.",
                     tool_call_id=call.id,
                 )
+                collapse(fingerprint, echo)
                 yield Event(
                     EventType.TOOL_RESULT,
                     {
@@ -742,11 +793,12 @@ class AgentLoop:
                         "changes. Turns that only repeat earlier calls end the "
                         "run; use the answer, or move to the next step."
                     )
-                self.context.append_tool_result(
+                echo = self.context.append_tool_result(
                     call.name,
                     body,
                     tool_call_id=call.id,
                 )
+                collapse(fingerprint, echo)
                 yield Event(
                     EventType.TOOL_RESULT,
                     {
@@ -860,12 +912,34 @@ class AgentLoop:
             for mutation in outcome.mutations:
                 self.state.reads.pop(mutation.path, None)
 
-            self.context.append_tool_result(
+            slice_path = _slice_path(call, outcome)
+            result_msg = self.context.append_tool_result(
                 call.name,
                 outcome.for_model(),
                 tool_call_id=call.id,
-                path=_slice_path(call, outcome),
+                path=slice_path,
             )
+            if slice_path is None:
+                # Same tool, same bytes back: the older pair is superseded.
+                #
+                # Only single-call, prose-free replies participate, so a pair is
+                # always removable whole — never an orphaned result, never lost
+                # prose. Sliced reads sit this out: the slice ledger already
+                # collapses those by path.
+                dup_key = f"{call.name}|{hash(outcome.for_model())}"
+                prior = self.state.dup_results.get(dup_key)
+                if prior and prior[0] is not assistant_msg:
+                    self.context.discard(*prior)
+                    self.state.dup_results.pop(dup_key, None)
+                if (
+                    assistant_msg is not None
+                    and not assistant_msg.content
+                    and len(assistant_msg.tool_calls) == 1
+                ):
+                    pair = self.state.dup_results.setdefault(dup_key, [])
+                    if not pair:
+                        pair.append(assistant_msg)
+                    pair.append(result_msg)
             yield Event(
                 EventType.TOOL_RESULT,
                 {"id": call.id, "name": call.name, **outcome.as_dict()},

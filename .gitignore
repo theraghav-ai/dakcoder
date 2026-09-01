@@ -26,3 +26,6 @@ code-review/
 apps/*/build/
 apps/*/*.egg-info/
 error.txt
+
+# The deployment env holds the JWT secret and model key; only the example ships.
+deploy/dakcoder.env

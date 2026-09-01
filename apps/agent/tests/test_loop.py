@@ -1784,3 +1784,137 @@ def test_the_turn_budget_reads_the_environment(monkeypatch) -> None:
     monkeypatch.delenv("DAKCODER_MAX_TURNS")
     assert max_turns_from_env() == DEFAULT_TURNS
 
+# ── the transcript must not teach the loop it is trying to break ─────────────
+#
+# Measured on the live endpoint (temperature 0.1, five trials per point): with
+# ONE (repeated call -> "not run") pair in history the model reads the answer
+# and moves on, 5/5. With TWO such pairs it re-issues the identical call 5/5,
+# at every depth tried, regardless of what the intercept text says — the
+# accumulated pairs are a few-shot pattern, and the pattern outweighs the
+# prose. So the context keeps at most one pair per fingerprint.
+
+
+def test_repeated_intercepts_collapse_to_one_pair(router: Router, gated) -> None:
+    same = ("search_repo", '{"pattern": "^func Nope"}')
+    agent, _ = loop_over(
+        router,
+        [calls(same)] * 5 + [say("1. Confirm handler/user.go compiles\n   Accepts: builds"), say("ok")],
+    )
+
+    messages = agent.context.build()
+    echoes = [m for m in messages if "That answer still stands" in m.content]
+    assert len(echoes) == 1, (
+        f"{len(echoes)} intercept answers in context; two identical pairs is "
+        "the measured tipping point into a 100% repeat loop"
+    )
+    fp_calls = [
+        m for m in messages
+        if any(c.name == "search_repo" and "Nope" in c.arguments for c in m.tool_calls)
+    ]
+    assert len(fp_calls) == 2, (
+        f"{len(fp_calls)} copies of the repeated call in context; expected the "
+        "original dispatch plus the single latest repeat"
+    )
+    # the surviving echo is the newest one — it carries the highest ask number
+    assert "ask number 5" in echoes[0].content
+
+
+def test_collapsed_context_keeps_the_wire_valid(router: Router, gated) -> None:
+    """Removal must take the pair whole: an orphaned tool result — or a call
+    with no result — is the malformed-request class all over again."""
+    same = ("read_file", '{"path": "handler/does_not_exist.go"}')
+    agent, _ = loop_over(
+        router,
+        [calls(same)] * 4 + [say("1. Confirm handler/user.go compiles\n   Accepts: builds"), say("ok")],
+    )
+
+    wire = agent.context.wire()
+    declared = {
+        c["id"] for m in wire for c in m.get("tool_calls", ())
+    }
+    answered = {
+        m["tool_call_id"] for m in wire if m.get("role") == "tool" and m.get("tool_call_id")
+    }
+    assert answered <= declared, f"orphaned results: {answered - declared}"
+    assert declared <= answered, f"unanswered calls: {declared - answered}"
+
+
+def test_a_reply_with_prose_beside_the_repeat_is_not_discarded(
+    router: Router, gated
+) -> None:
+    """Superseding is only safe for a reply that is nothing but the repeat.
+    One that also said something keeps its place — removing it would lose the
+    prose."""
+    same = ("search_repo", '{"pattern": "^func Nope"}')
+    mixed = ChatResult(
+        content="Comparing the handler layout before planning.",
+        tool_calls=[ToolCall(id="mx1", name="search_repo", arguments='{"pattern": "^func Nope"}')],
+        finish_reason="tool_calls",
+        usage=Usage(prompt_tokens=100),
+    )
+    agent, _ = loop_over(
+        router,
+        [calls(same), mixed, calls(same),
+         say("1. Confirm handler/user.go compiles\n   Accepts: builds"), say("ok")],
+    )
+
+    messages = agent.context.build()
+    assert any(
+        "Comparing the handler layout" in m.content for m in messages
+    ), "the prose that travelled with a repeat was discarded with it"
+    wire = agent.context.wire()
+    declared = {c["id"] for m in wire for c in m.get("tool_calls", ())}
+    answered = {m["tool_call_id"] for m in wire if m.get("role") == "tool" and m.get("tool_call_id")}
+    assert answered <= declared and declared <= answered
+
+def test_dispatched_calls_with_identical_results_collapse(router: Router, gated) -> None:
+    """The near-identical-probe hole, from the field.
+
+    Four searches with slightly different arguments dispatch every time — the
+    fingerprint never matches — and return the same lines each time. The pairs
+    rebuilt the induction pattern out of successes, and the model then locked
+    onto byte-identical repeats until the stall counter ended the run at turn
+    60. Superseding an identical-result pair loses nothing: the surviving copy
+    carries the same bytes.
+    """
+    a = calls(("search_repo", '{"pattern": "CreateUserRequest"}'))
+    b = calls(("search_repo", '{"pattern": "CreateUserReq"}'))
+    agent, events = loop_over(
+        router,
+        [a, b, say("1. Confirm handler/user.go compiles\n   Accepts: builds"), say("ok")],
+    )
+
+    dispatched = [
+        e for e in of_type(events, EventType.TOOL_CALL) if e.data["name"] == "search_repo"
+    ]
+    assert len(dispatched) == 2, "different arguments must still dispatch"
+
+    searches = [
+        m for m in agent.context.build()
+        if any(c.name == "search_repo" for c in m.tool_calls)
+    ]
+    assert len(searches) == 1, (
+        f"{len(searches)} identical-result search pairs in context; the older "
+        "must be superseded or the pattern rebuilds from successes"
+    )
+    wire = agent.context.wire()
+    declared = {c["id"] for m in wire for c in m.get("tool_calls", ())}
+    answered = {m["tool_call_id"] for m in wire if m.get("role") == "tool" and m.get("tool_call_id")}
+    assert answered == declared, "collapse orphaned part of a pair on the wire"
+
+
+def test_distinct_results_are_both_kept(router: Router, gated) -> None:
+    """Only byte-identical answers supersede; two searches that found different
+    things are both real information."""
+    a = calls(("search_repo", '{"pattern": "CreateUserRequest"}'))
+    b = calls(("search_repo", '{"pattern": "SanctionHandler"}'))
+    agent, _ = loop_over(
+        router,
+        [a, b, say("1. Confirm handler/user.go compiles\n   Accepts: builds"), say("ok")],
+    )
+    searches = [
+        m for m in agent.context.build()
+        if any(c.name == "search_repo" for c in m.tool_calls)
+    ]
+    assert len(searches) == 2, "a genuinely different answer was discarded"
+
