@@ -106,6 +106,8 @@ export type TranscriptEntry =
       /** Server-measured, so it excludes the approval wait — the developer's own time. */
       ms?: number;
       truncated?: boolean;
+      /** Answered from a ledger; no call was dispatched. See ToolResultEvent. */
+      intercepted?: boolean;
       fix?: string;
     })
   | (EntryBase & { kind: 'gate'; gate: GateRun })
@@ -779,6 +781,7 @@ export class RunState implements vscode.Disposable {
           mutations,
           ...(typeof d.ms === 'number' ? { ms: d.ms } : {}),
           ...(d.truncated === true ? { truncated: true } : {}),
+          ...(d.intercepted === true ? { intercepted: true } : {}),
           ...(typeof d.fix === 'string' ? { fix: d.fix } : {}),
         };
         if (existing) {

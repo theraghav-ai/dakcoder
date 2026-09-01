@@ -1016,6 +1016,7 @@ class ContextManager:
         else:
             cut = self._retention_cut(retain_pct)
 
+        cut = self._whole_turn_cut(cut)
         evicted, retained = self._working[:cut], self._working[cut:]
         if not evicted:
             return Recap(turns=(self._turn, self._turn))
@@ -1028,6 +1029,46 @@ class ContextManager:
         self._reindex_slices()
         self._compactions += 1
         return recap
+
+    def _whole_turn_cut(self, cut: int) -> int:
+        """Move a cut off a turn boundary it would have split.
+
+        ``_retention_cut`` budgets in tokens and knows nothing about roles, so
+        the index it returns lands wherever the allowance runs out — including
+        between an assistant message carrying ``tool_calls`` and the ``role:
+        "tool"`` messages answering them. The retained set then *begins* with a
+        result whose ``tool_call_id`` nothing declares, which is the malformed
+        shape ``Message.wire`` is written to prevent.
+
+        It does not heal. ``_parseable_arguments`` repairs a bad arguments
+        string; nothing repairs a missing message, and ``loopback.follow_up``
+        hands this same ContextManager to the next run — so one badly-placed cut
+        poisons every later request in the session, down to a plain "hi".
+
+        Measured before the fix: 14 turns of (assistant + ``read_file`` result)
+        swept over 42 size combinations produced an orphan in 13 of them.
+
+        Cut forward rather than back, so the retained set can only get smaller.
+        Walking backwards to swallow the assistant would re-admit tokens the
+        allowance had already refused, which is how a compaction returns still
+        over budget. The last message is never evicted — a compaction that drops
+        the result the model is reacting to is worse than not compacting.
+        """
+        if cut <= 0 or cut >= len(self._working):
+            return cut
+        declared = {
+            call.id
+            for msg in self._working[:cut]
+            for call in msg.tool_calls
+        }
+        limit = len(self._working) - 1
+        while cut < limit:
+            head = self._working[cut]
+            if head.tool_call_id and head.tool_call_id in declared:
+                cut += 1
+                continue
+            break
+        return cut
 
     def _retention_cut(self, retain_pct: float) -> int:
         """Index of the first message to keep, walking back from the newest.

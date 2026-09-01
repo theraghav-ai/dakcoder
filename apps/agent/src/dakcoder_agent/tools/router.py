@@ -353,10 +353,23 @@ class Router:
         than an instruction, and the alternative is what it is meant to act on.
         """
         elsewhere = ", ".join(sorted(str(m) for m in spec.modes)) or "no mode"
-        if spec.instead:
-            fix = f"Instead, {spec.instead}."
-        elif spec.mutates:
+        if spec.mutates:
+            # Checked before ``instead``, and the order is the whole fix.
+            #
+            # ``spec.instead`` names an alternative that is right when a tool is
+            # *unavailable* and wrong when it is refused by *mode*: it points at
+            # another writing tool, which a mode that cannot write cannot use
+            # either. In the field the Verifier was refused ``patch_file``, was
+            # told "Instead, use write_file to create a file that does not exist
+            # yet", and spent three turns truncating a 280-line ``write_file``
+            # against a 2,048-token output budget before being refused again for
+            # the same reason.
+            #
+            # A mutating tool refused by mode has exactly one correct answer, and
+            # it is not another tool.
             fix = "Describe the change you want; a later step in the run will make it."
+        elif spec.instead:
+            fix = f"Instead, {spec.instead}."
         else:
             # A read-only tool refused by mode leaves nothing to redirect to, so
             # the useful thing is the list of what *is* reachable. Without it the
@@ -367,6 +380,15 @@ class Router:
         return ToolResult.failure(
             f"{spec.name} is not available in {mode} mode (it belongs to {elsewhere}).",
             fix=fix,
+            # Tagged so the loop can tell this refusal from every other failure.
+            # It is the one outcome that is true of the *asking mode* rather than
+            # of the call, so caching it under a mode-blind fingerprint let the
+            # Verifier's refusal be replayed to the Coder as the answer to the
+            # Coder's own identical call — which is how a run spent seventeen
+            # turns being told "patch_file is not available in verifier mode"
+            # while the loop was, correctly, in coder mode. See
+            # ``AgentLoop._tool_calls``.
+            meta={"refused_by_mode": True},
         )
 
     def _confine(

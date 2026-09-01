@@ -81,7 +81,18 @@ export interface ToolResultEvent {
   content: string;
   mutations: Mutation[];
   fix?: string;
-  truncated?: boolean;
+  /**
+   * The answer came from a ledger; no call was dispatched.
+   *
+   * `ok` stays true because the content IS the current answer — marking it
+   * failed would read as an error and invite a retry. But a row that never ran
+   * must not look identical to one that did: the field transcript showed four
+   * green `patch_file` ticks against a file that never changed, and that is
+   * what made a seventeen-turn deadlock look like progress.
+   *
+   * Optional, so an older runtime that never sends it keeps working.
+   */
+  intercepted?: boolean;
   /** Server-measured, so it excludes the approval wait — the developer's time. */
   ms?: number;
 }

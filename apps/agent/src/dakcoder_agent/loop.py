@@ -224,6 +224,13 @@ class _State:
     #: that path is written, because re-reading what you just changed is the
     #: correct move. See ``_re_reading``.
     reads: dict[str, list[str]] = field(default_factory=dict)
+    #: What each ``search_docs`` query this run got back, as the set of section
+    #: citations. Keyed by query so a rephrasing can be compared against every
+    #: earlier one rather than only the last. See ``_retrieval_overlap``.
+    retrievals: list[tuple[str, frozenset[str]]] = field(default_factory=list)
+    #: Consecutive retrievals that returned nothing the run had not already been
+    #: given. Reset by a retrieval that brings back something new.
+    retrieval_repeats: int = 0
     plan: str = ""
     last_gate: GateReport | None = None
     #: The workspace state the last full gate ran against: how many mutations
@@ -410,6 +417,40 @@ _EXECUTING = frozenset({Mode.CODER, Mode.SCAFFOLDER, Mode.DEBUGGER})
 #: What 10 still catches is the tighter loop: the same file, over and over,
 #: until the context is nothing else.
 MAX_READS = 10
+
+#: How many retrievals in a row may return nothing new before the run is told
+#: the corpus is exhausted for this question.
+#:
+#: Three, because the first repeat is an ordinary rephrasing and the second is a
+#: developer's instinct to try once more. A model that has asked three different
+#: questions and been handed the same sections every time is not going to get a
+#: different answer from a fourth.
+#:
+#: This is the signal that was missing in the field, and it is worth saying why
+#: it is *this* signal and not a relevance score. ``search_docs`` runs BM25 with
+#: no floor, and a floor cannot be added, because the score does not separate
+#: the two cases. Measured against the real 92-section corpus:
+#:
+#:     in-domain  ("how do I add a new endpoint")          5.330
+#:     in-domain  ("where do I put the sql scripts")       3.640
+#:     OUT        ("api-server Router struct Engine field") 28.141   <- the highest
+#:
+#: The query the field transcript died on scores higher than every question the
+#: corpus genuinely answers, because it is built from words the corpus uses
+#: constantly. Term coverage fails for the same reason: all five of its words are
+#: in the vocabulary. No statistic computed from one query can tell "the corpus
+#: answers this" from "the corpus contains these words".
+#:
+#: What *is* reliable is the answer, not the question. Twenty search_docs turns
+#: in the field returned the same four sections for six different phrasings --
+#: the same 196 lines at turns 21, 22 and 23 -- and nothing said so. That is a
+#: set comparison, it needs no threshold, and it cannot refuse a question the
+#: corpus can actually answer.
+MAX_RETRIEVAL_REPEATS = 3
+
+#: How much of a retrieval must be old for it to count as adding nothing. Half,
+#: so two fresh sections out of four still counts as progress.
+RETRIEVAL_OVERLAP = 0.5
 
 
 class AgentLoop:
@@ -613,6 +654,23 @@ class AgentLoop:
 
         # The same thing for a mode that can write and has not. A mutation
         # clears it, so the ordinary read-edit-read cycle never reaches either
+        # A corpus that has been asked and has nothing more is not asked again.
+        #
+        # Telling the model was not enough on its own: the message is advice, and
+        # a model that has decided the answer must be in the knowledge base will
+        # keep rewording the question — which is precisely the sixteen turns this
+        # is here to stop. So once the retrieval ledger has said three times that
+        # a search returned only sections the run already had, ``search_docs``
+        # stops being offered. Withdrawn for the rest of the run rather than the
+        # turn: the corpus does not acquire new sections mid-run, so nothing that
+        # follows could change the answer.
+        #
+        # Only ``search_docs``. ``read_file`` and ``search_repo`` read the
+        # workspace, which the run does change, and taking those away would stop
+        # the model reading the file it is about to edit.
+        if self.state.retrieval_repeats >= MAX_RETRIEVAL_REPEATS:
+            tools = [s for s in tools if s["function"]["name"] != "search_docs"]
+
         # threshold; what does reach them is a Coder reading a whole service.
         if self.state.mode in _EXECUTING:
             if self.router.mutations != self.state.research_mutations:
@@ -754,25 +812,51 @@ class AgentLoop:
         # spent on a call that cannot succeed.
         if incomplete := result.chat.incomplete_tool_calls():
             names = ", ".join(sorted({c.name for c in incomplete}))
-            self.context.append_tool_result(
-                incomplete[0].name,
-                f"Your call to {names} arrived cut off — the arguments stop partway "
-                "through, so the call was not made. Nothing is wrong with your JSON; "
-                "this is what running into the "
-                f"{config_for(self.state.mode).max_tokens:,}-token output limit looks like.\n\n"
-                "Make the next reply shorter: fewer tool calls in one turn, and less "
-                "prose before them. One call is enough.",
-                tool_call_id=incomplete[0].id,
-            )
-            yield Event(
-                EventType.TOOL_RESULT,
-                {
-                    "id": incomplete[0].id,
-                    "name": incomplete[0].name,
-                    "ok": False,
-                    "content": f"output limit reached mid-call; {names} was not dispatched",
-                },
-            )
+            # Every call the assistant message declared gets an answer, not just
+            # the first cut-off one.
+            #
+            # ``incomplete_tool_calls`` returns a *list*, and this branch used to
+            # answer ``incomplete[0]`` and return. The assistant message carrying
+            # all of the calls was already appended above, so every other call in
+            # that reply was left with no ``role:"tool"`` message pointing at it.
+            # ``Message.wire`` says what that costs: a result whose
+            # ``tool_call_id`` no assistant message declares is malformed against
+            # a strict endpoint, and the poisoned message stays in the working
+            # set for the rest of the run *and the rest of the session*, because
+            # ``loopback.follow_up`` reuses this ContextManager. Unlike a bad
+            # arguments string, which ``_parseable_arguments`` repairs, a missing
+            # message never heals.
+            #
+            # Measured on a mixed reply (one complete `read_file`, one cut-off
+            # `write_file`): declared ['cut1', 'good1'], answered ['cut1'],
+            # orphaned ['good1'].
+            cut = {c.id for c in incomplete}
+            for call in result.chat.tool_calls:
+                if call.id in cut:
+                    body = (
+                        f"Your call to {call.name} arrived cut off — the arguments stop "
+                        "partway through, so the call was not made. Nothing is wrong with "
+                        "your JSON; this is what running into the "
+                        f"{config_for(self.state.mode).max_tokens:,}-token output limit "
+                        "looks like.\n\n"
+                        "Make the next reply shorter: fewer tool calls in one turn, and "
+                        "less prose before them. One call is enough."
+                    )
+                    said = f"output limit reached mid-call; {names} was not dispatched"
+                else:
+                    # Complete, but never dispatched: the turn is abandoned at the
+                    # truncation. Saying so is what keeps the wire coherent.
+                    body = (
+                        f"{call.name} was not run. Another call in the same reply was cut "
+                        "off by the output limit, so the whole turn was abandoned before "
+                        "anything was dispatched.\n\nAsk for it again in a shorter reply."
+                    )
+                    said = f"{call.name} was not dispatched; the reply was cut off"
+                self.context.append_tool_result(call.name, body, tool_call_id=call.id)
+                yield Event(
+                    EventType.TOOL_RESULT,
+                    {"id": call.id, "name": call.name, "ok": False, "content": said},
+                )
             return
 
         if result.chat.tool_calls:
@@ -858,6 +942,11 @@ class AgentLoop:
 
         mutated = False
         dispatched = False
+        #: Dispatched calls that actually told the run something it did not
+        #: already have. ``dispatched`` answers "did anything run";
+        #: ``informed`` answers "did anything change what we know", which is
+        #: the question the stall detector is actually asking.
+        informed = 0
 
         # Whether this whole reply is one fingerprint asked again — the only
         # shape it is safe to supersede wholesale. A reply that also said
@@ -888,11 +977,26 @@ class AgentLoop:
                     pair.append(assistant_msg)
                 pair.append(echo)
 
-        for call in calls:
+        for index, call in enumerate(calls):
             if self.cancelled():
                 # Before the call, not after. A batch can hold five writes, and
                 # "it stopped but three more files changed" is the report this
                 # check exists to prevent.
+                #
+                # The calls we are abandoning still get answered. The assistant
+                # message declaring all of them is already in the working set, so
+                # returning here left every undispatched call orphaned — and an
+                # aborted session is ``Status.resumable``, so the orphan was
+                # carried into the resume and every later request with it.
+                # Measured with a three-call batch cancelled after the first:
+                # orphaned ['r2', 'r3'].
+                for pending in calls[index:]:
+                    self.context.append_tool_result(
+                        pending.name,
+                        f"{pending.name} was not run: the developer stopped the run "
+                        "before this call was dispatched.",
+                        tool_call_id=pending.id,
+                    )
                 self.result = self._abort()
                 return
 
@@ -940,6 +1044,7 @@ class AgentLoop:
                         "id": call.id,
                         "name": call.name,
                         "ok": True,
+                        "intercepted": True,
                         "arguments": args,
                         "content": f"{call.name}: known dead end; answered without re-running",
                     },
@@ -1005,6 +1110,7 @@ class AgentLoop:
                         "id": call.id,
                         "name": call.name,
                         "ok": True,
+                        "intercepted": True,
                         "arguments": args,
                         "content": (
                             f"{call.name} asked again with the same arguments; "
@@ -1045,6 +1151,7 @@ class AgentLoop:
                         "id": call.id,
                         "name": call.name,
                         "ok": True,
+                        "intercepted": True,
                         "arguments": args,
                         "content": f"already read {len(ranges)} times this run; not re-read",
                     },
@@ -1084,7 +1191,17 @@ class AgentLoop:
                     )
 
             assert isinstance(outcome, ToolResult)
-            dispatched = True
+            # A tool refused because this mode does not hold it is the one
+            # outcome that says nothing about the call — only about who is
+            # asking. It is not progress, and it is not cacheable.
+            #
+            # Not progress: without this, uncaching the refusal below would let a
+            # model repeat a refused call forever, each repeat reaching the
+            # router and resetting ``stalled_turns``, and no detector would ever
+            # end the run.
+            refused_by_mode = bool(outcome.meta.get("refused_by_mode"))
+            dispatched = dispatched or not refused_by_mode
+            informed += 0 if refused_by_mode else 1
             mutated = mutated or bool(outcome.mutations)
             if call.name == "go_mod":
                 self.state.dependencies_changed = True
@@ -1102,7 +1219,25 @@ class AgentLoop:
             # replayed a rich first answer as a stub -- and a model handed a
             # worse answer than the one it remembered getting kept asking for
             # the original, seven times in one field run.
-            self.state.last_results[fingerprint] = outcome.for_model()[:6000]
+            #
+            # A mode refusal is never stored. The fingerprint is the tool and its
+            # arguments, with no mode in it, so a refusal earned in one mode
+            # would answer the identical call made in the mode that *can* run it
+            # -- and that is not a hypothetical. The field transcript: the
+            # Verifier called ``patch_file`` and was correctly refused; the
+            # ladder switched to the Coder; the Coder made the same call; the
+            # fingerprint matched, the call was never dispatched, and the Coder
+            # was handed "patch_file is not available in verifier mode" as the
+            # result of its own patch. It then said so in prose, was counted as
+            # narrating, and the run died seventeen turns later having changed
+            # nothing.
+            #
+            # ``router.py``'s own comment beside ``_unknown_tool`` already states
+            # the rule this restores: a tool hidden from a mode is deliberately
+            # NOT a dead end, because a mode switch can make it callable. The
+            # ``dead_ends`` ledger honoured that. This one did not.
+            if not refused_by_mode:
+                self.state.last_results[fingerprint] = outcome.for_model()[:6000]
             if outcome.truncated:
                 self.state.truncated_at[fingerprint] = _volume(call)
             else:
@@ -1148,6 +1283,34 @@ class AgentLoop:
                     if not pair:
                         pair.append(assistant_msg)
                     pair.append(result_msg)
+
+            # Said as a message of its own, deliberately, and placed here.
+            #
+            # Appending it to ``outcome.content`` instead would put a
+            # run-relative sentence inside ``last_results[fingerprint]`` — where
+            # it would be replayed forever — and would change the bytes
+            # ``dup_key`` hashes, disabling duplicate collapse for the one tool
+            # this is about. Both were measured on an earlier draft. So the note
+            # goes after every ledger has been written, carrying no
+            # ``tool_call_id``, exactly as the loop's other nudges do.
+            if note := self._retrieval_overlap(call, outcome):
+                self.context.append_tool_result(call.name, note)
+                # A retrieval that returned only sections the run already had did
+                # not inform this turn, so it must not count as progress.
+                #
+                # ``stalled_turns`` measures dispatch, and that is why the field
+                # run survived twenty search_docs turns: every query was worded
+                # differently, so every fingerprint was new, so every call
+                # dispatched and reset the counter to zero. It stayed at zero
+                # until the model finally repeated itself verbatim.
+                #
+                # Scoped to retrieval on purpose. The same idea applied to the
+                # acting tools was measured to end a legitimate run: six declined
+                # approvals on ``db/*.sql`` return a byte-identical refusal, and
+                # counting those as six stalled turns kills the run the developer
+                # is in the middle of steering.
+                informed -= 1
+
             yield Event(
                 EventType.TOOL_RESULT,
                 {"id": call.id, "name": call.name, **outcome.as_dict()},
@@ -1163,7 +1326,7 @@ class AgentLoop:
         # *forever*, so the third ask across a whole read-only phase was fatal
         # no matter what happened in between. Turns without progress is the
         # thing actually worth ending a run over, so it is the thing counted.
-        if dispatched or mutated:
+        if informed > 0 or mutated:
             self.state.stalled_turns = 0
         else:
             self.state.stalled_turns += 1
@@ -1295,7 +1458,7 @@ class AgentLoop:
                     tuple(self.router.touched),
                 )
                 return
-            if _is_explanation(self.context.task_text, text):
+            if _is_explanation(self.context.task_text, text, self.context.directives):
                 # Numbered, and not a plan. "Explain this bootstrapper and how
                 # it deviates from the template" is answered in numbered
                 # paragraphs, and counting them as steps sent the answer to the
@@ -1658,6 +1821,70 @@ class AgentLoop:
         targets = _plan_targets(self.state.plan)
         missing = [p for p in targets if p not in set(self.router.touched)]
         return [] if len(missing) == len(targets) else missing
+
+    def _retrieval_overlap(self, call: ToolCall, outcome: ToolResult) -> str:
+        """What to tell a run that keeps asking the corpus the same thing.
+
+        The field failure this exists for: sixteen Coder turns, every one of them
+        ``search_docs`` and nothing else, each query worded differently so every
+        fingerprint was new and ``stalled_turns`` never left zero. Three of those
+        queries returned the same four sections — the same 196 lines at turns 21,
+        22 and 23 — and the tool said nothing about it, because it cannot. It
+        answers with the best four sections it has whether or not they are any
+        good, and its scores do not separate a question the corpus answers from
+        one that merely uses the corpus's vocabulary (see
+        ``MAX_RETRIEVAL_REPEATS``).
+
+        So the judgement is made here, where the run's history is, and on the
+        answer rather than on the question. A retrieval that brings back sections
+        this run has already been given has not added anything, however new the
+        wording was.
+
+        Returns ``""`` when there is nothing to say, which is the common case.
+        """
+        if call.name != "search_docs" or not outcome.ok:
+            return ""
+        hits = frozenset(str(h) for h in (outcome.meta.get("hits") or ()))
+        if not hits:
+            # "nothing matches" is already an explicit answer; it needs no gloss,
+            # and counting it as a repeat would punish the one reply that is
+            # honest about coming back empty.
+            self.state.retrieval_repeats = 0
+            return ""
+        try:
+            query = str((call.parsed() or {}).get("query", ""))
+        except ValueError:
+            query = ""
+
+        seen: set[str] = set()
+        source = ""
+        for earlier_query, earlier in self.state.retrievals:
+            if len(hits & earlier) / len(hits) >= RETRIEVAL_OVERLAP and not source:
+                source = earlier_query
+            seen |= earlier
+        self.state.retrievals.append((query, hits))
+
+        fresh = hits - seen
+        if fresh:
+            self.state.retrieval_repeats = 0
+            return ""
+        self.state.retrieval_repeats += 1
+
+        if self.state.retrieval_repeats < MAX_RETRIEVAL_REPEATS:
+            return (
+                f"Those are the same sections {source or 'an earlier search'!r} already "
+                "returned — this search added nothing you had not been given.\n\n"
+                "Rewording the question will not reach different sections. Ask about "
+                "something else, or work from what is already above."
+            )
+        return (
+            f"That is {self.state.retrieval_repeats} searches in a row returning sections "
+            "you already have. The knowledge base does not cover this question — that is "
+            "an answer, not a gap to keep searching for.\n\n"
+            "Stop rephrasing it. Follow the pattern in the nearest existing code instead, "
+            "and if the step genuinely cannot be done without knowing this, say which step "
+            "and what you need, in one line."
+        )
 
     def _re_reading(self, call: ToolCall) -> list[str]:
         """The ranges a path has already been read at, once that is too many.
@@ -2100,7 +2327,13 @@ _PLAN_PATH = re.compile(r"\b[\w./-]+/[\w.-]+\.(?:go|sql|ya?ml)\b")
 #: false positive is telling a developer their finished read-only run failed.
 #: Anchored at the step number so a verb in prose underneath does not count.
 _PLAN_EDITS = re.compile(
-    r"^\s*\d+[.)]\s*[-*>\s]*\**\s*"
+    # Markdown decoration between the line start and the number, exactly as
+    # ``_STEP`` allows it. A plan is not less of a plan for being formatted,
+    # and ``**1. Add the repo function**`` is the shape the Planner reaches for
+    # most: it matched ``_STEP`` and not this, so a plan counted its steps and
+    # named no edit, and ``_unstarted_work`` let a run that wrote nothing
+    # finish clean.
+    r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:[*_]{1,3}[ \t]*)?\d+[.)]\s*[-*>\s]*\**\s*"
     # The step may lead with the file it is about before it says what to do:
     # ``1. **`core/domain/product.go`** — add the Product struct``. That shape
     # matched nothing, so a four-step plan read as an investigation and the run
@@ -2108,8 +2341,21 @@ _PLAN_EDITS = re.compile(
     # not arbitrary prose — widening this to "anything up to a verb" is how
     # "Confirm the handler needs no change" becomes an edit step.
     r"(?:[`*\"']*[\w./-]+\.(?:go|sql|ya?ml)[`*\"']*\s*[-—–:]+\s*)?"
-    r"(add|create|write|edit|update|modif|change|register|wire|implement|"
-    r"rename|delete|remove|insert|append|scaffold|generate|refactor|fix)",
+    # Stems, and the trailing ``\b`` is the whole point of writing them this
+    # way. Without it ``add`` matched "Adds", ``register`` matched "Registers"
+    # and ``wire`` matched "Wires" -- so a numbered *explanation* whose
+    # paragraphs open "1. Creates the Temporal worker" / "2. Registers the
+    # workflow" / "3. Wires the lifecycle hooks" read as four edit steps, and
+    # the answer to a question was pinned as a plan and handed to the Coder.
+    #
+    # A plan gives instructions, and an instruction is imperative. The third
+    # person singular is a description of what the code already does and no
+    # plan is ever written in it. ``e`` and ``ing`` are allowed, because
+    # "1. Creating the repository" is a step; ``s`` is not, because
+    # "1. Creates the repository" is a sentence about code that exists.
+    r"(?:add|creat|writ|edit|updat|modify|modifying|chang|register|wir|"
+    r"implement|renam|delet|remov|insert|append|scaffold|generat|refactor|fix)"
+    r"(?:e|ing)?\b",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -2154,8 +2400,6 @@ _REFUSES = re.compile(
 #: How much of a preamble counts as "where the plan should be".
 _REFUSAL_WINDOW = 400
 
-#: A step in a real plan carries one of these. The Planner is told so.
-_ACCEPTS = re.compile(r"^\s*[-*>\s]*\**\s*Accepts\s*:", re.MULTILINE | re.IGNORECASE)
 
 
 def _asks_the_developer(plan: str) -> bool:
@@ -2212,31 +2456,182 @@ def _refuses_to_plan(text: str) -> bool:
 
 
 #: An ``Accepts:`` line — the acceptance criterion the Planner is told to put on
-#: every step. Allowed a little leading decoration, and nothing else: it has to
-#: be the start of a line, or the word appearing in prose would count.
-_ACCEPTS = re.compile(r"^[ \t]{0,6}[-*>]?[ \t]*\**\s*Accepts\s*:", re.MULTILINE | re.IGNORECASE)
+#: every step. It has to start a line, or the word appearing in prose would
+#: count, but the indent is generous: the Planner writes it as a sub-bullet
+#: under a numbered step, and an eight-space ``- Accepts:`` failing to match
+#: cost a real plan the one signal that stops ``_asks_the_developer`` reading it
+#: as a bare question.
+#:
+#: This module used to bind ``_ACCEPTS`` twice. Python took the second, so the
+#: first never ran, and the live pattern quietly changed under anyone reading
+#: the dead one. The dead binding is gone; this is the only one.
+#:
+#: Deliberately not widened with ``|``. ``_ACCEPTS`` is the whole reply-side test
+#: in ``_is_explanation``, so admitting a markdown table row
+#: (``| Accepts: | the criterion |``) would pin an explanation that documents the
+#: step format as a plan and hand it to the Coder — the failure this guard exists
+#: to prevent, arriving through the guard itself.
+_ACCEPTS = re.compile(
+    r"^[ \t]{0,12}(?:[-*>+][ \t]*)*(?:\[[ xX]?\][ \t]*)?(?:\d+[.)][ \t]*)?"
+    r"\**[ \t]*Accepts[ \t]*:",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
-#: A task that asks to be told something. Anchored loosely — these turn up
-#: anywhere in a sentence ("also tell how it deviates") — because this is only
-#: half the test and the other half is what the Planner actually produced.
+#: A task that asks to be told something.
+#:
+#: Widened from a six-word list, every miss of which cost the same thing: the
+#: task fell through to "not a question", the Planner's numbered answer was
+#: pinned as a plan, and the Coder went looking for work in files nobody had
+#: named. "what all have been done in this repo", "give me an overview of the
+#: repo", "analyse the objection handler" and "review the bootstrapper" all
+#: missed, and all four are read-only requests a developer types every day.
+#:
+#: Three kinds of asking, and they need different anchoring.
+#:
+#: *Said in so many words* -- explain, describe, summarise, overview. These
+#: turn up anywhere in a sentence ("also tell me how it deviates"), so they are
+#: matched anywhere.
+#:
+#: *Asked as an inspection* -- analyse, review, audit, examine, compare. A
+#: review is a read with a report at the end. The Planner is not being asked to
+#: change what it is reviewing, and a run that "reviews" by editing has
+#: answered a different question.
+#:
+#: *Asked as a question* -- what, why, how, where, which, when, who. These are
+#: anchored to the start of a clause, because they are also ordinary words in
+#: this domain: "add a WHERE clause" and "the handler needs a When field" are
+#: work, and an interrogative that is not leading a clause is not asking
+#: anything.
 _ASKS_TO_BE_TOLD = re.compile(
-    r"\b(explain|describe|walk me through|tell me|what (is|are|does|do)|"
-    r"how (is|are|does|do|did)|why (is|are|does|do|did)|summari[sz]e)\b",
-    re.IGNORECASE,
+    r"(?:"
+    r"\b(?:explain|explanation|describe|description|clarify|"
+    r"summar(?:y|ies|ise|ize|ising|izing)|overview|rundown|breakdown|"
+    r"walk me through|talk me through|take me through|walk through|"
+    r"tell me|show me|remind me|"
+    r"analy(?:se|ze|sis|ses|zes|sing|zing)|review|reviewing|audit|assess|"
+    r"evaluate|inspect|examine|investigate|compare|critique|"
+    r"what all|how come|any idea|anything else)\b"
+    r"|(?:^|[.;:!?\n,]|\b(?:and|or|but|also|then|so|please)\b)[ \t]*"
+    r"(?:can you |could you |would you |do you know |i wonder )?"
+    r"\b(?:what|why|how|where|which|when|who|whose)\b"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: Where a command can start.
+#:
+#: The old ``_ASKS_FOR_WORK`` matched a work word *anywhere*, and that is what
+#: made "explain what the build does" a build: ``build`` is a noun here, and so
+#: are ``update`` in "the update flow", ``change`` in "the change detection
+#: logic", ``port`` in "the port mapping", ``wire`` in "the wire protocol" and
+#: ``register`` in "what does the register do". Every one of those is a
+#: read-only question the loop sent to the Coder.
+#:
+#: What separates the verb from the noun is position, not spelling. An
+#: imperative opens a clause; a noun sits behind a determiner. So a work word
+#: only counts where a *command* could begin: the start of the message, the
+#: start of a sentence or line, a bullet, or a word that hands off to a fresh
+#: instruction ("and", "then", "please", "can you", "i want you to").
+#: A determiner in front of the word is enough to disqualify it, which is
+#: exactly the discrimination the old regex had no way to make.
+_COMMAND_LEAD = (
+    r"(?:^[ \t]*(?:[-*•][ \t]+|\d+[.)][ \t]+)?"
+    r"|[.;:!?,\n][ \t]*"
+    r"|\b(?:and|then|also|plus|afterwards?|additionally|please|kindly)\b[ \t,]*"
+    r"|\b(?:can|could|would|will) you\b[ \t,]*(?:please[ \t,]*)?"
+    r"|\bi (?:want|need|would like|'d like)(?: you)? to\b[ \t,]*"
+    r"|\byou (?:should|must|need to|have to)\b[ \t,]*"
+    r"|\blet'?s\b[ \t,]*"
+    r"|\bhelp me\b[ \t,]*"
+    r"|\bgo ahead and\b[ \t,]*"
+    r"|\bmake sure (?:you |to )?\b[ \t,]*"
+    r")"
+)
+
+#: The verbs that ask for the code to change.
+_WORK_VERB = (
+    r"(?:add|create|implement|write|edit|update|modify|change|refactor|rename|"
+    r"delete|remove|insert|append|register|wire ?up|wire|scaffold|generate|"
+    r"build|fix|migrate|convert|port|move|split|extend|introduce|replace|"
+    r"rewrite|patch|hook ?up|set ?up|clean ?up|finish|complete|apply|expose|"
+    r"define|declare|stub|mock|bump|upgrade|drop|switch|swap|adjust|tweak|"
+    r"correct|repair|resolve|address|make|do)"
+)
+
+#: What an imperative is followed by, and the second half of the noun test.
+#:
+#: An imperative takes an object, and in English that object almost always
+#: opens with a determiner, a pronoun, a preposition or a path: "add *a*
+#: struct", "migrate *it*", "fix *the* vet failure", "refactor *loop.py*",
+#: "wire *up* the handler". A compound noun does not: "the create and update
+#: *handlers*", "build *pipeline* is broken", "the register *do*". Requiring
+#: the object is what keeps "describe the create and update handlers" a
+#: question -- ``and update`` sits at a command lead, and only the word after
+#: it says which of the two things it is.
+_WORK_OBJECT = (
+    r"(?:[ \t]+(?:a|an|the|this|that|these|those|it|them|its|his|her|their|"
+    r"our|my|your|all|both|each|every|everything|anything|new|another|more|"
+    r"one|two|three|up|out|in|into|over|down|on|off|to|for|from|by|with|"
+    r"back|again|here|there)\b"
+    r"|[ \t]+[`'\"]?[\w-]*[./][\w./-]*)"
 )
 
 #: A task that asks for the code to change. Its presence settles the question on
 #: its own: "explain the bootstrapper, then migrate it" is work with a preamble.
 _ASKS_FOR_WORK = re.compile(
-    r"\b(add|create|write|implement|fix|migrate|convert|port|update|change|"
-    r"modify|refactor|rename|delete|remove|register|wire|scaffold|generate|"
-    r"build|make it|do it|go ahead)\b",
+    _COMMAND_LEAD + r"(?:just |also |now |please |quickly |finally )?"
+    + _WORK_VERB + _WORK_OBJECT,
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: The follow-up that turns an answer into work.
+#:
+#: A read-only run now ends with its answer on screen, and the developer's
+#: reply to that is one word. It arrives as a pinned directive on the same
+#: transcript while ``task_text`` still holds "explain the bootstrapper" -- so
+#: without this, "go" is judged against the original question and answered
+#: again, forever. Matched only when the *whole* message is a go-ahead:
+#: "continue reading the docs and explain" is not one.
+_GO_AHEAD = (
+    r"(?:ok(?:ay)?|k|yes|yep|yeah|yup|sure|right|good|great|perfect|fine|"
+    r"go|go on|go ahead|go for it|do it|do that|do so|proceed|continue|"
+    r"carry on|get to it|have at it|let'?s go|make it so|ship it|apply it|"
+    r"apply them|please do|start|begin|run it|execute|implement it|write it|"
+    r"build it)"
+)
+_SAYS_GO = re.compile(
+    r"^[\s\W]*" + _GO_AHEAD + r"(?:[\s\W]+" + _GO_AHEAD + r")*[\s\W]*$",
     re.IGNORECASE,
 )
 
 
-def _is_explanation(task: str, text: str) -> bool:
+def _asks_for_work(task: str, directives: Sequence[str] = ()) -> bool:
+    """Whether anything the developer has said asks for the code to change.
+
+    The directives matter as much as the task. ``task_text`` is pinned once and
+    never replaced -- a follow-up is appended, not re-pinned, because the
+    original task is what the conversation is about. So on the turn after an
+    answer, the task still reads "explain the bootstrapper" and the only thing
+    that says otherwise is the directive that says "go".
+    """
+    if _ASKS_FOR_WORK.search(task):
+        return True
+    return any(_SAYS_GO.match(d) or _ASKS_FOR_WORK.search(d) for d in directives)
+
+
+def _is_read_only_task(task: str, directives: Sequence[str] = ()) -> bool:
+    """Whether the developer asked to be told something and not for a change.
+
+    Read-only in the strong sense: whatever the Planner comes back with, this
+    run answers and stops. Nothing here is a guess about the reply -- the
+    question is what was asked, and the answer to that does not change because
+    the model chose to phrase its reply in the imperative.
+    """
+    return not _asks_for_work(task, directives) and bool(_ASKS_TO_BE_TOLD.search(task))
+
+
+def _is_explanation(task: str, text: str, directives: Sequence[str] = ()) -> bool:
     """Whether a numbered Planner reply describes something rather than proposing work.
 
     ``_count_steps`` counts anything shaped like a numbered item, which is the
