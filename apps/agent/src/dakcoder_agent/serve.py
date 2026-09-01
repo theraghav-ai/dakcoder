@@ -49,6 +49,30 @@ from .tools.router import Router
 __all__ = ["build", "main"]
 
 
+#: The turn budget's floor, default and ceiling. 40 is sized for a single
+#: vertical slice; a whole-service migration under the conversion SOP touches
+#: every handler and legitimately needs several times that, which is what the
+#: `dakcoder.maxTurns` setting (carried here as DAKCODER_MAX_TURNS) is for. The
+#: ceiling is a cost backstop, not a safety net -- the no-progress machinery is
+#: what catches a run going in circles; the turn budget only bounds what an
+#: honest long run may spend.
+MIN_TURNS, DEFAULT_TURNS, MAX_TURNS = 10, 40, 400
+
+
+def max_turns_from_env() -> int:
+    """DAKCODER_MAX_TURNS, clamped to something the runtime will stand behind.
+
+    Garbage falls back to the default rather than erroring: the variable comes
+    from a settings field, and a typo there should cost the typo'd value, not
+    the whole runtime.
+    """
+    raw = os.environ.get("DAKCODER_MAX_TURNS", "")
+    try:
+        return min(MAX_TURNS, max(MIN_TURNS, int(raw)))
+    except ValueError:
+        return DEFAULT_TURNS
+
+
 def build(
     workspace: Path,
     *,
@@ -74,6 +98,8 @@ def build(
     # document would not catch.
     config = local_config(gateway_url, jwt)
 
+    turns = max_turns_from_env()
+
     def build_loop(session, approve):
         router = Router(space, handlers)
         context = ContextManager(mode=Mode.PLANNER, system_prompt=system_prompt())
@@ -83,6 +109,7 @@ def build(
             router,
             approve=approve,
             cancelled=session.cancel.is_set,
+            max_turns=turns,
         )
 
     runtime = Loopback(

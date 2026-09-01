@@ -283,6 +283,11 @@ def test_the_turn_budget_is_enforced(router: Router, gated) -> None:
     list(agent.run("t", start=Mode.CODER))
     assert agent.context.turn == 3
     assert agent.result.outcome == Outcome.EXHAUSTED
+    # The message is the developer's only signpost out of an exhausted run: the
+    # work is kept, Resume continues it, and the budget itself is a setting. A
+    # whole-service migration died at the cap with none of that said.
+    assert "resumable" in agent.result.summary
+    assert "dakcoder.maxTurns" in agent.result.summary
 
 
 def test_a_transport_failure_ends_the_run_with_an_error_event(router: Router) -> None:
@@ -1760,4 +1765,22 @@ def test_the_third_ask_is_told_what_is_at_stake(router: Router, gated) -> None:
     ]
     assert warned, "the third identical ask got the same polite echo as the first"
     assert "will not be dispatched again" in warned[0].content
+
+def test_the_turn_budget_reads_the_environment(monkeypatch) -> None:
+    """The knob the migration-scale tasks needed: DAKCODER_MAX_TURNS, clamped
+    so a typo in the settings field costs the value, not the runtime."""
+    from dakcoder_agent.serve import DEFAULT_TURNS, MAX_TURNS, MIN_TURNS, max_turns_from_env
+
+    cases = {
+        "": DEFAULT_TURNS,
+        "120": 120,
+        "3": MIN_TURNS,
+        "9999": MAX_TURNS,
+        "plenty": DEFAULT_TURNS,
+    }
+    for raw, want in cases.items():
+        monkeypatch.setenv("DAKCODER_MAX_TURNS", raw)
+        assert max_turns_from_env() == want, (raw, want)
+    monkeypatch.delenv("DAKCODER_MAX_TURNS")
+    assert max_turns_from_env() == DEFAULT_TURNS
 

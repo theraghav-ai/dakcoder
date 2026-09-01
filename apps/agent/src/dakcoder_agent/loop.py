@@ -418,7 +418,10 @@ class AgentLoop:
         if self.result is None:
             self.result = RunResult(
                 Outcome.EXHAUSTED,
-                f"stopped after {self.context.turn} turns without a clean gate",
+                f"stopped after {self.context.turn} turns without a clean gate. "
+                "Nothing is lost: the edits are in the workspace and the session "
+                "is resumable — Resume continues on this same transcript with a "
+                "fresh turn budget. For a task this size, raise dakcoder.maxTurns",
                 self.context.turn,
                 tuple(self.router.touched),
                 self.state.last_gate,

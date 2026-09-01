@@ -143,6 +143,13 @@
           "default": "write_side",
           "description": "Which tool calls need a human first: none, all, write_side, destructive, or an explicit list of tool names. Nothing under configs/** is ever auto-approved, whatever this says."
         },
+        "dakcoder.maxTurns": {
+          "type": "number",
+          "default": 40,
+          "minimum": 10,
+          "maximum": 400,
+          "markdownDescription": "How many turns one run may spend before it stops with `exhausted`. The default suits a single vertical slice; raise it (100\u2013200) for whole-service work such as a template migration. An exhausted session is never lost \u2014 **Resume** continues it on the same transcript with a fresh budget. Takes effect when the runtime restarts."
+        },
         "dakcoder.approvalTimeoutSeconds": {
           "type": "number",
           "default": 0,

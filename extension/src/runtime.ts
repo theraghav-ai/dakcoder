@@ -283,6 +283,14 @@ export class Runtime implements vscode.Disposable {
       DAKCODER_GATEWAY_URL: this.opts.gatewayUrl,
       DAKCODER_GATEWAY_TOKEN: this.loopbackToken,
       DAKCODER_VERSION: extensionVersion(this.opts.extensionPath),
+      // The turn budget, sized by the developer rather than hard-coded: 40
+      // suits a single vertical slice, and a whole-service migration under the
+      // conversion SOP exhausted it mid-task with the work half-landed. The
+      // runtime clamps whatever arrives, so a wild value costs the value, not
+      // the run.
+      DAKCODER_MAX_TURNS: String(
+        vscode.workspace.getConfiguration('dakcoder').get<number>('maxTurns', 40),
+      ),
       // The sidecar ships inside the `.vsix` under a platform-suffixed name
       // (`bin/gotools-win32-x64.exe`, §4.5) and the runtime is a venv under
       // globalStorage, so the child can reach it neither by PATH — which holds
