@@ -2585,6 +2585,36 @@ _ASKS_FOR_WORK = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+#: A lead that can only be an instruction: a conjunction handing off to a second
+#: clause, or an explicit request. Deliberately excludes the weak leads a bare
+#: line start and a full stop give, because those are also how a topic sentence
+#: opens -- "build failures are the problem" must stay a topic.
+_INSTRUCTION_LEAD = (
+    r"(?:\b(?:and|then|also|plus|additionally|please|kindly)\b[ \t,]*"
+    r"|\b(?:can|could|would|will) you\b[ \t,]*(?:please[ \t,]*)?"
+    r"|\bi (?:want|need|would like|'d like)(?: you)? to\b[ \t,]*"
+    r"|\byou (?:should|must|need to|have to)\b[ \t,]*"
+    r"|\blet'?s\b[ \t,]*|\bhelp me\b[ \t,]*|\bgo ahead and\b[ \t,]*)"
+)
+
+#: The second pass: a strong lead buys a bare-noun object. See
+#: ``_one_asks_for_work``.
+_ASKS_FOR_WORK_LOOSE = re.compile(
+    _INSTRUCTION_LEAD + r"(?:just |also |now |please |quickly |finally )?"
+    + _WORK_VERB + r"[ \t]+[\w`'\"]",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: Two work words conjoined behind one determiner are a noun phrase, not two
+#: instructions: "describe the **create and update** handlers". The determiner
+#: two words before the conjunction is the tell -- "review **the handler** and
+#: fix errors" has a noun in between and does not match.
+_CONJOINED_NOUNS = re.compile(
+    r"\b(?:a|an|the|this|that|these|those|its|their|our|your|my)[ \t]+"
+    + _WORK_VERB + r"[ \t]+(?:and|or)[ \t]+" + _WORK_VERB + r"\b",
+    re.IGNORECASE,
+)
+
 #: The follow-up that turns an answer into work.
 #:
 #: A read-only run now ends with its answer on screen, and the developer's
@@ -2593,8 +2623,14 @@ _ASKS_FOR_WORK = re.compile(
 #: without this, "go" is judged against the original question and answered
 #: again, forever. Matched only when the *whole* message is a go-ahead:
 #: "continue reading the docs and explain" is not one.
+#: Only explicit affirmatives. A reaction is not authorisation: ``right``,
+#: ``good``, ``great``, ``perfect`` and ``fine`` were all here and all of them
+#: are things a developer says about the *answer* -- and "right?" is a question,
+#: which the trailing ``[\s\W]*$`` swallowed into a match. This is ORed over
+#: ``context.directives``, which ``pin_directive`` keeps for the session, so one
+#: false match authorises writes for every later question in that session.
 _GO_AHEAD = (
-    r"(?:ok(?:ay)?|k|yes|yep|yeah|yup|sure|right|good|great|perfect|fine|"
+    r"(?:ok(?:ay)?|k|yes|yep|yeah|yup|sure|"
     r"go|go on|go ahead|go for it|do it|do that|do so|proceed|continue|"
     r"carry on|get to it|have at it|let'?s go|make it so|ship it|apply it|"
     r"apply them|please do|start|begin|run it|execute|implement it|write it|"
@@ -2615,9 +2651,38 @@ def _asks_for_work(task: str, directives: Sequence[str] = ()) -> bool:
     answer, the task still reads "explain the bootstrapper" and the only thing
     that says otherwise is the directive that says "go".
     """
-    if _ASKS_FOR_WORK.search(task):
+    return _one_asks_for_work(task) or any(
+        _SAYS_GO.match(d) or _one_asks_for_work(d) for d in directives
+    )
+
+
+def _one_asks_for_work(text: str) -> bool:
+    """Whether one message asks for a change.
+
+    Two passes, because the object rule that keeps "the update flow" a noun is
+    too strict for the commonest way a developer actually asks for work:
+    "review the objection handler **and fix compilation errors**". ``_ASKS_FOR_WORK``
+    wants a determiner, a pronoun or a path after the verb, and "compilation
+    errors" is a bare noun -- so six of eight realistic compound requests were
+    read as questions and answered instead of executed.
+
+    The second pass relaxes the object to any word, and pays for it by demanding
+    a *strong* lead: a conjunction or an explicit request form, never a bare line
+    start or full stop. "and fix errors" is an instruction; "build failures" at
+    the start of a line is a topic.
+
+    ``_CONJOINED_NOUNS`` is the one hole that opens, and it is closed directly.
+    In "describe the **create and update** handlers" both verbs are nouns sharing
+    one determiner and one head, so the "and update" looks exactly like a second
+    instruction. A determiner two words before the conjunction is what tells them
+    apart: "review **the handler** and fix errors" has a noun in between.
+
+    Measured on 8 compound work requests and 18 read-only phrasings: 8/8 caught,
+    0/18 false positives. Without the second pass, 2/8.
+    """
+    if _ASKS_FOR_WORK.search(text):
         return True
-    return any(_SAYS_GO.match(d) or _ASKS_FOR_WORK.search(d) for d in directives)
+    return bool(_ASKS_FOR_WORK_LOOSE.search(text)) and not _CONJOINED_NOUNS.search(text)
 
 
 def _is_read_only_task(task: str, directives: Sequence[str] = ()) -> bool:

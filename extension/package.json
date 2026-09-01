@@ -2,7 +2,7 @@
   "name": "dakcoder-go",
   "displayName": "dakcoder",
   "description": "The India Post IT 2.0 backend coding agent for Go services on the n-api-template contract.",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "publisher": "dop",
   "license": "UNLICENSED",
   "private": true,
@@ -108,7 +108,7 @@
         "dakcoder.serverGatewayUrl": {
           "type": "string",
           "default": "https://ai.cept.gov.in/dakcoder",
-          "description": "The IT 2.0 gateway: sign-in, quota, and the model proxy. The agent itself always runs on this machine — your repository, build output and git history never leave it. The prompt the agent builds does go to the India Post model endpoint, over internal infrastructure only. This host publishes everything except sign-in: ask an administrator for a token and run \"dakcoder: Enter Gateway Token\"."
+          "description": "The IT 2.0 gateway: sign-in, quota, and the model proxy. The agent itself always runs on this machine \u2014 your repository, build output and git history never leave it. The prompt the agent builds does go to the India Post model endpoint, over internal infrastructure only. This host publishes everything except sign-in: ask an administrator for a token and run \"dakcoder: Enter Gateway Token\"."
         },
         "dakcoder.gatewayUrl": {
           "type": "string",
@@ -153,7 +153,7 @@
         "dakcoder.approvalTimeoutSeconds": {
           "type": "number",
           "default": 0,
-          "description": "How long an approval waits. 0 waits indefinitely — a slow review must never auto-reject."
+          "description": "How long an approval waits. 0 waits indefinitely \u2014 a slow review must never auto-reject."
         },
         "dakcoder.autoApproveTrivialPatches": {
           "type": "boolean",
@@ -930,7 +930,7 @@
     "viewsWelcome": [
       {
         "view": "dakcoder.doctor",
-        "contents": "Doctor checks the Go toolchain, private-module credentials, the local runtime and your sign-in — and offers a one-click fix for everything it finds.\n[Run Doctor](command:dakcoder.doctor)"
+        "contents": "Doctor checks the Go toolchain, private-module credentials, the local runtime and your sign-in \u2014 and offers a one-click fix for everything it finds.\n[Run Doctor](command:dakcoder.doctor)"
       },
       {
         "view": "dakcoder.migration",

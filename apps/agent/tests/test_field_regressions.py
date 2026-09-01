@@ -411,3 +411,57 @@ def test_a_search_that_returns_nothing_new_says_so_and_is_eventually_withdrawn(r
     assert told, "the run was never told it was getting the same sections back"
     assert any("does not cover" in t for t in told), "the corpus was never declared exhausted"
     assert False in client.offered, "search_docs was never withdrawn"
+
+
+# ── a compound request is work, and a conjoined noun phrase is not ──────────
+
+
+@pytest.mark.parametrize(
+    ("task", "is_work"),
+    [
+        # "review X and fix Y" is how developers actually ask. The object rule
+        # that keeps "the update flow" a noun rejected the bare noun after the
+        # second verb, so 6 of these 8 were answered instead of executed.
+        ("review the objection handler and fix compilation errors", True),
+        ("explain the bootstrapper, then migrate it to the new template", True),
+        ("look at routes.go and add pagination", True),
+        ("check the handler then write unit tests", True),
+        ("review this file and remove dead code", True),
+        ("describe the flow and please fix vet errors", True),
+        ("explain the repo and add employee crud", True),
+        ("summarize routes.go then register the new handler", True),
+        # Two work words conjoined behind one determiner are a noun phrase.
+        ("describe the create and update handlers", False),
+        ("explain the add and remove handlers", False),
+        ("what are the create and delete endpoints", False),
+        # Nouns that happen to spell a work verb.
+        ("explain what the build does", False),
+        ("explain the change detection logic", False),
+        ("explain the port mapping and the wire protocol", False),
+        ("what does the register do", False),
+        ("describe the update flow and the build step", False),
+        ("explain the next change in the pipeline", False),
+        ("what is the generate step", False),
+        # A pasted list is data, not a command, even when a line is a work word.
+        ("explain these fields:\n- id\n- update\n- port", False),
+        ("describe the pipeline steps:\n1. build\n2. test\n3. deploy", False),
+    ],
+)
+def test_a_work_word_counts_only_where_a_command_could_begin(task, is_work):
+    from dakcoder_agent.loop import _asks_for_work
+
+    assert _asks_for_work(task) is is_work
+
+
+def test_courtesy_does_not_latch_write_authorisation_for_the_session():
+    """`_SAYS_GO` is ORed over `context.directives`, which `pin_directive` keeps
+    for the session. An earlier draft matched "thanks", "and" and "so", so one
+    courtesy reply after an answered question authorised writes for every later
+    question in that session.
+    """
+    from dakcoder_agent.loop import _asks_for_work
+
+    for courtesy in ["thanks", "thank you", "and", "so", "right?", "already", "hmm"]:
+        assert _asks_for_work("explain the bootstrapper", (courtesy,)) is False, courtesy
+    for affirmative in ["go", "go ahead", "yes", "do it", "proceed", "ok"]:
+        assert _asks_for_work("explain the bootstrapper", (affirmative,)) is True, affirmative
