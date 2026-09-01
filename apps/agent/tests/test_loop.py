@@ -57,6 +57,11 @@ def say(text: str) -> ChatResult:
     return ChatResult(content=text, finish_reason="stop", usage=Usage(prompt_tokens=100))
 
 
+#: A minimal reply the Planner's `_advance` accepts as a plan: one numbered step
+#: naming a real file, with the Accepts: line every step is required to carry.
+PLAN = "1. Confirm handler/user.go compiles\n   Accepts: builds"
+
+
 def calls(*specs: tuple[str, str]) -> ChatResult:
     return ChatResult(
         tool_calls=[
@@ -713,7 +718,14 @@ def test_a_repeated_call_is_answered_and_three_is_not_fatal(router: Router, gate
         r for r in results if "answered from the previous result" in str(r.get("content", ""))
     ]
     assert len(answered) == 2, "both repeats answered from the ledger"
-    assert all(r["ok"] is False for r in answered)
+    assert all(r["ok"] is True for r in answered), (
+        "an echo carries the answer the call produced, so it reports success — "
+        "drawn as a failure it reads as a call to retry, which is the loop"
+    )
+    assert all(r.get("arguments") for r in answered), (
+        "an intercept emits no TOOL_CALL, so it must carry its own arguments or "
+        "the client draws a bare tool name with nothing beside it"
+    )
     assert agent.result.outcome != Outcome.NO_PROGRESS, (
         "three identical calls ended the run again"
     )
@@ -1741,12 +1753,66 @@ def test_the_cached_echo_carries_the_whole_result(router: Router, gated) -> None
 
     echoes = [
         m for m in agent.context.build()
-        if "That answer still stands" in m.content
+        if "that is the current answer" in m.content
     ]
     assert echoes, "the repeated read was not answered from the ledger"
     assert "MARKER-AT-THE-END" in echoes[0].content, (
         "the echo truncated the result; the model is being handed a stub of "
         "the answer it remembers getting"
+    )
+
+
+def test_a_bigger_max_on_the_same_search_is_the_same_question(router: Router, gated) -> None:
+    """`max` bounds the answer, it does not choose it.
+
+    A Planner that had established a legacy service has no `Routes()` method
+    asked again as `max: 200`, got the same "no matches", and bought two more
+    dispatched turns for it — every ledger keyed on the raw argument string saw
+    a call it had never seen.
+    """
+    agent, events = loop_over(
+        router,
+        [
+            calls(("search_repo", '{"pattern": "^func Nope"}')),
+            calls(("search_repo", '{"pattern": "^func Nope", "max": 200}')),
+            say(PLAN),
+            say("ok"),
+        ],
+    )
+    dispatched = [
+        e for e in of_type(events, EventType.TOOL_CALL) if e.data["name"] == "search_repo"
+    ]
+    assert len(dispatched) == 1, "raising max asked the same question twice"
+
+
+def test_a_bigger_max_after_a_truncated_answer_does_dispatch(router: Router, gated) -> None:
+    """The one case where the cap does change the answer.
+
+    An answer that stopped at the cap has more behind it, so raising the cap is
+    a genuinely new question. Excluding `max` unconditionally would pin the
+    model to the truncated result for the rest of the run.
+    """
+    from dakcoder_shared.envelope import ToolResult as TR
+
+    calls_seen: list[int] = []
+
+    def wide(inv):
+        limit = inv.arg("max") or 40
+        calls_seen.append(limit)
+        return TR.success("\n".join(f"hit {i}" for i in range(limit)), truncated=limit < 200)
+
+    router.handlers["search_repo"] = wide
+    agent, events = loop_over(
+        router,
+        [
+            calls(("search_repo", '{"pattern": "func", "max": 40}')),
+            calls(("search_repo", '{"pattern": "func", "max": 200}')),
+            say(PLAN),
+            say("ok"),
+        ],
+    )
+    assert calls_seen == [40, 200], (
+        "a truncated answer must not pin the model to the cap that truncated it"
     )
 
 
@@ -1764,7 +1830,7 @@ def test_the_third_ask_is_told_what_is_at_stake(router: Router, gated) -> None:
         if "ask number 3" in m.content
     ]
     assert warned, "the third identical ask got the same polite echo as the first"
-    assert "will not be dispatched again" in warned[0].content
+    assert "keep returning the answer above" in warned[0].content
 
 def test_the_turn_budget_reads_the_environment(monkeypatch) -> None:
     """The knob the migration-scale tasks needed: DAKCODER_MAX_TURNS, clamped
@@ -1802,7 +1868,7 @@ def test_repeated_intercepts_collapse_to_one_pair(router: Router, gated) -> None
     )
 
     messages = agent.context.build()
-    echoes = [m for m in messages if "That answer still stands" in m.content]
+    echoes = [m for m in messages if "that is the current answer" in m.content]
     assert len(echoes) == 1, (
         f"{len(echoes)} intercept answers in context; two identical pairs is "
         "the measured tipping point into a 100% repeat loop"

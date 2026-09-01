@@ -11,9 +11,28 @@ fetch_when: "converting or migrating a whole legacy api-* service to the n-api t
 
 The migration program's SOP, in execution order: branch, swap the dependencies, convert every handler, regenerate validation, modernise the tests, prove the swagger document exists.
 
-Every rule in here was paid for. The dependency swap has one wrong turn that breaks the FX graph; the handler conversion has two mistakes that fail only at runtime; the validation step has two more that fail only when a request arrives. Follow the order, and treat the CRITICAL rules as blocking.
+Every rule in here was paid for, and five of them are marked CRITICAL: each breaks a service in a way the compiler does not catch. They are collected in the first section below, and repeated in place at the step they belong to. Follow the order, and treat the CRITICAL rules as blocking.
 
 Run `legacy_audit` before starting and after finishing — it should go from a page of findings to none.
+
+## The CRITICAL rules, in one place
+
+Five rules whose violation compiles. Four surface only when the service runs or
+a request arrives; one collides at build time. Each is repeated below at the
+step it belongs to — this section exists so that asking for "the CRITICAL rules"
+finds them, rather than finding the paragraph that mentions them.
+
+| # | Rule | Step | Fails |
+|---|---|---|---|
+| 1 | Use `n-api-bootstrapper`, never the legacy `api-bootstrapper`, and pin `protovalidate-go@v0.10.1` | 2 | FX graph, at start-up |
+| 2 | A handler parameter may not be a raw slice — wrap it in a struct tagged `validate:"dive"` | 3 | runtime, on first request |
+| 3 | Write route prefixes explicitly; `n-api-server` mounts paths exactly as `Routes()` declares them | 3 | runtime, as a 404 |
+| 4 | Never hand-write a `Validate()` method on a request DTO — `govalid` generates it | 4 | compile time |
+| 5 | Every request DTO carries at least one `validate:` tag, even `validate:"omitempty"` | 4 | bind time, as `validator not implemented` |
+
+Rules 2 and 3 are the two handler-conversion mistakes that fail only at runtime;
+rules 4 and 5 are the two validation mistakes. Rule 1 is the dependency swap's
+one wrong turn.
 
 ## What the conversion changes, in one screen
 

@@ -34,7 +34,13 @@ from .router import Invocation
 
 __all__ = ["Corpus", "HANDLERS", "handlers_for", "load_playbooks"]
 
-_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+#: A term. The leading class admits digits, which it did not until 2026-09-01.
+#: Requiring a letter first made ``3`` unindexable, so "step 3" tokenised to
+#: ``step`` and steps 1, 2 and 3 were the same query: a Planner asking for
+#: "legacy migration step 3" was answered with Step 1, every time, and searched
+#: until the run was killed. Bare numbers are rare in these documents and
+#: discriminating when they appear -- the step numbers, ``v0.10.1``, ``422``.
+_WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_]*")
 
 #: Words carrying no retrieval signal here. Deliberately short: an aggressive
 #: stop-list would drop "get", "new" and "error", which are the most
@@ -65,7 +71,12 @@ def _tokenise(text: str) -> list[str]:
         parts = re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+", word)
         if len(parts) > 1:
             out.extend(p.lower() for p in parts)
-    return [w for w in out if w not in _STOP and len(w) > 1]
+    # Single digits survive the length filter; single letters do not. "step 3"
+    # is a question this corpus can answer and "step x" is not, and dropping
+    # one-character terms wholesale is the other half of why it could not.
+    # Frequency takes care of the rest: "1" is in most documents and earns
+    # almost no IDF, while "3" is in few and earns a lot.
+    return [w for w in out if w not in _STOP and (len(w) > 1 or w.isdigit())]
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,13 +162,27 @@ class Corpus:
         return scored[:limit]
 
 
+#: A YAML frontmatter block at the very top of a document.
+_FRONTMATTER = re.compile(r"\A---\r?\n.*?\r?\n---[ \t]*\r?\n?", re.DOTALL)
+
+
 def _split_sections(document: str, text: str) -> list[Section]:
     """Split markdown on headings, keeping fenced code intact.
 
     Splitting without tracking fences would cut a section at a ``#`` comment
     inside a shell block — which is how a retrieval index ends up returning half
     a code example with no context.
+
+    The frontmatter is stripped first. Left in, it became a section of its own
+    whose heading was the document name — so ``slug: legacy-migration`` and
+    ``fetch_when: converting or migrating a whole legacy api-* service`` were
+    indexed as prose, and collected the heading-overlap boost besides. It cost
+    18 of 109 sections and 16% of every top-4, and for five of twenty measured
+    queries the highest-scoring passage in the whole knowledge base was four
+    lines of YAML. It is routing metadata; ``SKILL.md`` publishes it already.
     """
+    text = _FRONTMATTER.sub("", text, count=1)
+
     sections: list[Section] = []
     heading = document
     level = 1

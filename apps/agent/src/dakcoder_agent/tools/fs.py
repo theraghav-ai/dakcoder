@@ -188,7 +188,13 @@ def read_file(inv: Invocation) -> ToolResult:
     body = "\n".join(lines[start - 1 : end])
     span = f"lines {start}-{end} of {total}" if (start, end) != (1, total) else f"{total} lines"
     header = f"{inv.path()} ({span})"
-    return ToolResult.success(f"{header}\n{body}", meta={"lines": total})
+    # `span` in meta is the *clamped* range, which is what the context manager's
+    # slice ledger compares. Deriving it from the call arguments instead would
+    # read `end=99999` on a 200-line file as a range no later whole-file read
+    # contains, and keep both copies for the rest of the run.
+    return ToolResult.success(
+        f"{header}\n{body}", meta={"lines": total, "span": [start, end]}
+    )
 
 
 # ── write ───────────────────────────────────────────────────────────────────
@@ -369,20 +375,31 @@ def search_repo(inv: Invocation) -> ToolResult:
             break
 
     if not hits:
-        # Zero hits with somewhere to go next, not zero hits full stop.
+        # Zero hits is a finding, not a failed attempt.
         #
-        # A one-line "no matches" is correct and useless: in the field a model
-        # answered it by re-phrasing the same search until the run died. What
-        # it lacked was anything to aim the next search at, so the answer now
-        # carries the workspace's own top level — the model can see what the
-        # repository actually contains and search inside something real.
+        # This used to close with "Loosen the pattern, or scope a new one with
+        # glob", which is an instruction to search again — and a model obeys it.
+        # A Planner establishing that a legacy service has no `Routes()` method
+        # was told five times in a row to loosen a pattern that was already
+        # right, and went `func \(.*\) Routes\(\)` -> `func \(.*\) Routes` ->
+        # `Routes` -> +glob -> +max until the run was killed for making no
+        # progress. Every one of those searches returned the truthful answer to
+        # the question it asked.
+        #
+        # So the answer now says what zero matches means first, and offers the
+        # workspace's top level as orientation rather than as a prompt to
+        # re-search. Aiming somewhere real is still worth having; being told to
+        # try again is not.
         top = _top_level(root)
-        body = f"no matches for {pattern!r} in {scanned} files."
+        body = (
+            f"no matches for {pattern!r} in {scanned} files — this pattern is not "
+            "in the searched files. If you were checking whether something exists "
+            "here, that is your answer: it does not."
+        )
         if top:
             body += (
-                "\n\nThe workspace's top level, for aiming the next search:\n"
+                "\n\nThe workspace's top level, if you need somewhere else to look:\n"
                 + "\n".join(f"  {entry}" for entry in top)
-                + "\nLoosen the pattern, or scope a new one with glob."
             )
         return ToolResult.success(body, meta={"scanned": scanned})
 

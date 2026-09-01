@@ -1711,6 +1711,275 @@ The load-bearing assertions, and what each is guarding against:
 
 ## 5. Changelog
 
+### 2026-09-01 — The six fixes, and what each one moved
+
+The diagnosis below, acted on. Verified the way it was found: live runs against
+`https://ai.cept.gov.in/dakcoder` on `Qwen3.8-27B`, same three tasks, same two
+workspaces. The failure moved down the list each time a cause was removed, which
+is the useful part of the record — none of these six would have been enough
+alone, and the order they surfaced in is the order they cost.
+
+| Run | Task | Before | After |
+|---|---|---|---|
+| A | migrate the whole service | `no_progress` @22 | `exhausted` @40, edits made, gate cycling |
+| B | convert every handler, step 3 | `no_progress` @27 | `exhausted` @40, plan @14 |
+| C | plan the migration | `no_progress` @22 | `done` @13, plan + four questions |
+| D | add one GET route | — | `done` @28, gate clean |
+
+The sharper measure is intercepts. Run B's forty turns produced **one** answered
+repeat and never took `stalled_turns` above 1; before, its last twelve wire
+messages were nothing but refusals and it died at six. `exhausted` on A and B is
+the honest outcome for converting a hundred-odd handlers in forty turns, and the
+summary says so — `raise dakcoder.maxTurns`. It is a budget, not a loop failure.
+
+**The slice ledger is keyed on `(path, range)`.** `_supersede_slice` collapsed
+any earlier read of a path, so three disjoint windows of a 6,571-line file left
+two stubs saying *"re-read if needed"* over lines held nowhere else — and the
+repeat ledger then refused the re-read the stub had asked for. Two true messages,
+neither obeyable. Now a read supersedes an earlier one only when it **contains**
+it, which is the only case where collapsing costs the model nothing; the stub
+says where the lines went rather than telling it to fetch them again. The range
+is the *clamped* one, reported by `read_file` in `meta["span"]`, because
+`end=99999` on a 200-line file is `(1, 200)` and comparing raw arguments would
+call that disjoint from the whole-file read that supersedes it.
+
+Found on the way: `ContextManager.discard` removed messages without reindexing,
+so every slice index below a discarded pair was off by one — the same corruption
+`_reindex_slices` exists to prevent after compaction, on a path that never
+called it.
+
+**An echo leads with the answer.** The intercept opened `"Not run:"` and arrived
+`ok: false`, so a call that had succeeded was drawn with a ✗ — and a model that
+reads a failure retries it. The content was always there, three lines under a
+refusal. It now opens with the result and reports success. This is the same
+finding `discard` already records from the other side: the transcript is a
+stronger instruction than the prose in it.
+
+**Intercepts carry their own arguments.** `TOOL_CALL` still means *dispatched* —
+eleven tests depend on that and they are right to — so the arguments ride on the
+`TOOL_RESULT` instead, and `chat.js` fills the row's summary from there when no
+`tool_call` opened it. That is why the reported transcript was a column of bare
+`search_docs` rows with no query beside them, in precisely the situation where
+the query is the whole story.
+
+**The fingerprint ignores `max` and `limit`.** They bound an answer; they do not
+choose it. A Planner that had established a legacy service has no `Routes()`
+method asked again with `max: 200` and bought two more dispatched turns, because
+every ledger keyed on the raw argument string. With one exception, which
+`truncated_at` holds: an answer that *stopped at its cap* has more behind it, so
+raising the cap is a genuinely new question and is dispatched. A complete answer
+is complete at any cap.
+
+**Zero matches is a finding, not a failed attempt.** `search_repo` closed with
+*"Loosen the pattern, or scope a new one with glob"* — an instruction to search
+again, added in the field to stop this very loop. The model obeyed it five times
+running while every one of its searches returned the truthful answer. It now
+says what zero matches means first, and offers the workspace's top level as
+orientation rather than as a prompt. In run C the `Routes()` search happened
+once and was accepted; before, it started a seven-way reformulation cascade that
+ended the run.
+
+**The knowledge base keeps its promise, and can be searched by number.** Three
+defects, one document:
+
+- `legacy-migration.md` promised *"the CRITICAL rules"* and the word appeared
+  nowhere else in it — the three real ones in `SOP.md` were never carried
+  through. There is now a **"The CRITICAL rules, in one place"** section holding
+  all five with the step and the failure mode of each, and the intro points at
+  it instead of counting. A cross-reference cannot go stale the way a tally can.
+- `_WORD` required a leading letter, so `3` was unindexable and *"step 3"*
+  tokenised to *"step"* — steps 1, 2 and 3 were the same query, and a Planner
+  asking for step 3 was answered with step 1 every time. Digits are terms now,
+  and single digits survive the length filter that single letters do not.
+- YAML frontmatter was indexed as a section whose heading was the document name,
+  so it collected the heading-overlap boost as well. 18 of 109 sections were
+  pure metadata, taking 16% of every top-4 and ranking **first** for 5 of 20
+  measured queries.
+
+Measured on the query that killed the reported run — *"legacy migration step 3
+CRITICAL handler conversion two mistakes fail only at runtime"*:
+
+| | Before | After |
+|---|---|---|
+| top hit | the intro that generated the query, 25.99 | **The CRITICAL rules**, 57.39 |
+| the intro | 1st | 2nd, 22.62 |
+| sections in corpus | 109, 18 of them metadata | 92, none |
+
+That is the fixpoint broken: the query the document inspires now retrieves the
+answer instead of the promise.
+
+**The Planner has a research ceiling.** It was the one mode with no stopping
+condition — every other detector fires on a turn that called *nothing*, and a
+Planner calling a tool every turn reaches none of them. Run B spent all forty
+turns reading twenty-line windows, in perfect health by every measure the loop
+has, and finished with no plan and nothing to show. At twelve tool-calling turns
+it is asked for the plan; at sixteen its tools are withdrawn for one turn so
+prose is the only reply available and `_advance` gets to run. Deliberately not a
+way to end a run: what comes back is a plan, a question or "nothing to do", and
+each was already handled. In practice the nudge is enough — run B planned at
+turn 14 and run C at turn 13, neither reaching the limit.
+
+**Two adjacent repairs.** `make knowledge` now exists; every generated file and
+`.gitlab-ci.yml` had told people to run it for some time, and `packages/knowledge`
+— one of the two copies `_knowledge_root` describes as held identical — was
+empty. The target writes both from one generator run, so they cannot disagree.
+
+**Still open.** The Coder inherits the Planner's old shape: run B spent 26 turns
+reading without an edit, which no detector sees because it calls a tool every
+turn. Run D reported `done` after step 1 of its plan, with a clean gate on a
+partial change — the gate checks what was written, not what the plan said would
+be. And `test_a_comma_separated_path_list_becomes_an_array` fails on
+`json.loads` of the sidecar's `rules_lint` output; it fails identically on
+unmodified code, so it predates all of this.
+
+### 2026-09-01 — Why the Planner still stops for no progress: two subsystems giving opposite orders
+
+Three live runs against `https://ai.cept.gov.in/dakcoder` (model `Qwen3.8-27B`,
+minted dev token), driving `AgentLoop` directly against
+`pao-back-end-development`. All three ended `no_progress` — at turns 22, 27 and
+27 — without producing a plan, and without writing a line. The 2026-08-28 entry
+below fixed four causes of this shape; none of them is what is happening now.
+
+The detector is not misfiring. `MAX_STALLED_TURNS` counts turns in which nothing
+was dispatched, and in every run the last six turns genuinely dispatched
+nothing. The question is why a model that was working normally at turn 15 has
+nothing left to ask by turn 22, and the answer is that two mechanisms written to
+save context are, in combination, instructing the model to do something a third
+mechanism then refuses.
+
+**The stale-read stub tells the model to re-read; the repeat ledger refuses the
+re-read.** `ContextManager._supersede_slice` is keyed on **path alone**, not on
+the line range. Reading three disjoint windows of one file collapses the first
+two to
+
+```
+[stale read of handler/paogen.go — superseded by a later read in this
+ conversation; re-read if needed]
+```
+
+In run 3 that happened to a **6,571-line** file: the model read lines 40–150,
+153–205 and 3777–3840, and was left holding 64 lines of it with two stubs above
+them saying *re-read if needed*. It did exactly that, and
+`AgentLoop._tool_calls` answered from `last_results` with
+
+```
+Not run: you have already called read_file with exactly these arguments this
+run, and nothing in the workspace has changed since. […] That answer still
+stands. Do something different […]
+```
+
+Both messages are individually correct and they cannot both be obeyed. The
+content really was removed, and the call really was made before. There is no
+third move available, so the model alternates between the two calls the two
+messages point at until the stall counter reaches six. The last twelve wire
+messages of run 3 are nothing but `Not run:` refusals — that wall is the last
+thing the model sees before every one of its final turns.
+
+Two aggravating details. `"Not run:"` is a poor opening for a message whose body
+*is* the answer: it reads as a failure, and the event carries `ok: false`, so the
+extension draws it with a cross. The escalation that says *"the answer above IS
+the result"* only appears on ask number three, by which point `stalled_turns` is
+already at 3 of 6. And an intercepted call emits no `tool_call` event at all, so
+those rows render with no argument preview — which is why the failing rows in a
+transcript look like a bare tool name with no query beside it.
+
+**Semantically identical searches are six different fingerprints.** Every ledger
+— `seen_calls`, `last_results`, `dead_ends`, `_re_reading` — keys on
+`f"{call.name}:{call.arguments}"`. In run 2 the Planner correctly established
+that a legacy service has no `Routes()` method, then asked the same question
+seven more ways:
+
+```
+func \(.*\) Routes\(\)   ->  func \(.*\) Routes  ->  Routes
+        + glob "**/*.go"  ->  + max 200
+```
+
+Nine consecutive zero-match results, seven distinct fingerprints, nothing
+intervening. `max` in particular is a pure fingerprint-buster: it cannot change
+whether a pattern matches, and adding it bought two more dispatched turns.
+
+**And `search_repo` supplies the loosening instruction itself.** A zero-match
+search returns `ToolResult.success` whose body ends *"Loosen the pattern, or
+scope a new one with glob."* — added in the field precisely to stop this loop.
+The model obeyed it literally, five times, and the identical 12-line workspace
+listing was re-inserted with each one. What zero matches means here is not
+*search harder*: it is **the answer is no, and for a migration that is the
+expected answer**. Nothing in the result says so.
+
+**`search_docs` fails the same way, and the corpus is complicit.** This is the
+half visible in the reported transcript, where the Planner asked `search_docs`
+eight times and died.
+
+The generated `legacy-migration.md` opens with a sentence hardcoded at
+`gotools/internal/kb/references_migration.go:31`:
+
+> the handler conversion has two mistakes that fail only at runtime […] treat
+> the CRITICAL rules as blocking
+
+The word `CRITICAL` appears **once in the whole document — in that sentence**.
+The three real CRITICAL rules in `SOP.md` are not carried through by the
+generator. So the knowledge base promises a set of rules it does not contain,
+and the model spends its turns looking for them.
+
+Retrieval then makes the promise unescapable, because that intro section is a
+near-perfect lexical match for every query derived from it — it contains
+*handler*, *conversion*, *mistakes*, *runtime*, *critical*, *rules*, *migration*
+and *legacy*. It ranks first for every reformulation, re-injecting the promise
+that generated the query. A retrieval fixpoint: the top hit is the thing that
+produces the next search.
+
+Two independent defects in `tools/knowledge.py` keep the answer out of reach:
+
+- **Digits are not tokens.** `_WORD = [A-Za-z_][A-Za-z0-9_]*` requires a leading
+  letter, so `"step 3"` tokenises to `step`. Steps 1, 2 and 3 are the same query.
+  Measured: `"legacy migration step 3"` returns Step 1 and never Step 3;
+  `"step 3 handler conversion"` ranks **Step 1 first at 14.56 and Step 3 third
+  at 7.41**.
+- **YAML frontmatter is indexed as a retrievable section.** `_split_sections`
+  opens with `heading = document`, so the `slug`/`handle`/`fetch_when` block
+  becomes a section whose heading is the document name — which then collects the
+  heading-overlap boost. 18 of 109 sections are pure metadata; across 20
+  realistic queries they took 16% of all top-4 slots and were the **single
+  highest-ranked hit for 5 of 20**. `"legacy migration step 3"` scores four
+  lines of YAML at 28.94, more than twice any real section.
+
+With two of four slots spent on the intro and the frontmatter, and Step 3
+unreachable by name, `search_docs` cannot answer the question the document told
+the model to ask.
+
+**Nothing else catches a Planner.** Every assistant message in all three runs
+had empty `content` — the model emitted tool calls and no prose. `_narrating`
+counts idle turns only in `_EXECUTING` (Coder, Scaffolder, Debugger), and
+`_repeating` and `_restated_the_plan` compare reply text there is none of. So a
+Planner can research for 27 turns with no plan and no writing, and
+`stalled_turns` is the only thing that will ever stop it.
+
+**What this points at**, in the order the cost falls:
+
+1. Key the slice ledger on `(path, range)`, or have the stub carry the range it
+   superseded and the repeat ledger honour a re-read of a range it evicted. The
+   contradiction is the run-killer; everything else only wastes turns.
+2. Lead the intercept with the answer, not with `Not run:`. Report it `ok: true`
+   with a note, and emit the `tool_call` event so the row keeps its arguments.
+3. Fingerprint on normalised semantics, not the raw argument string — at minimum
+   drop `max`/`limit` from the key, and treat a zero-match `search_repo` as a
+   fact established about the workspace rather than a failed attempt. Zero
+   matches should say *this does not exist here*, not *loosen the pattern*.
+4. Carry the CRITICAL rules from `SOP.md` into `legacy-migration.md`, or delete
+   the sentence that promises them. A document that names content it does not
+   contain is a retrieval trap.
+5. In `tools/knowledge.py`: skip the frontmatter block when splitting, and admit
+   digits to `_WORD` so `step 3` is not `step 1`.
+6. Give the Planner a turn ceiling of its own. Research with no plan and no prose
+   is the one mode-shaped failure no detector currently sees.
+
+Not fixed in this entry — it is the diagnosis; the entry above is what was
+done about it. Two adjacent facts found on the
+way: `make knowledge` is referenced by every generated file and by
+`.gitlab-ci.yml`, and **no such target exists in the Makefile** (the generator is
+`gotools knowledge`); and `packages/knowledge/`, described in `_knowledge_root`
+as one of two copies "held identical by `knowledge-check`", is **empty**.
+
 ### 2026-08-28 — Four reasons a run repeats itself, and one that had never worked
 
 Two more sessions died against the no-progress detector. Neither was the

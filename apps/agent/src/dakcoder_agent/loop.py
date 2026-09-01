@@ -150,6 +150,13 @@ class _State:
     #: remove, built out of successes. Superseding an identical-result pair
     #: loses nothing: the surviving copy carries the same bytes.
     dup_results: dict[str, list[Message]] = field(default_factory=dict)
+    #: Fingerprint -> the ``max``/``limit`` that produced a *truncated* answer.
+    #: The fingerprint ignores those parameters, because varying one is not a
+    #: new question — except in the one case where it is. An answer that stopped
+    #: at the cap has more behind it, so raising the cap genuinely asks for
+    #: something the ledger does not hold, and that call is dispatched rather
+    #: than echoed. A complete answer is complete at any cap.
+    truncated_at: dict[str, int] = field(default_factory=dict)
     #: The context messages of the most recent intercept per fingerprint — the
     #: repeated assistant call and the ledger answers it drew — so the next
     #: repeat can supersede them instead of stacking beside them. Measured on
@@ -187,6 +194,14 @@ class _State:
     #: already started reading. One is a turn whose tool call was never emitted;
     #: two is a Planner with nothing to say. See ``_advance``.
     planner_idle: int = 0
+    #: Planner turns that called a tool. The Planner's only stopping condition
+    #: is running out of turns, so this is what bounds research. See
+    #: ``PLANNER_RESEARCH_NUDGE``.
+    planner_research: int = 0
+    #: Whether the "you have read enough" nudge has been delivered. Once only:
+    #: repeating it every turn would be the accumulating pattern that
+    #: ``ContextManager.discard`` exists to keep out of the transcript.
+    planner_nudged: bool = False
     #: How many times each path has been read, and the ranges it was read at.
     #: The slice ledger keeps the *context* from growing when a file is read
     #: seven times; it does nothing about the seven turns. Reset for a path when
@@ -292,6 +307,26 @@ MAX_IDLE_EXECUTING = 3
 #: do instead. Neither run was looping; both were killed for asking twice too
 #: often.
 MAX_STALLED_TURNS = 6
+
+#: How many tool-calling turns the Planner gets before it is asked for the plan,
+#: and how many before it is made to write one.
+#:
+#: The Planner is the one mode with no natural stopping condition. Every other
+#: detector here fires on a turn that called nothing — ``_narrating`` counts
+#: idle turns, ``_repeating`` and ``_restated_the_plan`` compare reply text —
+#: and a Planner that calls a tool every turn reaches none of them. A run on
+#: 2026-09-01 spent all forty turns reading twenty-line windows of handler
+#: files, in perfect health by every measure the loop has, and finished
+#: ``exhausted`` with no plan, no edit and nothing to show the developer.
+#:
+#: Twelve is where the nudge lands and sixteen is where the read tools are
+#: withdrawn for one turn, which leaves prose as the only reply available. That
+#: is deliberately not a way to end the run: what comes back is a plan, a
+#: question or a refusal, and ``_advance`` already knows what each of those
+#: means. Orienting genuinely takes a dozen calls on a service this size; it
+#: does not take forty.
+PLANNER_RESEARCH_NUDGE = 12
+PLANNER_RESEARCH_LIMIT = 16
 
 #: The modes that can write. ``_narrating`` counts idle turns only in these:
 #: the Planner and the Verifier are supposed to end with prose and no tool call,
@@ -468,6 +503,33 @@ class AgentLoop:
         # without them is consulted against the wrong number. Computed once and
         # reused below, which also stops the array being built twice per turn.
         tools = self.router.schemas_for(self.state.mode)
+
+        # The Planner has read enough. Asked for the plan at the nudge; left
+        # with no tools to call at the limit, so that prose is the only reply
+        # available and `_advance` gets to run at all. Withdrawing the schemas
+        # rather than ending the run keeps every outcome on the table: what
+        # comes back is a plan, a clarifying question or "nothing to do here",
+        # and each of those is already handled below.
+        if self.state.mode is Mode.PLANNER and not self.state.plan:
+            if self.state.planner_research >= PLANNER_RESEARCH_LIMIT:
+                tools = []
+            elif (
+                self.state.planner_research >= PLANNER_RESEARCH_NUDGE
+                and not self.state.planner_nudged
+            ):
+                self.state.planner_nudged = True
+                self.context.append_tool_result(
+                    "repo_map",
+                    f"You have spent {self.state.planner_research} turns reading and "
+                    "have not written a plan yet. That is enough to plan from — the "
+                    "Coder phase reads the files it edits, so anything you have not "
+                    "opened yet, it will.\n\n"
+                    "Write the plan now: at most eight numbered steps, each naming a "
+                    "real file and carrying an Accepts: line saying how you will know "
+                    "it worked. If the task is too large for eight steps, plan the "
+                    "first slice of it and say what you left out.",
+                )
+
         self.context.observe_tool_schemas(estimate_tokens(json.dumps(tools)))
 
         if self.context.should_compact():
@@ -603,6 +665,8 @@ class AgentLoop:
             return
 
         if result.chat.tool_calls:
+            if self.state.mode is Mode.PLANNER:
+                self.state.planner_research += 1
             yield from self._tool_calls(result.chat.tool_calls, assistant_msg)
             return
 
@@ -677,6 +741,7 @@ class AgentLoop:
             self.state.dead_ends.clear()
             self.state.intercepts.clear()
             self.state.dup_results.clear()
+            self.state.truncated_at.clear()
 
         mutated = False
         dispatched = False
@@ -689,7 +754,7 @@ class AgentLoop:
             return (
                 assistant_msg is not None
                 and not assistant_msg.content
-                and all(f"{c.name}:{c.arguments}" == fp for c in assistant_msg.tool_calls)
+                and all(_fingerprint(c) == fp for c in assistant_msg.tool_calls)
             )
 
         def collapse(fp: str, echo: Message) -> None:
@@ -718,11 +783,18 @@ class AgentLoop:
                 self.result = self._abort()
                 return
 
-            # Fingerprinted from the raw string, not the parsed object. Parsing
-            # can raise on malformed arguments, and a model that resends the
-            # same malformed arguments is precisely the case these ledgers
-            # exist for — so it must not be the case that crashes them.
-            fingerprint = f"{call.name}:{call.arguments}"
+            fingerprint = _fingerprint(call)
+
+            # An intercepted call never reaches TOOL_CALL — that event means
+            # "dispatched", and the tests below depend on it meaning only that.
+            # But the client builds its row from TOOL_CALL, so an intercept
+            # arrived as a result for a row that had never been opened and was
+            # drawn as a bare tool name with no arguments beside it. A
+            # transcript of a looping run was a column of those, which is
+            # exactly the case where seeing the arguments is how anyone works
+            # out what the loop is about. So the intercepts carry their own
+            # arguments on the result instead.
+            args = _safe_args(call)
 
             # A known dead end is answered, every time, and is never fatal.
             #
@@ -740,11 +812,12 @@ class AgentLoop:
                 )
                 echo = self.context.append_tool_result(
                     call.name,
-                    f"Not run: {call.name} with exactly these arguments is a known "
-                    f"dead end this run — {reason}.\n\n"
-                    "It will fail the same way every time until something in the "
-                    "workspace changes. Act on what does exist: the alternatives "
-                    "named in the earlier result still stand.",
+                    f"{call.name} with these arguments cannot succeed: {reason}. "
+                    "That was established earlier this run and nothing has changed "
+                    "since, so it was answered from the earlier result rather than "
+                    "run again.\n\n"
+                    "This is the answer, not a failure. Act on what does exist — the "
+                    "alternatives named in the earlier result still stand.",
                     tool_call_id=call.id,
                 )
                 collapse(fingerprint, echo)
@@ -753,7 +826,8 @@ class AgentLoop:
                     {
                         "id": call.id,
                         "name": call.name,
-                        "ok": False,
+                        "ok": True,
+                        "arguments": args,
                         "content": f"{call.name}: known dead end; answered without re-running",
                     },
                 )
@@ -770,28 +844,41 @@ class AgentLoop:
             # recoverable. The tools this must not throttle — re-running the
             # build after an edit, re-reading a file just written — are exactly
             # the ones a mutation precedes, and the mutation cleared this ledger.
-            if (cached := self.state.last_results.get(fingerprint)) is not None:
+            # An answer that stopped at its cap has more behind it, so asking
+            # again with a bigger one is a question the ledger cannot answer.
+            # Absent from `truncated_at` means the earlier answer was complete,
+            # and a complete answer is complete at any cap.
+            capped = self.state.truncated_at.get(fingerprint)
+            wants_more = capped is not None and _volume(call) > capped
+
+            if (cached := self.state.last_results.get(fingerprint)) is not None and not wants_more:
                 asks = self.state.seen_calls.get(fingerprint, 0) + 1
                 self.state.seen_calls[fingerprint] = asks
+                # The answer first, the bookkeeping after.
+                #
+                # This message used to open "Not run:" and arrive with
+                # ``ok: false``, which is how a call that succeeded came to look
+                # like a call that failed -- and a model that reads a failure
+                # retries it. The content was always here; it was three lines
+                # below a refusal. Leading with the result costs nothing and
+                # removes the reason to ask again.
                 body = (
-                    f"Not run: you have already called {call.name} with exactly "
-                    "these arguments this run, and nothing in the workspace has "
-                    f"changed since. It returned:\n\n{cached}\n\n"
-                    "That answer still stands. Do something different — a "
-                    "different tool, different arguments, or say plainly what is "
-                    "blocking you."
+                    f"{call.name} returned:\n\n{cached}\n\n"
+                    "— that is the current answer. The call ran earlier this turn "
+                    "or an earlier one, nothing in the workspace has changed since, "
+                    "so it was answered from that result rather than dispatched "
+                    "again. Use it and move to the next step; if it does not tell "
+                    "you what you need, ask something different or say plainly what "
+                    "is blocking you."
                 )
                 if asks >= 3:
-                    # The polite version was ignored twice. Before the stall
-                    # counter ends the run, say exactly what is at stake -- a
-                    # model that keeps asking is usually treating the echo as a
-                    # failed call, so name it as the answer it is.
+                    # Said plainly at the third ask, because by the sixth stalled
+                    # turn the run ends and the model deserves to have been told.
                     body += (
-                        f"\n\nThis is ask number {asks} for this exact call. The "
-                        "answer above IS the result — the call succeeded when it "
-                        "ran and will not be dispatched again while nothing "
-                        "changes. Turns that only repeat earlier calls end the "
-                        "run; use the answer, or move to the next step."
+                        f"\n\nThis is ask number {asks} for this exact call, and it "
+                        "will keep returning the answer above while the workspace "
+                        "is unchanged. Turns that only repeat earlier calls end the "
+                        "run."
                     )
                 echo = self.context.append_tool_result(
                     call.name,
@@ -804,9 +891,10 @@ class AgentLoop:
                     {
                         "id": call.id,
                         "name": call.name,
-                        "ok": False,
+                        "ok": True,
+                        "arguments": args,
                         "content": (
-                            f"{call.name} repeated with identical arguments; "
+                            f"{call.name} asked again with the same arguments; "
                             "answered from the previous result"
                         ),
                     },
@@ -830,13 +918,12 @@ class AgentLoop:
             if ranges := self._re_reading(call):
                 self.context.append_tool_result(
                     call.name,
-                    f"Not run: you have already read this file {len(ranges)} times this "
-                    f"run, at {', '.join(ranges)}. The most recent read is still in "
-                    "context above — older ones were collapsed because they were "
-                    "superseded, not because they were lost.\n\n"
-                    "Re-reading it again will not show you anything new. Either act on "
-                    "what you have, or say plainly what you are looking for and cannot "
-                    "find.",
+                    f"You have read this file {len(ranges)} times this run, at "
+                    f"{', '.join(ranges)}, and every one of those reads is still in "
+                    "context above except where a later read covered the same lines.\n\n"
+                    "Reading it again is not going to show you anything those did "
+                    "not. Act on what you have, or say plainly what you are looking "
+                    "for and cannot find.",
                     tool_call_id=call.id,
                 )
                 yield Event(
@@ -844,7 +931,8 @@ class AgentLoop:
                     {
                         "id": call.id,
                         "name": call.name,
-                        "ok": False,
+                        "ok": True,
+                        "arguments": args,
                         "content": f"already read {len(ranges)} times this run; not re-read",
                     },
                 )
@@ -900,6 +988,10 @@ class AgentLoop:
             # worse answer than the one it remembered getting kept asking for
             # the original, seven times in one field run.
             self.state.last_results[fingerprint] = outcome.for_model()[:6000]
+            if outcome.truncated:
+                self.state.truncated_at[fingerprint] = _volume(call)
+            else:
+                self.state.truncated_at.pop(fingerprint, None)
             if reason := outcome.meta.get("dead_end"):
                 # The tool has said this exact call can never succeed as asked.
                 # From here on it is answered from the ledger above, forever,
@@ -912,12 +1004,13 @@ class AgentLoop:
             for mutation in outcome.mutations:
                 self.state.reads.pop(mutation.path, None)
 
-            slice_path = _slice_path(call, outcome)
+            slice_path, slice_range = _slice_path(call, outcome)
             result_msg = self.context.append_tool_result(
                 call.name,
                 outcome.for_model(),
                 tool_call_id=call.id,
                 path=slice_path,
+                line_range=slice_range,
             )
             if slice_path is None:
                 # Same tool, same bytes back: the older pair is superseded.
@@ -1712,18 +1805,76 @@ def _safe_args(call: ToolCall) -> Any:
         return {"_malformed_arguments": call.arguments[:500]}
 
 
-def _slice_path(call: ToolCall, result: ToolResult) -> str | None:
-    """The file a tool result is *about*, for the slice ledger.
+#: Parameters that bound how much of an answer comes back, never what the
+#: answer is. Excluded from the fingerprint because varying one is not a new
+#: question: a Planner that had established a legacy service has no ``Routes()``
+#: method asked again as ``max: 200``, got the same "no matches", and bought two
+#: more dispatched turns for it. Every ledger keyed on the raw argument string
+#: saw a call it had never seen.
+#: A tuple, not a set: ``_volume`` returns the first one present, and a set's
+#: iteration order would make that answer depend on the hash seed.
+_VOLUME_PARAMS = ("max", "limit")
 
-    Only ``read_file`` supersedes: re-reading a file replaces the older slice
-    rather than stacking beside it. A mutation is not a supersede — the record
-    that a file was written is not made obsolete by writing it again.
+
+def _volume(call: ToolCall) -> int:
+    """How much this call asked for, or 0 when it did not say."""
+    try:
+        parsed = call.parsed()
+    except ValueError:
+        return 0
+    if not isinstance(parsed, dict):
+        return 0
+    for name in _VOLUME_PARAMS:
+        value = parsed.get(name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    return 0
+
+
+def _fingerprint(call: ToolCall) -> str:
+    """What makes two calls the same question.
+
+    Falls back to the raw string when the arguments do not parse — a model that
+    resends the same malformed arguments is exactly what the ledgers are for, so
+    this must not be the thing that raises on them.
+    """
+    try:
+        parsed = call.parsed()
+    except ValueError:
+        return f"{call.name}:{call.arguments}"
+    if not isinstance(parsed, dict):
+        return f"{call.name}:{call.arguments}"
+    kept = {k: v for k, v in parsed.items() if k not in _VOLUME_PARAMS}
+    return f"{call.name}:" + json.dumps(kept, sort_keys=True, separators=(",", ":"))
+
+
+def _slice_path(call: ToolCall, result: ToolResult) -> tuple[str | None, tuple[int, int] | None]:
+    """The file a tool result is *about* and the lines it covers.
+
+    Only ``read_file`` supersedes: a read that contains an earlier one replaces
+    it rather than stacking beside it. A mutation is not a supersede — the
+    record that a file was written is not made obsolete by writing it again.
+
+    The range comes from the result's ``span``, which the tool clamped to the
+    file, rather than from the call's ``start``/``end``. An older runtime whose
+    ``read_file`` predates ``span`` reports ``None``, which reads as "the whole
+    file" and collapses the way it always did.
     """
     if call.name != "read_file" or not result.ok:
-        return None
+        return None, None
     parsed = _safe_args(call)
     path = parsed.get("path") if isinstance(parsed, dict) else None
-    return path if isinstance(path, str) else None
+    if not isinstance(path, str):
+        return None, None
+    span = result.meta.get("span")
+    if isinstance(span, (list, tuple)) and len(span) == 2:
+        try:
+            return path, (int(span[0]), int(span[1]))
+        except (TypeError, ValueError):
+            pass
+    return path, None
 
 
 #: A numbered step, however the model chose to dress it up.

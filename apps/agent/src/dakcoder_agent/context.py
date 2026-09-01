@@ -135,6 +135,13 @@ class Message:
     source: str = ""
     #: Set on tool results, so a stale slice can be found and replaced.
     path: str | None = None
+    #: The lines this read actually covers, clamped to the file. ``None`` means
+    #: the whole file. Held because superseding on ``path`` alone discards
+    #: content the model cannot get back: three disjoint reads of a 6,500-line
+    #: file left two stubs saying "re-read if needed" over lines that were
+    #: nowhere else in the context, and the repeat ledger then refused the
+    #: re-read they asked for. See ``_supersede_slice``.
+    line_range: tuple[int, int] | None = None
     tool_call_id: str | None = None
     #: The calls an assistant message made, so its own actions survive into the
     #: next request. Without these every ``role: "tool"`` message that follows
@@ -171,6 +178,22 @@ class Message:
                 for call in self.tool_calls
             ]
         return out
+
+
+def _contains(outer: tuple[int, int] | None, inner: tuple[int, int] | None) -> bool:
+    """Whether a read covering ``outer`` makes one covering ``inner`` redundant.
+
+    ``None`` is the whole file, so it contains everything and is contained only
+    by another whole-file read. Ranges are the *clamped* ones the tool actually
+    returned, not what the model asked for: ``end=99999`` on a 200-line file is
+    ``(1, 200)``, and comparing the raw arguments would call it disjoint from a
+    later whole-file read that in fact supersedes it.
+    """
+    if outer is None:
+        return True
+    if inner is None:
+        return False
+    return outer[0] <= inner[0] and inner[1] <= outer[1]
 
 
 def _parseable_arguments(arguments: str) -> str:
@@ -427,8 +450,11 @@ class ContextManager:
         self._recap: Message | None = None
         self._working: list[Message] = []
 
-        # path -> index into _working of the newest read. The ledger.
-        self._slices: dict[str, int] = {}
+        # path -> indices into _working of that path's live reads, oldest
+        # first. A list rather than one index because disjoint reads of one
+        # file each carry content of their own; only a read that *contains* an
+        # earlier one supersedes it.
+        self._slices: dict[str, list[int]] = {}
 
     # ── properties ──────────────────────────────────────────────────────────
 
@@ -686,6 +712,12 @@ class ContextManager:
                 removed += 1
             except ValueError:
                 pass
+        if removed:
+            # Removing renumbers everything below, so the slice ledger's indices
+            # are stale from here on. Compaction already knew that; this path
+            # did not, and a stale index stubs out whichever message has since
+            # slid into that position — which need not even be a read.
+            self._reindex_slices()
         return removed
 
     def append_user(self, content: str) -> Message:
@@ -719,39 +751,68 @@ class ContextManager:
             Layer.WORKING_SET,
             source=f"tool:{tool}",
             path=path,
+            line_range=line_range,
             tool_call_id=tool_call_id or None,
             turn=self._turn,
         )
 
         if path:
-            self._supersede_slice(path)
-            self._slices[path] = len(self._working)
+            self._supersede_slice(path, line_range)
+            self._slices.setdefault(path, []).append(len(self._working))
         self._working.append(msg)
         return msg
 
     # ── the ledger ──────────────────────────────────────────────────────────
 
-    def _supersede_slice(self, path: str) -> None:
-        """Collapse an earlier read of the same path to a one-line stub.
+    def _supersede_slice(self, path: str, line_range: tuple[int, int] | None) -> None:
+        """Collapse the earlier reads of ``path`` that this one contains.
+
+        Containment, not identity of path. Superseding on the path alone is
+        correct only when every read of a file covers the same lines, and the
+        field disproved that: a Planner read one 6,571-line handler at 40-150,
+        153-205 and 3777-3840, and the first two were replaced by stubs reading
+        *"re-read if needed"* over lines that then existed nowhere in the
+        context. It asked for them again — the one thing the stub told it to do
+        — and ``AgentLoop._tool_calls`` answered from ``last_results`` with
+        *"Not run: you have already called read_file with exactly these
+        arguments"*. Both messages were true and they could not both be obeyed,
+        so the run alternated between them until the stall counter ended it.
+
+        A read that contains an earlier one makes it genuinely redundant: every
+        line of the old is in the new, a few messages further down. That is the
+        only case where collapsing costs the model nothing, so it is the only
+        case that collapses. Disjoint and partially-overlapping reads both stay.
 
         Replaced in place rather than removed, because removing a message
         renumbers everything after it — and a tool result whose matching
         ``tool_call_id`` has vanished is a malformed conversation, not a
         smaller one.
         """
-        index = self._slices.get(path)
-        if index is None or index >= len(self._working):
+        live = self._slices.get(path)
+        if not live:
             return
-        old = self._working[index]
-        if old.content.startswith("[stale read of "):
-            return
-        self._working[index] = replace(
-            old,
-            content=(
-                f"[stale read of {path} — superseded by a later read in this "
-                f"conversation; re-read if needed]"
-            ),
-        )
+
+        kept: list[int] = []
+        for index in live:
+            if index >= len(self._working):
+                continue
+            old = self._working[index]
+            if old.content.startswith("[stale read of "):
+                continue
+            if not _contains(line_range, old.line_range):
+                kept.append(index)
+                continue
+            where = (
+                f" lines {old.line_range[0]}-{old.line_range[1]}" if old.line_range else ""
+            )
+            self._working[index] = replace(
+                old,
+                content=(
+                    f"[stale read of {path}{where} — those lines are inside the "
+                    f"newer read of this file below]"
+                ),
+            )
+        self._slices[path] = kept
 
     def stale_slices(self) -> int:
         """How many reads the ledger has collapsed. For telemetry."""
@@ -1003,11 +1064,11 @@ class ContextManager:
 
     def _reindex_slices(self) -> None:
         """Rebuild the ledger after the working set is re-sliced."""
-        self._slices = {
-            msg.path: i
-            for i, msg in enumerate(self._working)
-            if msg.path and not msg.content.startswith("[stale read of ")
-        }
+        rebuilt: dict[str, list[int]] = {}
+        for i, msg in enumerate(self._working):
+            if msg.path and not msg.content.startswith("[stale read of "):
+                rebuilt.setdefault(msg.path, []).append(i)
+        self._slices = rebuilt
 
     # ── inspection ──────────────────────────────────────────────────────────
 

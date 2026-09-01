@@ -200,6 +200,57 @@ def test_only_the_newest_read_of_a_path_survives():
     assert cm.stale_slices() == 2
 
 
+def test_disjoint_reads_of_one_file_all_survive():
+    """The run-killer of 2026-09-01, in four lines.
+
+    A Planner read one 6,571-line handler at three disjoint windows. Superseding
+    on the path alone left two stubs saying "re-read if needed" over lines that
+    were then nowhere in the context — and the loop's repeat ledger refused the
+    re-read the stub had just asked for. Neither message was wrong and neither
+    could be obeyed, so the run alternated between them until it was killed for
+    making no progress.
+    """
+    cm = manager()
+    cm.begin_turn()
+    for span in ((40, 150), (153, 205), (3777, 3840)):
+        cm.append_tool_result(
+            "read_file", f"body {span}", path="handler/paogen.go", line_range=span
+        )
+
+    reads = [m for m in cm.build() if m.path == "handler/paogen.go"]
+    assert [m.content for m in reads] == [
+        "body (40, 150)",
+        "body (153, 205)",
+        "body (3777, 3840)",
+    ], "disjoint windows carry different lines; none of them supersedes another"
+    assert cm.stale_slices() == 0
+
+
+def test_a_containing_read_still_supersedes():
+    """The saving the ledger exists for, which containment must not give up."""
+    cm = manager()
+    cm.begin_turn()
+    cm.append_tool_result("read_file", "narrow", path="a.go", line_range=(60, 120))
+    cm.append_tool_result("read_file", "wider", path="a.go", line_range=(1, 400))
+    cm.append_tool_result("read_file", "whole", path="a.go")
+
+    reads = [m for m in cm.build() if m.path == "a.go"]
+    assert reads[0].content.startswith("[stale read of a.go lines 60-120")
+    assert reads[1].content.startswith("[stale read of a.go lines 1-400")
+    assert reads[2].content == "whole"
+    assert cm.stale_slices() == 2
+
+
+def test_a_partial_overlap_keeps_both():
+    """Half a window is not the window; 1-120 then 60-180 loses lines 1-59."""
+    cm = manager()
+    cm.begin_turn()
+    cm.append_tool_result("read_file", "first", path="a.go", line_range=(1, 120))
+    cm.append_tool_result("read_file", "second", path="a.go", line_range=(60, 180))
+
+    assert [m.content for m in cm.build() if m.path == "a.go"] == ["first", "second"]
+
+
 def test_the_ledger_bounds_by_distinct_files_not_by_reads():
     """The property that makes the ledger worth having."""
     cm = manager()

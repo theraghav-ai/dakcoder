@@ -1288,6 +1288,12 @@
           state: 'running',
         });
         const content = String(d.content || '');
+        // A call answered from the loop's ledger never sent `tool_call`, so the
+        // row above was created here with no arguments on it. Those results
+        // carry their own, and without this a repeating run reads as a column
+        // of bare tool names — which is the one case where the arguments are
+        // what tell you what the loop is about.
+        if (!row.summary && d.arguments) row.summary = argSummary(d.arguments);
         row.state = d.ok ? 'ok' : 'fail';
         row.content = content;
         row.lines = content ? content.split('\n').length : 0;
