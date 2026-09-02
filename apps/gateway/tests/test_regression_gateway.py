@@ -361,3 +361,273 @@ async def test_an_oversized_body_is_refused_before_it_is_held() -> None:
     with pytest.raises(ProxyError) as caught:
         await _read_body(Lying())
     assert caught.value.status == 413, "a body with no content-length is still bounded"
+
+
+# ── GW-7: a refresh token is a credential, not a dictionary key ────────────
+
+
+async def test_a_refresh_token_is_not_held_in_plaintext(gitlab: FakeGitLab) -> None:
+    """Thirty-day credentials sat in a dict, in the process that holds the model
+    API keys, for as long as they were valid. The gateway never needs the token
+    back — only to recognise one — so it keeps a SHA-256 verifier and the
+    plaintext lives only inside the request that presented it."""
+    import hashlib
+
+    service = AuthService(gitlab, TokenMinter("s" * 32))
+    started = service.start("vscode://dop.dakcoder/callback", verifier_challenge("v" * 43))
+    session = await service.exchange(
+        code="good-code",
+        code_verifier="v" * 43,
+        state=started["state"],
+        redirect_uri="vscode://dop.dakcoder/callback",
+    )
+
+    held = list(service._refresh)
+    assert session.refresh_token not in held, "the credential itself must not be stored"
+    assert held == [hashlib.sha256(session.refresh_token.encode("ascii")).hexdigest()]
+
+    # And it still works, which is the whole point of a verifier.
+    rotated = await service.refresh(session.refresh_token)
+    assert rotated.refresh_token != session.refresh_token
+
+
+async def test_the_provider_credential_is_never_in_a_repr(gitlab: FakeGitLab) -> None:
+    """Same discipline as the route's `api_key`. A dataclass renders every field,
+    and this one is a live GitLab token: one exception context away from a log."""
+    service = AuthService(gitlab, TokenMinter("s" * 32))
+    started = service.start("vscode://dop.dakcoder/callback", verifier_challenge("v" * 43))
+    await service.exchange(
+        code="good-code",
+        code_verifier="v" * 43,
+        state=started["state"],
+        redirect_uri="vscode://dop.dakcoder/callback",
+    )
+    record = next(iter(service._refresh.values()))
+    assert record.provider_token == "gitlab-access-token", "it is still usable"
+    assert "gitlab-access-token" not in repr(record)
+
+
+async def test_a_revoked_family_does_not_live_for_ever(gitlab: FakeGitLab) -> None:
+    """It was a set that only grew: one entry per revoked session for the life of
+    the process, and reuse detection adds them in cascades."""
+    service = AuthService(gitlab, TokenMinter("s" * 32))
+    started = service.start("vscode://dop.dakcoder/callback", verifier_challenge("v" * 43))
+    session = await service.exchange(
+        code="good-code",
+        code_verifier="v" * 43,
+        state=started["state"],
+        redirect_uri="vscode://dop.dakcoder/callback",
+    )
+    service.revoke(session.refresh_token)
+    assert len(service._revoked_families) == 1
+
+    # Past every refresh token the family could still have. Nothing can present
+    # one, so nothing needs to remember refusing it.
+    for family in service._revoked_families:
+        service._revoked_families[family] = 0.0
+    service._sweep()
+    assert service._revoked_families == {}
+
+
+# ── GW-8: a lost charge must not hide inside a ZSET member ─────────────────
+
+
+def test_two_charges_in_one_millisecond_are_two_rows() -> None:
+    """The member was `amount:now:i:sha1hex(key .. now .. i)` — a hash of three
+    values already in the member, so it added no entropy at all. ZADD on an
+    existing member updates its score instead of adding a row, and the second
+    charge vanished."""
+    import re
+
+    from dakcoder_gateway.quota.store import _APPLY_LUA
+
+    assert "sha1hex" not in _APPLY_LUA, "a hash of the member's own parts is not a nonce"
+    assert re.search(r"local nonce = ARGV\[3\]", _APPLY_LUA), "the nonce comes from the caller"
+    assert "'ZADD', key, now, amount .. ':' .. now .. ':' .. i .. ':' .. nonce" in _APPLY_LUA
+
+
+async def test_each_apply_sends_its_own_nonce() -> None:
+    """Two invocations, two nonces. One per call is what makes the member unique
+    across concurrent settlements of the same series."""
+    from datetime import datetime, timezone
+
+    from dakcoder_gateway.quota.model import Check, Series
+    from dakcoder_gateway.quota.store import RedisStore
+
+    seen: list[str] = []
+
+    class RecordingClient:
+        async def zadd(self, *a, **k):  # pragma: no cover - not reached
+            return 1
+
+        async def hgetall(self, *a, **k):
+            return {}
+
+        async def zrange(self, *a, **k):
+            return []
+
+        def register_script(self, _src):
+            async def run(keys=None, args=None):
+                seen.append(str(args[2]))
+                return '{"ok": true, "used": [0]}'
+
+            return run
+
+    store = RedisStore(RecordingClient())
+    now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    checks = [Check(series=Series.HOUR_TOKENS, amount=10, limit=1000, label="tokens an hour")]
+    await store.apply("gitlab:7", checks, now)
+    await store.apply("gitlab:7", checks, now)
+
+    assert len(seen) == 2
+    assert seen[0] != seen[1], "the same nonce twice is the collision this fixes"
+
+
+# ── GW-9/GW-10/GW-12: transports ───────────────────────────────────────────
+
+
+async def test_the_identity_adapter_keeps_one_http_client() -> None:
+    """It built a fresh AsyncClient per call and closed none, so every exchange,
+    profile read and refresh leaked a client and its connection pool."""
+    identity = GitLabIdentity("https://gitlab.test", "cid", "secret")
+    first = await identity._client()
+    second = await identity._client()
+    assert first is second, "one client, kept"
+    await identity.aclose()
+    assert identity._http is None
+
+
+async def test_an_injected_client_is_not_closed_by_the_adapter() -> None:
+    """It belongs to whoever passed it in; closing it would shut a pool somebody
+    else is still using."""
+
+    class Injected:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    injected = Injected()
+    identity = GitLabIdentity("https://gitlab.test", "cid", "secret", http=injected)
+    assert await identity._client() is injected
+    await identity.aclose()
+    assert not injected.closed
+
+
+async def test_group_membership_is_read_past_the_first_page() -> None:
+    """Roles are mapped from group paths. The call asked for `per_page=100` and
+    read one page, so a developer in more than a hundred groups could silently
+    lose the group that grants their role — a wrong answer that looks exactly
+    like a correct one."""
+    from dakcoder_gateway.auth.identity import GROUP_PAGE_SIZE
+
+    pages = {
+        1: [{"full_path": f"it-2.0/g{i}"} for i in range(GROUP_PAGE_SIZE)],
+        2: [{"full_path": "it-2.0/the-one-that-grants-access"}],
+    }
+
+    class Paged:
+        def __init__(self) -> None:
+            self.requested: list[int] = []
+
+        async def get(self, url, headers=None, params=None):
+            if url.endswith("/api/v4/user"):
+                return _Response({"id": 7, "username": "asha", "state": "active"})
+            page = int((params or {}).get("page", 1))
+            self.requested.append(page)
+            return _Response(pages.get(page, []))
+
+    http = Paged()
+    identity = GitLabIdentity("https://gitlab.test", "cid", "secret", http=http)
+    profile = await identity.profile("a-token")
+
+    assert http.requested == [1, 2], "it stops at the first short page"
+    assert "it-2.0/the-one-that-grants-access" in profile.groups
+    assert len(profile.groups) == GROUP_PAGE_SIZE + 1
+
+
+async def test_a_group_read_that_never_ends_is_bounded() -> None:
+    """An IdP that always returns a full page must not turn a sign-in into an
+    unbounded loop."""
+    from dakcoder_gateway.auth.identity import GROUP_PAGE_SIZE, MAX_GROUP_PAGES
+
+    class Endless:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get(self, url, headers=None, params=None):
+            if url.endswith("/api/v4/user"):
+                return _Response({"id": 7, "username": "asha", "state": "active"})
+            self.calls += 1
+            page = int((params or {}).get("page", 1))
+            return _Response([{"full_path": f"g{page}/{i}"} for i in range(GROUP_PAGE_SIZE)])
+
+    http = Endless()
+    identity = GitLabIdentity("https://gitlab.test", "cid", "secret", http=http)
+    profile = await identity.profile("a-token")
+
+    assert http.calls == MAX_GROUP_PAGES
+    assert len(profile.groups) == GROUP_PAGE_SIZE * MAX_GROUP_PAGES
+
+
+def test_the_upstream_pool_has_a_ceiling() -> None:
+    """Constructing a `Limits` at all replaces httpx's default cap of 100 with
+    whatever the object says, and an unset `max_connections` there means `None`
+    — no cap. So writing the object to raise the keep-alive ceiling silently
+    removed the connection ceiling."""
+    import httpx
+
+    from dakcoder_gateway.proxy import MAX_UPSTREAM_CONNECTIONS, ModelProxy
+
+    proxy = ModelProxy("https://upstream.test", "k", quota=None)  # type: ignore[arg-type]
+    client = proxy._client()
+    assert isinstance(client, httpx.AsyncClient)
+    limits = client._transport._pool  # type: ignore[attr-defined]
+    assert limits._max_connections == MAX_UPSTREAM_CONNECTIONS
+    assert MAX_UPSTREAM_CONNECTIONS is not None
+
+
+# ── GW-13: the ledger says what it is ──────────────────────────────────────
+
+
+async def test_the_in_memory_ledger_is_bounded_and_counts_what_it_drops() -> None:
+    """It is the fallback every deployment without Postgres runs on, and it grew
+    by one dataclass per metered turn until restart."""
+    from dakcoder_gateway.ledger import MemoryLedger, UsageEvent
+
+    ledger = MemoryLedger(capacity=3)
+    for turn in range(5):
+        await ledger.record(
+            UsageEvent(
+                sub="gitlab:7",
+                session_id="s1",
+                turn=turn,
+                model="m",
+                role="coder",
+                mode="coder",
+                prompt_tokens=1,
+                completion_tokens=1,
+                billed_tokens=2,
+            )
+        )
+
+    assert len(ledger.events) == 3
+    assert ledger.dropped == 2, "a report built from this is a floor, and can say so"
+    assert [e.turn for e in ledger.events] == [2, 3, 4], "the newest are the ones kept"
+
+
+async def test_a_dropped_ledger_row_is_counted_not_only_swallowed() -> None:
+    """The class fails open by design — the quota decision is already enforced —
+    but a hole nobody counts is a hole nobody finds."""
+    from dakcoder_gateway.ledger import PostgresLedger, UsageEvent
+
+    class Broken:
+        def acquire(self):
+            raise RuntimeError("the database is not there")
+
+    ledger = PostgresLedger(Broken())
+    await ledger.record(
+        UsageEvent(sub="gitlab:7", session_id="s1", turn=1, model="m", role="coder", mode="coder",
+                   prompt_tokens=1, completion_tokens=1, billed_tokens=2)
+    )
+    assert ledger.dropped == 1

@@ -88,6 +88,14 @@ def create_app(gateway: Gateway) -> FastAPI:
             # And the upstream connection pool, after the settlements that may
             # still be using it.
             await gateway.proxy.aclose()
+        # The identity adapter holds a pool of its own — the one every token
+        # exchange and every refresh goes through. It used to build one per call
+        # and close none (BUG GW-9); now that it keeps one, something has to
+        # close it. `getattr` because `IdentityProvider` does not require an
+        # adapter to own a transport, and a fake in a test does not.
+        aclose = getattr(getattr(gateway.auth, "identity", None), "aclose", None)
+        if aclose is not None:
+            await aclose()
 
     app = FastAPI(title="dakcoder gateway", version=gateway.version, lifespan=lifespan)
     app.state.gateway = gateway

@@ -12,8 +12,12 @@ Audit date: 2026-09-02. Basis: full read of `apps/agent`, `apps/shared`, `apps/g
 > lands: a paragraph describing behaviour that has since been fixed is marked
 > **FIXED** with the step number, and the CURRENT description is rewritten to say
 > what the code does now. Anything still marked as a defect is still a defect.
-> Last synchronised after **Phase 3** — every step of `CHANGE_PLAN.md` except
-> the rows listed as deliberately deferred in `task.md`.
+> Last synchronised after **Phase 3 complete** — every step of
+> `CHANGE_PLAN.md`, including the four rows that were previously deferred
+> (L-18, GW-7..13, the EXT UI set, and rehydrating a context from
+> `events.jsonl`). What is still open is listed at the end of §10, and it is two
+> things: a multi-worker gateway needs a shared store, and the two findings the
+> audit itself marked BY-DESIGN.
 
 > A note on the documentation, kept because the lesson outlives the defect: the
 > top-level `README.md` stated that the agent loop, the tool router, the gateway
@@ -44,9 +48,11 @@ VS Code extension (extension/src, TypeScript)
 dakcoderd — the local runtime (apps/agent)
   serve.py         entry point: binds port 0, prints it, wires everything
   loopback.py      FastAPI app: /v1/tasks, /v1/sessions/*, /v1/approvals/*, SSE
-  session.py       Session (in-memory event log, monotonic ids), SessionStore, revert
+  session.py       Session (event log, monotonic ids, journalled), SessionStore, revert
   undo.py          UndoStore — pre-run snapshots under .dakcoder/sessions/<id>/undo
   journal.py       events.jsonl + session.json per session; restored at startup
+  rehydrate.py     replays a stored transcript back into a ContextManager, so a
+                   follow-up after a daemon restart continues the conversation
   loop.py          AgentLoop — the state machine (one worker thread per run)
   context.py       ContextManager — the only message-list builder
   llm.py           complete(): context + mode config + client → one turn
@@ -171,8 +177,12 @@ Impossible/contradictory states found:
 
 ## 4. Context lifecycle — CURRENT IMPLEMENTATION
 
-Layers (eviction order): WORKING_SET → RECAP → TASK → MODE → SYSTEM. Task, mode
-and system are pinned. Insertion caps per tool (`TOOL_CAPS`, e.g. read_file
+Layers (eviction order): WORKING_SET → RECAP → TASK → DIRECTIVE → MODE →
+SYSTEM. Task, directive, mode and system are pinned. Assembly order is *not*
+eviction order: `DIRECTIVE` — the plan and the developer's steers — is assembled
+below the working set, which is what stopped a steer re-prefilling the
+conversation (L-18, §10). Pinned is about eviction; compaction only ever
+consumes `_working`. Insertion caps per tool (`TOOL_CAPS`, e.g. read_file
 48k tokens head-keep) with machine-readable elision markers. Compaction summarises
 the evicted working set into a structured `Recap` (schema-constrained call,
 `role="summariser"`), retains to a token floor, and `_whole_turn_cut` mostly keeps
@@ -192,35 +202,43 @@ What breaks:
   after an eviction. `dead_ends` and `seen_calls` survive deliberately.
 - ~~`_retention_cut` and `novel_tokens` count `content` only~~ — **FIXED (1.7)**.
   One `_message_cost()`, used by all three.
-- **A second compaction replaces the first recap** instead of folding it in (R5).
-  Open; step 2.1.
+- ~~A second compaction replaces the first recap~~ (R5) — **FIXED (2.1)**.
+  `Recap.merge` folds each recap into the one before it, so `do_not_retry` and
+  the decisions survive an arbitrary number of compactions.
 - The last-message-never-evicted rule can retain a tool result whose assistant
   was evicted → orphaned `tool_call_id` on the wire (R6). The cut is unchanged
   (step 2.3), but `wire()` now repairs and reports it (1.2), so it can no longer
   reach the endpoint.
-- Every steer/follow-up/pin rewrites the TASK message, which sits **above** the
-  working set — the entire suffix re-prefills (prior CM-6; a real cost, ~200k
-  tokens of prefill per steer at high context). Open; step 3.3, measure first.
+- ~~Every steer/follow-up/pin rewrites the TASK message, which sits **above** the
+  working set — the entire suffix re-prefills~~ (prior CM-6) — **FIXED (3.3)**,
+  after being measured, which is what the change plan asked for. At a
+  100-turn context a steer re-prefilled 75,764 of 80,543 tokens (94.1%); it now
+  costs 35. The pinned block was split: the task and the acceptance criteria are
+  the stable head and stay above the working set, the plan and the directives
+  move to `Layer.DIRECTIVE` below it. Numbers and reasoning in §10.
 
 ---
 
 ## 5. Duplicated state — the load-bearing problem
 
 The prior audit's core claim — *"context manager state and loop ledger state can
-disagree about what the model has actually seen"* — is **NOT fixed**. The
-mechanism moved but the class survived. Current duplicate representations:
+disagree about what the model has actually seen"* — is **fixed**, row by row.
+It was not, when this section was first written: the mechanism had moved and the
+class had survived. The table is kept in full rather than deleted, because which
+copy was authoritative is the thing a future change has to preserve:
 
 | Fact | Copy 1 | Copy 2 | Divergence trigger | Status |
 |---|---|---|---|---|
 | Lines of file X shown to the model | context messages (post-cap, post-compaction) | `_State.reads` ledger | insertion cap; compaction; developer edits between messages | **FIXED for cap + compaction (1.5, 1.6)** — `Message.line_range` now means "the lines in this message", `ContextManager.coverage()` is the authority, and `_forget_evicted` rebuilds the ledger from it. Developer edits between messages remain (L-25, step 2.6) |
-| Result of call F | context tool message | `_State.last_results[F][:6000]` | 6k char cut; compaction; workspace drift across messages | **partly fixed (1.6)** — cleared on eviction; the 6k cut is still unmarked (L-17, step 2.5) |
-| Mutation count | `router.mutations` (reborn 0 per message) | `_State.mutations_seen` (carried) | every follow-up after a mutating run → ledger wipe | open (L-5, step 2.2) |
-| Files the run changed | `router.touched` (reborn per message) | `session.mutations` (from events) / plan targets | follow-up: plan says unwritten, session says written | open (step 2.2) |
+| Result of call F | context tool message | `_State.last_results[F][:6000]` | 6k char cut; compaction; workspace drift across messages | **FIXED (1.6, 2.5)** — cleared on eviction, and a replayed body that was cut says so instead of presenting itself as the current answer |
+| Mutation count | `router.mutations` | `_State.mutations_seen` | every follow-up after a mutating run → ledger wipe | **FIXED (2.2)** — `carry_from` adopts the previous Router, so both are the session's one count and the follow-up's first batch no longer wipes the ledgers |
+| Files the run changed | `router.touched` | `session.mutations` (from events) / plan targets | follow-up: plan says unwritten, session says written | **FIXED (2.2)** — the Router is session-scoped and carried with the context |
 | Files the run changed, *before* it changed them | — | `UndoStore` manifest on disk | — | **NEW, and deliberately single-authority (1.4)**: revert reads the snapshot, never HEAD |
 | "The run is over" | `loop.result` | `session.status` (set later, from another thread) | steer between the two → message lost | **FIXED (1.9)** — `Session.steer`/`close_steer` decide inside the lock; the status becomes terminal strictly before the queue closes, and a leftover becomes a follow-up |
-| What was already broken | `Baseline` (background thread) | gate verdicts | 180 s join timeout → some gates baselined, some not | open (L-16, step 3.7) |
+| What was already broken | `Baseline` (background thread) | gate verdicts | 180 s join timeout → some gates baselined, some not | **FIXED (3.7)** — the thread reference is kept, a late baseline is marked late, and the gates it should have excused are re-verified |
 | Turn/compaction counts | `context._compactions` | `_State.compactions` (thrash detector) | emergency compaction in `_complete` bypasses the loop's list | **FIXED (1.6)** — every compaction routes through `AgentLoop._compact` |
 | What a message costs | `usage()` | `_retention_cut`, `novel_tokens` | tool-call arguments counted by one and not the others | **FIXED (1.7)** — one `_message_cost()` |
+| The conversation itself | `Loopback.contexts[id]` (in RAM) | `events.jsonl` (on disk) | any daemon restart → the record survives, the conversation does not | **FIXED** — `rehydrate.py` rebuilds the context from the transcript; see §7 and §10 |
 
 **RECOMMENDED**: collapse each row to one authority. Specifically: (a) the read
 ledger must be *written by the ContextManager* from what was actually inserted
@@ -275,36 +293,41 @@ the suite even though the request would be accepted.
 CURRENT: the transcript, the session summary and the mutation list are on disk
 (`journal.py`, `undo.py`) under `.dakcoder/sessions/<id>/`, and `SessionStore`
 restores the summaries when the daemon starts; the transcript is read back only
-when something asks for one. Contexts, loops and approvals are still process
-memory — a restart loses the *conversation state* and keeps the record of it,
-which is the split that matters: revert and the transcript survive, the
-in-flight run does not (and a session that was running when the process died
-comes back ERROR and resumable rather than permanently "running").
+when something asks for one. A session that was running when the process died
+comes back ERROR and resumable rather than permanently "running".
+
+**And the conversation comes back too.** `rehydrate.py` replays the stored
+events through the ContextManager's own append methods, so a follow-up after a
+restart continues where the run left off instead of starting the task again.
+Loops and approvals remain process memory, which is the split that is left: the
+messages survive a restart, the loop's `_State` ledgers do not, and an in-flight
+run does not. The ledger loss is one-directional — the agent may repeat a search
+it had already exhausted; it will not skip work it has not done. See §10.
 
 Follow-up = same context + `carry_from`, which now also adopts the previous
 Router, so the change set, the mutation count and the undo store are the
 session's rather than the message's (2.2). Resume is the same path with a
-different message: reused context, carried ledgers, fresh turn budget (2.7). When
-the daemon holds no context — after a restart — resume falls back to re-seeding
-the original task and says so.
+different message: reused context, carried ledgers, fresh turn budget (2.7).
+When the daemon holds no context — after a restart — it rebuilds one from the
+transcript; re-seeding the original task is the last resort now rather than the
+first, and it remains for the cases where there is genuinely nothing to
+continue: no transcript, an unreadable one, or a session that never got a reply.
 
 A message typed while the last turn is in flight is no longer lost (1.9): the
 steer queue is opened per run and closed atomically as the run ends, so a
 correction is either delivered to the live run or handed back to the loopback,
 which turns it into a follow-up on the same context.
 
-**Still recommended**: evicting `contexts`/`loops` is done (they are dropped with
-their session); what remains is that a *restart* cannot resume the conversation
-itself, only the record of it. Rehydrating a ContextManager from `events.jsonl`
-is the next step if that becomes worth having.
+The three things this section recommended are all done: (a) resume is a true
+continuation, the follow-up path with a different message (2.7); (b) the event
+log and the mutation list are on disk, so revert and the transcript survive a
+restart and the docstrings that claimed it are true (2.9); (c) `contexts` and
+`loops` are evicted when `SessionStore` trims or deletes a session (3.1).
 
-RECOMMENDED: (a) either make resume a true continuation (reuse context +
-carry, exactly the follow-up path with a synthetic user message) or change the
-user-facing copy — the current combination is a false promise; (b) persist, at
-minimum, the event log and mutation list per session (append-only JSONL under
-`.dakcoder/`) so revert and transcript survive a restart — the docstrings already
-claim this happens; (c) evict `contexts`/`loops` when `SessionStore` trims or
-deletes a session.
+What is left is the run in flight. A process that dies mid-turn loses that turn
+— the model call is not idempotent and replaying it is not free — and the
+session comes back ERROR and resumable, which is the honest outcome rather than
+a pretence of one.
 
 ## 8. Revert — CURRENT (rewritten in step 1.4)
 
@@ -376,23 +399,127 @@ Added since the audit, as places where a fact now has one owner:
 | `ContextManager._message_cost()` | what a message costs | `usage()` and `_retention_cut` disagreeing |
 | `Router.model_mutations` | "has the model changed anything since the gate" | a count the gate's own stages inflated |
 | `AgentLoop._answer_unrun()` | answering a batch's abandoned calls | three paths, one of which did it |
+| `rehydrate.py` | a conversation rebuilt from the transcript on disk | `follow_up` re-seeding the original task whenever the daemon had restarted (§7) |
+| `Layer.DIRECTIVE` | the plan and the developer's directives, below the working set | the same two things inside the pinned `TASK` block, above it (§4) |
+| `auth/service._fingerprint` | recognising a refresh token | holding the credential itself as a dictionary key |
+| `GitLabIdentity._client` / `aclose` | the adapter's one HTTP connection pool | a fresh `AsyncClient` per call, closed never |
 
-Deliberately not done, with the reason:
+### The four rows that were open, and what closed them
 
-* **L-18** — every steer rewrites the pinned TASK layer above the working set, so
-  the suffix re-prefills. The change plan says measure first and nothing has
-  measured it; moving directives below the stable head is a prompt-shape change
-  that would invalidate the budget regression suite's baselines.
-* **GW-7..13** — refresh tokens are still plaintext in memory and still lost on a
-  gateway restart; the reservation state is still per-process, so a multi-worker
-  deploy can still double-charge. Both need a store, which is a deployment
-  decision rather than a code one.
-* **EXT-11/12/13/14, EXT-19..22** — elapsed clock, two cache-% denominators,
-  duplicate raw re-emission, spliced streaming text after a reconnect, listener
-  and notice leaks. All UI correctness, none of it losing work.
-* **A ContextManager rehydrated from `events.jsonl`** — the record of a
-  conversation survives a restart; the conversation does not. §7.
+**L-18 — a steer no longer re-prefills the conversation.** The change plan said
+measure before moving, so it was measured, with the manager's own
+`novel_tokens` ("what a prefix cache actually has to prefill") over a context of
+the shape a migration run reaches:
 
-The audit's own §12 ("what can safely wait") is where these came from, and the
-list has not been widened: everything in Phase 0, 1 and 2 landed, and Phase 3
-landed apart from the rows above.
+| turns | prompt | a steer re-prefilled | now |
+|---|---|---|---|
+| 5 | 8,633 | 3,854 (44.6%) | 35 |
+| 20 | 19,983 | 15,204 (76.1%) | 35 |
+| 50 | 42,693 | 37,914 (88.8%) | 35 |
+| 100 | 80,543 | 75,764 (94.1%) | 35 |
+| 200 | 156,243 | 151,464 (96.9%) | 35 |
+
+The same sentence appended to the working set cost 11 tokens, so a developer
+typing one correction at turn 100 paid to re-read the whole run, and `set_plan`
+— which fires on every plan submission — paid the same. The prior audit carried
+this as CM-6, accepted by design; what was missing was the number, and the
+number is not marginal. The fix splits what was one pinned block: the task
+statement and the acceptance criteria never change after `set_task` and stay
+where §6.1 put them, while the plan and the directives move to `Layer.DIRECTIVE`
+below the working set. Pinned is about eviction, not position — compaction only
+ever consumes `_working` — so nothing became evictable, and the instruction the
+developer typed most recently now sits closest to the model's next token, which
+is where a correction belongs anyway.
+
+**GW-7..13 — the gateway rows, closed as code rather than deferred as a
+deployment decision.** Refresh tokens are no longer held at all: the service
+stores SHA-256 of one and the plaintext exists only inside the request that
+presents it, which is the same discipline as a password store and needs no
+infrastructure. The GitLab access token captured at sign-in is still held —
+`recheck` has to be able to use it — but is `repr=False`, so it is no longer one
+exception context away from a log. `_revoked_families` was a set that only grew;
+it expires with the refresh TTL now. The identity adapter built a fresh
+`AsyncClient` on every call and closed none, which with GW-1 fixed became one
+leaked pool per session per fifteen minutes; it keeps one and the app closes it.
+Group membership is read past the first page, bounded at twenty — roles are
+mapped from group paths, and a truncated group list is a wrong answer that looks
+exactly like a correct one. The quota script's ZSET member ended in
+`sha1hex(key .. now .. i)`, a hash of three values already in the member, so two
+charges in one timestamp collapsed into a score update and the second was lost;
+the nonce comes from the caller now. The upstream pool had no ceiling — writing
+an explicit `httpx.Limits` to raise the keep-alive bound silently removed
+httpx's own default cap of 100 — and has one. The in-memory ledger, which is
+what every deployment without `DAKCODER_POSTGRES_DSN` runs on, was unbounded and
+is now a stated window that counts what it drops.
+
+Still open here, and genuinely a deployment decision: reservation and auth state
+are per-process, so a multi-worker gateway can still double-charge across
+workers. That needs the `QuotaStore` seam extended to sessions, and a Redis to
+point it at.
+
+**EXT-11/12/13/14, EXT-19..22 — the UI rows.** The elapsed clock measured the
+session rather than the run, so a follow-up on a session opened before lunch
+drew "Working… 2h 41m" twenty seconds in; a run boundary now restarts it. The
+cache percentage had two denominators — the host divided by the context
+*budget*, the webview by `prompt_tokens` — under a comment claiming the wire
+carries both figures "so that no two surfaces can round their way to different
+answers"; there is one function now, over the prompt. The raw re-emission sat
+above the monotonic guard, so a duplicate the state machine correctly refused
+was still handed to every consumer, appending the row twice and putting a second
+gate-rerun offer on screen. A reconnect spliced streamed text across the outage
+hole, because deltas are not replayed and the buffer was not cleared. The gate
+re-run's task listener was disposed only on the event it waited for, so every
+cancelled run leaked a listener and left its promise pending for ever. Notices
+raised while the panel was closed were dropped by `post` and never replayed.
+`deactivate` aliased `context.subscriptions`, which VS Code disposes itself
+after `deactivate` returns — every disposable in the extension was torn down
+twice on shutdown.
+
+**Rehydration — a restart now restores the conversation, not only the record.**
+`journal.py` made the transcript survive a daemon restart, which is what the
+panel needs; it is not what the agent needs. `follow_up` said so in its own
+comment: after a restart there was no context to continue, so it re-seeded the
+original task. In practice that meant a developer reloading their VS Code window
+at turn 40 and typing "carry on with the repo layer" got an agent that began the
+migration again, with the transcript proving it had already read the service on
+screen beside it. `rehydrate.py` replays the stored events through the
+ContextManager's own append methods — same insertion caps, same read-slice
+ledger, same supersession rules, one assembler — and `_spawn` calls it when the
+daemon holds no context for a session. Re-seeding the task is the last resort
+now rather than the first.
+
+Three properties it is written for. A turn is replayed whole or not at all,
+because half a turn is exactly the wire defect `wire()` exists to repair,
+manufactured on purpose. The budget bound is deterministic — the newest whole
+turns that fit into 55% of the prompt budget, and a message saying how many were
+dropped — because summarising would mean a billed model call the developer did
+not ask for while they wait for a window to reload. And the call's arguments are
+carried to its result, so a restored read keeps its line range and the re-read
+intercept still knows the model has seen that file.
+
+What does not come back is the loop's `_State` ledgers: which searches were
+exhausted, which reads were refused, how many times a gate failed. Those live in
+`AgentLoop.carry_from`, and a restored session starts them empty. The loss is
+one-directional — the agent may repeat a search it had already exhausted; it
+will not skip work it has not done.
+
+**SH-6 — the one the board would never have reached.** Working `CHANGE_PLAN.md`
+end to end closes every row the plan names, which is not the same as every row
+in the register: SH-6 is a P1 line in `BUGS.md` that no step claimed. A sweep
+over every ID, asking what in the tree answers for it, found it. `DeltaCoalescer`
+evaluated its `max_interval` deadline only inside `feed`, and nothing calls
+`feed` while the model is silent — so the check ran on the arrival of the next
+fragment, describing the gap that had just ended rather than the one currently
+open. A model pausing mid-sentence held its last characters until it resumed:
+the "reads as a hang" behaviour the docstring directly above the code says the
+interval exists to prevent. `flush_due()` is the question a clock can ask, and
+`AgentLoop._complete` runs a ticker for the length of a streamed call; the
+coalescer took a lock, because the ticker and the stream are different threads.
+
+The lesson is about the method rather than the defect: a change plan is a list
+of the work someone decided to do, and the register is the list of what is
+wrong. Reconciling the two at the end is a separate step, and it found something.
+
+The audit's own §12 ("what can safely wait") is where the deferred list came
+from. It is now empty apart from the multi-worker gateway store above and the
+two rows the audit itself marked BY-DESIGN (GT-2/3, PI-1).

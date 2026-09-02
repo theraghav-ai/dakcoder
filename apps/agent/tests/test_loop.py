@@ -30,7 +30,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from dakcoder_agent.context import ContextManager, Layer
+from dakcoder_agent.context import PINNED_LAYERS, ContextManager, Layer
 from dakcoder_agent.gate import GATE
 from dakcoder_agent.loop import (
     MAX_FINISH_REFUSALS,
@@ -168,7 +168,7 @@ def test_the_plan_is_read_from_the_tool_call_not_from_prose(
 
     step = loop.state.plan[0]
     assert (step.file, step.accepts) == ("handler/user.go", "go build ./... clean")
-    pinned = [m for m in loop.context.build() if m.layer is Layer.TASK]
+    pinned = [m for m in loop.context.build() if m.layer in PINNED_LAYERS]
     assert any("handler/user.go" in m.content for m in pinned), "the plan is pinned"
 
 

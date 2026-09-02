@@ -359,6 +359,146 @@ describe('RunState — transient events', () => {
 });
 
 
+describe('RunState — the numbers a surface shows', () => {
+  function summary(over: Record<string, unknown> = {}) {
+    return {
+      id: 's1',
+      task: 'migrate the pension service',
+      workspace: '/w',
+      status: 'running',
+      created_at: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+      finished_at: null,
+      summary: '',
+      mutations: [],
+      events: 0,
+      resumable: true,
+      queued: 0,
+      winding_down: false,
+      ...over,
+    } as never;
+  }
+
+  /*
+   * BUG EXT-11. `_startedAt` was set once, with `??=`, and never moved. The
+   * second run of a conversation therefore reported the age of the
+   * *conversation*: a follow-up sent a moment ago on a session opened three
+   * hours earlier drew "Elapsed 3h" in the status bar, and `extension.ts`
+   * derives the panel's clock from the same number.
+   */
+  it('measures the current run, not the age of the session', () => {
+    const { state } = stateWith([]);
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    state.hydrate(summary({ created_at: threeHoursAgo }));
+    feed(state, [
+      event(1, 'turn_start', { turn: 1, mode: 'planner' }),
+      event(2, 'finish', { outcome: 'done', summary: 'first run', turns: 1, mutations: [] }),
+    ]);
+    const firstRun = state.elapsedMs;
+    assert.ok(firstRun >= 3 * 60 * 60 * 1000, 'the first run really did span the session');
+
+    // The follow-up. The wire says running again, with no finish time.
+    state.hydrate(summary({ created_at: threeHoursAgo, finished_at: null }));
+    assert.ok(
+      state.elapsedMs < 60_000,
+      `a follow-up starts its own clock; got ${state.elapsedMs} ms`,
+    );
+    assert.equal(state.status, 'running', 'a session that is running again is not still finished');
+  });
+
+  it('starts a fresh clock for a turn that arrives after a finish', () => {
+    // The same run-boundary, reached without a hydrate: a second window, or a
+    // slash command, sent the follow-up and this panel only sees the turn.
+    const { state } = stateWith([]);
+    state.hydrate(summary());
+    feed(state, [
+      event(1, 'turn_start', { turn: 1, mode: 'coder' }),
+      event(2, 'finish', { outcome: 'done', summary: 'done', turns: 1, mutations: [] }),
+    ]);
+    const frozen = state.elapsedMs;
+    feed(state, [event(3, 'turn_start', { turn: 2, mode: 'coder' })]);
+    assert.notEqual(state.elapsedMs, frozen, 'the clock was still frozen at the last run');
+    assert.ok(state.elapsedMs < 60_000, 'and it did not resume from the session start');
+  });
+
+  /*
+   * BUG EXT-12. The status bar divided `cached_tokens` by `budget` — the size
+   * of the context window — while the webview divided it by `prompt_tokens`.
+   * Same event, two percentages, and the one the status bar showed was wrong
+   * whenever the prompt was smaller than the window, which is always.
+   */
+  it('states one cache percentage, over the prompt it was sent', () => {
+    const { state } = stateWith([]);
+    feed(state, [
+      event(1, 'usage', {
+        prompt_tokens: 10_000,
+        completion_tokens: 500,
+        cached_tokens: 8_000,
+        budget: 128_000,
+        budget_used_pct: 7.8,
+        reasoning_tokens: 0,
+      }),
+    ]);
+    assert.equal(state.cacheLabel(), '80%', 'cache hit rate is of the prompt, not of the window');
+    assert.ok(
+      state.contextMeter()?.includes('cache 80%'),
+      `the meter must agree with the label; got ${String(state.contextMeter())}`,
+    );
+  });
+
+  it('says nothing rather than 0% when the endpoint did not report a cache', () => {
+    const { state } = stateWith([]);
+    feed(state, [
+      event(1, 'usage', {
+        prompt_tokens: 10_000,
+        completion_tokens: 500,
+        cached_tokens: null,
+        budget: 128_000,
+        budget_used_pct: 7.8,
+        reasoning_tokens: 0,
+      }),
+    ]);
+    assert.equal(state.cacheLabel(), 'not reported');
+    assert.equal(state.contextMeter()?.includes('cache'), false);
+  });
+});
+
+describe('RunState — what reaches a raw consumer', () => {
+  /*
+   * BUG EXT-13. The re-emission sat above the monotonic guard, so a server that
+   * resumed inclusively handed every `onDidReceive` consumer the duplicate that
+   * `ingest` itself was about to drop: the panel appended the row twice, the
+   * three trees applied it twice, and a repeated `gate` event put a second
+   * re-run offer in front of the developer.
+   */
+  it('does not re-emit an event it has already seen', () => {
+    const { state } = stateWith([]);
+    const seen: number[] = [];
+    state.onDidReceive((e) => seen.push(e.id));
+    feed(state, [
+      event(1, 'turn_start', { turn: 1, mode: 'coder' }),
+      event(2, 'assistant', { text: 'hello' }),
+      // The reconnect that resumed one event too early.
+      event(1, 'turn_start', { turn: 1, mode: 'coder' }),
+      event(2, 'assistant', { text: 'hello' }),
+      event(3, 'finish', { outcome: 'done', summary: 'done', turns: 1, mutations: [] }),
+    ]);
+    assert.deepEqual(seen, [1, 2, 3], 'a duplicate must be dropped before anyone renders it');
+  });
+
+  it('still re-emits the transient events, which carry no cursor', () => {
+    const { state } = stateWith([]);
+    const kinds: string[] = [];
+    state.onDidReceive((e) => kinds.push(e.type));
+    feed(state, [
+      event(4, 'assistant_delta', { text: 'pack' }),
+      event(4, 'assistant_delta', { text: 'age' }),
+      event(4, 'heartbeat'),
+      event(4, 'assistant', { text: 'package' }),
+    ]);
+    assert.deepEqual(kinds, ['assistant_delta', 'assistant_delta', 'heartbeat', 'assistant']);
+  });
+});
+
 describe('RunState — raising an approval', () => {
   /**
    * The card is drawn by the renderer from the raw event, but the *answer* is

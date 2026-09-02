@@ -62,6 +62,12 @@ log = logging.getLogger(__name__)
 #: reachable by accident.
 ALLOWED_PATHS = frozenset({"chat/completions", "embeddings"})
 
+#: The ceiling on simultaneous upstream connections. Well above the concurrency
+#: a quota-bounded fleet can reach, and still a ceiling: past it, requests queue
+#: on the pool instead of opening sockets the process cannot afford. See the
+#: note where the client is built.
+MAX_UPSTREAM_CONNECTIONS = 256
+
 
 class ProxyError(Exception):
     def __init__(self, message: str, *, status: int = 400) -> None:
@@ -394,7 +400,20 @@ class ModelProxy:
                 timeout=self.timeout,
                 trust_env=False,
                 http2=False,
-                limits=httpx.Limits(max_keepalive_connections=64, keepalive_expiry=300),
+                # `max_connections` is stated, and that is the whole fix for
+                # GW-12. Constructing a `Limits` at all replaces httpx's default
+                # — which caps connections at 100 — with whatever this object
+                # says, and an unset `max_connections` on an explicit `Limits`
+                # is `None`, meaning no cap. So writing the object to raise the
+                # keep-alive ceiling silently removed the connection ceiling:
+                # the upstream pool grew with concurrent streams until the
+                # process ran out of file descriptors, and the failure then
+                # looked like the model endpoint refusing connections.
+                limits=httpx.Limits(
+                    max_connections=MAX_UPSTREAM_CONNECTIONS,
+                    max_keepalive_connections=64,
+                    keepalive_expiry=300,
+                ),
             )
         return self._owned
 

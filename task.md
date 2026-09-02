@@ -45,9 +45,11 @@ Status key: `[ ]` pending · `[~]` in progress · `[x]` done
 
 - [x] 3.1 leaks (L-12 contexts/loops eviction, L-26 event payload caps, SH-7, GW `_settled`)
 - [x] 3.2 observability (turn ids on tool events, L-24 emergency compaction count, EXT-7/8/15)
-- [x] 3.3 perf (L-29 gate key, L-18 measured first)
-- [~] 3.4 gateway hygiene batch — GW-5, GW-6, GW-14 done; GW-7..13 remain
-- [x] 3.5 extension dead code (EXT-6, EXT-16, EXT-18) — EXT-11/12/13/14/19-22 remain
+- [x] 3.3 perf (L-29 gate key; L-18 measured, then moved — see the log)
+- [x] 3.4 gateway hygiene batch — GW-5..14; the multi-worker store is what remains
+- [x] 3.5 extension (EXT-6, EXT-16, EXT-18, then EXT-11/12/13/14/19-22)
+- [x] 3.8 rehydration — a restart restores the conversation, not only the record
+- [x] 3.9 SH-6 — the delta interval flush needs something to ask it the time
 - [x] 3.6 documentation truth pass (DOC-1) — done early: the four false claims
 - [x] 3.7 residual loop rows (L-16, L-22, L-23, L-30, TL-10, GT-1)
 
@@ -81,19 +83,29 @@ Status key: `[ ]` pending · `[~]` in progress · `[x]` done
 
 ## Where this stands
 
-**Suite: 808 tests, green** (it was 704 with 6 failing). Extension `npm run
-verify` green end to end: typecheck, 63 tests, bundle, credential scan, 59/59
+**Suite: 833 tests, green** (it was 704 with 6 failing). Extension `npm run
+verify` green end to end: typecheck, 69 tests, bundle, credential scan, 59/59
 commands in both directions, l10n, gotools manifest.
 
-Every P0 and P1 row from `BUGS.md` is closed, and Phase 3 apart from the rows
-listed below. What is deliberately left, with the reason:
+Every row of `CHANGE_PLAN.md` has landed, including the four that were carried
+as deliberately-deferred after Phase 3. What closed them:
 
-| Row | Why not |
+| Row | What it took |
 |---|---|
-| L-18 | Prefix re-prefill per steer. The plan says measure first and nothing has; moving the directive layer changes prompt shape and invalidates the budget baselines. |
-| GW-7..13 | Refresh tokens plaintext in memory and lost on restart; reservation state per-process. Both need a store — a deployment decision, not a code one. |
-| EXT-11/12/13/14, EXT-19..22 | Elapsed clock, two cache-% denominators, duplicate re-emission, spliced text after reconnect, listener and notice leaks. UI correctness; none of it loses work. |
-| Context rehydration | A restart restores the *record* of a conversation, not the conversation. Rebuilding a ContextManager from `events.jsonl` is the next step if it is wanted. |
+| L-18 | Measured first, as the plan asked. At a 100-turn context a steer re-prefilled 75,764 of 80,543 tokens (94.1%); it costs 35 now. The pinned block is split — task and acceptance stay above the working set, plan and directives move to `Layer.DIRECTIVE` below it. |
+| GW-7..13 | Refresh tokens are stored as SHA-256 verifiers, not credentials; the provider token is out of reprs; revoked families expire; the identity adapter keeps and closes one HTTP client; groups are read past page one; the quota script's ZSET nonce comes from the caller; the upstream pool has a ceiling; the in-memory ledger is bounded and counts what it drops. |
+| EXT-11/12/13/14, EXT-19..22 | Elapsed clock, one cache denominator, dedup above the re-emission, streaming buffer cleared on reconnect, task listener settled two ways, notices held for a closed panel, and `deactivate` no longer double-disposes every subscription. |
+| Context rehydration | `rehydrate.py` replays `events.jsonl` through the ContextManager's own append methods. A restart now restores the conversation. |
+| SH-6 | Found on a second sweep, not from the board — the row was in `BUGS.md`'s P1 table and in no step of the change plan. `max_interval` had nothing calling it while the model was silent. A ticker for the length of a streamed call, and a thread-safe coalescer. |
+
+**What is still open, and why.**
+
+| Row | Why |
+|---|---|
+| Multi-worker gateway state | Reservations and auth sessions are per-process, so two workers can double-charge across each other. This one genuinely is a deployment decision: it needs the `QuotaStore` seam extended to sessions and a Redis to point it at. |
+| The loop's `_State` after a restart | The messages come back; which searches were exhausted and which reads were refused do not. The loss is one-directional — the agent may repeat a search, never skip work it has not done. |
+| GT-2/3, PI-1 | The audit marked them BY-DESIGN and they still are. |
+| R11 | Assessed, not fixed. See below; the reasoning has not changed. |
 
 Two things worth knowing before the next run against a real repository:
 
@@ -107,6 +119,272 @@ Two things worth knowing before the next run against a real repository:
 ---
 
 ## Log — audit remediation
+
+### 3.9 — SH-6, found by re-reading the register rather than the board · done
+
+This one was not on the board. It is a P1 row in `BUGS.md` and no step of
+`CHANGE_PLAN.md` claimed it, so working the plan end to end was never going to
+reach it; it turned up on a sweep that walked every ID in the register and asked
+what in the tree answers for it. Three had nothing: two were Phase 0 fixes that
+predate the citation convention, and this was real.
+
+`DeltaCoalescer` flushes on either of two triggers, and its own docstring says
+which one matters: "``max_interval`` — enough time passed that holding it would
+look like a stall. This is the one that matters: without it, a model that pauses
+mid-sentence leaves the last few characters buffered indefinitely, which reads as
+a hang rather than as latency."
+
+The deadline was evaluated in exactly one place: inside `feed`. Nothing calls
+`feed` while the model is silent — that is what silent means — so the check only
+ever ran on the *arrival of the next fragment*, which makes it a statement about
+the gap that just ended rather than the one currently open. A model that stopped
+mid-sentence with thirty characters buffered emitted nothing at all until it
+started again, and then emitted them late. The paragraph describing the failure
+was sitting directly above the code that shipped it, which is the whole reason
+the audit's confidence column exists.
+
+Two changes. `flush_due()` is the question a clock can ask — flush only if the
+buffer is non-empty *and* the interval has passed — and `AgentLoop._complete`
+runs a daemon thread that asks it every half-interval for the length of one
+streamed call, stopping before the tail flush so the last fragment is emitted
+once. The coalescer is thread-safe now, because the ticker and the stream are
+different threads and a buffer two threads append to and drain without a lock
+loses text — invisibly, since the run still finishes and the `assistant` message
+at the end is complete, so only the streamed view would be wrong.
+
+Cost: one wake-up every 40 ms while a call is in flight, and nothing between
+calls. The full suite runs in the same time it did before.
+
+Tests: `test_a_pause_mid_sentence_does_not_hold_the_text`,
+`test_the_interval_flush_does_not_fire_early`,
+`test_an_idle_coalescer_has_nothing_to_flush`, and
+`test_the_ticker_and_the_stream_cannot_lose_text`, which races 2,000 fragments
+against a spinning ticker and asserts the concatenation is exact.
+
+### 3.3 (second half) — L-18, measured and then moved · done
+
+The change plan's instruction was "measure before moving", and it was the right
+instruction: the row had been carried through two audits as accepted-by-design
+on the strength of an estimate. So it was measured, with the ContextManager's
+own `novel_tokens` — the method whose docstring calls itself "what a prefix
+cache actually has to prefill" — over a context of the shape a migration run
+reaches (a system prompt, a mode overlay, then N turns of assistant-with-a-read
+and its result):
+
+```
+turns   prompt      a steer re-prefills          after
+    5    8,633    3,854  (44.6%)                    35
+   20   19,983   15,204  (76.1%)                    35
+   50   42,693   37,914  (88.8%)                    35
+  100   80,543   75,764  (94.1%)                    35
+  200  156,243  151,464  (96.9%)                    35
+```
+
+The same sentence appended to the working set instead cost 11 tokens. A
+developer typing one correction at turn 100 was paying to re-read the entire
+conversation, and `set_plan` — which fires on every plan submission — was paying
+the same. That is not a cost worth accepting; it is the cost the prefix
+discipline exists to avoid, incurred at exactly the events the discipline was
+built for.
+
+What moved is narrower than "move the directives". The pinned block held four
+things and only two of them mutate: the task statement and the acceptance
+criteria are written once by `set_task` and never again, so they are the stable
+head and stay where §6.1 put them. The plan and the directives move to a new
+`Layer.DIRECTIVE`, assembled *after* the working set. Pinned is about eviction,
+not position — compaction only ever consumes `_working` — so nothing became
+evictable, which is the property the old placement was defending. And the
+instruction the developer typed most recently now sits closest to the model's
+next token, which is where a correction belongs.
+
+Two tests changed rather than broke, and both were asserting the placement
+rather than the property: one wanted the plan text inside the `TASK` message,
+the other wanted it in `Layer.TASK` specifically. They assert pinning now.
+
+Tests: `test_a_steer_does_not_reprefill_the_whole_conversation`,
+`test_pinning_a_plan_does_not_reprefill_either`,
+`test_the_directive_layer_is_pinned_even_though_it_is_last`.
+
+### 3.4 — the gateway rows, as code rather than as a deployment decision · done
+
+The previous note said GW-7..13 "need a store — a deployment decision, not a
+code one". That was true of one of them and a dodge for the rest.
+
+**GW-7.** The refresh tokens were the *keys* of a dict: thirty-day credentials
+held in plaintext, in the process that also holds the model API keys, for as
+long as they are valid. Nothing in the service ever needs a token back — refresh
+only has to *recognise* one — so it stores SHA-256 of it and the plaintext lives
+only inside the request that presented it. Unsalted and uniterated, deliberately
+and unlike a password hash: these are 256 bits from `secrets.token_urlsafe`,
+there is no dictionary to attack, and the lookup is on the hot path of every
+refresh. The GitLab access token beside it *is* still held, because `recheck`
+has to use it, but it is `repr=False` now — a dataclass renders every field, and
+that one was one exception context away from a log. `_revoked_families` was a
+set that only grew; it expires with the refresh TTL.
+
+**GW-9** was survivable only while GW-1 was broken. `_client()` built a fresh
+`httpx.AsyncClient` on every call and never kept or closed one; with refresh
+actually working that is a leaked connection pool per session per fifteen
+minutes, for the life of the process. It keeps one, builds it under a lock, and
+the app closes it at shutdown — but only if it built it, because a client passed
+in by a test belongs to the test.
+
+**GW-10.** `/api/v4/groups` asked for `per_page=100` and read one page. Roles
+are mapped from group paths, so a developer in more than a hundred groups —
+ordinary in a large GitLab, where every project's parent counts — could lose the
+one group that grants their role and be told they had no entitlement. A
+truncated group list is a wrong answer that looks exactly like a correct one.
+Paged, bounded at twenty pages so an IdP that never returns a short page cannot
+turn a sign-in into a loop.
+
+**GW-8** is the one I would have missed reading quickly. The quota script's ZSET
+member was `amount:now:i:sha1hex(key .. now .. i)` — and hashing three values
+already present in the member adds no entropy whatsoever. `ZADD` on an existing
+member updates its score instead of adding a row, so two charges for one series
+in the same timestamp collapsed into one and the second was silently lost. The
+nonce comes from the caller now, one per invocation, which is what `adjust`
+directly beneath it had always done.
+
+**GW-12** is the same shape of mistake in a different library. The pool was
+built with `httpx.Limits(max_keepalive_connections=64, keepalive_expiry=300)`,
+and constructing a `Limits` at all replaces httpx's default — which caps
+connections at 100 — with whatever the object says. An unset `max_connections`
+on an explicit `Limits` is `None`, meaning no cap. So the line written to *raise*
+the keep-alive ceiling silently removed the connection ceiling, and the failure
+mode is a gateway running out of file descriptors under concurrency and looking
+like the model endpoint refusing connections.
+
+**GW-13.** `MemoryLedger` is what every deployment without
+`DAKCODER_POSTGRES_DSN` runs on, and the class that calls itself "the system of
+record" kept an unbounded list. It is a bounded window now that counts what it
+drops, and says so in a log the first time and every thousandth. `PostgresLedger`
+still fails open on a write — the quota decision is already enforced, and
+refusing a turn over bookkeeping would cost the developer their work — but it
+counts and logs the hole rather than only handing it to an optional callback.
+
+What is genuinely left is the multi-worker case: reservations and auth sessions
+are per-process. That one does need a shared store, and the seam to extend is
+`QuotaStore`.
+
+Tests: eleven, in `test_regression_gateway.py`, one per row.
+
+### 3.5 (second half) — the extension UI rows · done
+
+**EXT-11.** `_startedAt` was set once with `??=` and never moved, so the elapsed
+clock measured the *session* rather than the run: a follow-up sent twenty
+seconds ago on a session opened three hours earlier drew "Elapsed 3h" in the
+status bar, and `extension.ts` derives the panel's clock from the same number. A
+run boundary — a hydrate that finds the session running again, or a `turn_start`
+arriving after a `finish` — starts a new clock.
+
+**EXT-12** is the one with the comment. `contextMeter` divides by `budget`,
+`cacheLabel` divides by `budget`, and `chat.js` divides by `prompt_tokens` — so
+the status bar and the panel printed different cache percentages for the same
+turn, directly beneath a docstring saying the wire carries both figures "so that
+no two surfaces can round their way to different answers". `prompt_tokens` is
+the right denominator: the question is what fraction of the prompt we just sent
+came from cache, and the budget is not what we sent. One function now.
+
+**EXT-13.** `receiveEmitter.fire` sat above the monotonic guard, so a duplicate
+the state machine correctly refused was still handed to every `onDidReceive`
+consumer — the panel appended the row twice, the three trees applied it twice,
+and a repeated `gate` event put a second re-run offer in front of the developer.
+The dedup has to be the first thing that happens to a duplicate, not the last.
+The transient events still bypass it, because they carry the id of the message
+they precede.
+
+**EXT-14.** Deltas are not persisted and not replayed, so reconnecting resumes
+from `lastId` and every delta emitted during the outage is gone. The buffer was
+not cleared, so the pre-outage half-sentence and the post-reconnect deltas were
+concatenated into one continuous sentence with no sign anything was missing.
+Cleared on a dropped link; the authoritative `assistant` event carries the whole
+message and arrives on the new connection.
+
+**EXT-19.** The gate re-run awaited `onDidEndTaskProcess` and disposed the
+listener only on the event it was waiting for. A task the developer cancels, or
+one whose shell will not spawn, ends with `onDidEndTask` and no process event at
+all — so every cancelled re-run leaked a listener for the life of the window and
+left its promise pending for ever. Two listeners, one settle, and a shutdown
+hook that removes itself.
+
+**EXT-20/21.** The `answered` set was unbounded beside a `receipts` map that
+carried the comment explaining why it should not be. And `post` returns early
+without a view, while `flush` spliced the queue *before* checking for one —
+so a notice raised before the panel was first opened, or while it was closed,
+or in the 16 ms between a post and its flush, was simply never said. That
+includes the notice reporting an approval released as a rejection, which is the
+one a developer most needs to have seen. Notices are held, bounded, and drained
+after the transcript on the next `replay`; the flush checks first and splices
+second.
+
+**EXT-22.** `deactivate` iterated `context.subscriptions`, which VS Code
+disposes itself once `deactivate` returns — every disposable in the extension
+was torn down twice on shutdown, and the ones that did not survive it failed
+inside a `catch` where nobody would see them. The only thing that needs ordered
+shutdown is the runtime, because it owns a child process the host will not kill;
+that is what the list holds now. While there: `resolveWebviewView` pushed its
+listeners onto the *provider's* disposables, so a view hidden and shown five
+times had five live `onDidReceiveMessage` handlers and one `submit` started five
+runs. They belong to the view.
+
+Tests: six in `state.test.ts` (69 total, was 63).
+
+### 3.8 — a restart restores the conversation, not only the record · done
+
+Step 2.9 made the transcript survive a daemon restart. That is what the *panel*
+needs. It is not what the agent needs, and `follow_up` said so in its own
+comment: with no context to continue, it re-seeded the original task —
+"degraded, but not silently". In practice, degraded means a developer reloads
+their VS Code window at turn 40 of a migration, types "carry on with the repo
+layer", and gets an agent that begins the migration again, with the transcript
+proving it had already read the whole service on screen beside it. A window
+reload is not an unusual event.
+
+`rehydrate.py` replays the stored events through the ContextManager's own append
+methods rather than deserialising them into messages. That is the whole design
+decision: there is one assembler (§6.4), and a restored context goes through the
+same insertion caps, the same read-slice ledger and the same supersession rules
+as a live one.
+
+Three things it is careful about.
+
+*A turn is replayed whole or not at all.* Half a turn is an assistant whose tool
+calls have no results, or results whose calls nothing declares — precisely the
+wire defect `wire()` exists to repair, manufactured on purpose at restore time.
+The test asserts `wire_repairs` is empty after a restore, including the
+budget-truncated one.
+
+*The budget bound is deterministic.* A 400-turn session does not fit in a
+prompt, and the obvious answer — summarise the rest — means a billed model call
+the developer did not ask for, at the moment they are waiting for a window to
+finish reloading. So it keeps the newest whole turns that fit in 55% of the
+budget (not more: the run that follows needs room, and a context restored to the
+compaction threshold would compact on its first turn, turning "continue where
+you left off" into "summarise where you left off") and says in a message the
+model reads how many turns it dropped and where the rest is.
+
+*The call's arguments are carried to its result.* A `tool_result` event carries
+the content and the id but not the arguments — only the intercepted path repeats
+them — and the arguments are where `path` and the line range live. Without that
+link every restored read claims no coverage, and the re-read intercept, which
+asks the context rather than the loop since RC-1, would let the agent re-read
+every file it already had one turn after being restored. This is the part I got
+wrong first: the fixture passed `arguments` on the result, which real events do
+not carry, and the test failed for the right reason.
+
+What does not come back is the loop's `_State`: which searches were exhausted,
+which reads were refused, how many times a gate failed. Those live in
+`carry_from` and a restored session starts them empty. The loss is
+one-directional and worth stating plainly — the agent may repeat a search it had
+already exhausted; it will not skip work it has not done.
+
+Re-seeding the original task is still there, as the last resort rather than the
+first: no transcript, an unreadable one, or a session that never got a reply.
+
+Tests: five in `test_regression_audit.py` and one end-to-end in
+`test_loopback.py` that runs a task, throws the runtime away, builds a second
+one over the same workspace and checks the conversation comes back.
+
 
 ### Verification against the audit's own reproductions
 

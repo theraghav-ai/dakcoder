@@ -24,12 +24,20 @@ which turns a measurable decision into a matter of taste.
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+import logging
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
 __all__ = ["Ledger", "MemoryLedger", "PostgresLedger", "UsageEvent", "SCHEMA"]
+
+log = logging.getLogger(__name__)
+
+#: How many metered turns the in-memory ledger keeps. Roughly a week of a busy
+#: team's turns, and a bound rather than a promise: the durable ledger is
+#: Postgres, and this one says out loud that it is a window.
+MEMORY_LEDGER_CAPACITY = 50_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,14 +120,39 @@ class MemoryLedger:
     Also what a cold-start rebuild would read from in a single-process
     deployment. Not a stub: the aggregation logic here is the definition the
     SQL has to match.
+
+    **Bounded, and it says so.** This is the fallback a gateway runs with when
+    ``DAKCODER_POSTGRES_DSN`` is unset — which is every deployment that has not
+    provisioned Postgres yet — and the list it kept was unbounded, so the
+    process that calls itself "the system of record" grew by one dataclass per
+    metered turn until it was restarted (BUG GW-13). The cap is the honest
+    version of what this class actually is: a window over recent turns, held in
+    one process's memory, lost on restart. ``dropped`` counts what fell off the
+    front, so the reports it answers can say they are incomplete rather than
+    quietly under-reporting.
     """
 
-    def __init__(self) -> None:
-        self.events: list[UsageEvent] = []
+    def __init__(self, capacity: int = MEMORY_LEDGER_CAPACITY) -> None:
+        self.capacity = capacity
+        self.events: deque[UsageEvent] = deque(maxlen=capacity)
+        #: Turns evicted by the cap. Never resets; a non-zero value means the
+        #: totals below are a floor, not a total.
+        self.dropped = 0
         self._lock = asyncio.Lock()
 
     async def record(self, event: UsageEvent) -> None:
         async with self._lock:
+            if len(self.events) == self.capacity:
+                self.dropped += 1
+                if self.dropped == 1 or self.dropped % 1000 == 0:
+                    log.warning(
+                        "the in-memory ledger is full at %d events and has now dropped %d; "
+                        "usage history before the most recent %d turns is gone. Set "
+                        "DAKCODER_POSTGRES_DSN to keep it.",
+                        self.capacity,
+                        self.dropped,
+                        self.capacity,
+                    )
             self.events.append(event)
 
     async def totals(self, sub: str, since: datetime) -> dict[str, int]:
@@ -161,6 +194,11 @@ class PostgresLedger:
     def __init__(self, pool: Any, *, on_error=None) -> None:
         self.pool = pool
         self._on_error = on_error or (lambda exc, event: None)
+        #: Rows the database refused or never saw. The class fails open by
+        #: design — see the docstring — and a hole nobody counts is a hole
+        #: nobody finds. ``on_error`` is an operator's hook and may be absent;
+        #: this is not.
+        self.dropped = 0
 
     async def record(self, event: UsageEvent) -> None:
         try:
@@ -179,6 +217,16 @@ class PostgresLedger:
                     event.billed_tokens, event.estimated_tokens, event.latency_ms, event.at,
                 )
         except Exception as exc:  # noqa: BLE001 - see the class docstring
+            self.dropped += 1
+            log.error(
+                "the usage ledger dropped a turn for %s (session %s, turn %d): %s. "
+                "%d row(s) lost so far; quota counters are unaffected.",
+                event.sub,
+                event.session_id,
+                event.turn,
+                exc,
+                self.dropped,
+            )
             self._on_error(exc, event)
 
     async def totals(self, sub: str, since: datetime) -> dict[str, int]:

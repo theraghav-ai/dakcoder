@@ -20,10 +20,18 @@ GitLab token or reads group membership.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 __all__ = ["GitLabIdentity", "IdentityError", "IdentityProvider", "Profile"]
+
+
+#: Groups per request, and the ceiling on how many requests a sign-in will make.
+#: 100 is GitLab's own maximum ``per_page``; 20 pages is 2,000 groups, which is
+#: past any real membership and still a bounded sign-in.
+GROUP_PAGE_SIZE = 100
+MAX_GROUP_PAGES = 20
 
 
 class IdentityError(Exception):
@@ -107,6 +115,10 @@ class GitLabIdentity:
         self.client_secret = client_secret
         self.timeout = timeout
         self._http = http
+        #: True only for a client this adapter built, so ``aclose`` never closes
+        #: one that was handed in.
+        self._owns_http = False
+        self._http_lock = asyncio.Lock()
 
     def authorize_url(self, redirect_uri: str, challenge: str, state: str) -> str:
         from urllib.parse import urlencode
@@ -141,10 +153,7 @@ class GitLabIdentity:
 
     async def profile(self, access_token: str) -> Profile:
         user = await self._get("/api/v4/user", access_token)
-        groups = await self._get(
-            "/api/v4/groups", access_token, params={"min_access_level": 10, "per_page": 100}
-        )
-        paths = tuple(str(g.get("full_path", "")) for g in groups if g.get("full_path"))
+        paths = await self._groups(access_token)
 
         state = str(user.get("state", "active")).lower()
         return Profile(
@@ -159,6 +168,36 @@ class GitLabIdentity:
             active=state == "active",
             raw={"id": user.get("id"), "state": state},
         )
+
+    async def _groups(self, access_token: str) -> tuple[str, ...]:
+        """Every group the developer is in, not the first hundred.
+
+        The call asked for ``per_page=100`` and read one page. Roles are mapped
+        from group paths, so a developer in more than a hundred groups — normal
+        in a large GitLab instance, where every project's parent counts — could
+        silently lose the one group that grants their role and be told they had
+        no entitlement. A truncated group list is a wrong answer that looks
+        exactly like a correct one (BUG GW-10).
+
+        Bounded at ``MAX_GROUP_PAGES``: an IdP that never returns a short page
+        must not turn a sign-in into an unbounded loop.
+        """
+        paths: list[str] = []
+        for page in range(1, MAX_GROUP_PAGES + 1):
+            batch = await self._get(
+                "/api/v4/groups",
+                access_token,
+                params={"min_access_level": 10, "per_page": GROUP_PAGE_SIZE, "page": page},
+            )
+            if not isinstance(batch, list) or not batch:
+                break
+            paths += [str(g.get("full_path", "")) for g in batch if g.get("full_path")]
+            if len(batch) < GROUP_PAGE_SIZE:
+                break
+        # Order-preserving de-duplication: a group can appear on two pages if the
+        # membership changes between requests, and a repeated path would be
+        # counted twice by anything that counts.
+        return tuple(dict.fromkeys(paths))
 
     async def recheck(self, sub: str, access_token: str = "") -> Profile:
         """Re-read the account with the provider token captured at sign-in.
@@ -187,13 +226,50 @@ class GitLabIdentity:
     # -- transport ---------------------------------------------------------
 
     async def _client(self):
+        """The one HTTP client this adapter owns.
+
+        It used to build a fresh ``AsyncClient`` on every call and never keep or
+        close it, so every token exchange, profile read, group read and recheck
+        leaked a client and its connection pool (BUG GW-9). That was survivable
+        while ``recheck`` raised 501 and refresh never ran; with refresh working
+        it is one leaked pool per session per fifteen minutes, for the life of
+        the process, and the sockets go with it.
+
+        Built under a lock because two concurrent sign-ins would otherwise build
+        two and keep the second — the same leak, one per race rather than one
+        per call.
+        """
         if self._http is not None:
             return self._http
-        import httpx
+        async with self._http_lock:
+            if self._http is None:
+                import httpx
 
-        # trust_env=False for the same reason as the model client: a developer's
-        # proxy variables must not silently redirect an OAuth exchange.
-        return httpx.AsyncClient(timeout=self.timeout, trust_env=False, http2=False)
+                # trust_env=False for the same reason as the model client: a
+                # developer's proxy variables must not silently redirect an
+                # OAuth exchange. The pool is bounded: an unbounded one turns a
+                # slow IdP into unbounded socket growth here.
+                self._http = httpx.AsyncClient(
+                    timeout=self.timeout,
+                    trust_env=False,
+                    http2=False,
+                    limits=httpx.Limits(
+                        max_connections=32, max_keepalive_connections=8, keepalive_expiry=60
+                    ),
+                )
+                self._owns_http = True
+        return self._http
+
+    async def aclose(self) -> None:
+        """Close the client, if this adapter built it.
+
+        A client passed in by a caller or a test belongs to that caller; closing
+        it here would shut a connection pool somebody else is still using.
+        """
+        client, self._http = self._http, None
+        if client is not None and self._owns_http:
+            self._owns_http = False
+            await client.aclose()
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         client = await self._client()

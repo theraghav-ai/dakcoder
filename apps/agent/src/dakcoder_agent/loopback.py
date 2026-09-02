@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import math
 import os
 import secrets
@@ -56,10 +57,13 @@ from dakcoder_shared.envelope import Event, EventType
 
 from .loop import AgentLoop, Outcome, RunResult
 from .modes import Intent
+from .rehydrate import rehydrate, restorable
 from .session import Session, SessionStore, Status
 from .tools.router import ApprovalRequest
 
 __all__ = ["API_VERSION", "Loopback", "PendingApproval", "create_app"]
+
+log = logging.getLogger(__name__)
 
 #: The contract version the extension pins against. Bumped when a response shape
 #: changes in a way a client could not have anticipated — never for an additive
@@ -300,7 +304,7 @@ class Loopback:
             # one that already holds the exchange, and swapping it here keeps
             # ``build_loop`` a factory rather than something that has to know
             # about session lifecycles.
-            prior = self.contexts.get(session.id)
+            prior = self.contexts.get(session.id) or self._restore_context(session, agent)
             if prior is not None:
                 agent.context = prior
             # And the ledgers, for the same reason. The working set remembering
@@ -475,20 +479,64 @@ class Loopback:
         # request by construction -- there is nothing for the classifier to
         # decide.
         #
-        # `continued=True` only has a context to reuse while the daemon still
-        # holds one. After a restart there is none, and the resume falls back to
-        # re-seeding the original task -- degraded, but not silently: the
-        # message says which happened.
-        if self.contexts.get(session.id) is None:
-            self._spawn(
-                session,
-                "\n\n".join([session.task, message]),
-                Intent.AGENT,
-                (),
-            )
-        else:
-            self._spawn(session, message, Intent.AGENT, (), continued=True)
+        # `continued=True` wants a context to reuse. The daemon holds one only
+        # for a session it has run since it started; after a restart — which a
+        # VS Code window reload causes — `_spawn` rebuilds it from the session's
+        # own transcript instead. Re-seeding the original task is the last
+        # resort now rather than the first, and it stays because a transcript
+        # can be missing, unreadable, or too short to be a conversation.
+        self._spawn(session, message, Intent.AGENT, (), continued=True)
         return session
+
+    def _restore_context(self, session: Session, agent: Any) -> Any:
+        """Rebuild this session's conversation from disk, or return ``None``.
+
+        The daemon holds a context only for a session it has run since it
+        started, and a VS Code window reload restarts the daemon. So the case
+        this covers is the ordinary one: the developer reloads at turn 40 and
+        types "carry on with the repo layer". Before this, that answer came from
+        a context seeded with the original task and nothing else — the agent
+        began the migration again, having forgotten every file it had read,
+        while the transcript proving otherwise was on screen beside it.
+
+        `journal.py` made the *record* survive a restart. This makes the
+        conversation survive one. What does not come back is the loop's own
+        ledgers — which searches were exhausted, which reads were refused — and
+        the direction of that loss is safe: the agent may repeat a search, never
+        skip work it has not done. See `rehydrate` for the rest.
+
+        Best-effort in the same sense the journal is: a transcript that cannot be
+        read costs the continuation, not the run. The caller falls back to
+        re-seeding the task, which is what it did before.
+        """
+        try:
+            session.hydrate()
+            events = [
+                {"type": str(event.type), "data": event.data} for event in session.events
+            ]
+            if not restorable(events):
+                return None
+            restored = rehydrate(
+                events,
+                context=agent.context,
+                task=session.task,
+                acceptance=tuple(getattr(session, "acceptance", ()) or ()),
+            )
+        except Exception:  # noqa: BLE001 - a lost transcript must not fail a run
+            log.warning("could not restore %s from disk", session.id, exc_info=True)
+            return None
+
+        if restored.turns == 0:
+            return None
+        log.info(
+            "restored %s from disk: %d turn(s) of %d event(s)%s",
+            session.id,
+            restored.turns,
+            restored.events,
+            "" if restored.complete else f", {restored.dropped_turns} dropped for budget",
+        )
+        self.contexts[session.id] = restored.context
+        return restored.context
 
     def _await_decision(self, session: Session, request: ApprovalRequest) -> bool:
         """Block the loop thread until the developer decides, or time runs out."""

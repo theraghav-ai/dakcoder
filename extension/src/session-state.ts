@@ -333,6 +333,13 @@ export class RunState implements vscode.Disposable {
    * Wall clock from our side. `tool_result.ms` is server-measured and excludes
    * the approval wait, so summing it would under-report exactly the time the
    * developer spent staring at a dialog.
+   *
+   * It measures the *current run*, not the session. `_startedAt` used to be set
+   * once with `??=` and never moved again, so the second turn of a conversation
+   * reported the age of the conversation: a follow-up sent twenty seconds ago,
+   * on a session opened before lunch, drew "Working... 2h 41m" in the status bar
+   * and put the same figure behind the panel's clock (`extension.ts` derives the
+   * webview's `startedAt` from this number). `beginRun` is what moves it.
    */
   get elapsedMs(): number {
     if (this._startedAt === undefined) return 0;
@@ -452,9 +459,8 @@ export class RunState implements vscode.Disposable {
     // rather than printing a figure. The full breakdown says "not reported" in
     // words — see `cacheLabel` — because in a tooltip the absence is worth a
     // sentence and in a one-line meter it is worth nothing.
-    if (usage.cachedTokens !== null && usage.budget > 0) {
-      segments.push(vscode.l10n.t('cache {0}%', Math.round((usage.cachedTokens / usage.budget) * 100)));
-    }
+    const cache = cachePct(usage);
+    if (cache !== undefined) segments.push(vscode.l10n.t('cache {0}%', cache));
     return segments.join(' · ');
   }
 
@@ -465,10 +471,9 @@ export class RunState implements vscode.Disposable {
    */
   cacheLabel(): string {
     const usage = this._usage;
-    if (!usage || usage.cachedTokens === null || usage.budget <= 0) {
-      return vscode.l10n.t('not reported');
-    }
-    return vscode.l10n.t('{0}%', Math.round((usage.cachedTokens / usage.budget) * 100));
+    const cache = usage === undefined ? undefined : cachePct(usage);
+    if (cache === undefined) return vscode.l10n.t('not reported');
+    return vscode.l10n.t('{0}%', cache);
   }
 
   /** Count-bearing, so it needs both forms: `vscode.l10n` has no ICU plurals. */
@@ -485,20 +490,41 @@ export class RunState implements vscode.Disposable {
    * The transcript is replayed through the same `ingest`, which is what keeps
    * the de-duplication rules from applying only to live runs.
    */
+  /**
+   * Start the clock for a new run on a session that already had one. Status
+   * goes back to `running` because every caller reaching here has just learnt
+   * that it is; leaving it at the previous outcome is what left a panel drawing
+   * a finished run while turns arrived underneath it.
+   */
+  private beginRun(at: number): void {
+    this._startedAt = at;
+    this._finishedAt = undefined;
+    this._status = 'running';
+  }
+
   hydrate(summary: SessionSummary): void {
     if (summary.id !== this._sessionId) this.reset();
     this._sessionId = summary.id;
     this._task = summary.task;
     this._status = summary.status;
     this._summary = summary.summary;
-    this._startedAt ??= Date.parse(summary.created_at) || Date.now();
     // Cleared, not merely overwritten. A follow-up puts a finished session back
     // to running and sends `finished_at: null`; keeping the old value would
     // leave the elapsed timer frozen at whatever the last run took, which reads
     // as a run that has stalled.
-    this._finishedAt = summary.finished_at
+    const finishedAt = summary.finished_at
       ? Date.parse(summary.finished_at) || Date.now()
       : undefined;
+    if (finishedAt === undefined && this._finishedAt !== undefined) {
+      // A run that had ended is running again: this is a *new* run, and its
+      // clock starts now. The wire carries no per-run start time — only
+      // `created_at` for the session — so now is the best fact available, and
+      // it is the right one: the developer pressed send a moment ago.
+      this.beginRun(Date.now());
+    } else {
+      this._startedAt ??= Date.parse(summary.created_at) || Date.now();
+      this._finishedAt = finishedAt;
+    }
 
     /*
      * A stored transcript is history, and the difference matters for exactly
@@ -667,6 +693,18 @@ export class RunState implements vscode.Disposable {
       // A dropped link must not strand a held row behind a twin that will never
       // arrive on this connection.
       this.release();
+      // Nor may it splice.
+      //
+      // Deltas are not persisted and not replayed: reconnecting resumes from
+      // `lastId`, which counts stored events only, so every delta emitted while
+      // the link was down is simply gone. The buffer held the half-sentence
+      // from before the outage and the deltas after it were appended straight
+      // on to it, so the panel drew "...so I will update the" + "andler and
+      // re-run the gate" as one continuous sentence with no sign that anything
+      // was missing. Dropping the partial costs a flicker; the authoritative
+      // `assistant` event carries the whole message and arrives on the new
+      // connection.
+      this.setStreaming('');
       // A stream that closes cleanly on a finished session is not a failure to
       // retry; reconnecting forever against a terminal session is a busy loop
       // with a spinner on it.
@@ -748,10 +786,6 @@ export class RunState implements vscode.Disposable {
       event = { ...event, data: { ...(event.data ?? {}), historical: true } };
     }
 
-    // Re-emitted first, so a consumer that renders raw events sees them in
-    // exactly the order the server sent them, before any derived state moves.
-    this.receiveEmitter.fire(event);
-
     const d = event.data ?? {};
     const at = Date.now();
 
@@ -762,6 +796,24 @@ export class RunState implements vscode.Disposable {
     // therefore drops every delta after the first and then drops the authoritative
     // `assistant` message that shares their id, and advancing `lastId` from one
     // makes the next reconnect resume past an answer that was never delivered.
+    const transient = event.type === 'assistant_delta' || event.type === 'heartbeat';
+
+    // A server that resumed inclusively rather than exclusively would double
+    // every row at each reconnect. Ids are monotonic; trust nothing else.
+    //
+    // The guard sits *above* the re-emission, not merely above the derived
+    // state. It used to sit below it, so a duplicate the state machine
+    // correctly refused was still handed to every `onDidReceive` consumer:
+    // `chatView.push` appended the row a second time, the three trees applied
+    // it again, and a repeated `gate` event re-ran `offerGateRerun` and put a
+    // second modal in front of the developer. The dedup has to be the first
+    // thing that happens to a duplicate, not the last.
+    if (!transient && this.lastId && event.id <= this.lastId) return;
+
+    // Re-emitted before any derived state moves, so a consumer that renders raw
+    // events sees them in exactly the order the server sent them.
+    this.receiveEmitter.fire(event);
+
     if (event.type === 'assistant_delta') {
       this.setStreaming(this.streaming + str(d.text));
       return; // never a row: S11 says do not build a transcript from deltas
@@ -771,9 +823,6 @@ export class RunState implements vscode.Disposable {
       return;
     }
 
-    // A server that resumed inclusively rather than exclusively would double
-    // every row at each reconnect. Ids are monotonic; trust nothing else.
-    if (this.lastId && event.id <= this.lastId) return;
     if (event.id) this.lastId = event.id;
 
     switch (event.type) {
@@ -794,7 +843,12 @@ export class RunState implements vscode.Disposable {
         // Deltas are not persisted, so a new turn starts from nothing rather
         // than from whatever the last one left in the buffer.
         this.setStreaming('');
-        this._startedAt ??= at;
+        // A turn arriving on a session this panel had recorded as finished is a
+        // follow-up somebody else sent — a second window, a slash command — and
+        // it starts a run whose clock is its own. `hydrate` catches the case
+        // where this panel sent it; this catches the case where it did not.
+        if (this._finishedAt !== undefined) this.beginRun(at);
+        else this._startedAt ??= at;
         break;
       }
 
@@ -1131,6 +1185,26 @@ function str(value: unknown, fallback = ''): string {
 
 function num(value: unknown, fallback = 0): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * The cache figure, or `undefined` when there is not one to state.
+ *
+ * One function because there was one number and two answers. `contextMeter` and
+ * `cacheLabel` both divided `cached_tokens` by `budget` — the size of the
+ * context window — while the webview (`chat.js`) divided it by `prompt_tokens`,
+ * so the status bar and the panel printed different percentages for the same
+ * turn, the status bar's always the smaller of the two and never right.
+ *
+ * `prompt_tokens` is the denominator: the question is what fraction of the
+ * prompt we just sent was served from cache, and the budget is not what we
+ * sent. The comment above `contextMeter` says the wire carries both figures "so
+ * that no two surfaces can round their way to different answers" — it did, and
+ * they did, because this one was recomputed twice from the wrong pair.
+ */
+function cachePct(usage: ContextUsage): number | undefined {
+  if (usage.cachedTokens === null || usage.promptTokens <= 0) return undefined;
+  return Math.round((usage.cachedTokens / usage.promptTokens) * 100);
 }
 
 /** Distinguishes "the endpoint reported nothing" from zero. See `cacheLabel`. */

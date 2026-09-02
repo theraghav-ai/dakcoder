@@ -92,6 +92,10 @@ class Layer(StrEnum):
     WORKING_SET = "working_set"
     RECAP = "recap"
     TASK = "task"
+    #: The plan and the developer's directives. Pinned like ``TASK``, and
+    #: assembled *after* the working set rather than before it — see
+    #: ``build`` for the measurement that put it there.
+    DIRECTIVE = "directive"
     MODE = "mode"
     SYSTEM = "system"
 
@@ -99,7 +103,7 @@ class Layer(StrEnum):
 #: Layers that are never evicted. The task and the acceptance criteria are what
 #: the whole run is measured against; an agent that compacts away what it was
 #: asked to do will confidently finish something else.
-PINNED_LAYERS = frozenset({Layer.SYSTEM, Layer.MODE, Layer.TASK})
+PINNED_LAYERS = frozenset({Layer.SYSTEM, Layer.MODE, Layer.TASK, Layer.DIRECTIVE})
 
 #: How many developer directives the pinned task block may carry at once.
 #:
@@ -527,6 +531,9 @@ class ContextManager:
         #: The last raw mode instruction, for the dedupe in `switch_mode`.
         self._last_mode_instruction = ""
         self._task: Message | None = None
+        #: The plan and the directives, rendered below the working set. Pinned,
+        #: like the task, but never part of the cacheable head.
+        self._directive_message: Message | None = None
         self._task_text = ""
         self._plan_text = ""
         self._acceptance: tuple[str, ...] = ()
@@ -598,9 +605,40 @@ class ContextManager:
     def build(self) -> list[Message]:
         """Assemble the message list.
 
-        The only builder. Order is fixed and the head is stable:
+        The only builder. Order is fixed, and the head is stable:
 
-            system  ->  mode instructions  ->  task  ->  recap  ->  working set
+            system -> mode -> task -> recap -> working set -> plan & directives
+
+        **Why the last layer is last** (BUG L-18). Everything a steer or a plan
+        submission mutates lives at the end. It used to live in the ``task``
+        block, three messages from the top, and a prefix cache is a prefix: one
+        changed byte there invalidates every token after it. The manager's own
+        ``novel_tokens`` — "what a prefix cache actually has to prefill" — put
+        numbers on it, over a context of the shape a migration run reaches:
+
+            turns   prompt      a steer re-prefills
+                5    8,633    3,854   (44.6%)
+               20   19,983   15,204   (76.1%)
+               50   42,693   37,914   (88.8%)
+              100   80,543   75,764   (94.1%)
+              200  156,243  151,464   (96.9%)
+
+        The same words appended to the working set instead cost 11 tokens. So a
+        developer typing one sentence at turn 100 paid to re-read the entire
+        conversation, and ``set_plan`` — which fires on every plan submission —
+        paid the same. The prior audit carried this as CM-6 and it was accepted
+        as by-design; what was missing was the measurement, and the measurement
+        is not marginal.
+
+        Moving the *whole* task block down would have worked too and would have
+        cost more: the task statement and the acceptance criteria never change
+        after ``set_task``, so they are the stable head, and only the plan and
+        the directives mutate. Splitting them keeps §6.1's "the run is measured
+        against what it was asked to do" where it was and moves the two things
+        that actually move.
+
+        The instruction the developer typed most recently now sits closest to
+        the model's next token, which is where a correction belongs anyway.
         """
         out: list[Message] = [self._system]
         out.extend(self._mode_messages)
@@ -609,6 +647,8 @@ class ContextManager:
         if self._recap is not None:
             out.append(self._recap)
         out.extend(self._working)
+        if self._directive_message is not None:
+            out.append(self._directive_message)
         return out
 
     def wire(self) -> list[dict[str, Any]]:
@@ -796,16 +836,31 @@ class ContextManager:
         return self._acceptance
 
     def _rebuild_task(self) -> None:
+        """Rebuild both halves of what used to be one pinned block.
+
+        The stable half — what the run was asked to do, and what it is measured
+        against — is written once by ``set_task`` and never again. The volatile
+        half is rebuilt on every plan submission and every steer, and it is
+        assembled at the *end* of the prompt so that rebuilding it costs the
+        tokens it contains rather than every token above it. See ``build``.
+        """
         parts = [f"# Task\n{self._task_text}"]
-        if self._plan_text:
-            parts.append(f"\n# Plan\n{self._plan_text}")
         if self._acceptance:
             criteria = "\n".join(f"- {c}" for c in self._acceptance)
             parts.append(f"\n# Accepts\n{criteria}")
+        self._task = Message(Role.USER, "\n".join(parts), Layer.TASK, source="task")
+
+        volatile: list[str] = []
+        if self._plan_text:
+            volatile.append(f"# Plan\n{self._plan_text}")
         if self._directives:
             since = "\n".join(f"- {d}" for d in self._directives)
-            parts.append(f"\n# Since then, the developer has said\n{since}")
-        self._task = Message(Role.USER, "\n".join(parts), Layer.TASK, source="task")
+            volatile.append(f"# Since then, the developer has said\n{since}")
+        self._directive_message = (
+            Message(Role.USER, "\n\n".join(volatile), Layer.DIRECTIVE, source="directive")
+            if volatile
+            else None
+        )
 
     def switch_mode(self, mode: Mode | str, instruction: str) -> None:
         """Move to a new mode by *appending* its instruction.

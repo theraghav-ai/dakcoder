@@ -29,7 +29,21 @@ import { StatusBar } from './statusbar';
 import * as trees from './trees';
 import * as wizard from './wizard';
 
-let disposeAll: vscode.Disposable[] = [];
+/**
+ * Things that must be stopped *before* the host tears the extension down, in
+ * this order, rather than whenever `context.subscriptions` is disposed.
+ *
+ * It used to be `context.subscriptions` itself, aliased at the end of
+ * `activate`. VS Code disposes those subscriptions on its own once `deactivate`
+ * returns, so every disposable in the extension was disposed twice on shutdown:
+ * two teardowns of every tree view, two of every emitter, two of the diagnostic
+ * collections. Most survived it by luck rather than by design, and the ones
+ * that did not failed inside the `catch` below where nobody would see them.
+ *
+ * The only thing that genuinely needs ordered shutdown is the runtime, because
+ * it owns a child process the host will not kill for us.
+ */
+let shutdown: vscode.Disposable[] = [];
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const started = Date.now();
@@ -753,7 +767,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // awaits this command, which is why it presented as navigation being broken.
 
   // ── activation is over; everything below is lazy ─────────────────────────
-  disposeAll = context.subscriptions as vscode.Disposable[];
+  shutdown = [runtime];
   const elapsed = Date.now() - started;
   log.info(`dakcoder activated in ${elapsed} ms (api ${API_VERSION})`);
   if (elapsed > 50) {
@@ -765,14 +779,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 export function deactivate(): void {
-  for (const item of disposeAll) {
+  for (const item of shutdown) {
     try {
       item.dispose();
     } catch {
       /* shutdown must not throw */
     }
   }
-  disposeAll = [];
+  shutdown = [];
 }
 
 /**

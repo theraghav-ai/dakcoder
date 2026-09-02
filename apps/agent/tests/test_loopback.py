@@ -783,3 +783,55 @@ def test_a_zero_timeout_means_no_deadline(monkeypatch) -> None:
     pending = lb.PendingApproval(request.id, "s", request)
     pending.at = datetime.now(tz=timezone.utc) - timedelta(hours=4)
     assert pending.deadline_in() == float("inf")
+
+
+# ── a restart keeps the conversation, not only the record ──────────────────
+
+
+async def test_a_second_daemon_continues_the_conversation_from_disk(
+    scripted: Loopback, client: httpx.AsyncClient, workspace, router: Router
+) -> None:
+    """The end-to-end shape of the reload a developer actually does.
+
+    Run a task, throw the runtime away exactly as a VS Code window reload does,
+    build a second one over the same workspace, and ask it to continue. Before
+    this, the second runtime held no context for the session, so `follow_up`
+    re-seeded the original task and the agent began again — with the transcript
+    that proved it had already done the work on screen beside it.
+    """
+    from dakcoder_agent.context import ContextManager
+    from dakcoder_agent.modes import Mode
+
+    session = await start(client, "Add a Pension resource")
+    await settle(session["id"], scripted)
+
+    first = scripted.sessions.get(session["id"])
+    assert first is not None and first.journal is not None
+    first.journal.flush()
+    stored = first.journal.read_events()
+    assert any(e.get("type") == "tool_result" for e in stored), "there is a conversation on disk"
+
+    class _Loop:
+        """All `_restore_context` asks of a loop is somewhere to put the messages."""
+
+        context = ContextManager(mode=Mode.ASK, system_prompt="sys")
+
+    def build(session, approve):  # pragma: no cover - never run in this test
+        raise AssertionError("the restore path must not need a model")
+
+    # A new daemon over the same workspace: nothing carried in memory.
+    second = Loopback(workspace.root, build, token=TOKEN, version="1.2.3")
+    assert second.contexts == {}, "a fresh daemon holds nothing"
+
+    restored = second.sessions.get(session["id"])
+    assert restored is not None, "the session itself came back from disk"
+
+    rebuilt = second._restore_context(restored, _Loop())
+
+    assert rebuilt is not None, "the conversation was rebuilt, not re-seeded"
+    text = "\n".join(m.content for m in rebuilt.build())
+    assert "Add a Pension resource" in text
+    assert "handler/pension.go" in text, "the work the first run did is still in context"
+    rebuilt.wire()
+    assert rebuilt.wire_repairs == (), "and the rebuilt wire is well formed"
+    assert second.contexts[restored.id] is rebuilt, "and it is held for the follow-up"

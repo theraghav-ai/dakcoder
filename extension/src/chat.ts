@@ -42,6 +42,9 @@ const FLUSH_MS = 40;
 /** Matches the webview's own row cap, so a replay can never outrun what it keeps. */
 const RING = 500;
 
+/** Notices held for a closed panel. Newest kept; see `note`. */
+const NOTICE_BACKLOG = 20;
+
 /**
  * Types that are relayed and never replayed.
  *
@@ -217,6 +220,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    */
   private seq = 0;
   private readonly queue: HostMessage[] = [];
+  /** Notices raised with no webview to say them to. Drained by `replay`. */
+  private readonly pendingNotices: HostMessage[] = [];
   private timer?: NodeJS.Timeout;
   private run: RunState = { phase: 'idle' };
   private offline?: string;
@@ -293,8 +298,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.post({ type: 'queued', count });
   }
 
+  /**
+   * A one-line message that is not part of the transcript: an approval the
+   * runtime released, a gate that could not be re-run, a runtime that restarted.
+   *
+   * Held when there is no webview to post into. `post` returns early without a
+   * view, and everything else it carries is recoverable — `run`, `offline` and
+   * `queued` are re-sent from `replay`, and wire events come back out of the
+   * ring — but a notice was neither stored nor replayed, so any notice raised
+   * before the developer first opened the panel, or while it was closed, was
+   * simply never said. That includes the one that reports an approval released
+   * as a rejection, which is the notice a developer most needs to have seen.
+   */
   note(level: 'info' | 'warn' | 'error', text: string): void {
-    this.post({ type: 'notice', level, text });
+    const notice: HostMessage = { type: 'notice', level, text };
+    if (!this.view) {
+      this.pendingNotices.push(notice);
+      // Bounded: a panel left closed through a long session must not hand the
+      // developer a hundred toasts when they finally open it. The newest are
+      // the ones worth keeping.
+      while (this.pendingNotices.length > NOTICE_BACKLOG) this.pendingNotices.shift();
+      return;
+    }
+    this.post(notice);
   }
 
   /** The approval left the pending set — answered here, or answered elsewhere,
@@ -429,21 +455,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     };
     view.webview.html = await this.html(view.webview);
 
-    this.disposables.push(
+    // A view can be resolved more than once — VS Code disposes the webview when
+    // the view is hidden and resolves a fresh one when it comes back — so the
+    // listeners belong to the view, not to the provider. Pushing them onto the
+    // provider's list stacked one more `onDidReceiveMessage` per hide/show
+    // cycle, and every one of them stayed live: after five cycles a single
+    // `submit` from the panel started five runs.
+    const bound: vscode.Disposable[] = [
       view.webview.onDidReceiveMessage((raw: unknown) => {
         void this.onMessage(raw);
       }),
+    ];
+    bound.push(
+      view.onDidDispose(() => {
+        if (this.view === view) this.view = undefined;
+        // A queue with no webview to drain into would grow for the rest of the
+        // session; the ring is what makes dropping it safe.
+        this.queue.length = 0;
+        for (const d of bound) d.dispose();
+        bound.length = 0;
+      }),
     );
-    view.onDidDispose(() => {
-      if (this.view === view) this.view = undefined;
-      // A queue with no webview to drain into would grow for the rest of the
-      // session; the ring is what makes dropping it safe.
-      this.queue.length = 0;
-    });
   }
 
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
     for (const d of this.disposables) d.dispose();
     this.disposables.length = 0;
   }
@@ -552,6 +589,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.post({ type: 'event', event: entry.event, session: entry.session, seq: entry.seq });
       }
     }
+    // Said once, after the transcript they refer to. Drained rather than kept,
+    // because a notice is news: replaying it at every reload would turn one
+    // released approval into a toast on every window the developer opens.
+    const held = this.pendingNotices.splice(0, this.pendingNotices.length);
+    for (const notice of held) this.post(notice);
   }
 
   private async openScratch(content: string, language: string): Promise<void> {
@@ -578,9 +620,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   private flush(): void {
     if (!this.queue.length) return;
-    const messages = this.queue.splice(0, this.queue.length);
     const view = this.view;
+    // Checked before the splice. Taking the messages out of the queue and then
+    // finding no view to post them into discarded them: the panel closing
+    // between a `post` and its 16 ms flush ate whatever was in flight, and the
+    // ring-replay on reopen only covers wire events.
     if (!view) return;
+    const messages = this.queue.splice(0, this.queue.length);
     // One `postMessage` per flush whatever the queue depth, so the cap holds
     // under a burst as well as under a steady stream.
     void view.webview.postMessage(

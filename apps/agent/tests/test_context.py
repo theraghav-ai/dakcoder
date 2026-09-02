@@ -9,6 +9,7 @@ from dakcoder_agent.context import (
     DEFAULT_TOOL_CAP,
     MAX_DIRECTIVES,
     MAX_MODE_MESSAGES,
+    PINNED_LAYERS,
     RECAP_BUDGET_TOKENS,
     TOOL_CAPS,
     OverBudgetError,
@@ -95,7 +96,14 @@ def test_task_and_acceptance_are_pinned_above_the_working_set():
     assert layers.index(Layer.TASK) < layers.index(Layer.WORKING_SET)
     task = next(m for m in cm.build() if m.layer is Layer.TASK)
     assert "go build clean" in task.content
-    assert "1. domain" in task.content
+
+    # The plan is pinned too, but below the working set rather than above it:
+    # it is rewritten on every submission, and a byte changed above the working
+    # set re-prefills everything after it (BUG L-18, measured in `build`).
+    plan = next(m for m in cm.build() if m.layer is Layer.DIRECTIVE)
+    assert "1. domain" in plan.content
+    assert layers.index(Layer.DIRECTIVE) > layers.index(Layer.WORKING_SET)
+    assert Layer.DIRECTIVE in PINNED_LAYERS, "pinned is about eviction, not position"
 
 
 # ── insertion caps ──────────────────────────────────────────────────────────

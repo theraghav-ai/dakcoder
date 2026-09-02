@@ -66,6 +66,9 @@ const POLL_MS = 5_000;
 /** Above this, correcting arguments belongs in an editor rather than a one-line box. */
 const INPUT_BOX_LIMIT = 160;
 
+/** How many decided approval ids to remember. See `answered`. */
+const ANSWERED_CAP = 500;
+
 /**
  * Digits 1–4 are reserved for the approval card **product-wide**.
  *
@@ -129,6 +132,16 @@ export class ApprovalService implements vscode.Disposable {
   private readonly pending = new Map<string, Pending>();
   /** Corrected arguments, kept after the decision so the receipt survives the card. */
   private readonly receipts = new Map<string, string>();
+  /**
+   * Ids already decided, so a replayed or re-polled `tool_pending` does not
+   * raise a second card for an approval the developer has answered.
+   *
+   * Insertion-ordered and bounded, like `receipts` beside it. It was neither:
+   * a daemon left running across a week of work accumulated one string per
+   * approval for the life of the window, and the set is only ever consulted
+   * about approvals recent enough to still be arriving on the wire. The cap is
+   * generous for that — a run raising 500 approvals has other problems.
+   */
   private readonly answered = new Set<string>();
   private readonly disposables: vscode.Disposable[] = [];
 
@@ -831,6 +844,11 @@ export class ApprovalService implements vscode.Disposable {
     const pending = this.pending.get(id);
     this.pending.delete(id);
     this.answered.add(id);
+    while (this.answered.size > ANSWERED_CAP) {
+      const oldest = this.answered.keys().next();
+      if (oldest.done) break;
+      this.answered.delete(oldest.value);
+    }
     if (this.shown === id) {
       this.shown = undefined;
       void vscode.commands.executeCommand('setContext', CTX_CHANGESET, false);
@@ -940,6 +958,13 @@ export class ApprovalService implements vscode.Disposable {
   dispose(): void {
     this.stopPolling();
     for (const d of this.disposables) d.dispose();
+    // Emptied, so a second `dispose` is a no-op. Nothing in the extension
+    // should call it twice — see the note on `deactivate` — but a Disposable
+    // that only works once is a trap for whoever wires the next caller.
+    this.disposables.length = 0;
+    this.pending.clear();
+    this.answered.clear();
+    this.receipts.clear();
     void vscode.commands.executeCommand('setContext', CTX_PENDING, false);
     void vscode.commands.executeCommand('setContext', CTX_CHANGESET, false);
     void vscode.commands.executeCommand('setContext', CTX_EDITING, false);

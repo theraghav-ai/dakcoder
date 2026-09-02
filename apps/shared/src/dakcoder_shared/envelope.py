@@ -26,6 +26,7 @@ only place it can be fixed once for every consumer.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -270,6 +271,20 @@ class DeltaCoalescer:
       mid-sentence leaves the last few characters buffered indefinitely, which
       reads as a hang rather than as latency.
 
+    **And the interval needs something to ask it** (BUG SH-6). It used to be
+    evaluated only inside ``feed``, which makes it a check on the *previous*
+    gap rather than the current one: a model that stopped mid-sentence with
+    thirty characters buffered emitted nothing until it started again, so the
+    behaviour the paragraph above says this exists to prevent was exactly what
+    shipped, and the deadline only ever fired retrospectively. ``flush_due`` is
+    the method a timer calls; ``AgentLoop._complete`` runs one for the length of
+    a streamed call.
+
+    Thread-safe for the same reason: the ticker and the stream are different
+    threads, and a buffer two threads append to and drain without a lock loses
+    text. Every flush drains the whole buffer under the lock, so the two callers
+    can interleave freely without reordering a single character.
+
     The clock is injected so the interval behaviour is testable without sleeping.
     A coalescer whose timing can only be verified by wall-clock is one whose
     timing is never verified.
@@ -290,20 +305,38 @@ class DeltaCoalescer:
         self._buffer: list[str] = []
         self._size = 0
         self._last = clock()
+        self._lock = threading.Lock()
 
     def feed(self, fragment: str) -> Event | None:
         """Accept a fragment; return an event only when a flush is due."""
         if not fragment:
             return None
-        self._buffer.append(fragment)
-        self._size += len(fragment)
-
-        if self._size >= self.min_chars or self._clock() - self._last >= self.max_interval:
-            return self.flush()
+        with self._lock:
+            self._buffer.append(fragment)
+            self._size += len(fragment)
+            if self._size >= self.min_chars or self._clock() - self._last >= self.max_interval:
+                return self._flush()
         return None
+
+    def flush_due(self) -> Event | None:
+        """Emit the buffer if it has been held longer than ``max_interval``.
+
+        What a ticker calls. ``feed`` cannot answer this question, because
+        nothing calls ``feed`` while the model is silent — which is precisely
+        when the answer is yes.
+        """
+        with self._lock:
+            if not self._buffer or self._clock() - self._last < self.max_interval:
+                return None
+            return self._flush()
 
     def flush(self) -> Event | None:
         """Emit whatever is buffered. Idempotent — returns None when empty."""
+        with self._lock:
+            return self._flush()
+
+    def _flush(self) -> Event | None:
+        """The flush itself. Callers hold the lock."""
         if not self._buffer:
             return None
         text = "".join(self._buffer)
@@ -328,4 +361,5 @@ class DeltaCoalescer:
 
     @property
     def pending(self) -> int:
-        return self._size
+        with self._lock:
+            return self._size

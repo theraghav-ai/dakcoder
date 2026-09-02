@@ -1690,3 +1690,316 @@ def test_the_research_fence_still_ends_a_phase_that_only_reads(
 
     assert not loop._gate_wants_an_edit(), "no gate has spoken, so nothing is contradicted"
     assert loop._terminal_choice() == {"type": "function", "function": {"name": "finish"}}
+
+
+# ── L-18: a steer must not re-prefill the conversation ─────────────────────
+
+
+def _long_context(turns: int):
+    """A context of the shape a migration run reaches, built the way the loop
+    builds one: an assistant with a tool call, then its result, per turn."""
+    from dakcoder_agent.context import ContextManager
+    from dakcoder_shared.llm import ToolCall
+
+    system = "You are the dakcoder agent.\n" + ("a line of the system prompt.\n" * 200)
+    context = ContextManager(
+        mode="coder", system_prompt=system, tool_schema_tokens=1800, compact_at=0.999
+    )
+    context.set_task(
+        "Migrate the pension service to the new template.",
+        plan="1. handler\n2. service\n3. repo",
+        acceptance=("go build passes", "govalid clean"),
+    )
+    for turn in range(turns):
+        context.append_assistant(
+            f"Reading the handler for step {turn}.",
+            tool_calls=(
+                ToolCall(id=f"c{turn}", name="read_file", arguments='{"path": "h.go"}'),
+            ),
+        )
+        context.append_tool_result(
+            "read_file",
+            "package handler\n" + ("// a line of a real Go file.\n" * 60),
+            tool_call_id=f"c{turn}",
+            path=f"handler/pension_{turn}.go",
+            line_range=(1, 61),
+        )
+    return context
+
+
+def test_a_steer_does_not_reprefill_the_whole_conversation() -> None:
+    """BUG L-18 (prior audit's CM-6, carried as accepted-by-design).
+
+    `pin_directive` rewrote a message three from the top of the prompt, and a
+    prefix cache is a prefix: the tokens after it are all novel. Measured with
+    the manager's own instrument, over the context shape above:
+
+        turns   prompt      before      after
+          100   80,543      75,764         35
+
+    The plan says "measure before moving". The measurement is the reason it
+    moved: the same sentence appended to the working set cost 11 tokens, so a
+    developer typing one correction at turn 100 paid to re-read the run.
+    """
+    context = _long_context(100)
+    before = list(context.build())
+    total = context.usage().total
+
+    context.pin_directive("Stop reading and start writing the repo layer.")
+    novel = context.novel_tokens(before)
+
+    assert total > 40_000, "the point of the test is a context large enough to matter"
+    assert novel < 500, f"a steer re-prefilled {novel} of {total} tokens"
+    assert novel / total < 0.01
+
+
+def test_pinning_a_plan_does_not_reprefill_either() -> None:
+    """`set_plan` fires on every plan submission and rewrote the same layer."""
+    context = _long_context(100)
+    before = list(context.build())
+    total = context.usage().total
+
+    context.set_plan("1. handler (done)\n2. service\n3. repo")
+
+    assert context.novel_tokens(before) / total < 0.01
+
+
+def test_the_directive_layer_is_pinned_even_though_it_is_last() -> None:
+    """Position and eviction are separate questions. Compaction consumes the
+    working set; the plan and the directives are not in it, wherever they sit."""
+    from dakcoder_agent.context import PINNED_LAYERS, Layer
+
+    from dakcoder_agent.context import Recap
+
+    context = _long_context(40)
+    context.pin_directive("Write the repo layer next.")
+    context.compact(lambda evicted: Recap(turns=(1, 1)))
+
+    layers = [m.layer for m in context.build()]
+    assert Layer.DIRECTIVE in PINNED_LAYERS
+    assert layers.index(Layer.DIRECTIVE) > layers.index(Layer.WORKING_SET)
+    kept = next(m for m in context.build() if m.layer is Layer.DIRECTIVE)
+    assert "Write the repo layer next." in kept.content
+    assert "1. handler" in kept.content, "and the plan survived with it"
+
+
+# ── the record was restored, and now the conversation is too ───────────────
+
+
+def _stored(kind: str, **data):
+    return {"type": kind, "data": data}
+
+
+def _conversation() -> list[dict]:
+    """A session's stored events, in the shape `journal.read_events` returns."""
+    return [
+        _stored("user", text="Migrate the pension service.", turn=0),
+        _stored("turn_start", turn=1, mode="agent"),
+        _stored("assistant", text="Reading the handler first."),
+        _stored("tool_call", id="c1", name="read_file",
+                arguments={"path": "handler/pension.go", "start": 1, "end": 40}),
+        _stored("tool_result", id="c1", name="read_file", ok=True,
+                content="package handler\n// forty lines of it", arguments={"path": "handler/pension.go"}),
+        _stored("turn_start", turn=2, mode="agent"),
+        _stored("plan", text="1. handler\n2. repo", steps=2),
+        _stored("assistant", text="1. handler\n2. repo"),
+        _stored("turn_start", turn=3, mode="agent"),
+        _stored("steer", text="Do the repo layer first."),
+        _stored("assistant", text="Writing the repo layer."),
+        _stored("tool_call", id="c2", name="write_file",
+                arguments={"path": "repo/postgres/pension.go"}),
+        _stored("tool_result", id="c2", name="write_file", ok=True, content="wrote 31 lines"),
+        _stored("usage", prompt_tokens=900, budget=100_000),
+        _stored("finish", outcome="done", summary="handler read, repo written"),
+    ]
+
+
+def test_a_restarted_daemon_restores_the_conversation_not_only_the_record() -> None:
+    """`journal.py` (step 2.9) made the transcript survive a restart. It did not
+    make the *conversation* survive one: `follow_up` re-seeded the original task,
+    so a developer who reloaded their window at turn 40 and typed "carry on with
+    the repo layer" got an agent that started the migration again, with the
+    transcript proving otherwise on screen beside it."""
+    from dakcoder_agent.context import ContextManager
+    from dakcoder_agent.rehydrate import rehydrate
+
+    context = ContextManager(mode="agent", system_prompt="sys")
+    restored = rehydrate(_conversation(), context=context, task="Migrate the pension service.")
+
+    assert restored.complete
+    assert restored.turns == 4, "the opening message, then three turns"
+
+    text = "\n".join(m.content for m in context.build())
+    assert "package handler" in text, "the file it read is still read"
+    assert "wrote 31 lines" in text, "the file it wrote is still written"
+    assert "Do the repo layer first." in text, "and the steer survived the reload"
+
+
+def test_a_restored_conversation_is_a_well_formed_wire() -> None:
+    """Every declared call answered, no orphaned result — the invariant `wire()`
+    exists to repair. Manufacturing a breach at restore time would poison every
+    later turn of the session, because the message list is append-only."""
+    from dakcoder_agent.context import ContextManager
+    from dakcoder_agent.rehydrate import rehydrate
+
+    context = ContextManager(mode="agent", system_prompt="sys")
+    rehydrate(_conversation(), context=context, task="Migrate the pension service.")
+
+    wire = context.wire()
+    assert context.wire_repairs == (), f"the restore needed repairing: {context.wire_repairs}"
+    declared = {
+        call["id"]
+        for m in wire
+        for call in (m.get("tool_calls") or [])
+    }
+    answered = {m["tool_call_id"] for m in wire if m.get("role") == "tool"}
+    assert declared == answered == {"c1", "c2"}
+
+
+def test_a_restored_read_is_not_re_read() -> None:
+    """The re-read intercept asks the *context* what the model can still see
+    (root cause RC-1). A restore that dropped the line range would let the agent
+    re-read every file it already had, one turn after being restored."""
+    from dakcoder_agent.context import ContextManager
+    from dakcoder_agent.rehydrate import rehydrate
+
+    context = ContextManager(mode="agent", system_prompt="sys")
+    rehydrate(_conversation(), context=context, task="t")
+
+    assert context.coverage().get("handler/pension.go") == [(1, 40)]
+
+
+def test_a_conversation_too_long_to_restore_says_so() -> None:
+    """Restoring must not blow the budget, and must not call a model to
+    summarise: that is a billed request the developer did not ask for, while
+    they wait for a window to finish reloading. So it keeps the newest whole
+    turns that fit and states what it dropped."""
+    from dakcoder_agent.context import ContextManager
+    from dakcoder_agent.rehydrate import RESTORE_FRACTION, rehydrate
+
+    events = [_stored("user", text="Migrate everything.")]
+    for turn in range(400):
+        events += [
+            _stored("turn_start", turn=turn + 1, mode="agent"),
+            _stored("assistant", text=f"Reading file {turn}."),
+            _stored("tool_call", id=f"c{turn}", name="read_file",
+                    arguments={"path": f"handler/h{turn}.go"}),
+            _stored("tool_result", id=f"c{turn}", name="read_file", ok=True,
+                    content="package handler\n" + ("// a line of Go.\n" * 80)),
+        ]
+
+    context = ContextManager(mode="agent", system_prompt="sys")
+    restored = rehydrate(events, context=context, task="Migrate everything.")
+
+    assert not restored.complete
+    assert restored.dropped_turns > 0
+    assert context.usage().total <= context.budget * RESTORE_FRACTION + 2_000
+    text = "\n".join(m.content for m in context.build())
+    assert "did not fit the prompt budget" in text, "the model is told, not left to guess"
+    assert "Reading file 399." in text, "and the newest turns are the ones kept"
+    assert context.wire_repairs == () or True
+    context.wire()
+    assert context.wire_repairs == (), "a turn is dropped whole or not at all"
+
+
+def test_a_session_with_nothing_to_continue_is_not_restored() -> None:
+    """One `user` event and no reply is a session that never got one. There is
+    nothing to continue, and re-seeding the task is the right answer."""
+    from dakcoder_agent.rehydrate import restorable
+
+    assert not restorable([_stored("user", text="Migrate the pension service.")])
+    assert not restorable([])
+    assert restorable(_conversation())
+
+
+# ── SH-6: the interval flush needs something to ask it the time ────────────
+
+
+def test_a_pause_mid_sentence_does_not_hold_the_text() -> None:
+    """BUG SH-6. `max_interval` was evaluated only inside `feed`, which makes it
+    a check on the *previous* gap rather than the current one — and nothing
+    calls `feed` while the model is silent, which is exactly when the answer
+    matters. So a model that stopped mid-sentence with thirty characters
+    buffered emitted nothing until it started again: the behaviour the
+    coalescer's own docstring says the interval exists to prevent."""
+    from dakcoder_shared.envelope import DeltaCoalescer
+
+    now = [0.0]
+    deltas = DeltaCoalescer(min_chars=120, max_interval=0.08, clock=lambda: now[0])
+
+    assert deltas.feed("The handler needs a ") is None, "too little text to be worth a frame"
+    assert deltas.pending == 20
+
+    # The model thinks. Nothing feeds the coalescer, because nothing is arriving.
+    now[0] = 2.0
+    event = deltas.flush_due()
+
+    assert event is not None, "two seconds of silence must not sit in a buffer"
+    assert event.data["text"] == "The handler needs a "
+    assert deltas.pending == 0
+
+
+def test_the_interval_flush_does_not_fire_early() -> None:
+    """A ticker that flushed every time it looked would undo the coalescing —
+    one frame, one IPC message and one render per fragment, which is the cost
+    `min_chars` exists to avoid."""
+    from dakcoder_shared.envelope import DeltaCoalescer
+
+    now = [0.0]
+    deltas = DeltaCoalescer(min_chars=120, max_interval=0.08, clock=lambda: now[0])
+    deltas.feed("short")
+
+    now[0] = 0.01
+    assert deltas.flush_due() is None, "10 ms is not the deadline"
+    assert deltas.pending == 5
+
+    now[0] = 0.09
+    assert deltas.flush_due() is not None
+
+
+def test_an_idle_coalescer_has_nothing_to_flush() -> None:
+    """The ticker calls this every 40 ms for the length of a call, most of them
+    with an empty buffer. It must be free and it must not emit empty frames."""
+    from dakcoder_shared.envelope import DeltaCoalescer
+
+    now = [0.0]
+    deltas = DeltaCoalescer(clock=lambda: now[0])
+    now[0] = 5.0
+    assert deltas.flush_due() is None
+    assert deltas.flush() is None
+
+
+def test_the_ticker_and_the_stream_cannot_lose_text() -> None:
+    """They are different threads. A buffer two threads append to and drain
+    without a lock loses text, and the loss would be invisible: the run still
+    finishes, and the `assistant` message at the end is complete, so only the
+    streamed view is wrong."""
+    import threading
+
+    from dakcoder_shared.envelope import DeltaCoalescer
+
+    deltas = DeltaCoalescer(min_chars=8, max_interval=0.0)
+    seen: list[str] = []
+    guard = threading.Lock()
+
+    def collect(event) -> None:
+        if event is not None:
+            with guard:
+                seen.append(event.data["text"])
+
+    stop = threading.Event()
+
+    def tick() -> None:
+        while not stop.is_set():
+            collect(deltas.flush_due())
+
+    ticker = threading.Thread(target=tick, daemon=True)
+    ticker.start()
+    for i in range(2_000):
+        collect(deltas.feed(f"{i:04d}"))
+    stop.set()
+    ticker.join(timeout=5)
+    collect(deltas.flush())
+
+    joined = "".join(seen)
+    assert joined == "".join(f"{i:04d}" for i in range(2_000)), "text was lost or reordered"

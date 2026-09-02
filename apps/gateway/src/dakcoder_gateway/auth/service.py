@@ -112,7 +112,30 @@ class _Refresh:
     #: rotations. ``recheck`` needs a credential to re-read the account with, and
     #: the alternative — an administrative GitLab token on the gateway — would
     #: make a gateway compromise a compromise of every account.
-    provider_token: str = ""
+    #:
+    #: ``repr=False`` for the same reason the route's ``api_key`` is: a dataclass
+    #: renders every field, and this one reaches a log the moment anything
+    #: formats the record — an exception context, a debug line, a traceback
+    #: frame. It is a live GitLab credential.
+    provider_token: str = field(default="", repr=False)
+
+
+def _fingerprint(token: str) -> str:
+    """What the gateway stores in place of a refresh token.
+
+    The tokens were the keys of ``_refresh`` — thirty-day credentials held in
+    plaintext, in a process that also holds the model API keys, for as long as
+    they are valid (BUG GW-7). Nothing here ever needs the token back: refresh
+    only has to *recognise* one, which is what a verifier is for. So the gateway
+    keeps SHA-256 of it and the plaintext exists only inside the request that
+    presented it.
+
+    Unsalted and uniterated on purpose, unlike a password hash. These are 256
+    bits from ``secrets.token_urlsafe`` — there is no dictionary to attack and
+    no rainbow table to build — and the lookup is on the hot path of every
+    refresh. Stretching a random 256-bit value buys nothing and costs latency.
+    """
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
 def verifier_challenge(verifier: str) -> str:
@@ -142,8 +165,14 @@ class AuthService:
         self.roles = roles or RoleMap()
         self._clock = clock
         self._states: dict[str, tuple[str, float]] = {}
+        #: Keyed by ``_fingerprint`` of the token, never by the token.
         self._refresh: dict[str, _Refresh] = {}
-        self._revoked_families: set[str] = set()
+        #: Family -> the monotonic time after which nothing can present a token
+        #: from it anyway. It was a ``set`` that only ever grew: one entry per
+        #: revoked session for the life of the process, and a reuse-detection
+        #: cascade on a busy gateway adds them in batches. A family outlives its
+        #: longest-lived refresh token by nothing, so that is when it goes.
+        self._revoked_families: dict[str, float] = {}
 
     # -- start ---------------------------------------------------------------
 
@@ -197,7 +226,11 @@ class AuthService:
         so revocation is real without a deprovisioning step; and the old token is
         retired, so its reuse becomes a signal.
         """
-        record = self._refresh.get(refresh_token)
+        # Sweeping here as well as at `start`: a gateway whose developers are
+        # all signed in already never reaches `start`, and expired records used
+        # to sit in the map until somebody new signed in.
+        self._sweep()
+        record = self._refresh.get(_fingerprint(refresh_token))
         if record is None:
             raise AuthError("that refresh token is not recognised; sign in again")
 
@@ -230,7 +263,7 @@ class AuthService:
         )
 
     def revoke(self, refresh_token: str) -> None:
-        record = self._refresh.get(refresh_token)
+        record = self._refresh.get(_fingerprint(refresh_token))
         if record is not None:
             self._revoke_family(record.family)
 
@@ -291,7 +324,7 @@ class AuthService:
             sub=profile.sub, username=profile.username, roles=roles, family=family
         )
         refresh = secrets.token_urlsafe(32)
-        self._refresh[refresh] = _Refresh(
+        self._refresh[_fingerprint(refresh)] = _Refresh(
             sub=profile.sub,
             family=family,
             expires_at=time.monotonic() + REFRESH_TTL.total_seconds(),
@@ -357,14 +390,16 @@ class AuthService:
         return entry[0]
 
     def _revoke_family(self, family: str) -> None:
-        self._revoked_families.add(family)
-        for token, record in list(self._refresh.items()):
+        self._revoked_families[family] = time.monotonic() + REFRESH_TTL.total_seconds()
+        for fingerprint, record in list(self._refresh.items()):
             if record.family == family:
-                del self._refresh[token]
+                del self._refresh[fingerprint]
 
     def _sweep(self) -> None:
         now = time.monotonic()
         for state in [s for s, (_r, exp) in self._states.items() if exp <= now]:
             del self._states[state]
-        for token in [t for t, r in self._refresh.items() if r.expires_at <= now]:
-            del self._refresh[token]
+        for fingerprint in [t for t, r in self._refresh.items() if r.expires_at <= now]:
+            del self._refresh[fingerprint]
+        for family in [f for f, exp in self._revoked_families.items() if exp <= now]:
+            del self._revoked_families[family]

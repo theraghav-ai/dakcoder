@@ -1117,6 +1117,33 @@ class AgentLoop:
         # One coalescer per call, and the tail flushed however it ends.
         deltas = DeltaCoalescer()
 
+        # And something to ask it the time (BUG SH-6).
+        #
+        # `max_interval` exists so that a model pausing mid-sentence does not
+        # leave the last few characters buffered — the coalescer's own docstring
+        # calls that "the one that matters". But the deadline was only ever
+        # evaluated inside `feed`, and nothing calls `feed` while the model is
+        # silent, which is exactly when it needs evaluating. So the held text
+        # was released by the *next* fragment, whenever that came: the panel
+        # stopped mid-word for as long as the model thought, which is the "reads
+        # as a hang" the interval was written to prevent.
+        #
+        # A daemon thread for the length of one streamed call. It costs a
+        # wake-up every 40 ms while a call is in flight and nothing at all
+        # between calls, and both it and `feed` drain the whole buffer under the
+        # coalescer's lock, so they cannot interleave into reordered text.
+        ticking = threading.Event()
+
+        def tick() -> None:
+            # Half the interval, so a deadline is noticed within one period of
+            # passing. Floored, because a coalescer configured with no interval
+            # at all would otherwise turn this into a spin.
+            period = max(0.01, deltas.max_interval / 2)
+            while not ticking.wait(period):
+                self._relay(deltas.flush_due())
+
+        ticker = threading.Thread(target=tick, name="dakcoder-deltas", daemon=True)
+
         def dispatch() -> TurnResult:
             return complete(
                 self.context,
@@ -1127,6 +1154,7 @@ class AgentLoop:
                 on_delta=lambda fragment: self._relay(deltas.feed(fragment)),
             )
 
+        ticker.start()
         try:
             return dispatch()
         except UnsupportedParameterError:
@@ -1172,6 +1200,10 @@ class AgentLoop:
             )
             return None
         finally:
+            # Stopped before the tail flush, so the last fragment is emitted
+            # once, by the thread that owns the turn.
+            ticking.set()
+            ticker.join(timeout=1.0)
             self._relay(deltas.flush())
 
     def _tools(self) -> list[dict[str, Any]]:

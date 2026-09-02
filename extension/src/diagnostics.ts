@@ -880,11 +880,52 @@ export class GoDiagnostics implements vscode.Disposable {
     const task = buildTask(folder, name, command, args, cwd, matcher);
     const execution = await vscode.tasks.executeTask(task);
     return new Promise((resolve) => {
-      const listener = vscode.tasks.onDidEndTaskProcess((event) => {
-        if (event.execution !== execution) return;
-        listener.dispose();
-        resolve(event.exitCode);
-      });
+      /*
+       * Two listeners, one settle.
+       *
+       * `onDidEndTaskProcess` fires only for a task that actually started a
+       * process. A task the developer cancels from the terminal, one whose
+       * shell cannot be spawned, one ended by closing its terminal — all of
+       * those end with `onDidEndTask` and no process event at all, and the sole
+       * `onDidEndTaskProcess` listener that used to be here was disposed only
+       * on the event it was waiting for. So every cancelled gate re-run left a
+       * live listener on the tasks API for the life of the window, and left the
+       * promise behind it pending for ever: the caller's `await` never
+       * returned, and whatever it was holding was never released.
+       *
+       * `onDidEndTask` resolves `undefined` — "it never ran" — which is exactly
+       * what the signature already documents for that case.
+       */
+      const listeners: vscode.Disposable[] = [];
+      let settled = false;
+      const settle = (code: number | undefined): void => {
+        if (settled) return;
+        settled = true;
+        for (const d of listeners) d.dispose();
+        listeners.length = 0;
+        const held = this.subscriptions.indexOf(onShutdown);
+        if (held >= 0) this.subscriptions.splice(held, 1);
+        resolve(code);
+      };
+      // Nothing outlives the service: a window closing mid-task must not leave
+      // these attached to the tasks API. Removed again on settle, so a session
+      // of gate re-runs does not grow the subscription list by one per run.
+      const onShutdown: vscode.Disposable = { dispose: () => settle(undefined) };
+      listeners.push(
+        vscode.tasks.onDidEndTaskProcess((event) => {
+          if (event.execution !== execution) return;
+          settle(event.exitCode);
+        }),
+        vscode.tasks.onDidEndTask((event) => {
+          if (event.execution !== execution) return;
+          // A process end and a task end both arrive for a task that ran; the
+          // process event carries the exit code and wins because `settle` is
+          // once-only and VS Code fires it first. This is the path for a task
+          // that ended without one.
+          settle(undefined);
+        }),
+      );
+      this.subscriptions.push(onShutdown);
     });
   }
 

@@ -19,6 +19,15 @@ took every transcript with it, along with the mutation list ``revert`` reads
 summary beside it, and ``SessionStore`` restores the summaries at startup.
 Best-effort throughout: a full disk costs the transcript, never the run.
 
+**And read back as a conversation, not only as a record.** The transcript
+surviving a restart is what a panel needs; it is not what the *agent* needs.
+``rehydrate.py`` replays those events through the ContextManager's own append
+methods, so a follow-up sent after a window reload continues the conversation
+instead of starting the task again. What does not come back is the loop's own
+ledgers — which searches were exhausted, which reads were refused — and the
+direction of that loss is safe: the agent may repeat a search, never skip work
+it has not done.
+
 **Revert restores from a pre-run snapshot, not from git.** ``undo.py`` copies a
 path's bytes the first time a mutating tool touches it, and ``plan_revert``
 reads that. The earlier design restored to HEAD, which is correct only if the

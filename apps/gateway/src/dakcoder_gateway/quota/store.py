@@ -281,11 +281,21 @@ class MemoryStore:
 #: then a sum over the members' amounts. Amounts ride in the member name
 #: (`<amount>:<uniq>`) because a ZSET has no value field and a second hash per
 #: series would put two keys out of one script's reach.
+#:
+#: The `<uniq>` half has to be genuinely unique, and it was not: the member was
+#: built as `amount:now:i:sha1hex(key .. now .. i)`, and hashing three values
+#: already in the member adds no entropy at all. ZADD on an existing member
+#: updates its score instead of adding a row, so two charges for the same series
+#: landing on the same `now` — two workers settling concurrently, or one client
+#: whose retry arrives inside the same timestamp — collapsed into one and the
+#: second charge was silently dropped. The nonce now comes from the caller in
+#: ARGV[3], one per invocation, which is what `adjust` beside it already did.
 _APPLY_LUA = """
 local now = tonumber(ARGV[1])
 local n = tonumber(ARGV[2])
+local nonce = ARGV[3]
 local used = {}
-local base = 3
+local base = 4
 local violated = -1
 
 -- pass one: trim and total every series, refusing before anything is written.
@@ -333,7 +343,7 @@ for i = 0, n - 1 do
   local key    = ARGV[base + i * 4]
   local amount = tonumber(ARGV[base + i * 4 + 2])
   if amount ~= 0 then
-    redis.call('ZADD', key, now, amount .. ':' .. now .. ':' .. i .. ':' .. redis.sha1hex(key .. now .. i))
+    redis.call('ZADD', key, now, amount .. ':' .. now .. ':' .. i .. ':' .. nonce)
     redis.call('EXPIRE', key, 86400 * 8)
     used[i + 1] = used[i + 1] + amount
   end
@@ -366,7 +376,9 @@ class RedisStore:
     async def apply(self, sub: str, checks: Sequence[Check], now: datetime) -> Applied:
         import json
 
-        argv: list[Any] = [now.timestamp(), len(checks)]
+        # One nonce per invocation, so no two `apply` calls can write the same
+        # ZSET member and lose a charge to a score update (BUG GW-8).
+        argv: list[Any] = [now.timestamp(), len(checks), uuid.uuid4().hex]
         keys: list[str] = []
         for check in checks:
             horizon = self.limits.horizon(check.series)
