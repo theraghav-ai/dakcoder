@@ -251,6 +251,7 @@ class ModelProxy:
         started = time.monotonic()
         opened = False
         scheduled = False
+        released = False
 
         try:
             async for chunk in self._relay(path, outgoing, route):
@@ -276,6 +277,7 @@ class ModelProxy:
             if not opened:
                 # Nothing was produced, so nothing was spent.
                 await self.quota.release(reservation)
+                released = True
                 raise ProxyError(f"the model endpoint is unavailable: {exc}", status=502) from exc
             raise
         finally:
@@ -286,8 +288,43 @@ class ModelProxy:
                 self._schedule_settlement(
                     reservation, teed, sub, session_id, turn, mode, route, lane, started
                 )
+            elif not opened and not released:
+                # The client went away before the first byte. That arrives as
+                # ``CancelledError`` (or ``GeneratorExit``), which is a
+                # ``BaseException``: the release above never ran and the
+                # settlement below had nothing to settle, so the reservation sat
+                # against the developer's hourly quota at its full estimate until
+                # the window rolled — a run abandoned four times in a row could
+                # 429 a developer out of an untouched budget (BUG GW-2).
+                #
+                # Scheduled rather than awaited for the same reason settlement is
+                # (see `_schedule_settlement`): this block can run under
+                # cancellation, where the first ``await`` raises immediately.
+                self._schedule_release(reservation)
 
     # -- settlement ---------------------------------------------------------
+
+    def _schedule_release(self, reservation: Any) -> None:
+        """Give back a reservation nothing was ever charged against.
+
+        A sibling task, not an await: this is reached from a ``finally`` that can
+        be running under cancellation, and the first await there would raise
+        before the release happened.
+        """
+
+        async def give_back() -> None:
+            try:
+                await self.quota.release(reservation)
+            except Exception as exc:  # noqa: BLE001 - a lost release is a leak, not a crash
+                log.warning("reservation could not be released: %s", exc)
+
+        try:
+            task = asyncio.get_running_loop().create_task(give_back())
+        except RuntimeError:
+            log.warning("reservation release skipped: the event loop is closed")
+            return
+        self._settling.add(task)
+        task.add_done_callback(self._settling.discard)
 
     def _schedule_settlement(self, *args: Any) -> None:
         """Hand settlement to a task of the app's own, not this request's.

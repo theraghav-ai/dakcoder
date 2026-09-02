@@ -259,18 +259,25 @@ def create_app(gateway: Gateway) -> FastAPI:
         if gateway.proxy is None:
             raise ProxyError("this gateway has no model proxy configured", status=503)
 
-        body = json.loads(await request.body() or b"{}")
-        estimated = int(request.headers.get("X-Estimated-Tokens", 0)) or _estimate(body)
-        lane = Lane(request.headers.get("X-Lane", "interactive"))
+        # Validated, not trusted. Every line below used to raise straight out of
+        # the handler on input a caller controls — a malformed body, a
+        # non-numeric `X-Estimated-Tokens`, an unknown lane — and FastAPI turned
+        # each into a 500 on the hot path. A 500 says the gateway is broken; the
+        # caller cannot tell "my header is wrong" from "the service is down",
+        # and an authenticated client could flood the error budget with a header
+        # typo (BUG GW-3).
+        body = _body(await _read_body(request))
+        estimated = _tokens(request.headers.get("X-Estimated-Tokens")) or _estimate(body)
+        lane = _lane(request.headers.get("X-Lane"))
 
         stream = gateway.proxy.stream(
             path,
             body,
             sub=claims.sub,
             estimated=estimated,
-            session_id=request.headers.get("X-Session-Id", ""),
-            turn=int(request.headers.get("X-Turn", 0)),
-            mode=request.headers.get("X-Mode", "coder"),
+            session_id=request.headers.get("X-Session-Id", "")[:128],
+            turn=_turn(request.headers.get("X-Turn")),
+            mode=(request.headers.get("X-Mode") or "coder")[:32],
             lane=lane,
             idempotency_key=idempotency_key,
         )
@@ -328,6 +335,91 @@ async def _with_error_events(first: bytes, rest) -> Any:
             separators=(",", ":"),
         )
         yield f"event: error\ndata: {payload}\n\n".encode()
+
+
+#: A reservation is a claim against the developer's hourly budget, so a client
+#: that asks for an absurd one is refused rather than believed. The ceiling is
+#: well above any single turn the agent can assemble (the largest prompt budget
+#: is 245,760 tokens) and well below anything that could exhaust a window in one
+#: request.
+MAX_ESTIMATED_TOKENS = 1_000_000
+
+
+#: The largest request body the proxy will read.
+#:
+#: There was no limit: the whole body was read into memory before anything looked
+#: at it, so an authenticated client could hand the gateway as much as it cared
+#: to send (BUG GW-6). Sixteen megabytes is far above the largest prompt the
+#: agent can assemble — 245,760 tokens is roughly 1 MB of JSON — and far below
+#: anything that threatens a worker.
+MAX_BODY_BYTES = 16 * 1024 * 1024
+
+
+async def _read_body(request: Request) -> bytes:
+    """Read the body, refusing one that will not fit.
+
+    Streamed rather than `await request.body()`, so an oversized body is refused
+    at the point it exceeds the limit rather than after all of it has been held.
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        raise ProxyError(
+            f"the request body is larger than {MAX_BODY_BYTES:,} bytes", status=413
+        )
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_BODY_BYTES:
+            raise ProxyError(
+                f"the request body is larger than {MAX_BODY_BYTES:,} bytes", status=413
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _body(raw: bytes) -> dict[str, Any]:
+    """The request body as an object, or a 400 saying which it was not."""
+    try:
+        parsed = json.loads(raw or b"{}")
+    except ValueError as exc:
+        raise ProxyError(f"the request body is not valid JSON: {exc}", status=400) from exc
+    if not isinstance(parsed, dict):
+        raise ProxyError("the request body must be a JSON object", status=400)
+    return parsed
+
+
+def _tokens(raw: str | None) -> int:
+    """``X-Estimated-Tokens``, clamped. 0 means "the client did not say"."""
+    if raw is None or not raw.strip():
+        return 0
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ProxyError(
+            f"X-Estimated-Tokens must be an integer, not {raw!r}", status=400
+        ) from exc
+    if value < 0:
+        # A negative reservation would have *credited* the caller's window.
+        raise ProxyError("X-Estimated-Tokens cannot be negative", status=400)
+    return min(value, MAX_ESTIMATED_TOKENS)
+
+
+def _turn(raw: str | None) -> int:
+    """``X-Turn``. Telemetry only, so a bad one is dropped rather than refused."""
+    try:
+        return max(0, int(raw)) if raw else 0
+    except ValueError:
+        return 0
+
+
+def _lane(raw: str | None) -> Lane:
+    try:
+        return Lane(raw) if raw else Lane("interactive")
+    except ValueError as exc:
+        allowed = ", ".join(sorted(lane.value for lane in Lane))
+        raise ProxyError(f"X-Lane must be one of: {allowed}", status=400) from exc
 
 
 def _estimate(body: dict[str, Any]) -> int:

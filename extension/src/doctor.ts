@@ -814,10 +814,13 @@ export class Doctor implements vscode.Disposable {
     try {
       await this.deps.runtime.ensure();
       const info = await this.deps.runtime.client.health();
+      const known = info.sessions?.total;
       const sessions =
-        info.sessions.total === 1
-          ? vscode.l10n.t('1 session known')
-          : vscode.l10n.t('{0} sessions known', info.sessions.total);
+        known === undefined
+          ? vscode.l10n.t('session count not reported')
+          : known === 1
+            ? vscode.l10n.t('1 session known')
+            : vscode.l10n.t('{0} sessions known', known);
       const healthCheck: Check =
         info.api_version === API_VERSION
           ? {
@@ -851,28 +854,40 @@ export class Doctor implements vscode.Disposable {
               },
             };
 
-      const modelCheck: Check = info.ready.prewarmed
+      // `ready` and `gateway` are the token-gated half of `/v1/health`: an
+      // unauthenticated caller gets liveness only. Doctor always has the token,
+      // so their absence means the runtime is older than this extension — worth
+      // saying, not worth throwing over.
+      const ready = info.ready;
+      const gateway = info.gateway ?? vscode.l10n.t('the gateway');
+      const modelCheck: Check = !ready
         ? {
             name: model,
-            state: 'pass',
-            detail:
-              info.ready.latency_ms === undefined
-                ? vscode.l10n.t('reachable through {0} — prewarmed', info.gateway)
-                : vscode.l10n.t(
-                    'reachable through {0} — prewarmed in {1} ms',
-                    info.gateway,
-                    String(Math.round(info.ready.latency_ms)),
-                  ),
-          }
-        : {
-            name: model,
             state: 'warn',
-            detail: vscode.l10n.t(
-              'not prewarmed: {0}. The first request pays the cold start. Proxy variables in force: {1}',
-              info.ready.reason ?? vscode.l10n.t('no reason reported'),
-              proxySummary(),
-            ),
-          };
+            detail: vscode.l10n.t('the runtime did not report whether it is prewarmed.'),
+          }
+        : ready.prewarmed
+          ? {
+              name: model,
+              state: 'pass',
+              detail:
+                ready.latency_ms === undefined
+                  ? vscode.l10n.t('reachable through {0} — prewarmed', gateway)
+                  : vscode.l10n.t(
+                      'reachable through {0} — prewarmed in {1} ms',
+                      gateway,
+                      String(Math.round(ready.latency_ms)),
+                    ),
+            }
+          : {
+              name: model,
+              state: 'warn',
+              detail: vscode.l10n.t(
+                'not prewarmed: {0}. The first request pays the cold start. Proxy variables in force: {1}',
+                ready.reason ?? vscode.l10n.t('no reason reported'),
+                proxySummary(),
+              ),
+            };
 
       return [healthCheck, modelCheck, this.checkPosture()];
     } catch (err) {

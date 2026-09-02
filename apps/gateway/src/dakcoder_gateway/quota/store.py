@@ -462,17 +462,36 @@ class RedisStore:
         )
 
     async def remember(self, key: str, body_hash: str, value: Any, ttl: timedelta) -> Any | None:
+        """Claim the key and read the winner's record in one round trip.
+
+        GET-then-SET was a check-then-act across a network hop: two concurrent
+        deliveries of the same key both read ``None``, both wrote, and both
+        returned ``None`` — so the caller dispatched and charged the same request
+        twice, which is the one thing an idempotency key exists to prevent
+        (BUG GW-4). Idempotency that only works when nothing is concurrent is
+        idempotency that only works when it is not needed.
+
+        ``SET … NX GET`` decides it server-side: the winner gets ``None`` back
+        (there was no previous value) and the loser gets the winner's record —
+        the same answer a later replay gets, which is exactly right.
+        """
         import json
 
         full = f"{self.prefix}:idem:{key}"
-        stored = await self.client.get(full)
-        if stored is None:
-            await self.client.set(
-                full,
-                json.dumps({"hash": body_hash, "value": value}),
-                ex=int(ttl.total_seconds()),
-                nx=True,
+        mine = json.dumps({"hash": body_hash, "value": value})
+        try:
+            stored = await self.client.set(
+                full, mine, ex=int(ttl.total_seconds()), nx=True, get=True
             )
+        except TypeError:
+            # A redis-py too old for `get=True` on SET. Fall back to the
+            # two-step, which is racy but not *wrong* for the common case, and
+            # say so rather than pretending the guarantee holds.
+            stored = await self.client.get(full)
+            if stored is None:
+                await self.client.set(full, mine, ex=int(ttl.total_seconds()), nx=True)
+
+        if stored is None:
             return None
         record = json.loads(_text(stored))
         if record["hash"] != body_hash:

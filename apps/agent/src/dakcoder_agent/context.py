@@ -67,6 +67,7 @@ __all__ = [
     "Layer",
     "ToolCap",
     "TOOL_CAPS",
+    "Eviction",
     "Usage",
     "Recap",
     "ContextManager",
@@ -303,6 +304,11 @@ TOOL_CAPS: dict[str, ToolCap] = {
 #: Everything not named above. §6.2's "everything else".
 DEFAULT_TOOL_CAP = ToolCap(8_000, "tail", "call the tool again with narrower arguments")
 
+#: How many entries of each recap list survive a merge. A recap that grows
+#: without limit eventually costs more than the working set it replaced; twelve
+#: is roughly two screens of `do_not_retry` and well inside the recap budget.
+MAX_RECAP_ITEMS = 12
+
 #: The recap's allocation from §6.1. Reserved when deciding how much of the
 #: working set to retain, because the recap grows as history is evicted and
 #: budgeting against its current size would leave no room for the one about to
@@ -353,14 +359,35 @@ class Usage:
 
 
 @dataclass(frozen=True, slots=True)
+class Eviction:
+    """What the last compaction removed.
+
+    Returned as data rather than left implicit because the loop keeps ledgers
+    that describe the same content — what it has read, what each call returned —
+    and until they hear about an eviction they answer for messages that are no
+    longer there (BUG L-10, L-17, L-25).
+    """
+
+    paths: tuple[str, ...] = ()
+    tool_call_ids: tuple[str, ...] = ()
+    messages: int = 0
+    tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class Recap:
     """A structured compaction recap (Part A §6.5).
 
-    Structured, not prose, and with two properties that matter more than the
-    summary itself: ``do_not_retry`` records dead ends, which is what stops the
-    post-compaction agent cheerfully repeating them; and ``markdown()`` is
-    persisted to ``.dakcoder/session-<id>/recap.md``, so a compaction, a restart
-    or a new session on Monday can pick it up.
+    Structured, not prose, because of one field: ``do_not_retry`` records dead
+    ends, and that is what stops the post-compaction agent cheerfully repeating
+    them. ``merge`` folds each recap into the one before it, so a second
+    compaction does not throw the first one's dead ends away (BUG L-4).
+
+    ``markdown()`` is what goes into the pinned RECAP layer. It is not written to
+    disk; an earlier version of this docstring said it was persisted to
+    ``.dakcoder/session-<id>/recap.md`` and nothing ever wrote that file. What
+    *is* on disk is the transcript (``journal.py``), which is the thing a restart
+    needs.
     """
 
     goal: str = ""
@@ -384,6 +411,50 @@ class Recap:
     open_items: tuple[str, ...] = ()
     do_not_retry: tuple[str, ...] = ()
     turns: tuple[int, int] = (0, 0)
+
+    def merge(self, previous: "Recap | None") -> "Recap":
+        """Fold an earlier recap into this one.
+
+        A compaction *replaces* the pinned recap, and the evicted set handed to
+        the summariser never contains the previous one — so the first
+        compaction's `do_not_retry`, the field this class's own docstring calls
+        the reason it exists, vanished at the second compaction and the run
+        cheerfully repeated the dead end that had caused it (BUG L-4). Long runs
+        are exactly the runs that compact twice.
+
+        Older entries come first: they are the earlier history, and a reader —
+        model or human — should meet them in the order they happened. Bounded per
+        field, oldest dropped first, because a recap that grows without limit
+        eventually costs more than the working set it replaced.
+
+        `turns` spans both, so the header stops claiming the run began at the
+        last compaction.
+        """
+        if previous is None:
+            return self
+
+        def fold(older: tuple[str, ...], newer: tuple[str, ...]) -> tuple[str, ...]:
+            seen: dict[str, None] = {}
+            for item in (*older, *newer):
+                if item:
+                    seen[item] = None
+            return tuple(seen)[-MAX_RECAP_ITEMS:]
+
+        lo = min(previous.turns[0] or self.turns[0], self.turns[0] or previous.turns[0])
+        return Recap(
+            # The newest compaction is the closest to what the run is doing now,
+            # so its goal and step win where both have one.
+            goal=self.goal or previous.goal,
+            plan_step=self.plan_step or previous.plan_step,
+            files_created=fold(previous.files_created, self.files_created),
+            files_modified=fold(previous.files_modified, self.files_modified),
+            files_read=fold(previous.files_read, self.files_read),
+            decisions=fold(previous.decisions, self.decisions),
+            verified=fold(previous.verified, self.verified),
+            open_items=fold(previous.open_items, self.open_items),
+            do_not_retry=fold(previous.do_not_retry, self.do_not_retry),
+            turns=(lo, max(previous.turns[1], self.turns[1])),
+        )
 
     def markdown(self) -> str:
         lo, hi = self.turns
@@ -462,6 +533,9 @@ class ContextManager:
         #: Follow-ups and corrections, pinned. See ``pin_directive``.
         self._directives: list[str] = []
         self._recap: Message | None = None
+        #: The structured recap behind ``_recap``'s rendered text, so the next
+        #: compaction can fold this one in rather than replace it (BUG L-4).
+        self._previous_recap: Recap | None = None
         self._working: list[Message] = []
 
         # path -> indices into _working of that path's live reads, oldest
@@ -469,6 +543,16 @@ class ContextManager:
         # file each carry content of their own; only a read that *contains* an
         # earlier one supersedes it.
         self._slices: dict[str, list[int]] = {}
+
+        #: What the last ``wire()`` had to repair to keep the tool-call
+        #: invariant. Read by the loop, which turns a non-empty value into an
+        #: ERROR event: the repair keeps the request valid, but something
+        #: upstream produced an invalid one and that is worth knowing about.
+        self._wire_repairs: tuple[str, ...] = ()
+
+        #: What the last compaction evicted. Read by the loop to invalidate the
+        #: ledgers that describe evicted content.
+        self._last_eviction = Eviction()
 
     # ── properties ──────────────────────────────────────────────────────────
 
@@ -528,8 +612,106 @@ class ContextManager:
         return out
 
     def wire(self) -> list[dict[str, Any]]:
-        """Assemble in the shape the API expects."""
-        return [m.wire() for m in self.build()]
+        """Assemble in the shape the API expects, with the tool-call invariant repaired.
+
+        One ``role: "tool"`` message per declared ``tool_call_id``, no tool
+        message whose call nothing declares: that is not a convention, it is the
+        condition for the request being accepted at all. A strict
+        OpenAI-compatible endpoint rejects the whole conversation over a single
+        orphan, and because the message list is append-only the rejection is
+        permanent — every later turn of the session and every follow-up built on
+        the same context carries the same defect.
+
+        The invariant was a *discipline* before this: four call sites in the loop
+        each remembered to answer abandoned calls, and two paths forgot (BUG L-1,
+        L-6). Discipline scales with the number of people who read the comment.
+        A checkpoint on the one path every request must pass through does not.
+
+        This is a backstop, not the fix. When it fires, something upstream is
+        wrong and should be repaired there — hence ``wire_repairs``, which the
+        loop turns into an ERROR event rather than a silent recovery.
+        """
+        messages, repairs = self._coherent(self.build())
+        self._wire_repairs = repairs
+        return [m.wire() for m in messages]
+
+    @property
+    def last_eviction(self) -> Eviction:
+        """What the most recent ``compact()`` removed."""
+        return self._last_eviction
+
+    @property
+    def wire_repairs(self) -> tuple[str, ...]:
+        """What the last ``wire()`` had to repair. Empty is the only healthy value."""
+        return self._wire_repairs
+
+    @staticmethod
+    def _coherent(messages: Sequence[Message]) -> tuple[list[Message], tuple[str, ...]]:
+        """Return the list with every declared call answered and no orphaned result.
+
+        Two repairs, both information-preserving:
+
+        * A declared call with no result gets a synthesised one saying it did not
+          run. It is placed at the end of its assistant's block — the next
+          assistant message, or the end of the list — because a batch's results
+          are not always contiguous (a retrieval-overlap note is a ``role: user``
+          message appended between two results of the same batch).
+        * A result whose call no assistant declares becomes a ``role: user``
+          message carrying the same text. Dropping it would delete something the
+          model was told; leaving it would be malformed.
+        """
+        declared: set[str] = set()
+        answered: set[str] = set()
+        for message in messages:
+            for call in message.tool_calls:
+                declared.add(call.id)
+            if message.tool_call_id:
+                answered.add(message.tool_call_id)
+
+        if declared <= answered and answered <= declared:
+            return list(messages), ()
+
+        repairs: list[str] = []
+        out: list[Message] = []
+        pending: list[ToolCall] = []
+
+        def flush() -> None:
+            for call in pending:
+                repairs.append(f"unanswered call {call.name}#{call.id}")
+                out.append(
+                    Message(
+                        role=Role.TOOL,
+                        content=f"{call.name} was not run: the run moved on before "
+                        "this call was dispatched.",
+                        layer=Layer.WORKING_SET,
+                        source="wire-repair",
+                        tool_call_id=call.id,
+                    )
+                )
+            pending.clear()
+
+        for message in messages:
+            if message.role is Role.ASSISTANT:
+                flush()
+                out.append(message)
+                pending.extend(call for call in message.tool_calls if call.id not in answered)
+                continue
+            if message.tool_call_id and message.tool_call_id not in declared:
+                repairs.append(f"orphaned result {message.source or message.role}")
+                out.append(
+                    Message(
+                        role=Role.USER,
+                        content=f"[a tool result whose call is no longer in context]\n"
+                        f"{message.content}",
+                        layer=message.layer,
+                        source=message.source,
+                        turn=message.turn,
+                    )
+                )
+                continue
+            out.append(message)
+        flush()
+        return out, tuple(repairs)
 
     def prefix_signature(self) -> str:
         """A stable identifier for the cacheable head.
@@ -771,21 +953,30 @@ class ContextManager:
         25k tokens into history permanently (finding S8).
         """
         cap = TOOL_CAPS.get(tool, DEFAULT_TOOL_CAP)
-        capped = self._apply_cap(content, cap, path=path, line_range=line_range)
+        capped, survived = self._apply_cap(content, cap, path=path, line_range=line_range)
 
+        # The message carries what is *in* it, not what the tool returned. Every
+        # consumer of `line_range` — the slice ledger here, the loop's read
+        # ledger, the re-read intercept — is answering "has the model seen these
+        # lines", and the cap is where those two stopped being the same question
+        # (BUG L-8).
         msg = Message(
             Role.TOOL,
             capped,
             Layer.WORKING_SET,
             source=f"tool:{tool}",
             path=path,
-            line_range=line_range,
+            line_range=survived,
             tool_call_id=tool_call_id or None,
             turn=self._turn,
         )
 
-        if path:
-            self._supersede_slice(path, line_range)
+        if path and (survived is not None or line_range is None):
+            # A read whose content the cap removed entirely claims no coverage
+            # and supersedes nothing. Passing its `None` through would read as
+            # "the whole file" to `_contains` — the exact opposite of what
+            # happened, and it would stub out every earlier read of the file.
+            self._supersede_slice(path, survived)
             self._slices.setdefault(path, []).append(len(self._working))
         self._working.append(msg)
         return msg
@@ -868,6 +1059,29 @@ class ContextManager:
         """How many reads the ledger has collapsed. For telemetry."""
         return sum(1 for m in self._working if m.content.startswith("[stale read of "))
 
+    def coverage(self) -> dict[str, list[tuple[int, int]]]:
+        """Which lines of which files are in the working set *right now*.
+
+        The authority on "what has the model actually seen". The loop used to
+        keep its own answer to that question and never hear about eviction, so a
+        recap saying "re-read one only if you need a line range you have not
+        seen" sat beside an intercept refusing exactly those re-reads as "already
+        in context above" (BUG L-10). The content was gone and the ledger did not
+        know.
+
+        Excluded, because none of them is content the model can read: superseded
+        stubs, and results whose lines the insertion cap removed entirely
+        (``line_range is None`` after a cap that kept no body line).
+        """
+        out: dict[str, list[tuple[int, int]]] = {}
+        for msg in self._working:
+            if msg.role is not Role.TOOL or not msg.path or msg.line_range is None:
+                continue
+            if msg.content.startswith("[stale read of "):
+                continue
+            out.setdefault(msg.path, []).append(msg.line_range)
+        return out
+
     # ── caps ────────────────────────────────────────────────────────────────
 
     def _apply_cap(
@@ -877,10 +1091,29 @@ class ContextManager:
         *,
         path: str | None,
         line_range: tuple[int, int] | None,
-    ) -> str:
+    ) -> tuple[str, tuple[int, int] | None]:
+        """Cap the content, and say which of its lines actually survived.
+
+        The second return value is the fix for BUG L-8. The cap is where the
+        context stops agreeing with the tool: ``read_file`` hands over lines
+        1-8000 of a large file, the 48k-token cap keeps roughly the first third,
+        and the loop then recorded the *tool's* span in its read ledger. The
+        model was told two things that were each true on their own — the elision
+        marker said "re-read with a narrower line range", the repeat intercept
+        said "lines 6000-6500 are already in context above" — and could obey
+        neither. On a file over about 150KB the tail became unreachable for the
+        rest of the run.
+
+        So the cap reports what it kept, and everything downstream — the message
+        the model sees, the slice ledger, the loop's read ledger — is built from
+        that instead of from what the tool returned. ``None`` means "not
+        expressible as a range": a scattered ``errors`` elision, or a head cut so
+        tight that no content line survived at all. A caller must treat that as
+        *no* coverage, never as whole-file coverage.
+        """
         tokens = self._calibration.estimate(content)
         if tokens <= cap.max_tokens:
-            return content
+            return content, line_range
 
         lines = content.splitlines()
         if cap.strategy == "errors":
@@ -890,10 +1123,44 @@ class ContextManager:
         else:
             kept, elided = self._keep_edge(lines, cap.max_tokens, head=False)
 
-        marker = self._marker(elided, cap, path=path, line_range=line_range)
+        survived = self._surviving_range(
+            line_range, total_lines=len(lines), kept=len(kept), strategy=cap.strategy
+        )
+        marker = self._marker(
+            elided, cap, path=path, line_range=line_range, survived=survived
+        )
         if cap.strategy == "tail":
-            return marker + "\n" + "\n".join(kept)
-        return "\n".join(kept) + "\n" + marker
+            return marker + "\n" + "\n".join(kept), survived
+        return "\n".join(kept) + "\n" + marker, survived
+
+    @staticmethod
+    def _surviving_range(
+        line_range: tuple[int, int] | None,
+        *,
+        total_lines: int,
+        kept: int,
+        strategy: str,
+    ) -> tuple[int, int] | None:
+        """Which source lines are still in the message after an elision.
+
+        A read result is a header line followed by the file's lines, so the
+        difference between the rendered line count and the span's width is the
+        header. Deriving the offset rather than assuming one line keeps this
+        honest if the renderer ever gains a second.
+        """
+        if line_range is None or strategy == "errors":
+            return None
+        low, high = line_range
+        width = high - low + 1
+        offset = total_lines - width
+        if offset < 0:
+            return None
+        body = kept - offset if strategy == "head" else kept
+        if body <= 0:
+            return None
+        if strategy == "head":
+            return (low, min(high, low + body - 1))
+        return (max(low, high - body + 1), high)
 
     def _keep_edge(self, lines: list[str], budget: int, *, head: bool) -> tuple[list[str], int]:
         ordered = lines if head else list(reversed(lines))
@@ -947,6 +1214,7 @@ class ContextManager:
         *,
         path: str | None,
         line_range: tuple[int, int] | None,
+        survived: tuple[int, int] | None = None,
     ) -> str:
         """Render the elision marker.
 
@@ -954,29 +1222,48 @@ class ContextManager:
         cannot see is one it treats as absence — it concludes the symbol it was
         looking for does not exist, and plans around a repository that has more
         in it than it was shown.
+
+        When the surviving span is known it is named, because "re-read with a
+        narrower range" is only actionable if the model can tell which range is
+        missing. Without it the advice reads as "read a smaller slice of the
+        part you already have".
         """
         where = ""
         if path and line_range:
             where = f" of {path}:{line_range[0]}-{line_range[1]}"
         elif path:
             where = f" of {path}"
+        kept = f"; lines {survived[0]}-{survived[1]} are above" if survived else ""
         recover = f" — {cap.recover}" if cap.recover else ""
-        return f"[... {elided} line(s) elided{where}{recover} ...]"
+        return f"[... {elided} line(s) elided{where}{kept}{recover} ...]"
 
     # ── budget ──────────────────────────────────────────────────────────────
+
+    def _message_cost(self, message: Message) -> int:
+        """What one message costs on the wire. The only answer to that question.
+
+        There used to be two. ``usage()`` counted ``tool_calls`` arguments and
+        the retention cut did not, so a write-heavy working set — twenty
+        ``write_file`` calls carrying 40KB of arguments each, with empty
+        ``content`` — was 200k tokens to the compaction *trigger* and zero to
+        the compaction *cut* (BUG L-3). Compaction fired every turn, evicted
+        nothing, and the run died either as NO_PROGRESS with a message blaming
+        the working set or as ERROR "context cannot be reduced below budget".
+        Write-heavy runs are this product's core loop.
+
+        A turn whose whole content is a tool call has an empty ``content`` and a
+        real cost. Anything deciding how much room a message takes has to ask
+        here.
+        """
+        cost = self._calibration.estimate(message.content)
+        for call in message.tool_calls:
+            cost += self._calibration.estimate(f"{call.name}{call.arguments or ''}")
+        return cost
 
     def usage(self) -> Usage:
         by_layer: dict[Layer, int] = {layer: 0 for layer in Layer}
         for msg in self.build():
-            by_layer[msg.layer] += self._calibration.estimate(msg.content)
-            # Counted here as well as in the calibration, for the same reason:
-            # a turn whose whole content is a tool call has an empty `content`
-            # and a real cost, and a budget that cannot see it will happily
-            # assemble a prompt the endpoint refuses.
-            for call in msg.tool_calls:
-                by_layer[msg.layer] += self._calibration.estimate(
-                    f"{call.name}{call.arguments or ''}"
-                )
+            by_layer[msg.layer] += self._message_cost(msg)
         total = sum(by_layer.values()) + self._tool_schema_tokens
         return Usage(
             by_layer=by_layer,
@@ -1007,14 +1294,16 @@ class ContextManager:
         """
         current = self.build()
         if not previous:
-            return sum(self._calibration.estimate(m.content) for m in current)
+            return sum(self._message_cost(m) for m in current)
 
         shared = 0
         for old, new in zip(previous, current):
             if old.content != new.content or old.role is not new.role:
                 break
+            if old.tool_calls != new.tool_calls:
+                break
             shared += 1
-        return sum(self._calibration.estimate(m.content) for m in current[shared:])
+        return sum(self._message_cost(m) for m in current[shared:])
 
     def observe_usage(self, *, prompt_tokens: int) -> None:
         """Fold a real ``prompt_tokens`` back into the estimate.
@@ -1100,13 +1389,22 @@ class ContextManager:
         if not evicted:
             return Recap(turns=(self._turn, self._turn))
 
-        recap = summarise(evicted)
+        recap = summarise(evicted).merge(self._previous_recap)
+        self._previous_recap = recap
         self._recap = Message(
             Role.USER, recap.markdown(), Layer.RECAP, source="recap", turn=self._turn
         )
         self._working = retained
         self._reindex_slices()
         self._compactions += 1
+        self._last_eviction = Eviction(
+            paths=tuple(dict.fromkeys(m.path for m in evicted if m.path)),
+            tool_call_ids=tuple(
+                m.tool_call_id for m in evicted if m.tool_call_id
+            ),
+            messages=len(evicted),
+            tokens=sum(self._message_cost(m) for m in evicted),
+        )
         return recap
 
     def _whole_turn_cut(self, cut: int) -> int:
@@ -1132,6 +1430,16 @@ class ContextManager:
         allowance had already refused, which is how a compaction returns still
         over budget. The last message is never evicted — a compaction that drops
         the result the model is reacting to is worse than not compacting.
+
+        Those two rules met in one place and contradicted each other. When the
+        whole retained set is the results of an assistant the cut evicted, walking
+        forward runs into the never-evict-last rule and stops on an orphan: the
+        retained head is a ``role:"tool"`` message whose call nothing declares
+        (BUG L-6). ``wire()`` repairs that now, but a repair is a report of a
+        defect, not the absence of one — so when the forward walk cannot clear
+        the orphans, the cut steps *back* to include the assistant that declared
+        them. That re-admits its tokens, which is the lesser cost: the alternative
+        is a compaction whose output is a malformed conversation.
         """
         if cut <= 0 or cut >= len(self._working):
             return cut
@@ -1147,6 +1455,16 @@ class ContextManager:
                 cut += 1
                 continue
             break
+
+        head = self._working[cut] if cut < len(self._working) else None
+        if head is not None and head.tool_call_id and head.tool_call_id in declared:
+            # The forward walk hit the last message and it is still an orphan.
+            # Step back to the assistant that declared it.
+            back = cut
+            while back > 0:
+                back -= 1
+                if any(call.id == head.tool_call_id for call in self._working[back].tool_calls):
+                    return back
         return cut
 
     def _retention_cut(self, retain_pct: float) -> int:
@@ -1163,9 +1481,9 @@ class ContextManager:
         """
         overhead = (
             self._tool_schema_tokens
-            + self._calibration.estimate(self._system.content)
-            + sum(self._calibration.estimate(m.content) for m in self._mode_messages)
-            + (self._calibration.estimate(self._task.content) if self._task else 0)
+            + self._message_cost(self._system)
+            + sum(self._message_cost(m) for m in self._mode_messages)
+            + (self._message_cost(self._task) if self._task else 0)
             # The recap is about to be replaced, so budget for a full-sized one
             # rather than for whatever is there now.
             + RECAP_BUDGET_TOKENS
@@ -1175,7 +1493,11 @@ class ContextManager:
         used = 0
         cut = len(self._working)
         for i in range(len(self._working) - 1, -1, -1):
-            cost = self._calibration.estimate(self._working[i].content)
+            # `_message_cost`, not `estimate(content)`: the cut has to cost a
+            # message the same way the budget that fired the compaction did, or
+            # a working set made of tool-call arguments is invisible to exactly
+            # the machinery meant to shrink it (BUG L-3).
+            cost = self._message_cost(self._working[i])
             if used + cost > allowance and cut < len(self._working):
                 break
             used += cost

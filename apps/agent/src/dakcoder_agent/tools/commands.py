@@ -26,10 +26,14 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
+import threading
 from collections.abc import Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from dakcoder_shared.config import MODEL_CREDENTIAL_VARS
 from dakcoder_shared.envelope import Mutation, MutationKind, ToolResult
@@ -122,13 +126,34 @@ def child_env() -> dict[str, str]:
     return env
 
 
+#: Set for the duration of a baseline, so the Go toolchain refuses to update
+#: ``go.mod``/``go.sum`` rather than doing it quietly.
+#:
+#: A ContextVar rather than an argument because the flag has to travel from
+#: ``take_baseline`` through the router and a tool handler that has no reason to
+#: know about baselines, and a parameter threaded through all three would be a
+#: parameter every future handler had to remember. It is per-context, and a
+#: thread starts with a copy of the context that created it — so the baseline
+#: thread setting it does not change what the run thread's tools do.
+READONLY_MODULES: ContextVar[bool] = ContextVar("dakcoder_readonly_modules", default=False)
+
+
 def run(
     argv: Sequence[str],
     cwd: Path,
     *,
     timeout: int = DEFAULT_TIMEOUT,
+    readonly_modules: bool | None = None,
 ) -> Completed:
-    """Run one process. No shell, sanitised environment, hard timeout."""
+    """Run one process. No shell, sanitised environment, hard timeout.
+
+    ``readonly_modules`` adds ``-mod=readonly`` to ``GOFLAGS``, so the Go
+    toolchain refuses to update ``go.mod`` or ``go.sum`` rather than doing it
+    quietly. Used by the baseline: `take_baseline` runs `go build` before the run
+    has touched anything, and `go build` will happily add a missing checksum —
+    a mutation with no Mutation record, invisible to the spanning-edit guard that
+    is supposed to notice the workspace changing under the baseline (BUG GT-1).
+    """
     import time
 
     binary = shutil.which(argv[0])
@@ -136,39 +161,124 @@ def run(
         raise MissingToolchain(argv[0])
 
     started = time.monotonic()
-    try:
-        proc = subprocess.run(  # noqa: S603 - argv list, shell=False, allow-listed
-            [binary, *argv[1:]],
-            cwd=cwd,
-            env=child_env(),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
-            shell=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        partial = _join(exc.stdout, exc.stderr)
-        return Completed(
-            tuple(argv), 124, partial, time.monotonic() - started, timed_out=True
-        )
+    # Its own process group, so a timeout can kill what the child started.
+    #
+    # `subprocess.run(timeout=...)` kills the direct child only, and the direct
+    # child of `go build` or `go test` is a supervisor: the compiler, the linker
+    # and the test binaries are grandchildren, and every one of them survived
+    # every timeout (BUG TL-5). A hung build left a process tree holding the
+    # module cache and the CPU, and the agent reported it as stopped.
+    group: dict[str, Any] = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
+    env = child_env()
+    if readonly_modules if readonly_modules is not None else READONLY_MODULES.get():
+        env["GOFLAGS"] = f"{env.get('GOFLAGS', '')} -mod=readonly".strip()
 
+    proc = subprocess.Popen(  # noqa: S603 - argv list, shell=False, allow-listed
+        [binary, *argv[1:]],
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        shell=False,
+        **group,
+    )
+
+    captured, reader = _pump(proc)
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_tree(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - the kernel refused
+            pass
+    reader.join(timeout=5)
+
+    output = _join(b"".join(captured))
+    if timed_out:
+        return Completed(tuple(argv), 124, output, time.monotonic() - started, timed_out=True)
     return Completed(
-        tuple(argv),
-        proc.returncode,
-        _join(proc.stdout, proc.stderr),
-        time.monotonic() - started,
+        tuple(argv), proc.returncode or 0, output, time.monotonic() - started
     )
 
 
+#: How much of a child's output is kept in memory, in bytes.
+#:
+#: `capture_output=True` buffered the whole of it and the 400KB cap was applied
+#: *after* the process had finished, so a runaway `go test -v` could exhaust the
+#: runtime's memory before anything looked at the result (BUG TL-6). The pump
+#: below stops storing at this point and keeps reading, which is the part that
+#: matters: a child whose pipe fills blocks forever and would hang the timeout
+#: too. Twice `MAX_CAPTURE` characters, so the text cap is still the one that
+#: decides what the model sees.
+MAX_CAPTURE_BYTES = 2 * MAX_CAPTURE
+
+
+def _pump(proc: subprocess.Popen) -> tuple[list[bytes], threading.Thread]:
+    """Drain the child's output into a bounded buffer, on its own thread.
+
+    Bounded and *still draining*: dropping the reader would block the child on a
+    full pipe, and killing the child for being verbose would throw away the test
+    results the developer asked for. Past the cap the bytes are read and
+    discarded, so memory is bounded by the cap and the process still runs to its
+    own conclusion or to the timeout.
+    """
+    kept: list[bytes] = []
+    stream = proc.stdout
+
+    def pump() -> None:
+        if stream is None:  # pragma: no cover - PIPE is always requested above
+            return
+        total = 0
+        while True:
+            block = stream.read(65_536)
+            if not block:
+                break
+            if total < MAX_CAPTURE_BYTES:
+                kept.append(block[: MAX_CAPTURE_BYTES - total])
+                total += len(block)
+
+    reader = threading.Thread(target=pump, name="dakcoder-capture", daemon=True)
+    reader.start()
+    return kept, reader
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the child and everything it started."""
+    try:
+        if os.name == "nt":
+            subprocess.run(  # noqa: S603 - fixed argv
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                check=False,
+                shell=False,
+                timeout=15,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        # The group is gone, or this platform refused. The direct child is still
+        # ours to kill, which is what the old behaviour did on every platform.
+        try:
+            proc.kill()
+        except OSError:  # pragma: no cover
+            pass
+
+
 def _join(*streams: str | bytes | None) -> str:
-    """Merge stdout and stderr into one signal.
+    """Merge stdout and stderr into one signal, and cap what the model sees.
 
     The Go toolchain writes diagnostics to stderr and results to stdout, and a
     build failure is both. Keeping them separate would mean every caller
-    interleaving them again, in a slightly different order each time.
+    interleaving them again, in a slightly different order each time — so the
+    child is started with ``stderr=STDOUT`` and they are interleaved once, by the
+    kernel, in the order they were actually produced.
     """
     parts: list[str] = []
     for stream in streams:
@@ -316,7 +426,14 @@ def gofmt(inv: Invocation) -> ToolResult:
             current = path.read_bytes()
         except OSError:
             continue
-        if b"\r\n" in original and b"\r\n" not in current:
+        # Only a file that was *uniformly* CRLF gets its endings put back
+        # wholesale. A mixed file — some CRLF, some LF, which is what a
+        # half-converted repository looks like — would have every one of its LF
+        # lines converted by this, turning a formatting run into a whole-file
+        # diff of exactly the kind this code exists to prevent (BUG TL-10).
+        # Mixed files are left as gofmt produced them and reported, because
+        # guessing which lines the developer meant is not this tool's call.
+        if b"\r\n" in original and b"\r\n" not in current and not _mixed_eol(original):
             current = current.replace(b"\n", b"\r\n")
             path.write_bytes(current)
             restored += 1
@@ -334,6 +451,13 @@ def gofmt(inv: Invocation) -> ToolResult:
         mutations=[Mutation(p, MutationKind.MODIFY) for p in changed],
         meta={"binary": binary, "eol_restored": restored},
     )
+
+
+def _mixed_eol(raw: bytes) -> bool:
+    """Whether a file uses both CRLF and bare LF."""
+    crlf = raw.count(b"\r\n")
+    lf = raw.count(b"\n") - crlf
+    return crlf > 0 and lf > 0
 
 
 def go_mod(inv: Invocation) -> ToolResult:
@@ -753,6 +877,58 @@ def git_ops(inv: Invocation) -> ToolResult:
 # ── the escape hatch ────────────────────────────────────────────────────────
 
 
+#: git subcommands `run_terminal` refuses, and what they destroy.
+#:
+#: `git_ops`'s docstring says "There is no ``push``, no ``reset --hard`` and no
+#: ``rebase``, and that is a property of the tool rather than a policy in the
+#: prompt". It was a property of *that* tool and of nothing else: `git` is on the
+#: allow-list, so every one of them was one `run_terminal` call away (BUG TL-7).
+#: Approval-gated today, which is the only reason this was not worse — and an
+#: approval is a human reading a command, which is exactly the wrong place to
+#: rely on for "did you notice this one says --hard".
+#:
+#: What is refused is what is not recoverable from the reflog, or what is visible
+#: to other people. Everything else `git` can do stays available.
+_DESTRUCTIVE_GIT: dict[str, str] = {
+    "push": "it publishes to a remote, where nobody can take it back",
+    "reset": "`--hard` discards uncommitted work with no undo",
+    "clean": "`-fdx` deletes untracked files, including ones git never knew about",
+    "checkout": "it overwrites uncommitted changes in the files it touches",
+    "restore": "it overwrites uncommitted changes in the files it touches",
+    "rebase": "it rewrites history the developer may have already built on",
+    "filter-branch": "it rewrites every commit in the repository",
+    "gc": "it can prune the reflog the other refusals rely on",
+    "reflog": "`expire` removes the record every other recovery depends on",
+    "worktree": "it can remove a tree with uncommitted work in it",
+    "submodule": "it can reset or remove a whole nested repository",
+}
+
+#: `git checkout`/`restore` are also how a branch is made, which the agent does
+#: legitimately. Only the destructive spellings are refused.
+_SAFE_CHECKOUT_FLAGS = frozenset({"-b", "-B", "--orphan"})
+
+
+def _git_refusal(args: Sequence[str]) -> ToolResult | None:
+    """Whether this ``git`` invocation is one ``run_terminal`` will not make."""
+    subcommand = next((a for a in args if not a.startswith("-")), "")
+    reason = _DESTRUCTIVE_GIT.get(subcommand)
+    if reason is None:
+        return None
+    if subcommand in ("checkout", "restore") and any(
+        a in _SAFE_CHECKOUT_FLAGS for a in args
+    ):
+        return None
+    if subcommand == "reset" and not any(a in ("--hard", "--merge") for a in args):
+        return None
+    return ToolResult.failure(
+        f"run_terminal will not run `git {subcommand}`: {reason}.",
+        fix="git_ops covers branch, add and commit, and everything it does is "
+        "recoverable from the reflog. If this genuinely needs doing, it is the "
+        "developer's to do.",
+        meta={"dead_end": f"git {subcommand} is not available to the agent"},
+    )
+
+
 def run_terminal(inv: Invocation) -> ToolResult:
     """Run one allow-listed binary with explicit arguments."""
     import json
@@ -771,8 +947,24 @@ def run_terminal(inv: Invocation) -> ToolResult:
             fix='For example: ["go", "env", "GOPRIVATE"]',
         )
 
+    # A bare name, not a path. The check reads `Path(argv[0]).name`, so `./go`,
+    # `subdir/go` and `..\\go.exe` all passed it while naming a binary in the
+    # repository the model can write to (BUG TL-8). There is no legitimate call
+    # here that needs a path: everything on the allow-list is meant to be found
+    # on PATH, and `shutil.which` is what finds it.
+    if any(sep in argv[0] for sep in ("/", "\\")):
+        return ToolResult.failure(
+            f"run_terminal will not run {argv[0]!r} by path.",
+            fix="Name the binary alone (\"go\", \"gofmt\"); it is resolved on PATH.",
+        )
+
     binary = Path(argv[0]).name.lower()
     binary = binary[:-4] if binary.endswith(".exe") else binary
+
+    if binary == "git":
+        refusal = _git_refusal(argv[1:])
+        if refusal is not None:
+            return refusal
 
     if binary not in ALLOWED_BINARIES:
         alternative = _TERMINAL_ALTERNATIVES.get(binary)

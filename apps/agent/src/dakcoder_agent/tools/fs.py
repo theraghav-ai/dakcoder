@@ -22,6 +22,7 @@ prune list below.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -150,6 +151,56 @@ def _sibling_eol(path: Path, default: str = "\n") -> str:
     return default
 
 
+def _write_text(path: Path, text: str) -> None:
+    """Write text back the way it was read, and atomically.
+
+    Two failures this replaces, both of which destroy the developer's file
+    rather than failing the call.
+
+    **Encoding asymmetry (BUG TL-1).** ``_read_text`` reads with
+    ``errors="surrogateescape"`` so a repository file with one stray non-UTF-8
+    byte is still readable — the agent's job is real repositories, which contain
+    files nobody has looked at in years. The write used strict UTF-8, so the
+    surrogate the read produced could not be encoded. That alone would be an
+    honest failure; ``Path.write_text`` opens the file (truncating it) *before*
+    encoding, so the file was already zero bytes when the encoder raised. The
+    model saw a generic failure, no mutation was recorded, and neither the gate
+    nor ``revert`` ever learned the file had been emptied. Encoding first, with
+    the same error handler the read used, makes the round trip lossless and
+    makes a failure cost nothing.
+
+    **Non-atomic write (BUG TL-2).** A crash or a full disk between truncate and
+    the last byte leaves a half-written source file. Writing a sibling temp file
+    and renaming makes the change all-or-nothing on both platforms.
+
+    The original's mode is copied onto the replacement: a patched shell script
+    that quietly loses its executable bit is the kind of breakage nobody
+    attributes to the agent for a week.
+    """
+    data = text.encode("utf-8", errors="surrogateescape")
+    tmp = path.with_name(path.name + ".dakcoder-tmp")
+    try:
+        mode = path.stat().st_mode if path.exists() else None
+        with tmp.open("wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except OSError:
+        # Windows refuses `os.replace` over a file another process holds open —
+        # an editor with the file loaded is the common case, and failing the
+        # write there would be worse than the direct one. The encode has already
+        # happened by now, so this is no longer the truncate-then-raise path
+        # that emptied files.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        path.write_bytes(data)
+
+
 # ── read ────────────────────────────────────────────────────────────────────
 
 
@@ -220,7 +271,7 @@ def write_file(inv: Invocation) -> ToolResult:
         # gofmt would add it on the next run anyway — producing a spurious
         # one-line diff attributed to formatting rather than to this write.
         body += eol
-    path.write_text(body, encoding="utf-8", newline="")
+    _write_text(path, body)
 
     return ToolResult.success(
         f"wrote {rel} ({len(content.splitlines())} lines)",
@@ -277,7 +328,7 @@ def patch_file(inv: Invocation) -> ToolResult:
         )
 
     patched = text.replace(old, new, 1)
-    path.write_text(_apply_eol(patched, eol), encoding="utf-8", newline="")
+    _write_text(path, _apply_eol(patched, eol))
 
     delta = len(new.split("\n")) - len(old.split("\n"))
     change = f"{delta:+d} lines" if delta else "same line count"

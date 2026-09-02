@@ -58,6 +58,17 @@
    */
   let lastSeq = typeof restored.lastSeq === 'number' ? restored.lastSeq : 0;
   /**
+   * Which host process minted `lastSeq`.
+   *
+   * `seq` counts inside the extension host, and this panel's state outlives it:
+   * a window reload restarts the host at 0 while the webview still remembers
+   * 214, so every event afterwards failed `seq > lastSeq` and was silently
+   * dropped. The panel looked alive and received nothing until the new host had
+   * produced 215 events of its own. `init` carries the host's epoch; a different
+   * one means the cursor is meaningless and starts again.
+   */
+  let epoch = typeof restored.epoch === 'string' ? restored.epoch : '';
+  /**
    * Which session the events arriving now belong to. Row keys are namespaced by
    * it: ids are unique only *within* a session, so without this the second
    * conversation's `assistant:1` lands on the first one's row and replaces an
@@ -201,6 +212,7 @@
       vs.setState({
         rows: rows.slice(-MAX_ROWS),
         lastSeq: lastSeq,
+        epoch: epoch,
         session: session,
         localSeq: localSeq,
         runIndex: runIndex,
@@ -1390,6 +1402,17 @@
           });
           return;
         }
+        /*
+         * The `gate` event type carries two different things: a verification
+         * gate, which is a stage x attempt grid, and the loop's diagnostics —
+         * `forced_tool_call`, `tool_choice_unsupported`, `wire_repair` — which
+         * have no stages at all. Every one of those drew an empty gate table
+         * with a header and no rows (BUG EXT-8). A gate run always has stages;
+         * a diagnostic never does, and that is the test — rather than a list of
+         * known kinds, which would break again on the next one added.
+         */
+        if (!(Array.isArray(d.stages) && d.stages.length)) return;
+
         const key = keyFor('gate', runIndex + ':' + (d.kind || 'full'));
         let row = byKey.get(key);
         if (!row) {
@@ -1620,6 +1643,10 @@
         SLASH = message.commands || [];
         MENTIONS = message.mentions || [];
         MAX_ROWS = message.maxRows || 500;
+        if (typeof message.epoch === 'string' && message.epoch !== epoch) {
+          epoch = message.epoch;
+          lastSeq = 0;
+        }
         applyStrings();
         repaintAll();
         return;

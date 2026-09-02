@@ -172,6 +172,11 @@ type HostMessage =
       maxRows: number;
       commands: SlashSpec[];
       mentions: MentionSpec[];
+      /**
+       * Which host process minted the `seq` counter this webview is about to
+       * receive. See `EPOCH`.
+       */
+      epoch: string;
     }
   | { type: 'batch'; messages: HostMessage[] }
   | { type: 'event'; event: WireEvent; session: string; seq: number }
@@ -883,6 +888,20 @@ function mentionSpecs(s: Record<string, string>): MentionSpec[] {
   ];
 }
 
+/**
+ * This host process, as a value the webview can compare.
+ *
+ * `seq` is a cursor into a counter that lives in the extension host, and the
+ * webview persists its position across a window reload — but a reload restarts
+ * the host, so the counter goes back to 0 while the webview still remembers 214.
+ * Every event after that failed `message.seq > lastSeq` and was dropped, and the
+ * panel looked alive and received nothing until the new host had produced 215
+ * events (BUG EXT-4). Comparing epochs turns "my cursor is ahead of yours" from
+ * an impossible-looking state into a fact with an obvious response: start again
+ * from zero.
+ */
+const EPOCH = `${process.pid}-${Date.now().toString(36)}`;
+
 /** The `init` payload, built once per webview resolve. */
 function initMessage(): HostMessage {
   const s = strings();
@@ -892,6 +911,7 @@ function initMessage(): HostMessage {
     maxRows: RING,
     commands: slashCommands(s),
     mentions: mentionSpecs(s),
+    epoch: EPOCH,
   };
 }
 

@@ -33,7 +33,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from dakcoder_shared.envelope import Mutation, ToolResult
 from dakcoder_shared.paths import PathEscape, Workspace, is_protected
@@ -151,6 +151,19 @@ class ApprovalPolicy:
         return spec.name in self.auto
 
 
+class UndoSink(Protocol):
+    """The one thing the router needs from an undo store.
+
+    A protocol rather than an import so ``tools/`` keeps depending on nothing in
+    the runtime above it: the router is used by the gate, by tests and by the
+    loop, and only one of those has a session to snapshot into.
+    """
+
+    def capture(self, rel: str) -> None: ...
+
+    def note_unsnapshotted(self, rel: str) -> None: ...
+
+
 class Router:
     """Validates, confines, gates and dispatches every tool call."""
 
@@ -161,11 +174,17 @@ class Router:
         *,
         policy: ApprovalPolicy | None = None,
         clock: Callable[[], float] = time.monotonic,
+        undo: "UndoSink | None" = None,
     ) -> None:
         self.workspace = workspace
         self.handlers: dict[str, ToolHandler] = dict(handlers or {})
         self.policy = policy or ApprovalPolicy()
         self._clock = clock
+        #: Where each path's pre-run bytes are snapshotted, so ``revert`` can put
+        #: back what was there rather than what HEAD has (BUG L-11). Optional:
+        #: the router is used by tests and by the gate without a session, and a
+        #: run without a store simply cannot be reverted path-by-path.
+        self.undo = undo
         #: Every path mutated this session, in order, for the gate to scope itself to.
         self.touched: list[str] = []
         #: How many mutations have been applied, counting repeats of the same
@@ -174,6 +193,13 @@ class Router:
         #: identical. The loop asks that question to decide whether re-running
         #: the gate could possibly say something new.
         self.mutations: int = 0
+        #: Of those, the ones the *gate* made rather than the model — gofmt
+        #: rewriting whitespace, govalid_gen regenerating a validator. They
+        #: change the workspace, so the cached-result ledgers must still be
+        #: invalidated by them; they are not the model doing work, so the
+        #: questions that mean "has the model changed anything since I last
+        #: looked" have to subtract them (BUG L-29).
+        self.gate_mutations: int = 0
 
     def register(self, name: str, handler: ToolHandler) -> None:
         if name not in registry.REGISTRY:
@@ -263,6 +289,14 @@ class Router:
         if decision is not None and not (approved or gate):
             return decision
 
+        if spec.mutates and self.undo is not None:
+            # Before the handler, not after: the pre-image is only pre-image
+            # while the file is still untouched. First-write-wins inside the
+            # store, so a second edit of the same file does not overwrite the
+            # developer's version with the agent's first one.
+            for rel in paths:
+                self.undo.capture(rel)
+
         invocation = Invocation(
             spec=spec, arguments=args, workspace=self.workspace, paths=paths, mode=mode
         )
@@ -270,8 +304,18 @@ class Router:
 
         for mutation in result.mutations:
             self.mutations += 1
+            if gate:
+                self.gate_mutations += 1
             if mutation.path not in self.touched:
                 self.touched.append(mutation.path)
+            if self.undo is not None:
+                # A tool that only names its target in its *result* — `fx_wire`
+                # writes `bootstrap/bootstrapper.go`, `govalid_gen` writes
+                # whichever `*_validator.go` the structs imply — cannot be
+                # snapshotted before it runs. Saying so is better than the path
+                # being merely absent from the manifest: revert then blocks with
+                # the real reason instead of the generic one (BUG RG-1).
+                self.undo.note_unsnapshotted(mutation.path)
 
         elapsed_ms = int((self._clock() - started) * 1000)
         return ToolResult(
@@ -282,6 +326,19 @@ class Router:
             truncated=result.truncated,
             meta={**result.meta, "tool": name, "ms": elapsed_ms},
         )
+
+    @property
+    def model_mutations(self) -> int:
+        """Mutations the model asked for.
+
+        The number to compare when the question is "has anything changed since
+        the last gate": the gate's own stages mutate (gofmt, govalid_gen), so
+        counting those made every gate look like new work — the cache key moved
+        every run and the gate re-ran in full each time (BUG L-29), and a
+        gate-attributed edit reset the counter that notices a run standing still
+        in front of a failing gate.
+        """
+        return self.mutations - self.gate_mutations
 
     def run_gate_tool(self, name: str, arguments: Any = None) -> ToolOutcome:
         """Dispatch a gate stage, bypassing mode and approval.

@@ -1,3 +1,791 @@
+# DakCoder — audit remediation task board
+
+Working against `AUDIT.md` / `BUGS.md` / `CHANGE_PLAN.md` / `TEST_PLAN.md`
+(audit dated 2026-09-02). Every step lands its regression test in the same
+change. `ARCHITECTURE_AUDIT.md` is updated as each structural claim in it stops
+being true.
+
+Status key: `[ ]` pending · `[~]` in progress · `[x]` done
+
+## Phase 0 — restore the test signal
+
+- [x] 0.1 green suite on Linux (L-20 backslash normalisation, L-21 gofmt skips)
+
+## Phase 1 — stop losing data and corrupting protocol (P0)
+
+- [x] 1.1  answer every call in a batch that hits a terminal tool (L-1)
+- [x] 1.2  wire-invariant checkpoint before dispatch (L-1/L-6 class)
+- [x] 1.3  patch_file/write_file: surrogateescape + atomic write (TL-1, TL-2)
+- [x] 1.4  revert must not destroy developer work (L-11)
+- [x] 1.5  read ledger reflects what survived the insertion cap (L-8)
+- [x] 1.6  compaction invalidates loop ledgers (L-10, L-17/L-25 part)
+- [x] 1.7  retention cut sees tool-call arguments (L-3)
+- [x] 1.8  un-jam the acting phase (L-2)
+- [x] 1.9  never lose a steer (L-9)
+- [x] 1.10 approval timeout integrity (EXT-1, EXT-2, EXT-3, EXT-5)
+- [x] 1.11 gateway auth refresh + quota integrity (GW-1, GW-2, GW-3, GW-4)
+- [x] 1.12 LLM client: fail on silent mid-stream EOF; retry mid-stream drops (SH-1, SH-2, SH-3)
+
+## Phase 2 — reliability and honesty (P1)
+
+- [x] 2.1  cumulative recap (L-4)
+- [x] 2.2  carry that survives + session-scoped Router (L-5)
+- [x] 2.3  compaction orphan edge (L-6)
+- [x] 2.4  truncation counter (L-13)
+- [x] 2.5  honest messages (L-14, L-17, RT-1 copy)
+- [x] 2.6  plan-path normalisation (L-19) + follow-up read staleness (L-25)
+- [x] 2.7  resume as continuation (RT-1)
+- [x] 2.8  process hygiene (TL-5, TL-6, TL-7, TL-8)
+- [x] 2.9  persistence (L-7)
+- [x] 2.10 extension P1s (EXT-4, EXT-9, EXT-10)
+- [x] 2.11 summariser sees tool calls (L-27); forced-prose retention (L-15)
+- [x] 2.12 protected-glob case-insensitivity (SH-5b); registry approval bypass (RG-1)
+
+## Phase 3 — P2 cleanups
+
+- [x] 3.1 leaks (L-12 contexts/loops eviction, L-26 event payload caps, SH-7, GW `_settled`)
+- [x] 3.2 observability (turn ids on tool events, L-24 emergency compaction count, EXT-7/8/15)
+- [x] 3.3 perf (L-29 gate key, L-18 measured first)
+- [~] 3.4 gateway hygiene batch — GW-5, GW-6, GW-14 done; GW-7..13 remain
+- [x] 3.5 extension dead code (EXT-6, EXT-16, EXT-18) — EXT-11/12/13/14/19-22 remain
+- [x] 3.6 documentation truth pass (DOC-1) — done early: the four false claims
+- [x] 3.7 residual loop rows (L-16, L-22, L-23, L-30, TL-10, GT-1)
+
+## Regression tests (TEST_PLAN §1-2) — landed with their step
+
+- [x] test_terminal_tool_in_batch_answers_all_calls (1.1)
+- [x] test_capped_read_then_tail_read_dispatches (1.5)
+- [x] test_compaction_invalidates_read_ledger (1.6)
+- [x] test_write_heavy_compaction_frees_tokens (1.7)
+- [x] test_follow_up_carry_survives_first_batch (2.2)
+- [x] test_repeated_result_replay_marks_truncation (2.5)
+- [x] test_refused_finish_message_is_accurate (2.5)
+- [x] test_forced_flag_does_not_cross_phases (TC-4)
+- [x] test_repeated_truncation_has_hard_stop (2.4)
+- [x] test_resume_semantics_match_message (2.7)
+- [x] test_steer_never_lost_on_finish_race (1.9)
+- [x] test_summarizer_failure_falls_back (pin)
+- [x] test_over_budget_fallback_failure (1.7)
+- [x] test_invalid_line_ranges (pin)
+- [x] test_acting_phase_not_locked_out_after_12_turns (1.8)
+- [x] test_recap_accumulates_across_compactions (2.1)
+- [x] test_compaction_never_retains_orphaned_result (2.3)
+- [x] test_patch_file_non_utf8_preserves_content (1.3)
+- [x] test_subprocess_timeout_kills_process_tree (2.8)
+- [x] test_revert_blocks_on_pre_run_developer_changes (1.4) — landed as `test_revert_restores_pre_run_developer_changes` (+3 more)
+- [x] test_plan_paths_normalised (2.6)
+- [x] SH-1 / SH-3 client tests (1.12)
+- [x] GW-1..4 tests (1.11)
+- [x] EXT-1/2/3/4 tests (1.10, 2.10)
+- [x] invariant checks 1-4 (TEST_PLAN §4)
+
+## Where this stands
+
+**Suite: 808 tests, green** (it was 704 with 6 failing). Extension `npm run
+verify` green end to end: typecheck, 63 tests, bundle, credential scan, 59/59
+commands in both directions, l10n, gotools manifest.
+
+Every P0 and P1 row from `BUGS.md` is closed, and Phase 3 apart from the rows
+listed below. What is deliberately left, with the reason:
+
+| Row | Why not |
+|---|---|
+| L-18 | Prefix re-prefill per steer. The plan says measure first and nothing has; moving the directive layer changes prompt shape and invalidates the budget baselines. |
+| GW-7..13 | Refresh tokens plaintext in memory and lost on restart; reservation state per-process. Both need a store — a deployment decision, not a code one. |
+| EXT-11/12/13/14, EXT-19..22 | Elapsed clock, two cache-% denominators, duplicate re-emission, spliced text after reconnect, listener and notice leaks. UI correctness; none of it loses work. |
+| Context rehydration | A restart restores the *record* of a conversation, not the conversation. Rebuilding a ContextManager from `events.jsonl` is the next step if it is wanted. |
+
+Two things worth knowing before the next run against a real repository:
+
+* **The undo store writes into the workspace** (`.dakcoder/sessions/<id>/undo/`),
+  one pre-image per mutated file, capped at 2 MB each. `.dakcoder/` ignores
+  itself, but it is real disk in the developer's tree.
+* **Approval deadlines are now one number.** `dakcoder.approvalTimeoutSeconds`
+  reaches the runtime as `DAKCODER_APPROVAL_TIMEOUT` at spawn, so it takes effect
+  when the runtime restarts, and `0` genuinely means no deadline on both sides.
+
+---
+
+## Log — audit remediation
+
+### Verification against the audit's own reproductions
+
+`audit-repros/repro_audit.py` (R1–R9) and `repro_carry.py` (R10) all report
+**not reproduced**. R2 initially still fired, and it was right to: it drives
+`ContextManager.compact` directly, so it bypassed the loop's `_forget_evicted`.
+That is a fair criticism of where the fix sat — the loop was invalidating a
+ledger it also owned. `_re_reading` now asks `context.coverage()` what the model
+can still see and uses the stored ledger only for "how often has this been
+asked", which is the split the audit's root cause RC-1 prescribes: the loop
+queries, the context answers. Any eviction by any path is visible immediately,
+and `_forget_evicted` is now belt-and-braces that keeps the persisted ledger
+honest rather than the thing the refusal depends on.
+
+**R11 is assessed, not fixed, and deliberately so.** Its reproduction condition
+is "a named `finish` tool_choice appears at all", which is broader than the
+defect. The defect is the *contradiction* — that turn arriving while a failing
+gate in the same context says "make the edit" — and `_gate_wants_an_edit` closes
+it (`test_a_failing_gate_is_never_answered_by_a_forced_finish`). What R11 still
+shows is the fence ending a phase after twelve turns that wrote nothing, with
+every plan target already written, which is the fence working as designed. All
+three remedies `BUGS.md` prescribes for L-2 are implemented; the fourth thing the
+audit *observes* — that twelve turns is a small budget for a whole-service
+migration — is a measurement, not a bug fix, and raising a loop-containment bound
+without one is how the bounds got where they are.
+`test_the_research_fence_still_ends_a_phase_that_only_reads` pins that reading so
+the next person knows it was considered.
+
+### TC-4 — the narration re-ask is per phase · done
+
+`state.forced` resets at `submit_plan`. It was scoped to the run, and the
+argument behind that scope was always about one mode relitigating one decision —
+"a Planner that has decided there is nothing to plan says so, is forced,
+complies, says so again". Applying it across the phase boundary handed the
+acting mode a phase with no narration recovery at all, which is where narration
+costs the most: "Making the edit now" with no tool call is a turn in which
+nothing was edited.
+
+Test: `test_forced_flag_does_not_cross_phases`.
+
+### 3.5 — features that existed and could not be reached · done
+
+**EXT-18** Six commands had handlers and no palette entry — including
+`dakcoder.stopTask`, which the status bar's own tooltip tells the developer to
+run. `check-commands.mjs` checked one direction only, so it passed while the
+gap was real; it checks both now, and says what to do about a command that
+deliberately should not appear (contribute it with a `commandPalette` entry of
+`"when": "false"`, the way the context-menu commands already do).
+
+**EXT-16** `diagnostics.register` returns the service "so activation can call
+`audit()` and `offerGateRerun()`", and the return value went straight into
+`subscriptions.push`: nothing kept it, so the offer to re-run a blocked gate
+stage locally had no caller. Activation keeps the reference and calls it on a
+`gate` event. It declines quietly for a clean gate, a gate with no blocking
+stage, and a stage this build does not recognise — the additive-only rule.
+
+**EXT-6** `ContextTree.setSession` had exactly one caller, inside the command
+that reveals the view. Opening the view the way a tree view is normally opened —
+clicking it in the sidebar — showed "No session selected" for ever. It now
+follows whatever the panel is showing.
+
+`npm run verify` is green end to end: typecheck, 63 tests, bundle, credential
+scan, 59/59 commands both directions, l10n (770 strings), gotools manifest.
+
+### Test plan §1 and §4 — the pins · done
+
+The behaviours the audit found *correct* are now held in place:
+`test_summarizer_failure_falls_back`, `test_over_budget_fallback_recovers`,
+`test_invalid_line_ranges`, `test_cancelled_batch_still_answers_every_call`,
+`test_ordinary_git_still_runs`.
+
+All four §4 invariants are asserted: #1 the wire invariant
+(`assert_wire_is_coherent`, used by five tests), #2 the ledger invariant
+(`test_the_read_ledger_only_claims_what_the_context_holds` — every span the
+ledger claims is really in a live message), #3 the budget invariant
+(`test_the_cut_and_the_budget_agree_on_every_message`), #4 the terminal invariant
+(`test_a_terminal_session_dispatches_nothing_more`).
+
+One deviation from TEST_PLAN §2, recorded rather than smoothed over: it expected
+`read_file(start=0)` to be clamped to line 1. The router refuses it at coercion
+with the rule it broke and a `dead_end` mark, which is better — a model that
+asked for line 0 made a mistake worth telling it about, and silently reading
+something else teaches it nothing. The test pins the real behaviour.
+
+**Suite: 808 tests, green.** It was 704 with 6 failing.
+
+### 3.1, 3.2, 3.3, 3.7 and part of 3.4 — the P2 sweep · done
+
+**Leaks (3.1).** `SessionStore.on_forget` fires when a session is trimmed or
+deleted, and the loopback drops that session's context, loop and any stale
+approvals with it — they hold the whole message list and the whole ledger set,
+and were the expensive half of a session that nothing ever released (L-12).
+`ToolResult.as_dict` caps content at `MAX_EVENT_CONTENT`: the context caps its
+copy at insertion, so an uncapped 400KB build log went into the in-RAM event log,
+the transcript and the SSE frame at full size — three copies of something the
+model never saw in full (L-26). `Calibration._history` is gone; it was a list
+nothing read, growing by one float per turn (SH-7). `QuotaPolicy._settled` is a
+bounded `OrderedDict` (GW-5).
+
+**Observability (3.2).** Tool events carry `turn`, so a transcript can be grouped
+without inferring the turn from the position of the last `turn_start` — which a
+reconnect makes wrong. `turn_start.attempt` is the attempt *about to be made*
+rather than the count of failures behind it, so the first gate is attempt 1 on
+the wire as it already was in the UI (EXT-7). The webview no longer draws a gate
+grid for an event with no stages, which is what `forced_tool_call`,
+`tool_choice_unsupported` and `wire_repair` all are (EXT-8) — tested on the
+presence of stages rather than a list of known kinds, which would break again on
+the next kind added. A `QUOTA` event is emitted when a run ends: the type existed
+and nothing ever emitted one, so the status bar's listener was unreachable and
+the figure on screen was whatever the 60-second poll had last seen — including
+after the poll stopped (EXT-15). It is transient, because it carries no data:
+the gateway owns the numbers.
+
+**Perf (3.3).** `Router.model_mutations` excludes gate-attributed mutations, so
+the gate cache key stops moving every time gofmt or govalid_gen writes something
+(L-29) — and a gate-attributed edit no longer resets the counter that notices a
+run standing still in front of a failing gate. Total `mutations` still drives
+ledger invalidation, because a gate that rewrote a file did change the world.
+L-18 (directive placement) is left alone deliberately: the plan says measure
+first, and nothing here has measured it.
+
+**Residuals (3.7).** `_await_baseline` keeps the thread reference when the join
+times out, so a slow baseline is waited for again rather than landing mid-run and
+leaving the gates on either side of it disagreeing about what was already broken
+(L-16). An open-ended read of a file whose length nothing has reported dispatches
+instead of being answered by one covered line (L-23). `/v1/health` answers
+liveness without a token and everything about the developer's machine only with
+one (L-30). `take_baseline` runs with `-mod=readonly`, so `go build` cannot add a
+checksum to `go.sum` while measuring the workspace it is about to compare against
+(GT-1). The gofmt EOL restore leaves mixed-EOL files alone rather than converting
+every LF line in a half-converted repository (TL-10).
+
+**Gateway (part of 3.4).** `ModelRoute.api_key` is `repr=False` — the model key
+is the one secret this gateway exists to hold, and a dataclass repr puts it in
+every log line and traceback that touches a route (GW-14). `/v1/llm` reads the
+body with a 16 MB ceiling, streamed, so an oversized body is refused at the point
+it exceeds the limit rather than after all of it is held (GW-6).
+
+Not done, and honestly so: GW-7 (refresh tokens are still plaintext in memory and
+still lost on restart), GW-8..13, EXT-6/16/18 (dead features), L-18. They are the
+rows whose failure mode is honest degradation, which is where `AUDIT.md` §12 puts
+them.
+
+### 2.10 + 2.11 + 2.12 — the rest of P1 · done
+
+**EXT-4** `init` carries an epoch (`pid-timestamp`) and the webview resets
+`lastSeq` when it changes. `seq` counts inside the extension host and the
+webview's state outlives it: a window reload restarted the host at 0 while the
+panel still remembered 214, so every event afterwards failed `seq > lastSeq` and
+was dropped — the panel looked alive and received nothing until the new host had
+produced 215 events of its own.
+
+**EXT-9** The loopback token comes from `randomBytes(32)`. It was
+`sha256(Date.now() : Math.random() : pid)`, none of which is secret:
+`Math.random()` is a fast PRNG whose state is recoverable from a few outputs, the
+clock is public and the pid is in `ps`. That token is the whole of the defence
+the design claims against other local processes.
+
+**EXT-10** `pythonPath`, `goPath`, `goplsPath` and `gotoolsPath` are
+`"scope": "machine"`. A cloned repository's `.vscode/settings.json` chose which
+binaries the extension executed, with Workspace Trust as the only gate.
+
+**L-27** `_rendered` puts `called write_file(path=…)` into the summariser's
+transcript. An assistant turn that is purely tool calls has an empty `content`,
+so every edit the run made rendered as a blank line — and the histories that
+summarised worst were exactly the write-heavy ones the recap matters most for.
+Arguments are truncated at 200 characters with the real length named: which file
+was written is the fact worth carrying, and the content is in the workspace.
+
+**L-15** The prose from a turn that was forced to re-ask travels with the forced
+reply. Its deltas had already streamed to the panel, so discarding it displayed
+text the backend then dropped — and the model's own turn was absent from its
+history, so it could not see that it had narrated and been asked again.
+
+**SH-5b** `is_protected` matches case-insensitively. The primary platform's
+filesystem is case-insensitive, so `dockerfile` and `GO.MOD` address exactly the
+files the globs name and a write to either skipped the approval gate. On Linux
+this refuses slightly more than it must, which is the safe direction for a gate
+whose job is to make a human look.
+
+**RG-1** A mutation whose path the tool only names in its *result* — `fx_wire`,
+`govalid_gen` — is recorded in the undo manifest as `UNRECORDED`. It cannot be
+snapshotted (the target is not known before the run), so revert still blocks; it
+now blocks with the real reason rather than the generic one, and says so after a
+restart too. The approval exception itself stays as designed and documented in
+`_SAFE_MUTATORS`.
+
+Tests: `test_protected_globs_match_case_insensitively` (5 spellings),
+`test_an_unsnapshotted_mutation_is_recorded_as_such`,
+`test_the_summariser_sees_what_the_run_did`,
+`test_the_summariser_transcript_does_not_carry_a_whole_write`,
+`test_a_forced_re_ask_keeps_the_prose_it_streamed`; extension typecheck and
+63 tests green.
+
+### 2.9 — something survives a restart · done
+
+New module `journal.py`. Two files per session under `.dakcoder/sessions/<id>/`:
+`events.jsonl` (append-only, one stored event per line, written inside the same
+lock that assigns the id, so the file is in id order for the same reason the list
+is) and `session.json` (the summary a list view needs, rewritten when it
+changes). `SessionStore` restores the summaries at startup and
+`Session.hydrate()` reads a transcript only when one is asked for — a daemon
+starting in a workspace with a hundred finished sessions reads a hundred small
+JSON files, not a hundred transcripts.
+
+Three properties it is written for, in order: it must never fail a run (every
+write is best-effort; a read-only checkout costs the transcript, not the work),
+it must never slow a turn (buffered, flushed at the points the run is already
+waiting on something slower — a mutation, the end of the run), and reading it
+back must be cheap.
+
+A session that was RUNNING when the process died comes back as ERROR and
+resumable. Nothing is driving it, and leaving it "running" makes it unresumable,
+undeletable and permanently in the way.
+
+`SessionStore(..., persist=False)` exists for callers that should not leave
+directories behind — a unit test constructing a store against the repo root, for
+instance, which is how this was caught.
+
+**DOC-1, done here** because the claims were about this code. `session.py` said
+"Events are persisted before they are sent" and meant "appended to a list";
+`context.py` said the recap was written to `.dakcoder/session-<id>/recap.md` and
+nothing ever wrote that file; `session.py` still described revert as
+restoring from git; `README.md` said the loop, the router, the gateway and the
+extension were "not built yet". All four now say what the code does.
+
+Tests: `test_a_transcript_survives_a_restart`,
+`test_a_run_interrupted_by_a_restart_is_not_left_running`,
+`test_revert_works_after_a_restart`,
+`test_a_journal_that_cannot_write_does_not_fail_the_run`.
+
+### 2.6 + 2.8 — paths that match, and processes that stop · done
+
+**2.6 (L-19)** `_normalise_plan` puts every `PlanStep.file` through
+`workspace.relative(workspace.resolve(...))` at `submit_plan`, which is the form
+`router.touched` records — `_confine` rewrites every path argument before a
+handler sees it. `./handler/user.go` and `handler\user.go` compared unequal to
+the `handler/user.go` the write produced, so a step spelled either way was
+"never written" for the life of the run: it refused the first `finish` and
+mis-headlined the DONE summary. A path that will not resolve is kept verbatim —
+it is the model's text and the developer should see what was planned.
+
+**2.6 (L-25)** `_ReadLedger.mtime` is recorded at every read, and `carry_from`
+drops the coverage of any file whose mtime moved, telling the model in a user
+message that what is above is the older version. Between two messages the
+developer is doing their own work — reading the diff, fixing a line — and the
+carried ledger refused the re-read of a file whose contents had moved. By mtime
+rather than content hash: this runs once per follow-up over every file the
+conversation has read, and a stat is the cheap question; an unknown mtime on
+either side keeps the entry rather than discarding the ledger.
+
+**2.8 (TL-5)** Children start in their own process group
+(`start_new_session` / `CREATE_NEW_PROCESS_GROUP`) and a timeout kills the group
+(`killpg` / `taskkill /T /F`). `subprocess.run(timeout=…)` killed the direct
+child, and the direct child of `go build` is a supervisor — the compiler, the
+linker and the test binaries are grandchildren, and every one of them survived
+every timeout while the agent reported the build as stopped.
+
+**2.8 (TL-6)** Output is drained on a reader thread into a buffer bounded at
+`MAX_CAPTURE_BYTES`, with `stderr=STDOUT` so the kernel interleaves the two in
+the order they were produced. Past the cap the bytes are read and discarded
+rather than stored — and read rather than ignored, because a child whose pipe
+fills blocks forever and would hang the timeout too. The process is not killed
+for being verbose: that would throw away the test results the developer asked
+for, and the timeout is the bound on how long it may go on.
+
+**2.8 (TL-7)** `run_terminal` refuses the destructive `git` subcommands by name
+(`push`, `reset --hard`, `clean`, `rebase`, `filter-branch`, `gc`,
+`reflog expire`, and `checkout`/`restore` unless they are creating a branch).
+`git_ops` documents "no push, no reset --hard, no rebase … a property of the tool
+rather than a policy in the prompt" — it was a property of *that* tool and of
+nothing else, because `git` is on the allow-list. What is refused is what the
+reflog cannot recover or what other people can see.
+
+**2.8 (TL-8)** A binary named by path is refused. The allow-list read
+`Path(argv[0]).name`, so `./go` and `subdir/go` passed while naming a binary in
+the repository the model can write to.
+
+Tests: `test_plan_paths_normalised` (both spellings),
+`test_an_unresolvable_plan_path_is_kept_verbatim`,
+`test_a_follow_up_re_reads_a_file_the_developer_changed`,
+`test_subprocess_timeout_kills_process_tree` (a real grandchild, POSIX),
+`test_capture_is_bounded`, `test_destructive_git_is_refused` (5 spellings),
+`test_ordinary_git_still_runs`, `test_a_binary_named_by_path_is_refused`.
+
+Also fixed a latent race in the `settle` test helper: it waited on
+`session.running`, which the worker sets while the last events are still queued
+as `call_soon_threadsafe` callbacks, so a transcript could be read without its
+final `assistant` and `end`. It waits for `end` now.
+
+### 2.1–2.5, 2.7 — the run stops contradicting itself · done
+
+**2.1 (L-4)** `Recap.merge` folds the previous recap into the new one, oldest
+first, bounded at `MAX_RECAP_ITEMS` per field, with `turns` spanning both. A
+compaction replaces the pinned recap and the evicted set handed to the summariser
+never contains the previous one, so the first compaction's `do_not_retry` — the
+field the class's own docstring calls the reason it exists — vanished at the
+second, and long runs are exactly the runs that compact twice.
+
+**2.2 (L-5)** `carry_from` adopts the previous loop's Router. The Router was
+rebuilt per message while the ledgers were carried, and those two facts destroyed
+each other: a carried `mutations_seen` of 3 met a Router at 0, the follow-up's
+first batch read that as "the world changed", and every carried ledger was wiped
+— by the line whose comment says it prevents exactly this. `mutations_seen` is
+now read off the shared Router, so the two agree by construction. It also gives
+the follow-up a real change set: `_unwritten_targets` was comparing a carried
+plan against an empty one, and the gate was scoping itself to nothing.
+
+**2.3 (L-6)** `_whole_turn_cut` steps *back* to the declaring assistant when the
+forward walk cannot clear an orphan. Two correct rules — keep a call with its
+results, never evict the last message — met and produced a retained set that was
+one orphaned `role: tool` message. The token overshoot is the lesser cost.
+
+**2.4 (L-13)** `_State.truncated_turns`, incremented in `_answer_truncated` and
+cleared by any complete reply; at `MAX_TRUNCATED_TURNS` (3) the run ends naming
+the output limit and the mode. The per-turn handling was already careful — every
+declared call answered, the cause named accurately — but nothing counted the
+repetition, so a model that always overran spent all 40 (or 400) turns doing it
+and ended EXHAUSTED without truncation ever being mentioned.
+
+**2.5 (L-14, L-17)** `_State.answer_because` carries *why* a turn is being made
+to answer, so a refused terminal call is no longer told "that call has already
+been answered and asking it again returns the same thing" — false on every
+clause, and it points at the repetition when the arguments are the problem. And
+`partial_results` records when a cached result was cut at `CACHED_RESULT_CHARS`,
+so the replay says "the first 6,000 characters of 41,204" instead of presenting
+the head as the whole answer.
+
+**2.7 (RT-1)** `resume` is the follow-up path: same context, ledgers carried,
+Router carried, fresh turn budget, with the note as the message. It used to build
+a run on a *fresh* context seeded with `task + "The previous attempt ended: …"`
+while the EXHAUSTED message promised "Resume continues on this same transcript" —
+so a run that exhausted its turns at the point of writing the last file resumed
+by re-reading the service from scratch. When the daemon holds no context (after a
+restart) it falls back to re-seeding the task, and the message says so rather
+than pretending. The EXHAUSTED copy now describes what happens.
+
+Tests: `test_recap_accumulates_across_compactions`, `test_recap_merge_is_bounded`,
+`test_follow_up_carry_survives_first_batch`,
+`test_a_follow_up_sees_what_the_session_already_wrote`,
+`test_compaction_never_retains_orphaned_result`,
+`test_repeated_truncation_has_hard_stop`,
+`test_a_complete_reply_clears_the_truncation_streak`,
+`test_refused_finish_message_is_accurate`,
+`test_repeated_result_replay_marks_truncation`,
+`test_resume_semantics_match_message`.
+
+### 1.12 — the transport stops lying about how a stream ended · done
+
+**SH-1** A stream that reaches EOF with no `[DONE]` and no `finish_reason` now
+raises a retryable `UpstreamError` instead of returning the partial content as a
+success with `truncated == False` and zero usage. The zero usage was its own
+harm: it fed the calibration a free turn. A stream that reported a
+`finish_reason` has said what it needed to and is still accepted without
+`[DONE]`.
+
+**SH-2** `RemoteProtocolError` and `ReadError` join the retryable transport set.
+They are what "the upstream died mid-SSE" actually raises — a vLLM worker
+restarting, a proxy dropping a long connection — so the retry machinery was
+missing its main customer and failed on attempt one.
+
+**SH-3** Tool-call slots key on `index` when the endpoint sends one and on the
+call `id` when it does not. Defaulting a missing index to 0 folded every parallel
+call into one slot: two calls arrived as one with both argument strings
+concatenated, which the loop reported to the model as malformed arguments for a
+reply that was fine. A slot that accumulated arguments and never a name is now a
+loud failure rather than a silent drop — it is a call the model made that the
+client cannot deliver, and dropping it made the turn look like it had asked for
+less than it did.
+
+Risk noted in the plan: a benign server that never sends `[DONE]` *and* never
+sends a `finish_reason` would now error. The retry (`502`,
+`kind="incomplete_stream"`) gives it a second chance before the run sees
+anything, which is the guard the plan asked for.
+
+Tests: six in `apps/shared/tests/test_llm.py`, including the indexed path pinned
+so the SH-3 fix cannot regress the normal case.
+
+### 1.11 — the gateway · done
+
+**GW-1** `recheck` is on the `IdentityProvider` protocol and `GitLabIdentity`
+implements it. It was found with `getattr`, no production adapter had it, and the
+only implementation in the tree was the test fake — so `/v1/auth/refresh`
+answered 501 in production and 200 in CI, every session died at the
+fifteen-minute access-token TTL, and the developer went through a full browser
+OAuth flow four times an hour. The recheck uses the *user's own* GitLab token,
+captured at sign-in and carried across rotations on the refresh record: the
+alternative is an administrative GitLab token on the gateway, whose leak would be
+every account rather than one. The identity is verified, not assumed — a token
+that now answers for a different account is refused.
+
+**GW-2** A client that goes away before the first byte arrives as
+`CancelledError`, a `BaseException`: `except Exception` never saw it and the
+`finally` had nothing to settle, so a 40,000-token reservation sat against the
+developer's hourly quota until the window rolled. The `finally` now schedules a
+release (a sibling task, for the same reason settlement is one — this block can
+run under cancellation, where the first `await` raises immediately).
+
+**GW-3** The hot path validates instead of trusting: a malformed body, a
+non-numeric or negative `X-Estimated-Tokens`, an unknown `X-Lane` are 400s with a
+reason. Each used to raise straight out of the handler as a 500, which tells an
+authenticated caller nothing and lets a header typo flood the error budget. A
+negative estimate would have *credited* the caller's window. Reservations are
+clamped at `MAX_ESTIMATED_TOKENS`; `X-Turn` is telemetry, so a bad one is dropped
+rather than refused.
+
+**GW-4** `remember` uses `SET … NX GET`, so the winner is decided server-side in
+one round trip. GET-then-SET was a check-then-act across a network hop: two
+concurrent deliveries of one key both read `None`, both wrote, and both were told
+"this is new" — the same request dispatched and charged twice, which is the one
+thing an idempotency key exists to prevent. A redis-py too old for `get=True`
+falls back to the two-step with the loss of guarantee stated in the code rather
+than assumed away.
+
+Tests: `apps/gateway/tests/test_regression_audit.py` — 10 tests, including a
+pre-first-byte disconnect against a slow upstream (verified red before the fix:
+`0 -> 120000` tokens reserved and never returned) and a concurrent
+`asyncio.gather` on one idempotency key.
+
+### 1.10 — an approval means what the developer thinks it means · done
+
+Four defects, one story: a reviewer taking their time had their review turned
+into a rejection, and was then told it had been recorded as one.
+
+**EXT-1** `_await_decision` polls (5s) and re-reads `deadline_in()` each time, so
+`/extend` reaches the thread that is counting. The single
+`wait(timeout=deadline_in())` computed its timeout before the extension existed —
+the counter went up, the UI showed minutes remaining, and the run rejected at the
+original deadline anyway.
+
+**EXT-2** The deadline is one number now instead of two unrelated ones.
+`APPROVAL_TIMEOUT` reads `DAKCODER_APPROVAL_TIMEOUT` (0 = no timeout,
+`deadline_in()` returns `math.inf`); the extension passes
+`dakcoder.approvalTimeoutSeconds` to the runtime as that variable; and
+`asApproval` stops discarding the server's `seconds_left`, `extensions` and
+`session_id`, which `protocol.ts` has declared all along (that dropped
+`session_id` was EXT-17 as well). `deadlineFor()` prefers the server's countdown
+and falls back to the local setting; `reconcile` re-anchors a held approval's
+deadline on what the runtime says is left. The setting's text no longer promises
+something the backend contradicted.
+
+**EXT-3** `openSession` fetches the transcript for a *running* session too.
+Hydrating from a tree summary left the event cursor at 0, so the stream replayed
+the whole transcript through the live path and every stored `tool_pending` in it
+became a card with Accept and Reject on it — for approvals already answered —
+followed five seconds later by "recorded as a rejection" for each. A transcript
+is history whatever the session's status.
+
+**EXT-5** `ApprovalService.discover()` runs a reconcile pass and then starts
+polling, and is called on every session attach. `ensurePolling` returned early
+when nothing was pending, so the reconcile's documented job — finding approvals
+raised before this window was listening — was unreachable, and a reloaded or
+second window left the run blocked until its deadline.
+
+**L-22** (picked up here because it is the same code): `POST /v1/approvals/{id}`
+returns 410 when the approval has already timed out, instead of answering
+"accept" for a call the run recorded as rejected.
+
+Deviation from the plan: the reconcile pass runs on attach but *not* at
+activation — activation has a 50 ms budget and the runtime is not spawned yet, so
+there is nothing to poll. Every path that opens or starts a session discovers.
+
+Tests: `test_extending_an_approval_extends_the_wait`,
+`test_a_decision_after_the_timeout_is_refused`,
+`test_a_zero_timeout_means_no_deadline`, and
+`does not raise an answered approval replayed from a running transcript`
+(extension `state.test.ts`, 63 pass).
+
+### 1.8 — the acting phase can act again · done
+
+Three changes, all of them about the same contradiction: a failing gate report
+in the transcript saying *"Make the edit, or say plainly what is stopping you"*
+while the same turn's `tool_choice` named `finish` and forbade every other tool.
+
+1. A batch that mutates resets `research_turns`. Writing is not research; the
+   fence exists to stop a phase spent reading and never deciding, and a turn
+   that changed a file has decided. Counting write turns capped the acting phase
+   at ~12 tool turns on a product that advertises `dakcoder.maxTurns` to 400.
+2. `_gate_wants_an_edit()` — a failing gate with attempts left — makes the fence
+   force `"required"` instead of the phase's terminal tool, so a tool call is
+   still mandatory but the model may choose `patch_file`. The message names the
+   blocking stage and says the gate is a function of the files.
+3. `_gate_failed` resets `research_turns`: a gate verdict is new information and
+   the work it asks for is fresh work. The run is still bounded, by
+   `MAX_GATE_FAILURES` and by `_gate_stalled`, both of which count turns that
+   changed nothing — so loosening this bound did not remove a bound.
+
+Tests: `test_acting_phase_not_locked_out_after_twelve_turns`,
+`test_a_failing_gate_is_never_answered_by_a_forced_finish`,
+`test_a_gate_verdict_reopens_the_fix_window`.
+
+### 1.9 — a steering message cannot vanish · done
+
+`Session.steer` now answers from inside the lock and returns whether the
+correction was actually queued; `close_steer` atomically stops taking them and
+hands back whatever was never drained. The endpoint's `session.running` check
+and its append used to be two separate observations of a value the worker thread
+changes, so a message typed while the last turn was in flight went onto a queue
+nothing would read again — never delivered, never recorded, never a follow-up.
+
+Two paths now cover the window. `message_session` falls through to `follow_up`
+when the queue refuses, and the worker's `finally` calls `_rescue_steers`, which
+turns anything left in the queue into a follow-up run on the same context. The
+ordering is what makes this airtight: the status becomes terminal (in
+`session.finish`, or in the crash handler) strictly before the queue closes, so
+a caller that sees `running` is talking to a queue that is still open. The
+impossible remainder returns 409 "send it again" rather than a 500.
+
+Tests: `test_a_steer_queued_after_the_run_ends_is_refused_not_swallowed`,
+`test_steer_never_lost_on_finish_race`, `test_a_leftover_steer_starts_a_follow_up`.
+
+### 1.5 + 1.6 + 1.7 — one answer to "what has the model seen" · done
+
+The prior audit's central finding, in three parts. All three are the same shape:
+two components hold the same fact and nothing tells one when the other changes.
+
+**1.5 (L-8)** `_apply_cap` now returns *what survived* alongside the capped
+text, and `append_tool_result` stores that on the message's `line_range` — so
+`Message.line_range` means "the lines in this message" rather than "the lines
+the tool returned". Everything downstream reads it: the slice ledger, the loop's
+read ledger, the re-read intercept. Before this, `read_file` on an 8,000-line
+file put ~2,650 lines in context and recorded 1-8,000 in the ledger, so the
+elision marker's "re-read with a narrower line range" and the intercept's "lines
+6000-6500 are already in context above" were both delivered and neither could be
+obeyed. The marker now also names the surviving span, because "read a narrower
+range" is not actionable unless the model can tell which range is missing.
+
+A cap that keeps no content line at all reports `None`, which callers must read
+as *no* coverage — `None` would otherwise mean "whole file" to `_contains` and
+stub out every earlier read of that file.
+
+**1.6 (L-10)** `ContextManager.compact` records an `Eviction` (paths, tool call
+ids, messages, tokens) and `ContextManager.coverage()` answers "which lines of
+which files are in the working set right now". `AgentLoop._forget_evicted`
+rebuilds the read ledger from that coverage — so a file with surviving reads
+keeps them and only the evicted spans become askable again — and clears
+`last_results` / `echoes` / `truncated_at`, which exist to say "you already have
+this above" and cannot say it truthfully after an eviction. `seen_calls` and
+`dead_ends` survive on purpose: a dead end is a fact about the world, not about
+the transcript.
+
+The emergency compaction in `_complete` now routes through `_compact` too, which
+was L-24 (invisible to the thrash detector) and would otherwise have become the
+one path that evicts without invalidating.
+
+**1.7 (L-3)** `_message_cost` is the only answer to "what does this message
+cost", used by `usage()`, `_retention_cut` and `novel_tokens`. Twenty
+`write_file` calls carrying 40KB of arguments each are 200k tokens to the
+compaction trigger; they used to be *zero* to the compaction cut, so compaction
+fired every turn, evicted nothing, and the run died as NO_PROGRESS blaming the
+working set or as ERROR "context cannot be reduced below budget". Write-heavy
+runs are the product's core loop.
+
+Tests: `test_capped_read_then_tail_read_dispatches`,
+`test_the_elision_marker_names_what_survived`,
+`test_compaction_invalidates_read_ledger`,
+`test_compaction_keeps_coverage_that_survived`,
+`test_write_heavy_compaction_frees_tokens`,
+`test_the_cut_and_the_budget_agree_on_every_message` (TEST_PLAN invariant #3).
+
+### 1.3 — writes that cannot empty a file · done
+
+`fs._write_text` replaces both `Path.write_text` call sites. It encodes with the
+same `errors="surrogateescape"` the read uses, *then* writes — the old order
+opened (and truncated) the file before the strict-UTF-8 encoder raised, so a
+repository file with one stray byte past the 8KB binary probe was left at zero
+bytes with a generic failure and no mutation record, which meant neither the
+gate nor `revert` ever learned it had been emptied (BUG TL-1). The write goes to
+a sibling `.dakcoder-tmp` and is renamed, so a crash or a full disk leaves the
+old file rather than half of a new one (TL-2), and the original's mode is copied
+onto the replacement so a patched shell script keeps its executable bit.
+
+`os.replace` failing (Windows, file held open by an editor) falls back to a
+direct `write_bytes` of the already-encoded data — no longer the
+truncate-then-raise path.
+
+Tests: `test_patch_file_non_utf8_preserves_content` (red before: *"UnicodeEncode
+Error: surrogates not allowed"*, file emptied), plus atomicity, the executable
+bit, and no temp file left behind.
+
+### 1.4 — revert restores what was there, not what HEAD has · done
+
+New module `undo.py`. The router snapshots each path's pre-image the first time
+a *mutating* tool touches it (`spec.mutates`, before the handler runs,
+first-write-wins), into `.dakcoder/sessions/<id>/undo/` with a JSON manifest.
+`SessionStore.plan_revert` now reads that manifest instead of asking HEAD:
+
+| pre-run state | revert does |
+|---|---|
+| a file was there | restore those bytes |
+| nothing was there | delete — the run created it |
+| too large / unreadable / **not recorded** | **blocked**, with the reason said out loud |
+
+That closes both halves of L-11: a developer's uncommitted edit to a file the
+agent later touched is no longer reset to HEAD, and a developer's *untracked*
+file the agent merely modified is no longer deleted (HEAD not having it never
+meant the run created it). It also makes revert work outside a git repository at
+all, which is why `test_revert_outside_a_git_repository_is_blocked_not_attempted`
+became `test_revert_works_outside_a_git_repository` — the snapshot is a stronger
+source of truth than HEAD, so git's absence is no longer a reason to give up. A
+path with *no* snapshot is refused rather than guessed at
+(`test_revert_blocks_a_path_it_has_no_snapshot_for`).
+
+`revert` now returns what it actually did — restored, deleted, and anything that
+failed — rather than echoing the plan it was handed.
+
+The manifest is on disk, so a daemon restart between the run and the revert no
+longer silently turns "restore what was there" back into "reset to HEAD" (a
+first slice of L-7). `.dakcoder/` writes a `.gitignore` containing `*` on first
+use, so the runtime state does not appear in the developer's `git status`.
+
+Tests: `test_revert_restores_pre_run_developer_changes`,
+`test_revert_keeps_a_developers_untracked_file`,
+`test_revert_deletes_only_what_the_run_created`,
+`test_the_snapshot_is_the_first_state_not_the_latest`.
+
+### 1.1 + 1.2 — the tool-call invariant · done
+
+**1.1** `_answer_unrun` is now the single place a batch's abandoned calls are
+answered, and all three paths that abandon calls go through it: cancellation
+mid-batch (which already did this), a terminal tool that ended the phase with
+calls behind it, and the forced-terminal cap. The two that returned without
+answering were BUG L-1 — and L-1 is not a cosmetic gap, because the message list
+is append-only: one orphan sits in the working set for every later turn of the
+session and every follow-up built on the same context, and a strict
+OpenAI-compatible endpoint rejects each of them.
+
+**1.2** `ContextManager.wire()` now repairs the invariant on the one path every
+request passes through. A declared call with no result gets a synthesised
+"was not run" result placed at the end of its assistant's block (not immediately
+after the assistant — a batch's results are not contiguous, because a
+retrieval-overlap note is a `role: user` message appended between two results of
+the same batch). A result whose call nothing declares becomes a user message
+carrying the same text: dropping it would edit what the model was told, keeping
+it as `role: tool` would be malformed. `context.wire_repairs` records what was
+repaired and the loop turns it into an ERROR event — a silent recovery for an
+invariant violation is how the violation survives to the next release.
+
+Deviation from the plan: none, but note the repair is deliberately *not* the
+fix. Both regression tests assert `wire_repairs` is empty, so if the loop stops
+answering its own calls the tests fail even though the request would still be
+accepted.
+
+Tests: `test_terminal_tool_in_batch_answers_all_calls`,
+`test_finish_in_batch_answers_all_calls`,
+`test_cancelled_batch_still_answers_every_call` (pins the path that was already
+right), `test_wire_repairs_an_orphaned_call_and_says_so`,
+`test_wire_keeps_an_orphaned_result_as_prose`. Verified red before the fix and
+green after.
+
+Also: `ScriptedClient` and friends moved to `apps/agent/tests/scripted.py` so the
+regression suite drives the same stub as the behavioural one (TEST_PLAN's
+"promoted to a shared fixture"), and `calls()` now issues process-unique tool
+ids — restarting at zero every turn made two batches in one run share ids, which
+reads as "answered twice" to any check written against the transcript.
+
+### 0.1 — green suite on Linux · done
+
+`Workspace.resolve` now maps `\` to `/` before the string reaches `Path`
+(`_separators`). On POSIX `Path("handler\user.go")` is one filename with a
+backslash in it, so a Windows-shaped path from the model created a stray file
+the developer cannot open, and the read ledger, `router.touched` and the gate
+scope each disagreed about which file had been touched. The three tests that
+already asserted this behaviour pass; the trade (a POSIX file whose name really
+contains a backslash is no longer addressable) is the one the rest of the system
+already makes — `relative()` returns POSIX form, the protected globs are POSIX,
+the wire is POSIX.
+
+The three gofmt tests now carry `@needs_gofmt`, which skips when `gofmt` is
+absent and raises under `DAKCODER_REQUIRE_INTEGRATION` — the same switch
+`test_gotools_bridge.py` uses, so CI still fails on a missing toolchain instead
+of going quietly green. `test_gofmt_leaves_an_lf_file_as_lf` was marked too: it
+passed without the binary only because its assertion is vacuous when nothing is
+formatted.
+
+Suite: **green** (was 6 failed).
+
+---
+
 # Fixing dakcoder — implementation log
 
 Working against `agent-failure-report.md` (commit `2c197a7`). Track A of §10 in

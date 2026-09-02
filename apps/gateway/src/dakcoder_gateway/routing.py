@@ -34,7 +34,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dakcoder_shared.config import ROLES, Deployment, LLMConfig, MissingCredential
 
@@ -69,7 +69,12 @@ class ModelRoute:
     role: str
     model: str
     base_url: str
-    api_key: str
+    #: Never in a repr. The model key is the one secret this whole gateway
+    #: exists to hold, and a dataclass repr puts it in every log line, every
+    #: traceback and every debugger frame that touches a route — including the
+    #: ones an operator pastes into a ticket (BUG GW-14). ``repr=False`` costs
+    #: nothing: nothing debugs a route by reading its key.
+    api_key: str = field(repr=False, default="")
     #: Which of the three the role named for itself, rather than inheriting.
     #: Published so an operator can see that an override took effect without
     #: reading a log or inferring it from behaviour — the same reason the quota

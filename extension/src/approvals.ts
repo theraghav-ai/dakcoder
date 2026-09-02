@@ -216,13 +216,12 @@ export class ApprovalService implements vscode.Disposable {
     if (this.pending.has(approval.id) || this.answered.has(approval.id)) return;
 
     const paths = this.pathsOf(approval);
-    const timeout = config().get<number>('approvalTimeoutSeconds', 0);
+    const owner = sessionId ?? approval.session_id;
     const pending: Pending = {
       approval,
-      ...(sessionId ? { sessionId } : {}),
+      ...(owner ? { sessionId: owner } : {}),
       seenAt: Date.now(),
-      // 0 means "wait indefinitely", which is the default and stays the default.
-      ...(timeout > 0 ? { deadline: Date.now() + timeout * 1000 } : {}),
+      ...deadlineFor(approval),
       warned: false,
       extensions: 0,
       unchecked: new Set<string>(),
@@ -619,6 +618,22 @@ export class ApprovalService implements vscode.Disposable {
 
   // ── the timeout watch ─────────────────────────────────────────────────────
 
+  /**
+   * Ask the runtime what it is holding, now, whether or not this window knows
+   * of anything pending.
+   *
+   * The poll only ran while something was already pending, so the one job the
+   * reconcile pass documents for itself — finding approvals raised before this
+   * window was listening — was unreachable (BUG EXT-5). A reloaded window, or a
+   * second window attaching to the same runtime, saw nothing and the run sat
+   * blocked until its deadline turned the silence into a rejection. Called on
+   * activation and on every session attach.
+   */
+  async discover(): Promise<void> {
+    await this.reconcile();
+    this.ensurePolling();
+  }
+
   private ensurePolling(): void {
     if (this.poll || this.pending.size === 0) return;
     this.poll = setInterval(() => void this.tick(), POLL_MS);
@@ -665,6 +680,21 @@ export class ApprovalService implements vscode.Disposable {
       void vscode.window.showWarningMessage(
         vscode.l10n.t('{0} was released by the runtime before it was answered, and recorded as a rejection.', tool),
       );
+    }
+
+    // The server's clock is the only one that decides. An approval we are
+    // already showing has its countdown re-anchored on what the runtime says is
+    // left, so the warning fires against the real deadline rather than against
+    // a local setting that defaults to never warning at all (BUG EXT-2).
+    for (const approval of live) {
+      const held = this.pending.get(approval.id);
+      if (!held) continue;
+      const fresh = deadlineFor(approval);
+      if (fresh.deadline === undefined) continue;
+      if (held.deadline === undefined || Math.abs(held.deadline - fresh.deadline) > 2000) {
+        held.deadline = fresh.deadline;
+        held.warned = false;
+      }
     }
 
     // Approvals raised before this window was listening — after a reload, or a
@@ -1191,6 +1221,24 @@ function cmd(id: string, handler: (arg?: unknown) => unknown): vscode.Disposable
 }
 
 /** Warn late enough not to nag, early enough to be actionable. */
+/**
+ * When this approval will be released, in local clock terms.
+ *
+ * The server's `seconds_left` wins whenever it is present, because it is the
+ * only number in the system that describes the deadline the runtime will
+ * actually act on. `dakcoder.approvalTimeoutSeconds` is the fallback for a
+ * runtime too old to report one, and its 0 still means "no local estimate" —
+ * but it no longer means "no deadline exists", which is what made the default
+ * configuration silently convert a slow review into a rejection (BUG EXT-2).
+ */
+function deadlineFor(approval: ApprovalEvent): { deadline?: number } {
+  if (typeof approval.seconds_left === 'number' && Number.isFinite(approval.seconds_left)) {
+    return { deadline: Date.now() + Math.max(0, approval.seconds_left) * 1000 };
+  }
+  const local = config().get<number>('approvalTimeoutSeconds', 0);
+  return local > 0 ? { deadline: Date.now() + local * 1000 } : {};
+}
+
 function warnAt(pending: Pending): number {
   const total = Math.max(0, ((pending.deadline ?? 0) - pending.seenAt) / 1000);
   return Math.max(15, Math.min(60, Math.round(total * 0.25)));
@@ -1228,6 +1276,14 @@ function asApproval(value: unknown): ApprovalEvent | undefined {
     // Absent means "the runtime did not say it is unwaivable"; treating it as
     // waivable is the additive-safe reading, and every other gate still applies.
     unconditional: raw.unconditional === true,
+    // The server's own countdown and its session. `protocol.ts` has declared
+    // both for as long as the endpoint has sent them, and this function dropped
+    // them on the floor: the countdown fell back to a local estimate anchored
+    // on a setting whose default is "never warn", and a polled approval lost
+    // the session it belonged to (BUG EXT-2, EXT-17).
+    ...(typeof raw.seconds_left === 'number' ? { seconds_left: raw.seconds_left } : {}),
+    ...(typeof raw.extensions === 'number' ? { extensions: raw.extensions } : {}),
+    ...(typeof raw.session_id === 'string' ? { session_id: raw.session_id } : {}),
   };
 }
 

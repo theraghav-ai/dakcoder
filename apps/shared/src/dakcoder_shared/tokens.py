@@ -31,7 +31,7 @@ an over-length request.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 __all__ = ["estimate_tokens", "Calibration", "CHARS_PER_TOKEN_PROSE", "CHARS_PER_TOKEN_CODE"]
 
@@ -105,8 +105,6 @@ class Calibration:
     min_ratio: float = 2.0
     max_ratio: float = 6.0
 
-    _history: list[float] = field(default_factory=list, repr=False)
-
     def observe(self, *, estimated_chars: int, actual_tokens: int) -> None:
         """Record one real measurement.
 
@@ -117,7 +115,10 @@ class Calibration:
             return
         observed = estimated_chars / actual_tokens
         observed = max(self.min_ratio, min(self.max_ratio, observed))
-        self._history.append(observed)
+        # No history list. There was one, nothing ever read it, and it grew by
+        # one float per turn for the life of the process — a slow leak whose only
+        # purpose was to be a slow leak (BUG SH-7). `samples` is the count, and
+        # the EMA is the state; a distribution nobody plots is not worth holding.
         self.samples += 1
         self.ratio += (observed - self.ratio) * self.smoothing
         self.ratio = max(self.min_ratio, min(self.max_ratio, self.ratio))

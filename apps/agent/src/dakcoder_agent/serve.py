@@ -45,6 +45,7 @@ from .tools import commands, control, fs, knowledge
 from .tools.catalog import as_json
 from .tools.gotools import GoTools, handlers_for
 from .tools.router import Router
+from .undo import UndoStore
 
 __all__ = ["build", "main"]
 
@@ -121,7 +122,11 @@ def build(
     client = make_client(config, credential=credential)
 
     def build_loop(session, approve):
-        router = Router(space, handlers)
+        # The undo store is keyed on the session, so every mutating tool call
+        # copies the file's pre-run bytes once before it changes them. That is
+        # what lets `revert` put back what the developer had rather than what
+        # HEAD has (BUG L-11).
+        router = Router(space, handlers, undo=UndoStore(space.root, session.id))
         context = ContextManager(mode=Mode.ASK, system_prompt=system_prompt())
         return AgentLoop(
             context,

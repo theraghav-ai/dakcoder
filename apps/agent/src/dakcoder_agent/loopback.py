@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
+import os
 import secrets
 import threading
 import uuid
@@ -79,7 +81,27 @@ API_VERSION = "1.1"
 #: How long a run waits for an approval before giving up. Long enough for someone
 #: to read a seven-file scaffold; short enough that a developer who closed the
 #: window does not leave a thread parked until the process ends.
-APPROVAL_TIMEOUT = 600.0
+#:
+#: Overridable, and ``0`` means no timeout at all. The extension's setting
+#: documents "0 waits indefinitely" and the backend hard-rejected at ten minutes
+#: regardless (BUG EXT-2), so the advertised default was a fiction over a silent
+#: auto-rejection of changes the developer was in the middle of reviewing. One of
+#: the two had to become true; this is the half that can be.
+def _approval_timeout() -> float:
+    raw = os.environ.get("DAKCODER_APPROVAL_TIMEOUT", "").strip()
+    try:
+        seconds = float(raw) if raw else 600.0
+    except ValueError:
+        return 600.0
+    return max(0.0, seconds)
+
+
+APPROVAL_TIMEOUT = _approval_timeout()
+
+#: How often a blocked run re-reads the deadline while waiting. Short enough
+#: that an extension granted at t=590 is seen before the original deadline
+#: passes, long enough that a parked approval costs nothing measurable.
+APPROVAL_POLL = 5.0
 
 
 @dataclass
@@ -102,9 +124,19 @@ class PendingApproval:
     #: adjust the limit — and the people most likely to exceed ten minutes are
     #: the ones reviewing the changesets that matter most.
     extensions: int = 0
+    #: Set when the wait gave up. Read by ``decide`` so a decision that arrives
+    #: after the run has already recorded a rejection is told so, instead of
+    #: being answered "accepted" for a call that never ran (BUG L-22).
+    timed_out: bool = False
 
     def deadline_in(self) -> float:
-        """Seconds left to decide, counting any extensions granted."""
+        """Seconds left to decide, counting any extensions granted.
+
+        ``math.inf`` when no timeout is configured, so the one place that waits
+        does not need a second code path for it.
+        """
+        if APPROVAL_TIMEOUT <= 0:
+            return math.inf
         spent = (datetime.now(tz=timezone.utc) - self.at).total_seconds()
         return max(0.0, APPROVAL_TIMEOUT * (1 + self.extensions) - spent)
 
@@ -154,6 +186,10 @@ class Loopback:
         #: The loop that last ran for each session, so a follow-up can inherit
         #: its ledgers the way it already inherits its context.
         self.loops: dict[str, Any] = {}
+        # Dropped together with the session they belong to. These hold the whole
+        # message list and the whole ledger set, so they are the expensive half
+        # of a session and were the half nothing ever released (BUG L-12).
+        self.sessions.on_forget = self._forget
         self.ready: dict[str, Any] = {"prewarmed": False}
         #: The developer's gateway JWT, as the extension last refreshed it.
         #: Read per request by the LLM client rather than captured at spawn —
@@ -252,6 +288,7 @@ class Loopback:
             """Put the approval in the table before the event announcing it goes out."""
             self.approvals[request.id] = PendingApproval(request.id, session.id, request)
 
+        session.reopen_steer()
         agent = self.build_loop(session, approve)
         # Set here rather than asked of ``build_loop``, so a factory that knows
         # nothing about sessions stays a factory. Without it every ledger row
@@ -345,36 +382,112 @@ class Loopback:
                 # way the run ended. A crashed run holding a pending approval
                 # leaves the extension showing a card nothing will ever answer.
                 self._release(session.id)
+                self._rescue_steers(session, loop)
 
         threading.Thread(target=run, name=f"dakcoder-{session.id}", daemon=True).start()
 
+    def _rescue_steers(self, session: Session, loop: asyncio.AbstractEventLoop) -> None:
+        """Turn a correction the run never read into the next message.
+
+        A developer typing while the last turn is in flight used to lose the
+        message outright (BUG L-9): ``message_session`` saw ``running``, queued
+        it, and the run finished before the next drain — so it was never
+        delivered, never recorded, and never became a follow-up. Silence was the
+        whole of the feedback.
+
+        Closing the queue is atomic with taking what is in it, so the window
+        does not simply move: anything posted after this point is refused by
+        ``session.steer`` and the endpoint sends it as a follow-up itself.
+        """
+        leftover = session.close_steer()
+        if not leftover:
+            return
+
+        text = "\n\n".join(leftover)
+
+        def deliver() -> None:
+            if session.running:
+                # Something restarted the session between the worker ending and
+                # this callback. Re-queueing keeps the message in the run that
+                # is now live rather than starting a third one.
+                if not session.steer(text):
+                    return
+                return
+            try:
+                self.follow_up(session, text)
+            except RuntimeError:
+                # The session is gone or already running again; the message is
+                # still in the transcript as a USER event either way.
+                pass
+
+        try:
+            loop.call_soon_threadsafe(deliver)
+        except RuntimeError:
+            # The event loop has closed (shutdown). Record it so the transcript
+            # shows what the developer typed, even though nothing can run it.
+            session.record(Event(EventType.USER, {"text": text, "turn": session.turns}))
+
     def resume(self, session: Session, *, note: str = "") -> Session:
-        """Run the session again, on the same transcript.
+        """Run the session again, on the same transcript and the same context.
 
         A *resume*, not a new task: the id, the event log and the mutation list
         are the ones the developer was already looking at, so the second attempt
         appears where the first one ended rather than in a new row that shares
-        nothing with it. The task is re-seeded with what the run learned, which
-        is the difference between resuming and simply retrying.
+        nothing with it.
+
+        **And the same conversation.** This used to build a run on a *fresh*
+        context seeded with ``task + "The previous attempt ended: …"`` while the
+        EXHAUSTED message on screen promised "Resume continues on this same
+        transcript with a fresh turn budget" (BUG RT-1). Every file the run had
+        read, every answer it had been given and every ledger it had built were
+        discarded, and the developer's evidence that this was not so — the
+        transcript, still on screen — was the same session's event log. A run
+        that exhausted its turns at the point of writing the last file resumed by
+        re-reading the service from scratch.
+
+        It is the follow-up path now, with the note as the message: context
+        reused, ledgers carried, Router carried (so the gate still knows what
+        this session changed), and a fresh turn budget because the loop is new.
+        The only thing that differs from a follow-up is what the message says —
+        which is the honest difference between "carry on" and "here is something
+        else".
         """
         if session.running:
             raise RuntimeError("that session is still running")
 
-        parts = [session.task]
+        parts = []
         if session.summary:
             parts.append(f"The previous attempt ended: {session.summary}")
         if note:
             parts.append(note)
-        task = "\n\n".join(parts)
+        parts.append(
+            "Carry on from where that left off. Everything above is still your "
+            "work; do not start again from the beginning."
+        )
+        message = "\n\n".join(parts)
 
         session.status = Status.RUNNING
         session.finished_at = None
         session.cancel = threading.Event()
         session.winding_down = threading.Event()
+        session.record(Event(EventType.USER, {"text": message, "turn": session.turns}))
         # A resume is another go at work that did not land, so it is a change
         # request by construction -- there is nothing for the classifier to
         # decide.
-        self._spawn(session, task, Intent.AGENT, ())
+        #
+        # `continued=True` only has a context to reuse while the daemon still
+        # holds one. After a restart there is none, and the resume falls back to
+        # re-seeding the original task -- degraded, but not silently: the
+        # message says which happened.
+        if self.contexts.get(session.id) is None:
+            self._spawn(
+                session,
+                "\n\n".join([session.task, message]),
+                Intent.AGENT,
+                (),
+            )
+        else:
+            self._spawn(session, message, Intent.AGENT, (), continued=True)
         return session
 
     def _await_decision(self, session: Session, request: ApprovalRequest) -> bool:
@@ -387,18 +500,35 @@ class Loopback:
             pending = PendingApproval(request.id, session.id, request)
             self.approvals[pending.id] = pending
 
-        if not pending.decided.wait(timeout=pending.deadline_in()):
-            # A timeout is a refusal, not an approval. Nobody looked, so nobody
-            # agreed — and the failure mode of the opposite choice is a write
-            # that happened while the developer was at lunch.
-            self.approvals.pop(pending.id, None)
-            return False
+        # Polled rather than waited once, so `/extend` can actually extend
+        # (BUG EXT-1). A single `wait(timeout=deadline_in())` computed its
+        # timeout before the extension existed: the counter went up, the UI
+        # showed minutes remaining, and the run rejected the approval at the
+        # original deadline anyway. The deadline is re-read every poll, so
+        # granting time works whenever it is granted.
+        while not pending.decided.wait(timeout=min(APPROVAL_POLL, pending.deadline_in())):
+            if pending.deadline_in() <= 0:
+                # A timeout is a refusal, not an approval. Nobody looked, so
+                # nobody agreed — and the failure mode of the opposite choice is
+                # a write that happened while the developer was at lunch.
+                self.approvals.pop(pending.id, None)
+                pending.timed_out = True
+                return False
 
         self.approvals.pop(pending.id, None)
         if pending.approved and pending.arguments is not None:
             request.arguments.clear()
             request.arguments.update(pending.arguments)
         return pending.approved
+
+    def _forget(self, session_id: str) -> None:
+        """Release everything this runtime holds for a session the store dropped."""
+        self.contexts.pop(session_id, None)
+        self.loops.pop(session_id, None)
+        for approval_id in [
+            key for key, p in self.approvals.items() if p.session_id == session_id
+        ]:
+            self.approvals.pop(approval_id, None)
 
     def _release(self, session_id: str) -> None:
         for pending in [p for p in self.approvals.values() if p.session_id == session_id]:
@@ -438,26 +568,40 @@ def create_app(runtime: Loopback) -> FastAPI:
     # -- readiness ----------------------------------------------------------
 
     @app.get("/v1/health")
-    async def health() -> dict[str, Any]:
-        """No token required.
+    async def health(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        """No token required — for the liveness half.
 
         A health check that needs a credential cannot tell the extension whether
-        the credential path is the thing that is broken — and this is the
-        endpoint it polls for up to sixty seconds while deciding whether the
-        runtime came up at all.
+        the credential path is the thing that is broken, and this is the endpoint
+        it polls for up to sixty seconds while deciding whether the runtime came
+        up at all. So "is it alive, and what does it speak" stays open.
+
+        Everything that describes *this developer's machine* — which directory is
+        open, which gateway it talks to, how many sessions are running — needs
+        the token. Any process on the box could read all of it, and "which
+        repository is this person working on" is not a liveness fact (BUG L-30).
         """
-        return {
+        payload: dict[str, Any] = {
             "ok": True,
             "api_version": API_VERSION,
             "version": runtime.version,
-            "workspace": str(runtime.workspace),
-            "gateway": runtime.gateway_url,
-            "ready": runtime.ready,
-            "sessions": {
-                "total": len(runtime.sessions.list()),
-                "running": sum(1 for s in runtime.sessions.list() if s.running),
-            },
         }
+        try:
+            authorise(authorization)
+        except HTTPException:
+            return payload
+        payload.update(
+            {
+                "workspace": str(runtime.workspace),
+                "gateway": runtime.gateway_url,
+                "ready": runtime.ready,
+                "sessions": {
+                    "total": len(runtime.sessions.list()),
+                    "running": sum(1 for s in runtime.sessions.list() if s.running),
+                },
+            }
+        )
+        return payload
 
     @app.get("/v1/tools")
     async def tools(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -653,6 +797,15 @@ def create_app(runtime: Loopback) -> FastAPI:
                 raise HTTPException(status_code=400, detail="edit needs an arguments object")
             pending.arguments = arguments
 
+        if pending.timed_out or pending.deadline_in() <= 0:
+            # The run has already recorded this as a rejection and moved on.
+            # Reporting the developer's "accept" back to them would be a receipt
+            # for something that did not happen (BUG L-22).
+            raise HTTPException(
+                status_code=410,
+                detail="that approval timed out and was recorded as a rejection",
+            )
+
         pending.approved = decision in ("accept", "edit")
         pending.decided.set()
         return {"id": approval_id, "decision": decision}
@@ -711,18 +864,29 @@ def create_app(runtime: Loopback) -> FastAPI:
         if not text:
             raise HTTPException(status_code=400, detail="text is required")
 
-        if session.running:
-            session.steer(text)
-        else:
+        # `steer` answers from inside the session's lock, so "the run is taking
+        # corrections" and "this correction is queued" are one observation
+        # rather than two with a race between them. A run that has just ended
+        # refuses, and the message becomes the next one in the conversation
+        # instead of disappearing (BUG L-9).
+        if not (session.running and session.steer(text)):
             # No default here. This read `body.get("mode", "planner")`, which
             # made every follow-up an explicit request for the Planner and left
             # `follow_up`'s own default unreachable. Absent means "decide from
             # the conversation", which is what the classifier is for; a client
             # with an Ask/Agent toggle says which and is obeyed.
             requested = body.get("intent") or body.get("mode")
-            runtime.follow_up(
-                session, text, intent=Intent.coerce(requested) if requested else None
-            )
+            try:
+                runtime.follow_up(
+                    session, text, intent=Intent.coerce(requested) if requested else None
+                )
+            except RuntimeError:
+                # The worker closed the correction queue and something restarted
+                # the session before this request got here. Honest and
+                # retryable, rather than a 500 the client cannot interpret.
+                raise HTTPException(
+                    status_code=409, detail="that session is still running; send it again"
+                ) from None
         return session.as_dict()
 
     @app.post("/v1/sessions/{session_id}/wind-down")

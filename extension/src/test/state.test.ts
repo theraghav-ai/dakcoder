@@ -430,4 +430,43 @@ describe('RunState — raising an approval', () => {
       'an approval that outlived its frame is unanswerable unless hydrate re-raises it',
     );
   });
+
+  it('does not raise an answered approval replayed from a running transcript', () => {
+    // BUG EXT-3. Opening a *running* session hydrated from a tree summary with
+    // no transcript, so the stream replayed the whole thing through the live
+    // path: every approval the run had ever raised came back as a card with
+    // Accept and Reject on it, and the poller then toasted "recorded as a
+    // rejection" for each one. `openSession` fetches the transcript for a
+    // running session too, and a transcript is history whatever the status.
+    const raised = approvalsRaisedBy((state) =>
+      state.hydrate({
+        id: 's1',
+        task: 'add a repo function',
+        workspace: '/w',
+        status: 'running',
+        created_at: new Date(0).toISOString(),
+        finished_at: null,
+        summary: '',
+        mutations: [],
+        events: 2,
+        resumable: true,
+        queued: 0,
+        winding_down: false,
+        transcript: [
+          event(1, 'tool_pending', {
+            id: 'answered',
+            tool: 'write_file',
+            arguments: { path: 'a.go' },
+            reason: 'writes a file',
+            paths: ['a.go'],
+            protected: [],
+            unconditional: false,
+          }),
+          event(2, 'tool_result', { id: 'answered', name: 'write_file', ok: true }),
+        ],
+        pending_approvals: [],
+      }),
+    );
+    assert.deepEqual(raised, [], 'a decided approval must never come back as a live card');
+  });
 });

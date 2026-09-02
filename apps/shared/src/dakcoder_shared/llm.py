@@ -71,6 +71,24 @@ SLOW_TO_CLEAR = frozenset({"quota_unavailable"})
 #: to fail and say why rather than to sit silently for minutes.
 MAX_RETRY_AFTER = 45.0
 
+#: Transport failures worth another attempt.
+#:
+#: ``RemoteProtocolError`` and ``ReadError`` are the canonical shapes of "the
+#: upstream died mid-SSE" — a vLLM worker restarting, a proxy dropping a long
+#: connection — and they were the two the retry machinery did not cover, so its
+#: main customer failed on attempt one (BUG SH-2). ``ConnectError`` and the two
+#: timeouts were already here.
+#:
+#: All five are safe to retry for the same reason: this endpoint is a
+#: completion, so a repeat costs tokens and changes nothing else.
+_RETRYABLE_TRANSPORT: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+)
+
 _HTML_TAG = re.compile(r"<[^>]+>")
 _WHITESPACE = re.compile(r"\s+")
 
@@ -571,7 +589,7 @@ class LLMClient:
                 if exc.status not in RETRYABLE_STATUS or attempt == self._config.max_attempts:
                     raise
                 last = exc
-            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+            except _RETRYABLE_TRANSPORT as exc:
                 if attempt == self._config.max_attempts:
                     raise
                 last = exc
@@ -772,8 +790,15 @@ def _consume_stream(
                 reasoning.append(delta["reasoning_content"])
 
             for fragment in delta.get("tool_calls") or []:
-                index = fragment.get("index", 0)
-                slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                # `index` when the endpoint sends one, the call `id` when it does
+                # not. Defaulting an absent index to 0 folded every parallel call
+                # into one slot: two calls became one with both argument strings
+                # concatenated, which the loop then reported to the model as
+                # "malformed arguments" for a reply that was fine (BUG SH-3).
+                key = fragment.get("index")
+                if key is None:
+                    key = fragment.get("id") or f"slot-{len(calls)}"
+                slot = calls.setdefault(key, {"id": "", "name": "", "arguments": ""})
                 if fragment.get("id"):
                     slot["id"] = fragment["id"]
                 fn = fragment.get("function") or {}
@@ -786,9 +811,40 @@ def _consume_stream(
     result.reasoning = "".join(reasoning)
     result.tool_calls = [
         ToolCall(id=slot["id"], name=slot["name"], arguments=slot["arguments"])
-        for _, slot in sorted(calls.items())
+        for _, slot in _ordered(calls)
         if slot["name"]
     ]
+
+    dropped = [slot for _, slot in _ordered(calls) if not slot["name"]]
+    if dropped:
+        # A slot that accumulated arguments and never a name is a call the model
+        # made and this client cannot deliver. Dropping it silently made the
+        # turn look like it simply asked for less than it did — and the loop
+        # then answered the calls it *could* see, leaving the model's actual
+        # request unaddressed with no record anywhere (BUG SH-3).
+        raise UpstreamError(
+            502,
+            f"the stream carried {len(dropped)} tool call(s) with no function name; "
+            "the endpoint's tool-call deltas are malformed",
+            kind="malformed_tool_call",
+        )
+
+    # A stream that stopped without saying so is not a completed answer.
+    #
+    # A clean mid-stream EOF — no `[DONE]`, no `finish_reason`, no usage chunk —
+    # returned a truncated `ChatResult` as a *success*: partial content,
+    # `truncated == False`, zero usage feeding the calibration a free turn. The
+    # agent then acted on half an answer with no signal that anything was
+    # missing, and every layer above trusted it (BUG SH-1). Retryable, because
+    # this is exactly what a worker restarting mid-answer looks like and the
+    # request is a completion, so repeating it is safe.
+    if not done and not result.finish_reason:
+        raise UpstreamError(
+            502,
+            "the model stream ended without a finish_reason or [DONE]; "
+            f"{len(result.content)} character(s) had arrived",
+            kind="incomplete_stream",
+        )
 
     # An empty completion is a wasted turn, and it has to be visible as one.
     # Guarded on having actually seen a content key so that a pure tool-call
@@ -797,3 +853,14 @@ def _consume_stream(
         raise EmptyCompletionError(result.finish_reason, result.usage.reasoning_tokens)
 
     return result
+
+
+def _ordered(calls: dict[Any, dict[str, str]]) -> list[tuple[Any, dict[str, str]]]:
+    """The assembled slots, in the order the model declared them.
+
+    Keys are integer indices when the endpoint sends them and insertion-ordered
+    ids when it does not, so they cannot be compared with ``sorted``. Python
+    dicts preserve insertion order, which is the arrival order, which is the
+    order the model emitted the calls in.
+    """
+    return list(calls.items())

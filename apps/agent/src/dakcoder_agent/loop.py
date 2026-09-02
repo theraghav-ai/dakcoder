@@ -47,7 +47,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from dakcoder_shared.envelope import DeltaCoalescer, Event, EventType, ToolResult
@@ -57,9 +57,10 @@ from dakcoder_shared.llm import (
     ToolCall,
     UnsupportedParameterError,
 )
+from dakcoder_shared.paths import PathEscape
 from dakcoder_shared.tokens import estimate_tokens
 
-from .context import ContextManager, Message, OverBudgetError, Recap
+from .context import ContextManager, Eviction, Message, OverBudgetError, Recap
 from .gate import (
     Baseline,
     GateReport,
@@ -151,6 +152,9 @@ class _ReadLedger:
     lines: int = 0
     #: Dispatched reads of this path, for the backstop ceiling.
     calls: int = 0
+    #: The file's modification time when it was last read, so a follow-up can
+    #: tell whether what the model saw is still what is there. 0.0 when unknown.
+    mtime: float = 0.0
 
     def add(self, low: int, high: int) -> None:
         if high < low:
@@ -236,8 +240,13 @@ class _State:
     #: when something actually changed.
     mutations_seen: int = 0
     #: What each fingerprinted call last returned, so a repeat is answered with
-    #: the result rather than run again.
+    #: the result rather than run again. Cut to ``CACHED_RESULT_CHARS``.
     last_results: dict[str, str] = field(default_factory=dict)
+    #: Fingerprints whose cached result is only the head of what the tool
+    #: returned, and how long the whole thing was. A replay of one of these has
+    #: to say it is partial: presenting a third of a result as "the current
+    #: answer" is what makes asking again the reasonable move (BUG L-17).
+    partial_results: dict[str, int] = field(default_factory=dict)
     #: Calls the tools themselves declared can never succeed as asked.
     #: fingerprint -> the tool's one-line reason.
     dead_ends: dict[str, str] = field(default_factory=dict)
@@ -267,13 +276,17 @@ class _State:
     dependencies_changed: bool = False
     #: Whether a turn has already been re-asked with ``tool_choice: required``.
     #:
-    #: Once per **run**, not once per turn. Forcing on every prose turn reads as
+    #: Once per **phase**, not once per turn. Forcing on every prose turn reads as
     #: harmless and is not: a Planner that has decided there is nothing to plan
     #: says so, is forced, complies with some call it does not need, says so
     #: again, is forced again -- two model calls a turn to relitigate a decision
     #: it has already made twice. The first refusal might be a turn whose call
     #: was never emitted; the second is an answer, and the loop already knows
     #: what to do with it.
+    #:
+    #: Reset when a phase ends. Run scope was the wrong reading of that argument:
+    #: it is about one mode relitigating one decision, and a Planner that used
+    #: the re-ask left the acting mode without one (prior-audit TC-4).
     forced: bool = False
     #: The most recent intercept result per fingerprint, so the next repeat can
     #: supersede it rather than stack beside it. Measured: one such pair in
@@ -283,6 +296,15 @@ class _State:
     #: Set when a turn asked for nothing it had not already been given, and the
     #: next turn must therefore answer rather than call. Cleared once used.
     must_answer: bool = False
+    #: Why the next turn is being made to answer. Two situations reach the same
+    #: mechanism and they are not the same thing: a *stall* is the model asking
+    #: for what it has already been given; a *refused terminal* is the model
+    #: reaching for the exit with arguments the schema would not take. Telling it
+    #: "that call has already been answered and asking it again returns the same
+    #: thing" after the second is false on every clause, and it teaches the wrong
+    #: correction -- the arguments, not the repetition, are the problem
+    #: (BUG L-14).
+    answer_because: str = ""
     #: ``router.mutations`` as of the last failing gate, so turns that follow it
     #: without editing anything can be counted. See ``_gate_stalled``.
     gate_mutations: int = 0
@@ -300,6 +322,13 @@ class _State:
     #: `submit_plan` and sent arguments the schema refused, say. Bounded,
     #: because forcing the same call again is the loop this exists to escape.
     forced_terminal: int = 0
+    #: Consecutive replies the output budget cut off. Reset by any reply that
+    #: completes. The per-turn handling of a truncated reply is careful -- every
+    #: declared call answered, the cause named accurately -- but nothing counted
+    #: the *repetition*, so a model that always overran its output budget spent
+    #: the entire turn budget doing it and ended EXHAUSTED without truncation
+    #: ever being mentioned (BUG L-13).
+    truncated_turns: int = 0
 
 
 _RECAP_PROMPT = """Summarise this agent transcript for a handover to a fresh context.
@@ -458,6 +487,33 @@ MAX_RESEARCH_TURNS = 12
 #: the first refusal switches the target to ``finish``, whose schema is one
 #: required string, and a second refusal after that is not an arguments problem.
 MAX_FORCED_TERMINAL = 2
+
+#: How many replies in a row may be cut off by the output limit before the run
+#: stops asking for another one.
+#:
+#: Three. The first is information the model did not have; the second says the
+#: advice ("make the next reply shorter") did not take; a third says the mode's
+#: output budget cannot hold what this turn is trying to say, and no number of
+#: further attempts changes that. The run ends naming the limit, which is the
+#: one thing a developer can act on -- an EXHAUSTED at turn 40 with no mention
+#: of truncation is not.
+MAX_TRUNCATED_TURNS = 3
+
+#: How long a gate waits for the baseline before running without it.
+#:
+#: Three minutes, which is a cold module cache fetching from
+#: gitlab.cept.gov.in. Past that the gate runs un-baselined and says so rather
+#: than holding the run: a baseline is an excuse for pre-existing damage, and a
+#: run that never verifies is worse than one that over-reports.
+BASELINE_JOIN_SECONDS = 180
+
+#: How much of a tool result is kept for answering an exact repeat.
+#:
+#: The context already holds the whole result; this is a second copy kept only so
+#: a repeat can be answered without dispatching. Six thousand characters is
+#: roughly a large file's worth of head, and a replay that hits the cut says so
+#: rather than presenting an extract as the whole answer.
+CACHED_RESULT_CHARS = 6_000
 
 #: How many times a `finish` that abandons the plan is sent back.
 #:
@@ -651,13 +707,23 @@ class AgentLoop:
                 Outcome.EXHAUSTED,
                 f"stopped after {self.context.turn} turns without finishing. "
                 "Nothing is lost: the edits are in the workspace and the session "
-                "is resumable -- Resume continues on this same transcript with a "
-                "fresh turn budget. For a task this size, raise dakcoder.maxTurns",
+                "is resumable -- Resume continues on this same transcript and the "
+                "same context, with a fresh turn budget. For a task this size, "
+                "raise dakcoder.maxTurns",
                 self.context.turn,
                 tuple(self.router.touched),
                 self.state.last_gate,
             )
 
+        # The quota moved, and the run is the only thing that knows it has
+        # finished moving it. The event type existed and nothing ever emitted
+        # one, so the status bar's listener and the quota tree's refresh were
+        # both unreachable (BUG EXT-15) and the figure on screen was whatever the
+        # 60-second poll had last seen — including for the whole time after a run
+        # ended, when the poll has stopped. It carries no data on purpose: the
+        # gateway owns the numbers and `GET /v1/quota` is the shape under
+        # contract.
+        yield Event(EventType.QUOTA, {"reason": "run finished"})
         yield Event(EventType.FINISH, self.result.as_dict())
         yield Event(EventType.END, self.result.as_dict())
 
@@ -766,10 +832,23 @@ class AgentLoop:
         thread.start()
 
     def _await_baseline(self) -> None:
-        """Block until the baseline is in, if it is not already."""
-        thread, self._baseline_thread = self._baseline_thread, None
-        if thread is not None:
-            thread.join(timeout=180)
+        """Block until the baseline is in, if it is not already.
+
+        The reference is *kept* when the join times out. It used to be cleared
+        unconditionally, so a slow baseline — a cold module cache is minutes, not
+        seconds — landed mid-run and the gates on either side of it disagreed
+        about what was already broken: the early ones blamed the run for damage
+        it had not done, the later ones excused it, and nothing said which had
+        happened (BUG L-16). Keeping the reference means the next gate waits for
+        the same thread instead of running un-baselined again, so a run gets one
+        answer to "what was already broken" rather than two.
+        """
+        thread = self._baseline_thread
+        if thread is None:
+            return
+        thread.join(timeout=BASELINE_JOIN_SECONDS)
+        if not thread.is_alive():
+            self._baseline_thread = None
 
     # -- one turn ---------------------------------------------------------
 
@@ -803,7 +882,12 @@ class AgentLoop:
                 # mode it is in. This is the decision the whole run turns on and
                 # nothing on the wire used to name it.
                 "intent": str(self.state.intent),
-                "attempt": self.state.gate_failures,
+                # The attempt about to be made, not the number of failures
+                # behind it. `gate_failures` is 0 before any gate has failed, so
+                # the wire said "attempt 0" while the panel's own default said 1
+                # and its grid header counted from 1 — the first column was
+                # labelled with a number no other surface used (BUG EXT-7).
+                "attempt": self.state.gate_failures + 1,
             },
         )
 
@@ -819,17 +903,26 @@ class AgentLoop:
         # which is the one lever measured to work here -- but they are different
         # situations and the model is told which one it is in.
         answering, self.state.must_answer = self.state.must_answer, False
+        because, self.state.answer_because = self.state.answer_because, ""
         forced_choice: str | None = None
         if answering:
             # Measured live at the depth where the loop forms: the instruction
             # alone breaks the repeat but the model keeps acting (it has no other
             # move); the tool alone is ignored; the two together end the turn
             # 5/5, and the named `tool_choice` makes it 5/5 regardless.
+            #
+            # The *text* depends on why. A refused terminal call routed through
+            # here was told "that call has already been answered and asking it
+            # again returns the same thing" -- false on every clause, and it
+            # points the model at the wrong correction (BUG L-14).
             self.context.append_user(
-                "Stop searching. That call has already been answered and asking it "
-                "again returns the same thing.\n\n"
-                "Give the developer what you have established now, and say what you "
-                "could not find out."
+                because
+                or (
+                    "Stop searching. That call has already been answered and asking it "
+                    "again returns the same thing.\n\n"
+                    "Give the developer what you have established now, and say what you "
+                    "could not find out."
+                )
             )
         elif self.state.research_turns >= MAX_RESEARCH_TURNS:
             # Walked to the fence rather than off the cliff. See
@@ -847,7 +940,26 @@ class AgentLoop:
                 self._unwritten_targets() if self.state.mode is Mode.AGENT else []
             )
             answering = True
-            if outstanding:
+            if self._gate_wants_an_edit():
+                # A failing gate in the same context says "Make the edit, or say
+                # plainly what is stopping you". Forcing `finish` on the same
+                # turn forbids the first half of that instruction, and the run
+                # then burns MAX_FORCED_TERMINAL forced finishes and ends
+                # UNVERIFIED with the fix one call away (BUG L-2). `required`
+                # keeps a tool call mandatory without naming which.
+                forced_choice = "required"
+                report = self.state.last_gate
+                blocker = (
+                    report.blocked_by.name if report and report.blocked_by else "the gate"
+                )
+                self.context.append_user(
+                    f"You have spent {self.state.research_turns} turns in this phase "
+                    f"without clearing the gate, which is still blocked at {blocker}.\n\n"
+                    "Reading more will not move it — the gate is a function of the "
+                    "files. Make the edit it asked for now, or say in one line what is "
+                    "stopping you and call `finish`."
+                )
+            elif outstanding:
                 # Not a terminal call: a tool call, any tool call, with the
                 # message naming what is missing. `required` rather than a named
                 # choice because the right move is `write_file` or `patch_file`
@@ -892,6 +1004,7 @@ class AgentLoop:
                 (forced_choice or self._terminal_choice()) if answering else None
             ),
         )
+        yield from self._report_wire_repairs()
         if outcome is None:
             return
         result = outcome
@@ -912,10 +1025,27 @@ class AgentLoop:
                 EventType.GATE,
                 {"kind": "forced_tool_call", "mode": str(self.state.mode)},
             )
+            narration = result.chat.content
             forced = yield from self._complete(tools, tool_choice="required")
+            yield from self._report_wire_repairs()
             if forced is None:
                 return
             if forced.chat.tool_calls:
+                # The prose the model actually said travels with the forced
+                # reply, because it has already been streamed to the panel: the
+                # deltas went out as they arrived, and discarding the result they
+                # belonged to displayed text the backend then silently dropped
+                # (BUG L-15). The model's own turn also vanished from its
+                # history, so it could not see that it had narrated and been
+                # asked again.
+                #
+                # Prefixed rather than concatenated blindly: the forced reply
+                # usually carries no prose of its own, and where it does, both
+                # halves are the model's and both are worth keeping in order.
+                if narration and narration not in (forced.chat.content or ""):
+                    forced.chat.content = "\n\n".join(
+                        part for part in (narration, forced.chat.content) if part
+                    )
                 result = forced
 
         yield from self._usage(result)
@@ -940,6 +1070,11 @@ class AgentLoop:
             yield from self._answer_truncated(result, incomplete)
             return
 
+        # A reply that arrived whole clears the streak: the shorter-reply advice
+        # took, and the next overrun is a new run of bad luck rather than a
+        # continuation of this one.
+        self.state.truncated_turns = 0
+
         if result.chat.tool_calls:
             self.state.research_turns += 1
             yield from self._tool_calls(result.chat.tool_calls, assistant_msg)
@@ -947,6 +1082,29 @@ class AgentLoop:
 
         # No tool calls: the model has said its piece.
         yield from self._finish_turn(result)
+
+    def _report_wire_repairs(self) -> Iterator[Event]:
+        """Announce a request that had to be repaired to be legal.
+
+        ``ContextManager.wire`` synthesises results for declared-but-unanswered
+        calls rather than letting a strict endpoint reject the conversation
+        (BUG L-1, L-6). That recovery keeps the run alive, and a silent recovery
+        for an invariant violation is how the violation survives to the next
+        release: the loop is the component that produced the invalid list, so it
+        is the one that has to say so.
+
+        Once the batch paths and the compaction cut are correct this never
+        fires. If it does, the repair is the symptom and the loop is the bug.
+        """
+        for repair in self.context.wire_repairs:
+            yield Event(
+                EventType.ERROR,
+                {
+                    "message": f"internal: the assembled request was repaired ({repair}). "
+                    "The turn was dispatched; please report this.",
+                    "kind": "wire_repair",
+                },
+            )
 
     def _complete(
         self, tools: list[dict[str, Any]], *, tool_choice: str | None = None
@@ -996,8 +1154,7 @@ class AgentLoop:
             # The context manager exists to prevent this, so reaching it means
             # compaction could not free enough. Compacting harder and retrying
             # once is worth a turn; failing the run outright is not.
-            yield Event(EventType.GATE, {"kind": "compaction", "reason": "over budget"})
-            self.context.compact(self._summarise, retain_pct=0.15)
+            yield from self._compact(retain_pct=0.15, reason="over budget")
             try:
                 return dispatch()
             except OverBudgetError:
@@ -1064,7 +1221,7 @@ class AgentLoop:
                 report is not None
                 and not report.ok
                 and self.state.gate_key is not None
-                and self.state.gate_key[0] == self.router.mutations
+                and self.state.gate_key[0] == self.router.model_mutations
             )
         return False
 
@@ -1083,6 +1240,7 @@ class AgentLoop:
         declares is malformed, and the poisoned message stays in the working set
         for the rest of the run *and the rest of the session*.
         """
+        self.state.truncated_turns += 1
         names = ", ".join(sorted({c.name for c in incomplete}))
         cut = {c.id for c in incomplete}
         for call in result.chat.tool_calls:
@@ -1107,8 +1265,29 @@ class AgentLoop:
             self.context.append_tool_result(call.name, body, tool_call_id=call.id)
             yield Event(
                 EventType.TOOL_RESULT,
-                {"id": call.id, "name": call.name, "ok": False, "content": said},
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "ok": False,
+                    "content": said,
+                    "turn": self.context.turn,
+                },
             )
+
+        if self.state.truncated_turns >= MAX_TRUNCATED_TURNS:
+            limit = config_for(self.state.mode).max_tokens
+            self.result = RunResult(
+                Outcome.UNVERIFIED if self.router.touched else Outcome.NO_PROGRESS,
+                f"{self.state.truncated_turns} replies in a row were cut off by the "
+                f"{limit:,}-token output limit for {self.state.mode}, so no tool call "
+                "was ever dispatched. The turn the model is trying to make does not "
+                "fit; narrow the task, or raise the mode's output budget"
+                + self._unfinished(),
+                self.context.turn,
+                tuple(self.router.touched),
+                self.state.last_gate,
+            )
+            yield Event(EventType.ERROR, {"message": self.result.summary})
 
     def _usage(self, result: TurnResult) -> Iterator[Event]:
         usage = self.context.usage()
@@ -1131,6 +1310,30 @@ class AgentLoop:
         yield Event(EventType.USAGE, payload)
 
     # -- tools ------------------------------------------------------------
+
+    def _answer_unrun(self, pending: Sequence[ToolCall], reason: str) -> None:
+        """Answer the calls a batch will never dispatch.
+
+        The assistant message declaring every call in the batch is already in
+        the working set, and the wire format is not "results for the calls that
+        ran" -- it is *one* ``role: "tool"`` message per declared
+        ``tool_call_id``, for the rest of the conversation. A declared call left
+        unanswered is not a cosmetic gap: a strict OpenAI-compatible endpoint
+        rejects the whole message list, so the orphan poisons every later turn
+        of the session and every follow-up built on the same context.
+
+        Three paths reach here -- cancellation mid-batch, a terminal tool that
+        ended the phase with calls behind it, and the forced-terminal cap -- and
+        each used to be its own discipline. One of the three had it; the other
+        two returned (BUG L-1). It is one helper now so a fourth path cannot get
+        it wrong by omission.
+        """
+        for call in pending:
+            self.context.append_tool_result(
+                call.name,
+                f"{call.name} was not run: {reason}",
+                tool_call_id=call.id,
+            )
 
     def _tool_calls(
         self, calls: Sequence[ToolCall], assistant_msg: Message | None = None
@@ -1160,13 +1363,10 @@ class AgentLoop:
                 # answered: the assistant message declaring all of them is
                 # already in the working set, and an aborted session is
                 # resumable, so an orphan would be carried into the resume.
-                for pending in calls[index:]:
-                    self.context.append_tool_result(
-                        pending.name,
-                        f"{pending.name} was not run: the developer stopped the run "
-                        "before this call was dispatched.",
-                        tool_call_id=pending.id,
-                    )
+                self._answer_unrun(
+                    calls[index:],
+                    "the developer stopped the run before this call was dispatched.",
+                )
                 self.result = self._abort()
                 return
 
@@ -1204,6 +1404,7 @@ class AgentLoop:
                         "id": call.id,
                         "name": call.name,
                         "ok": True,
+                        "turn": self.context.turn,
                         "intercepted": True,
                         "arguments": args,
                         "content": said,
@@ -1213,7 +1414,16 @@ class AgentLoop:
 
             yield Event(
                 EventType.TOOL_CALL,
-                {"id": call.id, "name": call.name, "arguments": args},
+                # The turn travels with it. Tool events carried no turn id, so a
+                # transcript could not be grouped by turn without inferring it
+                # from the position of the last `turn_start` — which a reconnect
+                # or a dropped frame makes wrong (AUDIT §Observability).
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": args,
+                    "turn": self.context.turn,
+                },
             )
 
             outcome = self.router.dispatch(call.name, call.arguments, mode=self.state.mode)
@@ -1224,7 +1434,10 @@ class AgentLoop:
                 # the instant it reads the event cannot arrive before the
                 # approval exists.
                 self.on_pending(request)
-                yield Event(EventType.TOOL_PENDING, request.as_dict())
+                yield Event(
+                    EventType.TOOL_PENDING,
+                    {**request.as_dict(), "turn": self.context.turn},
+                )
                 if self.approve(request):
                     # Re-dispatched with the *request's* arguments, not the
                     # model's original string: an approver may have corrected
@@ -1255,7 +1468,17 @@ class AgentLoop:
 
             self.state.seen_calls[fingerprint] = self.state.seen_calls.get(fingerprint, 0) + 1
             if not refused_by_mode:
-                self.state.last_results[fingerprint] = outcome.for_model()[:6000]
+                whole = outcome.for_model()
+                self.state.last_results[fingerprint] = whole[:CACHED_RESULT_CHARS]
+                # Remembered, so the replay can say so. A cache cut at 6,000
+                # characters and replayed as "that is the current answer" told
+                # the model it had the whole result when it had a third of one,
+                # and the reasonable response to an answer that seems to be
+                # missing something is to ask again (BUG L-17).
+                if len(whole) > CACHED_RESULT_CHARS:
+                    self.state.partial_results[fingerprint] = len(whole)
+                else:
+                    self.state.partial_results.pop(fingerprint, None)
             if outcome.truncated:
                 self.state.truncated_at[fingerprint] = _volume(call)
             else:
@@ -1268,21 +1491,28 @@ class AgentLoop:
                 self.state.reads.pop(mutation.path, None)
 
             slice_path, slice_range = _slice_path(call, outcome)
-            if slice_path is not None:
-                # Recorded from the result, not the request: the tool clamps the
-                # range to the file, so a call for lines 1-9999 of a 200-line file
-                # has been given all of it, and a ledger built from the arguments
-                # would not know that.
-                self._record_read(
-                    slice_path, slice_range, int(outcome.meta.get("lines") or 0)
-                )
-            self.context.append_tool_result(
+            appended = self.context.append_tool_result(
                 call.name,
                 outcome.for_model(),
                 tool_call_id=call.id,
                 path=slice_path,
                 line_range=slice_range,
             )
+            if slice_path is not None:
+                # Recorded from what is *in context*, not from what the tool
+                # returned and not from what the model asked for. Three
+                # different numbers when a large file meets the 48k insertion
+                # cap, and the ledger's only job is to answer "has the model
+                # seen these lines" — so it is written from the message that
+                # holds them (BUG L-8). `append_tool_result` reports the span
+                # that survived the cap; `None` means none of it did, and the
+                # read is recorded as having delivered nothing.
+                self._record_read(
+                    slice_path,
+                    appended.line_range,
+                    int(outcome.meta.get("lines") or 0),
+                    delivered=appended.line_range is not None or slice_range is None,
+                )
 
             if note := self._retrieval_overlap(call, outcome):
                 # As a user message. It carries no `tool_call_id` because no
@@ -1297,12 +1527,24 @@ class AgentLoop:
 
             yield Event(
                 EventType.TOOL_RESULT,
-                {"id": call.id, "name": call.name, **outcome.as_dict()},
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "turn": self.context.turn,
+                    **outcome.as_dict(),
+                },
             )
 
             # A phase ends on its own tool call, not on its prose.
             if call.name in _TERMINAL:
                 if outcome.ok:
+                    # The phase is over, so nothing behind this call will run --
+                    # but every one of them was declared in the same assistant
+                    # message and every one of them still needs a result.
+                    self._answer_unrun(
+                        calls[index + 1 :],
+                        f"the {call.name} call in the same reply ended the phase.",
+                    )
                     yield from self._phase_ended(call.name, outcome)
                     return
                 # It reached for the exit and missed -- arguments the schema
@@ -1311,6 +1553,11 @@ class AgentLoop:
                 # to call something it keeps failing to call.
                 self.state.forced_terminal += 1
                 if self.state.forced_terminal >= MAX_FORCED_TERMINAL:
+                    self._answer_unrun(
+                        calls[index + 1 :],
+                        f"the run ended when {call.name} was refused for the "
+                        f"{self.state.forced_terminal}th time.",
+                    )
                     self.result = RunResult(
                         Outcome.NO_PROGRESS,
                         f"asked {self.state.forced_terminal} times to end the phase "
@@ -1322,6 +1569,12 @@ class AgentLoop:
                     )
                     return
                 self.state.must_answer = True
+                self.state.answer_because = (
+                    f"Your `{call.name}` call was refused: {outcome.for_model()[:300]}"
+                    + (f"\n\n{outcome.fix}" if outcome.fix else "")
+                    + "\n\nSend it again with arguments the schema accepts. Nothing "
+                    "else about the run has changed."
+                )
 
         # Turn-level progress, judged on the batch rather than on any one call.
         # A batch that dispatched nothing -- every call a verbatim repeat or a
@@ -1354,6 +1607,11 @@ class AgentLoop:
                 return
 
         if mutated:
+            # Writing is not research. The fence exists to stop a phase spent
+            # reading and never deciding; a turn that changed a file has decided,
+            # and counting it drove the acting phase into a wall at ~12 turns on
+            # a product that advertises 400 (BUG L-2).
+            self.state.research_turns = 0
             yield from self._inner_loop()
 
     def _stalled(self) -> RunResult:
@@ -1447,14 +1705,27 @@ class AgentLoop:
             # run:" with ok=false, which is how a call that succeeded came to
             # look like a call that failed -- and a model that reads a failure
             # retries it.
-            body = (
-                f"{call.name} returned:\n\n{cached}\n\n"
-                "-- that is the current answer. The call ran earlier, nothing in the "
-                "workspace has changed since, so it was answered from that result "
-                "rather than dispatched again. Use it and move to the next step; if it "
-                "does not tell you what you need, ask something different or say "
-                "plainly what is blocking you."
-            )
+            whole = self.state.partial_results.get(fingerprint)
+            if whole is None:
+                body = (
+                    f"{call.name} returned:\n\n{cached}\n\n"
+                    "-- that is the current answer. The call ran earlier, nothing in the "
+                    "workspace has changed since, so it was answered from that result "
+                    "rather than dispatched again. Use it and move to the next step; if it "
+                    "does not tell you what you need, ask something different or say "
+                    "plainly what is blocking you."
+                )
+            else:
+                body = (
+                    f"{call.name} returned (the first {len(cached):,} characters of "
+                    f"{whole:,}):\n\n{cached}\n\n"
+                    "-- the call ran earlier and nothing in the workspace has changed "
+                    "since, so this is the earlier result rather than a fresh dispatch, "
+                    "and only its beginning was kept. Asking again returns this same "
+                    "extract. If you need the part that is missing, ask something "
+                    "narrower -- a line range, a scoped path, a tighter pattern -- so "
+                    "the answer fits."
+                )
             if asks >= 3:
                 body += (
                     f"\n\nThis is ask number {asks} for this exact call, and it will "
@@ -1475,6 +1746,21 @@ class AgentLoop:
         if why := self._re_reading(call):
             return why, "asks for lines already in context; not re-read"
         return None
+
+    def _gate_wants_an_edit(self) -> bool:
+        """Whether a failing gate is currently asking for a change that has not come.
+
+        The one situation where forcing the phase's terminal tool contradicts
+        the context the model is reading: the gate report sits in the transcript
+        saying "make the edit", and the request forbids every tool but `finish`.
+        """
+        report = self.state.last_gate
+        return (
+            self.state.mode is Mode.AGENT
+            and report is not None
+            and not report.ok
+            and self.state.gate_failures <= MAX_GATE_FAILURES
+        )
 
     def _terminal_choice(self) -> dict[str, Any]:
         """The tool this mode is forced to call when it must stop.
@@ -1569,7 +1855,16 @@ class AgentLoop:
 
         self.state.research_turns = 0
         self.state.forced_terminal = 0
-        steps = steps_from_meta(dict(outcome.meta))
+        # And the narration re-ask. It is once per *phase*, which is what the
+        # reasoning behind it was always about: a Planner that has decided there
+        # is nothing to plan should not be forced twice over the same decision.
+        # It was scoped to the run, so a Planner that consumed it handed the
+        # acting mode a phase with no narration recovery at all — and the acting
+        # mode is where narration costs the most, because a "Making the edit
+        # now" with no tool call is a turn in which nothing was edited
+        # (prior-audit TC-4).
+        self.state.forced = False
+        steps = self._normalise_plan(steps_from_meta(dict(outcome.meta)))
         self.state.plan = steps
         self.state.plan_summary = str(outcome.meta.get("summary") or "")
         rendered = "\n".join(step.rendered(i) for i, step in enumerate(steps, 1))
@@ -1712,7 +2007,7 @@ class AgentLoop:
             )
             return
 
-        key = (self.router.mutations, tuple(self.router.touched))
+        key = (self.router.model_mutations, tuple(self.router.touched))
         if self.state.last_gate is not None and key == self.state.gate_key:
             # Only reachable on a failing report: a clean one ends the run below.
             report = self.state.last_gate
@@ -1757,8 +2052,14 @@ class AgentLoop:
         fail identically, and asking again is asking the same question.
         """
         self.state.gate_failures += 1
-        self.state.gate_mutations = self.router.mutations
+        self.state.gate_mutations = self.router.model_mutations
         self.state.idle_since_gate = 0
+        # A gate verdict is new information and the work it asks for is a fresh
+        # piece of work. Carrying the phase's research count across it is what
+        # made a gate failure at turn 13 unfixable (BUG L-2); the run is still
+        # bounded, by MAX_GATE_FAILURES and by `_gate_stalled`, both of which
+        # count turns that changed nothing.
+        self.state.research_turns = 0
         if self.state.gate_failures > MAX_GATE_FAILURES:
             self.result = RunResult(
                 Outcome.UNVERIFIED,
@@ -1813,8 +2114,8 @@ class AgentLoop:
         report = self.state.last_gate
         if report is None or report.ok:
             return ""
-        if self.router.mutations != self.state.gate_mutations:
-            self.state.gate_mutations = self.router.mutations
+        if self.router.model_mutations != self.state.gate_mutations:
+            self.state.gate_mutations = self.router.model_mutations
             self.state.idle_since_gate = 0
             return ""
         self.state.idle_since_gate += 1
@@ -1848,7 +2149,21 @@ class AgentLoop:
         could outlive the thing that made it true. What carries is the fact that
         a question has already been asked, which does not go stale -- and the
         read coverage, which the context still holds the reads for.
+
+        **The Router comes too.** It was rebuilt per message while the ledgers
+        were carried, and those two facts destroyed each other: a carried
+        ``mutations_seen`` of 3 met a Router at 0, the first tool batch of the
+        follow-up read that as "the world changed", and every carried ledger was
+        wiped (BUG L-5) -- by the very line whose comment says it prevents
+        exactly this. The Router is also the only thing that knows which files
+        this session has changed, so a fresh one left ``_unwritten_targets``
+        comparing a carried plan against an empty change set and the gate
+        scoping itself to nothing.
+
+        A conversation is one session, so the change set, the mutation count and
+        the undo snapshots are the session's, not the message's.
         """
+        self.router = previous.router
         self.state.seen_calls = dict(previous.state.seen_calls)
         self.state.reads = dict(previous.state.reads)
         self.state.retrievals = list(previous.state.retrievals)
@@ -1857,9 +2172,21 @@ class AgentLoop:
         self.state.plan = previous.state.plan
         self.state.plan_summary = previous.state.plan_summary
         self.state.dependencies_changed = previous.state.dependencies_changed
-        # `mutations_seen` travels with them, or the first mutation of the new
-        # message clears ledgers that were never synced and the carry is undone.
-        self.state.mutations_seen = previous.state.mutations_seen
+        # Read off the Router that is now shared, so the two agree by
+        # construction rather than by both being copied and hoping.
+        self.state.mutations_seen = self.router.mutations
+        self.state.gate_mutations = self.router.model_mutations
+
+        # Whatever the developer changed between the two messages, the run has
+        # not seen. The context still holds the old text -- nothing can be done
+        # about that without rewriting history -- but the ledger stops claiming
+        # the model has read the current file, so the re-read it needs is
+        # dispatched instead of refused.
+        for path in self._drop_stale_reads():
+            self.context.append_user(
+                f"{path} has changed on disk since you last read it. What is above "
+                "is the older version; read it again before you act on it."
+            )
 
     def _abort(self) -> RunResult:
         return RunResult(
@@ -1929,8 +2256,43 @@ class AgentLoop:
         missing = self._unwritten_targets()
         return ". The plan named files this run never wrote: " + ", ".join(missing) if missing else ""
 
+    def _normalise_plan(self, steps: Sequence[PlanStep]) -> tuple[PlanStep, ...]:
+        """Put every plan path into the form the change set is recorded in.
+
+        ``router.touched`` holds workspace-relative POSIX paths, because
+        ``_confine`` rewrites every path argument before a handler sees it. Plan
+        steps came straight off the model's JSON, so `./handler/user.go` and
+        `handler\\user.go` compared unequal to the `handler/user.go` the write
+        actually produced — and a step named that way was "never written" for the
+        life of the run, whatever the run did. It refused the first `finish` and
+        mis-headlined the DONE summary (BUG L-19).
+
+        A path that will not resolve is kept verbatim. It is the model's text and
+        the developer should see what was planned; it simply will not match, which
+        is the same outcome as before and is now the *only* case with that outcome.
+        """
+        out: list[PlanStep] = []
+        for step in steps:
+            if not step.file:
+                out.append(step)
+                continue
+            try:
+                rel = self.router.workspace.relative(
+                    self.router.workspace.resolve(step.file)
+                )
+            except (PathEscape, ValueError):
+                out.append(step)
+                continue
+            out.append(step if rel == step.file else replace(step, file=rel))
+        return tuple(out)
+
     def _unwritten_targets(self) -> list[str]:
-        """Plan steps whose file no change reached."""
+        """Plan steps whose file no change reached.
+
+        Both sides are workspace-relative POSIX paths: `touched` because
+        `_confine` normalises every argument, the plan because `_normalise_plan`
+        does the same at `submit_plan`.
+        """
         if not self.state.plan:
             return []
         touched = set(self.router.touched)
@@ -2020,9 +2382,10 @@ class AgentLoop:
         if not isinstance(path, str) or not path:
             return ""
 
-        ledger = self.state.reads.get(path)
-        if ledger is None:
+        recorded = self.state.reads.get(path)
+        if recorded is None:
             return ""
+        ledger = self._live_reads(path, recorded)
 
         start, end = _as_line(parsed.get("start")), _as_line(parsed.get("end"))
         if start is None and end is None:
@@ -2039,6 +2402,13 @@ class AgentLoop:
             return ""
 
         low = start or 1
+        if end is None and not ledger.lines:
+            # An open-ended read of a file whose length nothing has reported:
+            # `read_file(start=400)` means "from 400 to the end", and the end is
+            # unknown. Collapsing it to `(400, 400)` made a single covered line
+            # answer for the whole tail (BUG L-23). Unknown coverage is not
+            # coverage; dispatch it.
+            return ""
         high = end or (ledger.lines or low)
         if ledger.covers(low, high):
             return (
@@ -2059,22 +2429,91 @@ class AgentLoop:
             )
         return ""
 
-    def _record_read(self, path: str, span: tuple[int, int] | None, total: int) -> None:
-        """Remember what a dispatched read actually delivered.
+    def _live_reads(self, path: str, recorded: _ReadLedger) -> _ReadLedger:
+        """What the model can actually still see of ``path``, right now.
 
-        Recorded from the *result's* span rather than the call's arguments,
-        because the tool clamps the range to the file: a model asking for lines
-        1-9999 of a 200-line file has been given the whole thing, and a ledger
-        built from the request would not know that.
+        The context manager is the authority on that, and the loop asks rather
+        than remembers. This is the shape the prior audit's root cause (RC-1)
+        asks for: the ledger records *how often* a file has been asked for, which
+        is a fact about the run; the context holds *which lines are in front of
+        the model*, which is a fact about the messages — and the moment those two
+        answers came from the same place they could disagree.
+
+        `_forget_evicted` still rebuilds the stored spans on compaction, so the
+        persisted ledger stays honest. But the refusal no longer depends on that
+        having happened: any eviction, by any path, is visible here immediately.
+        """
+        live = _ReadLedger(lines=recorded.lines, calls=recorded.calls)
+        for low, high in self.context.coverage().get(path, []):
+            live.add(low, high)
+        return live
+
+    def _record_read(
+        self,
+        path: str,
+        span: tuple[int, int] | None,
+        total: int,
+        *,
+        delivered: bool = True,
+    ) -> None:
+        """Remember what a dispatched read actually put in front of the model.
+
+        Not the call's arguments: the tool clamps the range to the file, so a
+        model asking for lines 1-9999 of a 200-line file has been given the whole
+        thing. Not the tool's span either: the insertion cap can elide most of a
+        large file on the way into the context, and a ledger written from the
+        tool's span then refuses the re-read the elision marker just asked for
+        (BUG L-8). The caller passes the span of the message as it exists in
+        context.
+
+        ``delivered=False`` means the cap kept none of the file's lines. The call
+        still counts against the per-file read budget — it was dispatched and it
+        cost a turn — but it covered nothing, so the ledger records no lines.
         """
         ledger = self.state.reads.setdefault(path, _ReadLedger())
         ledger.calls += 1
         if total > 0:
             ledger.lines = total
+        ledger.mtime = self._mtime(path)
+        if not delivered:
+            return
         if span is not None:
             ledger.add(*span)
         elif total > 0:
             ledger.add(1, total)
+
+    def _mtime(self, path: str) -> float:
+        """When ``path`` was last written, or 0.0 if that cannot be answered."""
+        try:
+            return self.router.workspace.resolve(path).stat().st_mtime
+        except (OSError, PathEscape, ValueError):
+            return 0.0
+
+    def _drop_stale_reads(self) -> list[str]:
+        """Forget coverage of files that changed since the run that read them.
+
+        The read ledger carries across a follow-up, and between two messages the
+        developer is doing their own work: they read the agent's diff, fix a line
+        themselves, and type the next message. The ledger then refused the
+        re-read of a file whose contents had moved, and the agent reasoned about
+        the version it had been shown rather than the one on disk (BUG L-25).
+        The `carry_from` docstring drops `last_results` for exactly this reason
+        and kept `reads`.
+
+        By mtime rather than by content hash: this runs once per follow-up over
+        every file the conversation has read, and a stat is the cheap question.
+        A file whose mtime is unknown on either side is kept — dropping on "we
+        cannot tell" would discard the whole ledger on any filesystem that does
+        not report one.
+        """
+        dropped: list[str] = []
+        for path, ledger in list(self.state.reads.items()):
+            now = self._mtime(path)
+            if not ledger.mtime or not now or now == ledger.mtime:
+                continue
+            del self.state.reads[path]
+            dropped.append(path)
+        return dropped
 
     def _thrashing(self) -> str:
         """Whether the run is spending its turns on eviction rather than work.
@@ -2095,19 +2534,85 @@ class AgentLoop:
             "files at once"
         )
 
-    def _compact(self) -> Iterator[Event]:
+    def _compact(self, *, retain_pct: float = 0.35, reason: str = "threshold") -> Iterator[Event]:
+        """Compact, invalidate the ledgers, and say what it actually freed.
+
+        Every compaction goes through here, including the emergency one in
+        ``_complete``. That one used to call ``context.compact`` directly, so it
+        was invisible to the thrash detector and to the compaction counter
+        (BUG L-24) — and, once ledgers began to be invalidated on eviction, it
+        would also have been the one path that evicted content while leaving the
+        ledgers claiming the model could still see it.
+        """
         self.state.compactions.append(self.context.turn)
         before = self.context.usage().total
-        recap = self.context.compact(self._summarise)
+        recap = self.context.compact(self._summarise, retain_pct=retain_pct)
+        evicted = self.context.last_eviction
+        self._forget_evicted(evicted)
         yield Event(
             EventType.GATE,
             {
                 "kind": "compaction",
+                "reason": reason,
                 "before": before,
                 "after": self.context.usage().total,
                 "turns": getattr(recap, "turns", None),
+                # Reported because a compaction that freed nothing used to look
+                # identical to one that freed half the context.
+                "evicted_messages": evicted.messages,
+                "evicted_paths": list(evicted.paths),
             },
         )
+
+    def _forget_evicted(self, evicted: Eviction) -> None:
+        """Drop every ledger entry that described content compaction removed.
+
+        This is the second half of the prior audit's central finding: the
+        context manager evicts, the loop's ledgers refuse, and nothing connects
+        them. The recap tells the model "re-read one only if you need a line
+        range you have not seen" while the read intercept answers that same
+        re-read with "those lines are already in context above" — two true-
+        sounding messages, neither of which can be obeyed, and the model has no
+        way to recover the content (BUG L-10).
+
+        The read ledger is *rebuilt* from what the context still holds rather
+        than cleared, so a file with surviving reads keeps its coverage and only
+        the evicted spans become askable again. The call ledgers
+        (``last_results``, ``echoes``, ``truncated_at``) are cleared for evicted
+        ids: they exist to answer a repeat with "you already have this", and
+        after eviction that claim is simply false.
+
+        ``seen_calls`` and ``dead_ends`` survive deliberately. A dead end is a
+        fact about the world, not about the transcript — the arguments are still
+        invalid — and the repeat counts are what stop a post-compaction run from
+        walking the same circle again.
+        """
+        coverage = self.context.coverage()
+        for path in evicted.paths:
+            ledger = self.state.reads.get(path)
+            if ledger is None:
+                continue
+            spans = coverage.get(path, [])
+            if not spans:
+                # Nothing of this file is left in context. The dispatch count
+                # stays -- it is a budget against re-reading, and the reads did
+                # happen -- but the run has seen none of it any more.
+                ledger.covered = []
+                continue
+            ledger.covered = []
+            for low, high in spans:
+                ledger.add(low, high)
+
+        if not evicted.messages:
+            return
+        # The cached-result ledgers are keyed by fingerprint, not by message, so
+        # they cannot be pruned precisely. Any eviction makes "you already have
+        # this answer above" unreliable, and answering a repeat from a cache of
+        # a message that is gone is exactly the failure this is fixing.
+        self.state.last_results.clear()
+        self.state.partial_results.clear()
+        self.state.truncated_at.clear()
+        self.state.echoes.clear()
 
     def _summarise(self, messages: Sequence[Message]) -> Recap:
         """Summarise the evicted working set into a structured recap.
@@ -2125,9 +2630,7 @@ class AgentLoop:
             min((m.turn for m in messages), default=self.context.turn),
             max((m.turn for m in messages), default=self.context.turn),
         )
-        transcript = "\n\n".join(
-            f"[{m.role}{'' if not m.path else ' ' + m.path}] {m.content}" for m in messages
-        )
+        transcript = "\n\n".join(_rendered(m) for m in messages)
 
         read = self._read_paths(messages)
         modified = tuple(self.router.touched)
@@ -2243,6 +2746,36 @@ class AgentLoop:
                 f"{listed}"
             )
         return f"{len(files)} file(s) changed and the gate is clean:\n{listed}"
+
+
+#: How much of a tool call's arguments the summariser is shown. Enough to tell
+#: `write_file(handler/user.go)` from `write_file(repo/postgres/user.go)`, not
+#: enough for one 40KB write to be the whole recap prompt.
+_ARGS_IN_TRANSCRIPT = 200
+
+
+def _rendered(message: Message) -> str:
+    """One message, as the summariser sees it.
+
+    It used to see ``content`` alone. An assistant turn that was purely tool
+    calls has an empty ``content``, so the transcript handed to the summariser
+    rendered every edit the run made as a blank line — and the histories that
+    summarised worst were exactly the write-heavy ones the recap matters most for
+    (BUG L-27). The recap then said nothing about what had been done, and the
+    post-compaction run had no way to know it had already written the file.
+
+    Arguments are truncated rather than omitted: which file was written is the
+    fact worth carrying, and the content of the write is in the workspace.
+    """
+    where = "" if not message.path else " " + message.path
+    head = f"[{message.role}{where}]"
+    parts = [f"{head} {message.content}".rstrip()]
+    for call in message.tool_calls:
+        args = (call.arguments or "").strip()
+        if len(args) > _ARGS_IN_TRANSCRIPT:
+            args = f"{args[:_ARGS_IN_TRANSCRIPT]}… ({len(call.arguments):,} chars)"
+        parts.append(f"{head} called {call.name}({args})")
+    return "\n".join(p for p in parts if p.strip() != head)
 
 
 def _safe_args(call: ToolCall) -> Any:

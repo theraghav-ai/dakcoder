@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import uuid
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,12 @@ from .model import Check, Lane, Limits, QuotaExceeded, Series, Snapshot, WindowS
 from .store import Applied, Conflict, MemoryStore, QuotaStore, ScriptContractError
 
 __all__ = ["QuotaPolicy", "Reservation", "StoreUnavailable"]
+
+
+#: How many settled reservation ids are remembered. A reservation is settled once,
+#: seconds after it opens, so this is several minutes of the busiest plausible
+#: traffic — far more than the "have I already settled this?" question needs.
+MAX_SETTLED_IDS = 4_096
 
 
 class StoreUnavailable(Exception):
@@ -151,7 +158,13 @@ class QuotaPolicy:
         #: Settled ids, so a double reconcile is caught rather than charged
         #: twice. Kept here rather than on the frozen Reservation, which the
         #: caller holds and could not be updated in place anyway.
-        self._settled: set[str] = set()
+        # Bounded, because it only exists to answer "have I already settled
+        # this?" for a reservation that is still in flight. It was an unbounded
+        # set holding every reservation id the process had ever settled — one
+        # more string per turn, for the life of the worker (BUG GW-5). A
+        # reservation is settled once, seconds after it is opened, so a few
+        # thousand ids is far more history than the question needs.
+        self._settled: OrderedDict[str, None] = OrderedDict()
         #: When the store was first seen to be down in the current outage, or
         #: None. Reset by any successful store call, so an intermittent store
         #: does not accumulate its blips into an expired grace window.
@@ -318,7 +331,7 @@ class QuotaPolicy:
                 break
 
         self._open.pop(reservation.id, None)
-        self._settled.add(reservation.id)
+        self._remember_settled(reservation.id)
 
         return Settlement(
             reservation_id=reservation.id,
@@ -351,7 +364,12 @@ class QuotaPolicy:
                     raise
                 break
         self._open.pop(reservation.id, None)
-        self._settled.add(reservation.id)
+        self._remember_settled(reservation.id)
+
+    def _remember_settled(self, reservation_id: str) -> None:
+        self._settled[reservation_id] = None
+        while len(self._settled) > MAX_SETTLED_IDS:
+            self._settled.popitem(last=False)
 
     def _bill(self, prompt: int, completion: int, cached: int) -> int:
         """What a turn costs, with the cached-prefill discount applied.

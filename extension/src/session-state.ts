@@ -1160,6 +1160,16 @@ function readMutations(value: unknown): Mutation[] {
   }));
 }
 
+/**
+ * A `gate` event's data as a typed `GateEvent`.
+ *
+ * Exported because activation needs the same reading to decide whether to offer
+ * a local re-run, and two parsers of one wire shape is one parser too many.
+ */
+export function readGateEvent(d: Record<string, unknown>): GateEvent {
+  return readGate(d);
+}
+
 function readGate(d: Record<string, unknown>): GateEvent {
   const stages: GateStage[] = records(d.stages).map((s) => ({
     name: str(s.name),

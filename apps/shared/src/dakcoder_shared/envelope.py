@@ -127,7 +127,18 @@ class ToolResult:
         return self.content
 
     def as_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"ok": self.ok, "content": self.content}
+        """The wire form, with the content capped.
+
+        The context manager caps its copy of a tool result at insertion; this one
+        was uncapped, so a 400KB build log went into the in-RAM event log, into
+        the transcript on disk, and out over SSE at full size — three copies of
+        something the model never saw in full (BUG L-26). The panel truncates for
+        display anyway, so the only thing the extra bytes bought was memory.
+
+        The cap is generous: it is above what any renderer here emits, so in
+        practice it fires on a runaway build log and nothing else.
+        """
+        payload: dict[str, Any] = {"ok": self.ok, "content": _capped(self.content)}
         if self.mutations:
             payload["mutations"] = [m.as_dict() for m in self.mutations]
         else:
@@ -152,6 +163,19 @@ class ToolResult:
     def paths(self) -> tuple[str, ...]:
         """Just the touched paths — what the gate scopes itself to."""
         return tuple(m.path for m in self.mutations)
+
+
+#: How much of a tool result's content travels on the event stream and into the
+#: transcript. Everything that reaches the model is already capped by the context
+#: manager's per-tool caps; this bounds the *other* three copies.
+MAX_EVENT_CONTENT = 64_000
+
+
+def _capped(text: str) -> str:
+    if len(text) <= MAX_EVENT_CONTENT:
+        return text
+    dropped = len(text) - MAX_EVENT_CONTENT
+    return f"{text[:MAX_EVENT_CONTENT]}\n… {dropped:,} more characters not shown"
 
 
 # ── C2: the event stream ────────────────────────────────────────────────────
@@ -188,7 +212,15 @@ class EventType(StrEnum):
 
 
 #: Types that must never be written to a transcript or replayed on reconnect.
-TRANSIENT: frozenset[EventType] = frozenset({EventType.ASSISTANT_DELTA, EventType.HEARTBEAT})
+#: Types that are relayed but never written to a transcript.
+#:
+#: ``QUOTA`` joins the other two because it carries no data: the extension's own
+#: comment says it "is treated as a signal and not as data — the status bar
+#: re-reads the endpoint whose shape is under contract". A signal in a transcript
+#: is a row that means nothing to whoever reads it later.
+TRANSIENT: frozenset[EventType] = frozenset(
+    {EventType.ASSISTANT_DELTA, EventType.HEARTBEAT, EventType.QUOTA}
+)
 
 
 @dataclass(frozen=True, slots=True)

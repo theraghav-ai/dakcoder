@@ -108,6 +108,11 @@ class _Refresh:
     family: str
     expires_at: float
     used: bool = False
+    #: The provider's own access token, captured at sign-in and carried across
+    #: rotations. ``recheck`` needs a credential to re-read the account with, and
+    #: the alternative — an administrative GitLab token on the gateway — would
+    #: make a gateway compromise a compromise of every account.
+    provider_token: str = ""
 
 
 def verifier_challenge(verifier: str) -> str:
@@ -180,7 +185,7 @@ class AuthService:
                 str(exc), retryable=exc.retryable, status=503 if exc.retryable else 401
             ) from exc
 
-        return self._issue(profile)
+        return self._issue(profile, provider_token=token)
 
     # -- refresh -------------------------------------------------------------
 
@@ -215,12 +220,14 @@ class AuthService:
 
         record.used = True
 
-        profile = await self._recheck(record.sub)
+        profile = await self._recheck(record.sub, record.provider_token)
         if not profile.active:
             self._revoke_family(record.family)
             raise AuthError("this account is no longer active")
 
-        return self._issue(profile, family=record.family)
+        return self._issue(
+            profile, family=record.family, provider_token=record.provider_token
+        )
 
     def revoke(self, refresh_token: str) -> None:
         record = self._refresh.get(refresh_token)
@@ -265,7 +272,9 @@ class AuthService:
 
     # -- internals -----------------------------------------------------------
 
-    def _issue(self, profile: Profile, family: str = "") -> Session:
+    def _issue(
+        self, profile: Profile, family: str = "", *, provider_token: str = ""
+    ) -> Session:
         if not profile.active:
             raise AuthError("this account is not active")
 
@@ -286,6 +295,7 @@ class AuthService:
             sub=profile.sub,
             family=family,
             expires_at=time.monotonic() + REFRESH_TTL.total_seconds(),
+            provider_token=provider_token,
         )
         return Session(
             access_token=access,
@@ -295,12 +305,20 @@ class AuthService:
             expires_at=self._clock() + self.minter.access_ttl,
         )
 
-    async def _recheck(self, sub: str) -> Profile:
+    async def _recheck(self, sub: str, provider_token: str = "") -> Profile:
         """Re-read the account from the IdP.
 
         A refresh that trusted the profile captured at sign-in would make the
         fifteen-minute expiry pointless: the whole reason for a short access
         token is that something re-asks this question.
+
+        ``recheck`` is on the ``IdentityProvider`` protocol now. It was found
+        with ``getattr`` and no production adapter had it, so this raised 501 in
+        production and returned a session in CI — every real session died at
+        fifteen minutes and asked for a full browser sign-in (BUG GW-1). The
+        ``getattr`` remains only so an adapter written against the older,
+        optional shape degrades with an explanation rather than an
+        AttributeError.
         """
         recheck = getattr(self.identity, "recheck", None)
         if recheck is None:
@@ -310,7 +328,7 @@ class AuthService:
                 status=501,
             )
         try:
-            return await recheck(sub)
+            return await recheck(sub, provider_token)
         except IdentityError as exc:
             raise AuthError(
                 str(exc), retryable=exc.retryable, status=503 if exc.retryable else 401

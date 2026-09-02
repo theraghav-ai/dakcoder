@@ -7,11 +7,25 @@ which is why the fixture workspace is CRLF throughout.
 
 from __future__ import annotations
 
+import os
+import shutil
+
 import pytest
 
 from dakcoder_agent.modes import Mode
 from dakcoder_agent.tools.router import Router
 from dakcoder_shared.paths import Workspace
+
+#: The gofmt tests assert what the real formatter does to real bytes; without the
+#: binary they assert only that a missing-toolchain result is a missing-toolchain
+#: result. Skipping is right on a laptop without Go and wrong in CI, so the same
+#: DAKCODER_REQUIRE_INTEGRATION switch the gotools suite uses turns it back into
+#: a failure where a missing toolchain means a broken pipeline.
+_HAS_GOFMT = shutil.which("gofmt") is not None
+if not _HAS_GOFMT and os.environ.get("DAKCODER_REQUIRE_INTEGRATION"):
+    raise RuntimeError("DAKCODER_REQUIRE_INTEGRATION is set but gofmt is not on PATH")
+
+needs_gofmt = pytest.mark.skipif(not _HAS_GOFMT, reason="gofmt is not on PATH")
 
 
 def run(router: Router, tool: str, **args):
@@ -229,6 +243,7 @@ def test_deleting_an_absent_file_is_idempotent(router: Router) -> None:
 # ── gofmt and line endings ──────────────────────────────────────────────────
 
 
+@needs_gofmt
 def test_gofmt_formats_without_converting_line_endings(router: Router, workspace) -> None:
     """gofmt -w rewrites CRLF as LF. Measured, not assumed.
 
@@ -249,6 +264,7 @@ def test_gofmt_formats_without_converting_line_endings(router: Router, workspace
     assert out.meta["eol_restored"] == 1
 
 
+@needs_gofmt
 def test_a_file_changed_only_by_line_endings_is_not_reported_as_modified(
     router: Router,
 ) -> None:
@@ -262,6 +278,7 @@ def test_a_file_changed_only_by_line_endings_is_not_reported_as_modified(
     assert "already formatted" in out.content
 
 
+@needs_gofmt
 def test_gofmt_leaves_an_lf_file_as_lf(router: Router, workspace) -> None:
     path = workspace.root / "core" / "port" / "x.go"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,6 +288,7 @@ def test_gofmt_leaves_an_lf_file_as_lf(router: Router, workspace) -> None:
     assert b"\r\n" not in path.read_bytes()
 
 
+@needs_gofmt
 def test_unparseable_go_is_not_reported_as_a_gofmt_failure(
     router: Router, workspace
 ) -> None:

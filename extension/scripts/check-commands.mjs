@@ -83,6 +83,43 @@ ${shadowed.length} command(s) registered over an id VS Code owns:
   process.exit(1);
 }
 
+/**
+ * And the other direction: a command with a handler and no palette entry.
+ *
+ * This was checked in one direction only, and the gap was real (BUG EXT-18): six
+ * commands — including `dakcoder.stopTask`, which the status bar's own tooltip
+ * tells the developer to run — had handlers and no way to reach them. Nothing
+ * fails; the feature is simply not there, and the person looking for it
+ * concludes the extension cannot do it.
+ *
+ * A command deliberately kept out of the palette is contributed with a
+ * `commandPalette` entry of `"when": "false"`, which is how the context-menu
+ * commands here already do it. So "registered and not contributed at all" has no
+ * legitimate form.
+ */
+const uncontributed = [...registered]
+  .filter((c) => c.startsWith('dakcoder.') && !declared.has(c) && !reserved.has(c))
+  .sort();
+
+if (uncontributed.length > 0) {
+  console.error(`
+${uncontributed.length} command(s) registered with no entry in package.json:
+`);
+  for (const c of uncontributed) console.error(`  ${c}`);
+  console.error(
+    [
+      '',
+      'These have handlers and no way to reach them: not in the palette, not in a',
+      'menu, not discoverable at all. Add a `contributes.commands` entry — and if',
+      'it should not appear in the palette, add a `commandPalette` menu entry with',
+      '`"when": "false"` the way the context-menu commands do.',
+      '',
+    ].join(EOL),
+  );
+  process.exit(1);
+}
+
 console.log(
-  `all ${declared.size} declared commands are registered, none over a view's own id`,
+  `all ${declared.size} declared commands are registered, all ${registered.size} ` +
+    `registered commands are contributed, none over a view's own id`,
 );

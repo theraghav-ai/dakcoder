@@ -6,17 +6,26 @@ resumption path, so a dropped connection loses the live view of a run that is
 still executing. Every event here carries a monotonic id and is kept, so
 ``since_id`` replay is a query rather than a rewrite.
 
-**Events are persisted before they are sent.** The order matters. Sending first
+**Events are recorded before they are sent.** The order matters. Sending first
 and recording afterwards means a crash between the two produces an event the
 client saw and the log does not have — and then resumption silently skips it,
 which is worse than losing the connection, because nothing looks wrong.
 
-**Revert restores from git, not from a snapshot.** §12: restore every path the
-session touched to HEAD, deleting files that have no baseline. Reading HEAD at
-revert time rather than copying files at write time means no memory is held for
-a revert that will probably never happen, and it is the same content git would
-give a developer typing the command themselves — which is what they will compare
-it against.
+**And written down.** This paragraph used to say "persisted" and mean "appended
+to a list in this process": a daemon restart — which a VS Code reload causes —
+took every transcript with it, along with the mutation list ``revert`` reads
+(BUG L-7). ``journal.py`` now appends each stored event to
+``.dakcoder/sessions/<id>/events.jsonl`` and keeps a small ``session.json``
+summary beside it, and ``SessionStore`` restores the summaries at startup.
+Best-effort throughout: a full disk costs the transcript, never the run.
+
+**Revert restores from a pre-run snapshot, not from git.** ``undo.py`` copies a
+path's bytes the first time a mutating tool touches it, and ``plan_revert``
+reads that. The earlier design restored to HEAD, which is correct only if the
+agent was the only writer since the last commit — an assumption the rest of this
+system is careful never to make, and one that destroyed a developer's
+uncommitted edits and deleted their untracked files (BUG L-11). See §8 of
+``ARCHITECTURE_AUDIT.md``.
 """
 
 from __future__ import annotations
@@ -25,7 +34,7 @@ import asyncio
 import subprocess
 import threading
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -35,6 +44,8 @@ from typing import Any
 from dakcoder_shared.envelope import TRANSIENT, Event, EventType
 
 from .loop import Outcome, RunResult
+from .journal import Journal, parse_time, restore_summaries
+from .undo import PreState, UndoStore
 
 __all__ = ["Session", "SessionStore", "Status", "StoredEvent", "RevertPlan"]
 
@@ -152,6 +163,19 @@ class Session:
     #: Corrections typed while the run is going. Drained by the loop at the top
     #: of each turn.
     _steer: list[str] = field(default_factory=list)
+    #: Set as the run ends, so a correction typed in the window between the last
+    #: drain and the end of the run becomes the next message rather than being
+    #: appended to a queue nobody will read again.
+    _steer_closed: bool = False
+
+    #: Where this session is written down. ``None`` for a session nobody will
+    #: want back — the tests build plenty, and a fixture should not leave
+    #: directories in a temp workspace it did not ask for.
+    journal: Journal | None = None
+    #: True for a session restored from disk whose events have not been read
+    #: back yet. The transcript is the expensive part and most callers only want
+    #: the summary.
+    _events_pending: bool = False
 
     _next_id: int = 1
     _subscribers: list[asyncio.Queue] = field(default_factory=list)
@@ -162,9 +186,11 @@ class Session:
     def record(self, event: Event) -> StoredEvent:
         """Persist an event and hand it to every live subscriber.
 
-        Persisted first. A crash between sending and recording would produce an
-        event the client saw and the log does not have, and resumption would then
-        silently skip it — a hole that looks like nothing is wrong.
+        Recorded first, and written to the journal in the same lock, so the file
+        is in id order for the same reason the list is. A crash between sending
+        and recording would produce an event the client saw and the log does not
+        have, and resumption would then silently skip it — a hole that looks like
+        nothing is wrong.
 
         Transient events (``assistant_delta``, ``heartbeat``) are relayed but not
         stored: they are superseded by the ``assistant`` message that follows, so
@@ -182,11 +208,26 @@ class Session:
                 self._next_id += 1
                 self.events.append(stored)
 
+            mutated = False
             if event.type is EventType.TOOL_RESULT:
                 for mutation in event.data.get("mutations") or []:
                     path = mutation.get("path")
                     if path and path not in self.mutations:
                         self.mutations.append(path)
+                        mutated = True
+
+            # Written down inside the lock, so the file is in id order for the
+            # same reason the list is. Buffered, so this costs a string append
+            # per event and a disk write a few times a turn.
+            if self.journal is not None and not event.transient:
+                self.journal.append(stored.as_dict())
+                if mutated:
+                    # The mutation list is what `revert` reads, and a revert
+                    # after a crash is exactly the revert the developer wants.
+                    self.journal.flush()
+                    self._write_meta()
+                elif event.type in (EventType.FINISH, EventType.END):
+                    self.journal.flush()
 
             subscribers = list(self._subscribers)
 
@@ -218,6 +259,56 @@ class Session:
         for path in result.mutations:
             if path not in self.mutations:
                 self.mutations.append(path)
+        if self.journal is not None:
+            self.journal.flush()
+            self._write_meta()
+
+    def _write_meta(self) -> None:
+        """Update the on-disk summary. Never the transcript: that is append-only."""
+        if self.journal is None:
+            return
+        self.journal.write_meta(
+            {
+                "id": self.id,
+                "task": self.task,
+                "workspace": self.workspace,
+                "status": str(self.status),
+                "created_at": self.created_at.isoformat(),
+                "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+                "summary": self.summary,
+                "mutations": list(self.mutations),
+            }
+        )
+
+    def hydrate(self) -> None:
+        """Read the transcript back, for a session restored from disk.
+
+        Called when something actually asks for it. A daemon starting in a
+        workspace with a hundred finished sessions reads a hundred small
+        summaries; it does not read a hundred transcripts.
+        """
+        with self._lock:
+            if not self._events_pending or self.journal is None:
+                return
+            self._events_pending = False
+            restored: list[StoredEvent] = []
+            for raw in self.journal.read_events():
+                try:
+                    restored.append(
+                        StoredEvent(
+                            id=int(raw["id"]),
+                            type=EventType(raw["type"]),
+                            data=raw.get("data") or {},
+                            at=parse_time(raw.get("at")) or self.created_at,
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+            # Ahead of anything already in memory: a restored session that has
+            # been run again holds the new events, and the file holds the old.
+            existing = {e.id for e in self.events}
+            self.events[:0] = [e for e in restored if e.id not in existing]
+            self._next_id = max((e.id for e in self.events), default=0) + 1
 
     def abort(self) -> None:
         self.cancel.set()
@@ -225,14 +316,45 @@ class Session:
     def wind_down(self) -> None:
         self.winding_down.set()
 
-    def steer(self, text: str) -> None:
+    def steer(self, text: str) -> bool:
+        """Queue a correction for the running loop to read before its next turn.
+
+        Returns False once the run has stopped taking them. That answer has to
+        come from inside the lock, because the caller's ``session.running`` check
+        and this append were two separate observations of a value the worker
+        thread changes: a message posted in that window was appended to a queue
+        nothing would ever drain, and was then neither delivered, nor recorded,
+        nor turned into a follow-up — the developer's message simply vanished
+        (BUG L-9). A False here means "this is the next message, not a
+        correction", which the caller can act on.
+        """
         with self._lock:
+            if self._steer_closed:
+                return False
             self._steer.append(text)
+            return True
 
     def drain_steer(self) -> list[str]:
         with self._lock:
             queued, self._steer = self._steer, []
         return queued
+
+    def close_steer(self) -> list[str]:
+        """Stop taking corrections, and hand back anything never drained.
+
+        Called once by the worker as the run ends. Whatever comes back was typed
+        while the run was alive and read by nobody, so the caller owes the
+        developer a follow-up run with it.
+        """
+        with self._lock:
+            self._steer_closed = True
+            queued, self._steer = self._steer, []
+        return queued
+
+    def reopen_steer(self) -> None:
+        """Take corrections again. Called when a session starts another run."""
+        with self._lock:
+            self._steer_closed = False
 
     @property
     def queued(self) -> int:
@@ -270,20 +392,73 @@ class Session:
             "winding_down": self.winding_down.is_set(),
         }
         if transcript:
+            self.hydrate()
             payload["transcript"] = [e.as_dict() for e in self.events]
+            payload["events"] = len(self.events)
         return payload
 
 
 class SessionStore:
     """Sessions for this runtime, and the git operations revert needs."""
 
-    def __init__(self, workspace: Path, *, limit: int = 200) -> None:
+    def __init__(self, workspace: Path, *, limit: int = 200, persist: bool = True) -> None:
         self.workspace = workspace
         self.limit = limit
+        self.persist = persist
         self._sessions: dict[str, Session] = {}
+        if persist:
+            self.restore()
+
+    def restore(self) -> int:
+        """Load what previous runs of the daemon left behind.
+
+        A VS Code reload restarts the daemon, and until now that took every
+        transcript with it — along with the mutation list `revert` reads, which
+        is the one piece of state a developer actually needs *after* something
+        has gone wrong (BUG L-7).
+
+        Summaries only; `Session.hydrate` reads a transcript when one is asked
+        for. A session that was RUNNING when the process died is marked ERROR:
+        nothing is driving it, and leaving it "running" makes it unresumable,
+        undeletable and permanently in the way.
+        """
+        loaded = 0
+        for meta in restore_summaries(self.workspace):
+            session_id = str(meta.get("id"))
+            if not session_id or session_id in self._sessions:
+                continue
+            status = Status.of(str(meta.get("status") or "error"))
+            summary = str(meta.get("summary") or "")
+            if status is Status.RUNNING:
+                status = Status.ERROR
+                summary = summary or "the runtime stopped while this run was in flight"
+            created = parse_time(meta.get("created_at")) or datetime.now(tz=timezone.utc)
+            self._sessions[session_id] = Session(
+                id=session_id,
+                task=str(meta.get("task") or ""),
+                workspace=str(meta.get("workspace") or self.workspace),
+                status=status,
+                created_at=created,
+                finished_at=parse_time(meta.get("finished_at")),
+                summary=summary,
+                mutations=[str(m) for m in (meta.get("mutations") or [])],
+                journal=Journal(self.workspace, session_id),
+                _events_pending=True,
+                _steer_closed=True,
+            )
+            loaded += 1
+        self._trim()
+        return loaded
 
     def create(self, task: str) -> Session:
-        session = Session(id=uuid.uuid4().hex[:12], task=task, workspace=str(self.workspace))
+        session_id = uuid.uuid4().hex[:12]
+        session = Session(
+            id=session_id,
+            task=task,
+            workspace=str(self.workspace),
+            journal=Journal(self.workspace, session_id) if self.persist else None,
+        )
+        session._write_meta()
         self._sessions[session.id] = session
         self._trim()
         return session
@@ -297,8 +472,17 @@ class SessionStore:
             sessions = [s for s in sessions if str(s.status) == status]
         return sessions
 
+    #: Called with a session id whenever the store stops holding it, so the
+    #: things keyed on that id elsewhere go too. Set by the loopback, which owns
+    #: the context and the loop for each session; ``SessionStore`` should not
+    #: know what they are.
+    on_forget: Callable[[str], None] | None = None
+
     def delete(self, session_id: str) -> bool:
-        return self._sessions.pop(session_id, None) is not None
+        gone = self._sessions.pop(session_id, None) is not None
+        if gone:
+            self._forget(session_id)
+        return gone
 
     def _trim(self) -> None:
         if len(self._sessions) <= self.limit:
@@ -309,8 +493,35 @@ class SessionStore:
         )
         for session in finished[: len(self._sessions) - self.limit]:
             del self._sessions[session.id]
+            self._forget(session.id)
+
+    def _forget(self, session_id: str) -> None:
+        """Tell the owner of everything else keyed on this session that it is gone.
+
+        The store trimmed itself and `runtime.contexts` / `runtime.loops` kept
+        the whole message list and the whole ledger set for every session the
+        daemon had ever run (BUG L-12). A long-lived daemon in a busy workspace
+        held every conversation it had ever had, and the one thing it definitely
+        no longer needed was the one nothing dropped.
+        """
+        if self.on_forget is None:
+            return
+        try:
+            self.on_forget(session_id)
+        except Exception:  # noqa: BLE001 - housekeeping must not fail a request
+            pass
 
     # -- revert ------------------------------------------------------------
+
+    def undo_store(self, session: Session) -> UndoStore:
+        """The pre-run snapshots for one session.
+
+        Constructed on demand from the session id rather than held on the
+        Session, so a revert works after a daemon restart — which is the case
+        the developer is most likely to want it in, and the case the old
+        HEAD-based revert was most dangerous in.
+        """
+        return UndoStore(self.workspace, session.id)
 
     def plan_revert(self, session: Session) -> RevertPlan:
         """Work out what a revert would do, without doing it.
@@ -318,6 +529,14 @@ class SessionStore:
         Refuses a running session (§12's guard) by returning everything as
         blocked rather than by raising, so the caller can show the reason in the
         same list it would have shown the paths in.
+
+        The pre-run snapshot decides, not HEAD (BUG L-11). Restoring a touched
+        path to HEAD is only correct when the agent was the only writer since the
+        last commit, and nothing else in this system assumes that: it destroyed a
+        developer's uncommitted edit to a file the agent later touched, and
+        *deleted* a developer's untracked file the agent merely modified. What
+        the run found at a path is a fact the run can record, so it records it,
+        and a path with no record is blocked rather than guessed at.
         """
         if session.running:
             return RevertPlan(
@@ -327,33 +546,85 @@ class SessionStore:
                 ),
             )
 
+        undo = self.undo_store(session)
         restore: list[str] = []
         delete: list[str] = []
         blocked: list[tuple[str, str]] = []
 
         for path in session.mutations:
-            tracked = self._in_head(path)
-            if tracked is None:
-                blocked.append((path, "this workspace is not a git repository"))
-            elif tracked:
-                restore.append(path)
-            else:
-                # No baseline in HEAD means the session created it. §12: delete.
-                delete.append(path)
+            match undo.state(path):
+                case PreState.FILE:
+                    restore.append(path)
+                case PreState.ABSENT:
+                    delete.append(path)
+                case PreState.TOO_LARGE:
+                    blocked.append(
+                        (path, "it was too large to snapshot before the run changed it")
+                    )
+                case PreState.UNREADABLE:
+                    blocked.append(
+                        (path, "its contents could not be read before the run changed it")
+                    )
+                case PreState.UNRECORDED:
+                    blocked.append(
+                        (
+                            path,
+                            "the tool that changed it does not say which file it will "
+                            "write until afterwards, so no pre-run copy was taken",
+                        )
+                    )
+                case _:
+                    blocked.append((path, self._no_snapshot_reason(path)))
+
         return RevertPlan(session.id, tuple(restore), tuple(delete), tuple(blocked))
+
+    def _no_snapshot_reason(self, path: str) -> str:
+        """Why an unsnapshotted path is not reverted, in the terms the developer needs.
+
+        Deliberately not "restore it from HEAD anyway". A path reaches here when
+        it was changed by something that did not run through the router's
+        snapshot — a sidecar tool writing a generated file, a run that predates
+        this store, a snapshot the disk refused — and in every one of those cases
+        the run does not know what was there before. Reverting to HEAD would be a
+        guess with a developer's uncommitted work as the stake.
+        """
+        if not self._is_repo():
+            return "there is no pre-run snapshot of it, and this is not a git repository"
+        if self._in_head(path):
+            return (
+                "there is no pre-run snapshot of it; restoring it from HEAD would "
+                "also discard any edit made before the run"
+            )
+        return (
+            "there is no pre-run snapshot of it, and it is not in HEAD, so nothing "
+            "here knows whether the run created it or only changed it"
+        )
 
     def revert(self, session: Session) -> RevertPlan:
         plan = self.plan_revert(session)
         if plan.blocked or plan.empty:
             return plan
 
-        if plan.restore:
-            self._git("checkout", "HEAD", "--", *plan.restore)
+        undo = self.undo_store(session)
+        failed: list[tuple[str, str]] = []
+        restored: list[str] = []
+        for path in plan.restore:
+            if undo.restore(path):
+                restored.append(path)
+            else:
+                failed.append((path, "its snapshot could not be read back"))
+
+        deleted: list[str] = []
         for path in plan.delete:
             target = self.workspace / path
-            if target.is_file():
-                target.unlink()
-        return plan
+            try:
+                if target.is_file():
+                    target.unlink()
+                deleted.append(path)
+            except OSError as exc:
+                failed.append((path, f"it could not be removed: {exc}"))
+
+        return RevertPlan(session.id, tuple(restored), tuple(deleted), tuple(failed))
 
     def _in_head(self, path: str) -> bool | None:
         """Whether HEAD has this path. ``None`` when there is no repository."""

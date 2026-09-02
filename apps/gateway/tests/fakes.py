@@ -31,6 +31,9 @@ class FakeGitLab:
         self.exchanges: list[tuple[str, str, str]] = []
         self.unreachable = False
         self.rechecks = 0
+        #: The provider token each recheck was given, so a test can assert the
+        #: gateway carries one rather than needing an administrative credential.
+        self.recheck_tokens: list[str] = []
 
     def authorize_url(self, redirect_uri: str, challenge: str, state: str) -> str:
         return (
@@ -52,8 +55,9 @@ class FakeGitLab:
     async def profile(self, access_token: str) -> Profile:
         return self.profile_data
 
-    async def recheck(self, sub: str) -> Profile:
+    async def recheck(self, sub: str, access_token: str = "") -> Profile:
         self.rechecks += 1
+        self.recheck_tokens.append(access_token)
         if self.unreachable:
             raise IdentityError("connection refused", retryable=True)
         return self.profile_data

@@ -67,6 +67,20 @@ class IdentityProvider(Protocol):
         """Who that token belongs to, including group membership."""
         ...
 
+    async def recheck(self, sub: str, access_token: str = "") -> Profile:
+        """Re-read the account, for a refresh.
+
+        Part of the protocol rather than an optional attribute discovered with
+        ``getattr``. It was optional, no production adapter implemented it, and
+        the only implementation in the tree was the test fake — so
+        ``/v1/auth/refresh`` answered 501 in production and 200 in CI, every
+        session died at the fifteen-minute access-token TTL, and the developer
+        was sent through a full browser OAuth flow four times an hour (BUG GW-1).
+        A protocol member makes the absence a type error instead of a runtime
+        surprise nobody could see from the tests.
+        """
+        ...
+
 
 class GitLabIdentity:
     """The GitLab adapter.
@@ -145,6 +159,30 @@ class GitLabIdentity:
             active=state == "active",
             raw={"id": user.get("id"), "state": state},
         )
+
+    async def recheck(self, sub: str, access_token: str = "") -> Profile:
+        """Re-read the account with the provider token captured at sign-in.
+
+        Re-asking is the entire reason the access token is short-lived: a blocked
+        or deactivated account loses access within one token lifetime and nobody
+        has to run a deprovisioning step. It is the *user's* own token rather
+        than a service credential, which keeps the gateway free of an
+        administrative GitLab token — the blast radius of a leak here stays the
+        one account.
+
+        The identity is verified rather than assumed: if the token now answers
+        for a different account, the session it belongs to is not this one.
+        """
+        if not access_token:
+            raise IdentityError(
+                "no provider credential is held for that session; sign in again"
+            )
+        profile = await self.profile(access_token)
+        if profile.sub != sub:
+            raise IdentityError(
+                "the stored credential no longer identifies that account; sign in again"
+            )
+        return profile
 
     # -- transport ---------------------------------------------------------
 

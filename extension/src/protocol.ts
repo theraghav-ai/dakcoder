@@ -259,10 +259,19 @@ export interface Health {
   ok: boolean;
   api_version: string;
   version: string;
-  workspace: string;
-  gateway: string;
-  ready: { prewarmed: boolean; latency_ms?: number; reason?: string };
-  sessions: { total: number; running: number };
+  /**
+   * Everything below describes the developer's machine — which directory is
+   * open, which gateway it talks to, what is running — and needs the loopback
+   * token. `/v1/health` answers without one so the extension can tell "the
+   * runtime is down" from "the credential is wrong", but any process on the box
+   * could ask, and "which repository is this person working on" is not a
+   * liveness fact. Optional here because an unauthenticated caller does not get
+   * them, not because the runtime sometimes omits them.
+   */
+  workspace?: string;
+  gateway?: string;
+  ready?: { prewarmed: boolean; latency_ms?: number; reason?: string };
+  sessions?: { total: number; running: number };
 }
 
 export interface RevertPlan {

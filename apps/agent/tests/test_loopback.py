@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from datetime import datetime, timedelta, timezone
 import subprocess
 from pathlib import Path
 
@@ -25,7 +27,8 @@ from dakcoder_agent.modes import Mode
 from dakcoder_agent.prompts import system_prompt
 from dakcoder_agent.session import Status
 from dakcoder_agent.tools import control
-from dakcoder_agent.tools.router import Router
+from dakcoder_agent.tools.router import ApprovalRequest, Router
+from dakcoder_agent.undo import UndoStore
 from dakcoder_shared.llm import ChatResult, ToolCall, Usage
 
 from test_loop import ScriptedClient, calls, say
@@ -108,6 +111,10 @@ def scripted(router: Router, workspace):
     }
 
     def build(session, approve):
+        # Per session, exactly as `serve.build_loop` does it: the pre-run
+        # snapshot is what `revert` restores from, and a fixture without one
+        # would exercise a revert path production never takes.
+        router.undo = UndoStore(workspace.root, session.id)
         context = ContextManager(mode=Mode.ASK, system_prompt=system_prompt())
         return AgentLoop(context, ScriptedClient(plan["turns"]), router, approve=approve)
 
@@ -137,11 +144,21 @@ async def start(client: httpx.AsyncClient, task: str = "Add a Pension resource")
 
 
 async def settle(session_id: str, runtime: Loopback, tries: int = 200) -> None:
-    """Let the worker thread finish. The run is scripted, so this is quick."""
+    """Let the worker thread finish, *and* its events reach the transcript.
+
+    `session.running` is set on the worker thread while the events travel by
+    `call_soon_threadsafe`, so the status can go terminal with the last few
+    records still queued as callbacks. Waiting on the status alone let a test
+    read a transcript that was missing its final `assistant` and `end` — rarely,
+    and only under whatever scheduling the rest of the suite happened to
+    produce. `end` is the run's own statement that it is over, so that is what
+    is waited for.
+    """
     for _ in range(tries):
         session = runtime.sessions.get(session_id)
         if session and not session.running:
-            return
+            if any(str(e.type) == "end" for e in session.events):
+                return
         await asyncio.sleep(0.01)
 
 
@@ -571,11 +588,16 @@ async def test_a_running_session_cannot_be_reverted(
     await settle(session["id"], approving)
 
 
-async def test_revert_outside_a_git_repository_is_blocked_not_attempted(
-    client: httpx.AsyncClient, scripted: Loopback
+async def test_revert_works_outside_a_git_repository(
+    client: httpx.AsyncClient, scripted: Loopback, workspace
 ) -> None:
-    """Blocked with a reason rather than silently doing nothing: a revert that
-    reports success and changes nothing is the worst of both."""
+    """git is no longer the source of truth, so its absence no longer blocks.
+
+    Revert used to ask HEAD what was at each path and had to give up without a
+    repository. The run now records what it found before it wrote (BUG L-11),
+    which is both safer on a dirty tree and available in a directory that was
+    never a repository at all.
+    """
     scripted._plan["turns"] = [
         plan_for("handler/pension.go", "add the handler"),
         calls(("write_file", json.dumps({"path": "a/b.go", "content": "package b"}))),
@@ -583,10 +605,34 @@ async def test_revert_outside_a_git_repository_is_blocked_not_attempted(
     ]
     session = await start(client)
     await settle(session["id"], scripted)
+    assert (workspace.root / "a/b.go").exists()
 
     plan = (await client.post(f"/v1/sessions/{session['id']}/revert")).json()
-    assert plan["blocked"]
-    assert "git repository" in plan["blocked"][0]["reason"]
+    assert plan["blocked"] == []
+    assert "a/b.go" in plan["delete"]
+    assert not (workspace.root / "a/b.go").exists()
+
+
+async def test_revert_blocks_a_path_it_has_no_snapshot_for(
+    client: httpx.AsyncClient, scripted: Loopback, git_workspace
+) -> None:
+    """The safe direction when the run does not know what was there.
+
+    A path can reach this state through a tool that writes without going through
+    the router's snapshot, or through a session that predates the store. The old
+    behaviour — restore it from HEAD — is a guess with a developer's uncommitted
+    work as the stake, so it is refused with the reason said out loud.
+    """
+    session = await start(client)
+    await settle(session["id"], scripted)
+
+    stored = scripted.sessions.get(session["id"])
+    stored.mutations.append("handler/user.go")  # nothing snapshotted this one
+
+    plan = (await client.post(f"/v1/sessions/{session['id']}/revert")).json()
+    reasons = {b["path"]: b["reason"] for b in plan["blocked"]}
+    assert "handler/user.go" in reasons
+    assert "no pre-run snapshot" in reasons["handler/user.go"]
 
 
 # ── housekeeping ────────────────────────────────────────────────────────────
@@ -617,3 +663,123 @@ async def test_the_tool_catalogue_is_served_for_the_approval_ui(
     client: httpx.AsyncClient,
 ) -> None:
     assert (await client.get("/v1/tools")).json()["contract"] == "C1"
+
+
+async def test_steer_never_lost_on_finish_race(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """A message typed as the run ends becomes the next message, not silence.
+
+    `message_session` saw `running`, queued a steer, and the run finished before
+    the next drain: the text was never delivered, never recorded, and never
+    became a follow-up (BUG L-9). The window is closed atomically now — the
+    queue refuses once the run has ended — so the endpoint sends it as a
+    follow-up instead.
+    """
+    session = await start(client)
+    await settle(session["id"], scripted)
+
+    stored = scripted.sessions.get(session["id"])
+    # The exact window: the worker has marked the run finished and closed the
+    # correction queue, and the developer's message is already in flight.
+    stored.close_steer()
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/messages", json={"text": "and add the index"}
+    )
+    assert response.status_code == 200
+    await settle(session["id"], scripted)
+
+    transcript = (
+        await client.get(f"/v1/sessions/{session['id']}?transcript=1")
+    ).json()
+    assert "and add the index" in json.dumps(transcript), (
+        "the developer's message must reach the transcript one way or another"
+    )
+
+
+async def test_a_leftover_steer_starts_a_follow_up(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """What the worker owes the developer when it finds an undrained correction."""
+    session = await start(client)
+    await settle(session["id"], scripted)
+
+    stored = scripted.sessions.get(session["id"])
+    stored.reopen_steer()
+    assert stored.steer("one more thing")
+
+    runtime_loop = asyncio.get_running_loop()
+    scripted._rescue_steers(stored, runtime_loop)
+    await asyncio.sleep(0)
+    await settle(session["id"], scripted)
+
+    transcript = (
+        await client.get(f"/v1/sessions/{session['id']}?transcript=1")
+    ).json()
+    assert "one more thing" in json.dumps(transcript)
+
+
+# ── approvals: EXT-1, EXT-2, L-22 ──────────────────────────────────────────
+
+
+def test_extending_an_approval_extends_the_wait(scripted: Loopback) -> None:
+    """"Give me more time" has to reach the thread that is counting.
+
+    `/extend` incremented a counter the blocked `Event.wait(timeout=...)` had
+    already read: the UI showed minutes remaining and the run rejected the
+    approval at the original deadline anyway (BUG EXT-1). The wait polls now, so
+    the deadline is re-read while it is still being waited on.
+    """
+    from dakcoder_agent import loopback as lb
+
+    session = scripted.sessions.create("scaffold the service")
+    request = ApprovalRequest("write_file", {"path": "a.go"}, reason="protected path")
+    pending = lb.PendingApproval(request.id, session.id, request)
+    scripted.approvals[pending.id] = pending
+
+    # Already past the original deadline, and extended.
+    pending.at = datetime.now(tz=timezone.utc) - timedelta(seconds=lb.APPROVAL_TIMEOUT + 5)
+    assert pending.deadline_in() == 0
+    pending.extensions = 1
+    assert pending.deadline_in() > 0, "an extension must put time back on the clock"
+
+    decided: list[bool] = []
+    waiter = threading.Thread(target=lambda: decided.append(
+        scripted._await_decision(session, request)))
+    waiter.start()
+    pending.approved = True
+    pending.decided.set()
+    waiter.join(timeout=10)
+
+    assert decided == [True]
+
+
+async def test_a_decision_after_the_timeout_is_refused(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """A receipt saying "accepted" for a call the run rejected is worse than a 410."""
+    from dakcoder_agent import loopback as lb
+
+    session = scripted.sessions.create("scaffold the service")
+    request = ApprovalRequest("write_file", {"path": "a.go"}, reason="protected path")
+    pending = lb.PendingApproval(request.id, session.id, request)
+    pending.timed_out = True
+    scripted.approvals[pending.id] = pending
+
+    response = await client.post(
+        f"/v1/approvals/{pending.id}", json={"decision": "accept"}
+    )
+    assert response.status_code == 410
+    assert "timed out" in response.json()["error"]
+
+
+def test_a_zero_timeout_means_no_deadline(monkeypatch) -> None:
+    """The extension's setting documents "0 waits indefinitely"; it now does."""
+    from dakcoder_agent import loopback as lb
+
+    monkeypatch.setattr(lb, "APPROVAL_TIMEOUT", 0.0)
+    request = ApprovalRequest("write_file", {"path": "a.go"}, reason="protected path")
+    pending = lb.PendingApproval(request.id, "s", request)
+    pending.at = datetime.now(tz=timezone.utc) - timedelta(hours=4)
+    assert pending.deadline_in() == float("inf")

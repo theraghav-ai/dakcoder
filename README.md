@@ -55,8 +55,15 @@ python -m pytest apps -q
 `gotools/README.md` covers the sidecar in detail — what it checks, what it
 writes, and the design notes behind both.
 
-## What is not built yet
+## What is built
 
-The agent loop, the tool router, the gateway (auth, quota, ledger, model proxy)
-and the VS Code extension. ARCHITECTURE §1 has the current state and §6.3 says
-what is deferred and why.
+All of it: the agent loop and tool router (`apps/agent`), the gateway — auth,
+quota, ledger and model proxy (`apps/gateway`), the shared contracts
+(`apps/shared`), the Go sidecar (`gotools/`) and the VS Code extension
+(`extension/`). This section used to say those four were "not built yet", which
+was true when it was written and had been wrong for some time; an audit is a poor
+way to find out what your own README claims.
+
+`ARCHITECTURE_AUDIT.md` is the current map, `AUDIT.md` and `BUGS.md` the known
+defects, `CHANGE_PLAN.md` the order they are being fixed in, and `task.md` what
+has actually landed.

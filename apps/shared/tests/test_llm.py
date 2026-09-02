@@ -15,6 +15,7 @@ from dakcoder_shared.config import (
 )
 from dakcoder_shared.llm import (
     BACKOFF_SECONDS,
+    RETRYABLE_STATUS,
     ChatResult,
     EmptyCompletionError,
     LLMClient,
@@ -667,3 +668,92 @@ def test_complete_arguments_are_never_reported_as_cut_off():
         finish_reason="length",
     )
     assert result.incomplete_tool_calls() == []
+
+
+# ── the 2026-09-02 audit: SH-1, SH-2, SH-3 ─────────────────────────────────
+
+
+def test_a_stream_that_ends_without_saying_so_is_an_error():
+    """SH-1. A clean mid-stream EOF is not a completed answer.
+
+    No `[DONE]`, no `finish_reason`, no usage chunk: the client returned the
+    partial content as a *success* with `truncated == False` and zero usage —
+    which also fed the calibration a free turn. The agent then acted on half an
+    answer, and nothing above could tell.
+    """
+    frames = [
+        'data: {"choices":[{"index":0,"delta":{"content":"package han"}}]}',
+    ]
+    with pytest.raises(UpstreamError) as caught:
+        _consume_stream(iter(frames))
+    assert caught.value.kind == "incomplete_stream"
+    assert "11 character(s)" in str(caught.value)
+
+
+def test_a_finish_reason_without_done_is_still_a_complete_answer():
+    """The other half: not every stream ends with `[DONE]`, and one that
+    reported why it stopped has said what it needed to."""
+    frames = [
+        'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}',
+    ]
+    assert _consume_stream(iter(frames)).content == "ok"
+
+
+def test_mid_stream_transport_drops_are_retryable():
+    """SH-2. `RemoteProtocolError` and `ReadError` are what "the upstream died
+    mid-SSE" actually raises, and they were the two the retry set missed — so
+    the retry machinery failed its main customer on attempt one."""
+    from dakcoder_shared.llm import _RETRYABLE_TRANSPORT
+
+    assert httpx.RemoteProtocolError in _RETRYABLE_TRANSPORT
+    assert httpx.ReadError in _RETRYABLE_TRANSPORT
+    assert httpx.ConnectError in _RETRYABLE_TRANSPORT
+
+
+def test_parallel_tool_calls_without_an_index_stay_two_calls():
+    """SH-3. Defaulting a missing `index` to 0 folded every parallel call into
+    one slot, so two calls arrived as one with both argument strings
+    concatenated — which the loop reported to the model as malformed arguments
+    for a reply that was fine."""
+    frames = [
+        'data: {"choices":[{"delta":{"tool_calls":['
+        '{"id":"a","function":{"name":"read_file","arguments":"{\\"path\\":\\"a.go\\"}"}}]}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":['
+        '{"id":"b","function":{"name":"read_file","arguments":"{\\"path\\":\\"b.go\\"}"}}]}}]}',
+        "data: [DONE]",
+    ]
+    result = _consume_stream(iter(frames))
+
+    assert [c.id for c in result.tool_calls] == ["a", "b"]
+    assert [c.arguments for c in result.tool_calls] == [
+        '{"path":"a.go"}',
+        '{"path":"b.go"}',
+    ]
+
+
+def test_indexed_tool_calls_still_assemble_across_fragments():
+    """The normal path, pinned: an endpoint that does send `index` is unaffected."""
+    frames = [
+        'data: {"choices":[{"delta":{"tool_calls":['
+        '{"index":0,"id":"a","function":{"name":"write_file","arguments":"{\\"pa"}}]}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":['
+        '{"index":0,"function":{"arguments":"th\\":\\"a.go\\"}"}}]}}]}',
+        "data: [DONE]",
+    ]
+    result = _consume_stream(iter(frames))
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].arguments == '{"path":"a.go"}'
+
+
+def test_a_nameless_tool_call_is_reported_rather_than_dropped():
+    """A slot that accumulated arguments and never a name is a call the model
+    made and the client cannot deliver. Dropping it made the turn look like it
+    had asked for less than it did."""
+    frames = [
+        'data: {"choices":[{"delta":{"tool_calls":['
+        '{"index":0,"id":"a","function":{"arguments":"{}"}}]}}]}',
+        "data: [DONE]",
+    ]
+    with pytest.raises(UpstreamError) as caught:
+        _consume_stream(iter(frames))
+    assert caught.value.kind == "malformed_tool_call"

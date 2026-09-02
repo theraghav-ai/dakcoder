@@ -22,7 +22,7 @@
  */
 
 import { ChildProcess, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -326,6 +326,17 @@ export class Runtime implements vscode.Disposable {
       DAKCODER_MAX_TURNS: String(
         vscode.workspace.getConfiguration('dakcoder').get<number>('maxTurns', 40),
       ),
+      // The approval deadline the *runtime* will act on, taken from the same
+      // setting the UI counts down against. They used to be two unrelated
+      // numbers: the setting's documented default of "0 waits indefinitely" sat
+      // over a backend that hard-rejected at ten minutes with no warning, so the
+      // default configuration silently converted a slow review into a rejection
+      // (BUG EXT-2). One number now, and 0 really does wait.
+      DAKCODER_APPROVAL_TIMEOUT: String(
+        vscode.workspace
+          .getConfiguration('dakcoder')
+          .get<number>('approvalTimeoutSeconds', 0),
+      ),
       // The sidecar ships inside the `.vsix` under a platform-suffixed name
       // (`bin/gotools-win32-x64.exe`, §4.5) and the runtime is a venv under
       // globalStorage, so the child can reach it neither by PATH — which holds
@@ -534,10 +545,21 @@ export class Runtime implements vscode.Disposable {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+/**
+ * The loopback bearer token.
+ *
+ * From a CSPRNG, because it is the whole of the defence the design claims
+ * against other local processes: the daemon listens on 127.0.0.1 and anything
+ * running as this user can reach it, so the token is what stops another program
+ * driving the agent. It was `sha256(Date.now() : Math.random() : pid)` — none of
+ * which is secret. `Math.random()` is a fast PRNG whose state is recoverable
+ * from a handful of outputs, the clock is public and the pid is in `ps`, so the
+ * search space was small enough to be worth an attacker's afternoon (BUG EXT-9).
+ *
+ * 32 bytes, base64url: 256 bits, and nothing to reason about.
+ */
 function randomToken(): string {
-  return createHash('sha256')
-    .update(`${Date.now()}:${Math.random()}:${process.pid}`)
-    .digest('base64url');
+  return randomBytes(32).toString('base64url');
 }
 
 function sleep(ms: number): Promise<void> {

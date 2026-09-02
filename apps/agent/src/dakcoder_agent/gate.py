@@ -44,6 +44,7 @@ from typing import Any
 
 from dakcoder_shared.envelope import ToolResult
 
+from .tools import commands
 from .tools.router import Router
 
 __all__ = [
@@ -784,6 +785,20 @@ def take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
     recorded as *not taken*, because "we did not look" and "nothing was wrong"
     must not read the same to `excuses`.
     """
+    # `-mod=readonly` for everything the baseline runs. `go build` will add a
+    # missing checksum to `go.sum` without being asked, and a baseline that
+    # rewrites the workspace it is measuring is not a baseline — the write
+    # carries no Mutation record, so the spanning-edit guard below cannot see it
+    # either (BUG GT-1). Refusing is the right answer here: a module graph that
+    # does not resolve is a finding, not something to fix on the way past.
+    token = commands.READONLY_MODULES.set(True)
+    try:
+        return _take_baseline(router, include_tests=include_tests)
+    finally:
+        commands.READONLY_MODULES.reset(token)
+
+
+def _take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
     before = router.mutations
     findings: dict[str, frozenset[str]] = {}
     passed: dict[str, bool] = {}

@@ -24,7 +24,7 @@ import * as diagnostics from './diagnostics';
 import * as doctor from './doctor';
 import { API_VERSION, isResumable, type SessionSummary } from './protocol';
 import { Runtime, RuntimeError } from './runtime';
-import { RunState } from './session-state';
+import { RunState, readGateEvent } from './session-state';
 import { StatusBar } from './statusbar';
 import * as trees from './trees';
 import * as wizard from './wizard';
@@ -265,8 +265,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Findings come from a local binary, not the model: `gotools lint --format
   // json` emits structured violations sub-second, offline, signed out, for zero
   // tokens. Regexing prose out of a tool_result would cost a run to learn less.
-  context.subscriptions.push(
-    diagnostics.register(context, {
+  const diagnosticsService = diagnostics.register(context, {
       startTask: async (task, options) => {
         if (!(await ready())) return;
         const session = await runtime.client.startTask(task, {
@@ -280,8 +279,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       workspaceRoot,
       extensionUri: context.extensionUri,
       log,
-    }),
-  );
+  });
 
   context.subscriptions.push(
     wizard.register(context, {
@@ -331,7 +329,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       treeSet.sessions.applyEvent(event);
       treeSet.quota.applyEvent(event);
       treeSet.context.applyEvent(event);
+      // `register` returns the service so activation can offer a local re-run of
+      // the stage a gate blocked on, and its own docstring said so — but the
+      // return value went straight into `subscriptions.push` and nothing kept
+      // it, so `offerGateRerun` had no caller and the offer never appeared
+      // (BUG EXT-16). It declines quietly for a clean gate, for a gate with no
+      // blocking stage, and for a stage this build does not recognise.
+      if (event.type === 'gate') {
+        void diagnosticsService.offerGateRerun(readGateEvent(event.data ?? {}));
+      }
     }),
+    // The context inspector needs to be told which session to inspect, and
+    // nothing told it: `setSession` had one caller, inside the command that
+    // reveals the view, so opening the view any other way — clicking it in the
+    // sidebar, which is how a tree view is normally opened — showed "No session
+    // selected" for ever (BUG EXT-6). It follows whatever the panel is showing,
+    // which is the session the developer is looking at.
+    state.onDidChange(() => treeSet.context.setSession(state.sessionId ?? undefined)),
     // An approval is raised by the runtime and has to reach the service that
     // owns the answer.
     //
@@ -509,6 +523,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     chatView.showSession(session.id);
     state.hydrate(session);
     state.attach(session.id);
+    void approvalService.discover();
     treeSet.sessions.refresh();
     void statusBar.refresh(true);
   }
@@ -518,11 +533,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // the same `onDidReceive` the live stream uses, so a clear that arrived
     // afterwards would wipe the rows it had just drawn.
     chatView.showSession(session.id);
-    state.hydrate(session);
-    if (session.status === 'running') state.attach(session.id);
-    else {
-      const full = await runtime.client.session(session.id, true);
-      state.hydrate(full);
+
+    // The transcript is fetched for a *running* session too, and that is not a
+    // nicety. Hydrating from a tree summary leaves the event cursor at 0, so the
+    // stream then replays the whole transcript through the live path — and every
+    // stored `tool_pending` in it arrived as a card with Accept and Reject on
+    // it, for approvals that had already been answered. Five seconds later the
+    // poller noticed the runtime was not holding them and toasted "recorded as a
+    // rejection" for each one: buttons that did nothing, followed by a receipt
+    // for a decision nobody made (BUG EXT-3). Replaying it through `hydrate`
+    // marks it history and leaves the cursor where the live stream should
+    // resume; `pending_approvals` in the same response is the live set.
+    const full = await runtime.client.session(session.id, true);
+    state.hydrate(full);
+    if (session.status === 'running') {
+      state.attach(session.id);
+      // The runtime's live set, not this window's memory of it. An approval
+      // raised before this window was listening has no frame left to replay.
+      void approvalService.discover();
     }
     await focusPanel();
   }

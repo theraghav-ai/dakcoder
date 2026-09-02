@@ -123,17 +123,20 @@
         "dakcoder.pythonPath": {
           "type": "string",
           "default": "",
-          "description": "Python 3.11+ for the local runtime. Empty auto-detects: this setting, then the Python extension's interpreter, then py/python3/python."
+          "scope": "machine",
+          "description": "Python 3.11+ for the local runtime. Empty auto-detects: this setting, then the Python extension's interpreter, then py/python3/python. Machine-scoped: a workspace cannot choose which binary the extension executes, because a cloned repository's .vscode/settings.json is untrusted input and Workspace Trust was the only thing between it and code execution."
         },
         "dakcoder.goPath": {
           "type": "string",
           "default": "",
-          "description": "Override the go binary Doctor and the gate use."
+          "scope": "machine",
+          "description": "Override the go binary Doctor and the gate use. Machine-scoped: a workspace cannot choose which binary the extension executes, because a cloned repository's .vscode/settings.json is untrusted input and Workspace Trust was the only thing between it and code execution."
         },
         "dakcoder.goplsPath": {
           "type": "string",
           "default": "",
-          "description": "Override gopls. Empty prefers the golang.go extension's managed copy, then GOBIN, then PATH."
+          "scope": "machine",
+          "description": "Override gopls. Empty prefers the golang.go extension's managed copy, then GOBIN, then PATH. Machine-scoped: a workspace cannot choose which binary the extension executes, because a cloned repository's .vscode/settings.json is untrusted input and Workspace Trust was the only thing between it and code execution."
         },
         "dakcoder.requireApproval": {
           "type": [
@@ -153,7 +156,7 @@
         "dakcoder.approvalTimeoutSeconds": {
           "type": "number",
           "default": 0,
-          "description": "How long an approval waits. 0 waits indefinitely — a slow review must never auto-reject."
+          "markdownDescription": "How many seconds an approval waits before the runtime records it as a rejection. `0` waits indefinitely — a slow review must never auto-reject. This is the deadline the runtime itself acts on, and the panel counts down against the same number. **Give me more time** on the warning extends it. Takes effect when the runtime restarts."
         },
         "dakcoder.autoApproveTrivialPatches": {
           "type": "boolean",
@@ -188,7 +191,8 @@
         "dakcoder.gotoolsPath": {
           "type": "string",
           "default": "",
-          "description": "Override the gotools analyser. Empty uses the checksum-verified binary bundled with the extension, then any gotools on PATH."
+          "scope": "machine",
+          "description": "Override the gotools analyser. Empty uses the checksum-verified binary bundled with the extension, then any gotools on PATH. Machine-scoped: a workspace cannot choose which binary the extension executes, because a cloned repository's .vscode/settings.json is untrusted input and Workspace Trust was the only thing between it and code execution."
         },
         "dakcoder.lintOnSave": {
           "type": "boolean",
@@ -572,6 +576,42 @@
         "command": "dakcoder.rerunGateStage",
         "title": "Run Gate Stage Locally",
         "category": "dakcoder"
+      },
+      {
+        "command": "dakcoder.newTask",
+        "title": "New Task",
+        "category": "dakcoder",
+        "icon": "$(add)"
+      },
+      {
+        "command": "dakcoder.stopTask",
+        "title": "Stop",
+        "category": "dakcoder",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "dakcoder.windDown",
+        "title": "Stop After This Turn",
+        "category": "dakcoder",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "dakcoder.compactContext",
+        "title": "Compact Context",
+        "category": "dakcoder",
+        "icon": "$(fold)"
+      },
+      {
+        "command": "dakcoder.restartRuntime",
+        "title": "Restart Runtime",
+        "category": "dakcoder",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "dakcoder.showOutput",
+        "title": "Show Log",
+        "category": "dakcoder",
+        "icon": "$(output)"
       }
     ],
     "menus": {

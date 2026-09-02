@@ -107,7 +107,7 @@ class Workspace:
         """
         self._check_syntax(given)
 
-        candidate = (self.root / given).resolve()
+        candidate = (self.root / self._separators(given)).resolve()
         if not self._contains(candidate):
             symbolic = self._looks_symbolic(given)
             raise PathEscape(
@@ -134,6 +134,22 @@ class Workspace:
             return False
 
     # -- internals -------------------------------------------------------
+
+    @staticmethod
+    def _separators(given: str) -> str:
+        """A single separator before the path reaches ``Path``.
+
+        A model hosted on Windows writes ``handler\\user.go`` whichever platform
+        the runtime is on, and on POSIX ``Path`` reads that as one filename with a
+        backslash in it: the tool creates a stray literal-backslash file, the
+        ledger and the gate scope disagree about which file was touched, and the
+        mutation the developer sees is a file they cannot open. Backslash is a
+        legal POSIX filename character, so this trades an unreachable spelling
+        for a path that means the same thing on both platforms — the trade the
+        rest of the system already assumes (``relative`` returns POSIX form, the
+        globs are POSIX, the wire is POSIX).
+        """
+        return given.replace("\\", "/")
 
     def _contains(self, candidate: Path) -> bool:
         try:
@@ -212,8 +228,17 @@ def is_protected(rel: str) -> bool:
 
     Matched against the path the tool will actually act on, never the argument as
     written, so no spelling of a protected path can slip past.
+
+    **Case-insensitively**, because the primary platform is Windows and its
+    filesystem is case-insensitive: ``dockerfile`` and ``GO.MOD`` address exactly
+    the files ``Dockerfile`` and ``go.mod`` name, and a case-sensitive match let a
+    write to either skip the approval gate entirely (BUG SH-5b). On Linux the two
+    spellings are genuinely different files, so this refuses a little more than it
+    must there — which is the safe direction for a gate whose whole job is to
+    make a human look.
     """
-    return any(glob_match(rel, pattern) for pattern in PROTECTED_GLOBS)
+    lowered = rel.lower()
+    return any(glob_match(lowered, pattern.lower()) for pattern in PROTECTED_GLOBS)
 
 
 @lru_cache(maxsize=256)
