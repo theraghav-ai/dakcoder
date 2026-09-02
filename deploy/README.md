@@ -3,7 +3,7 @@
 to mint the gateway token
 
 cd /mnt/data/raghav/dakcoder && . deploy/shellenv.sh
-.venv/bin/python deploy/gateway_main.py --mint dev:localdev --mint-hours 168
+.venv/bin/python deploy/gateway_main.py --mint dev:localdev --mint-hours 500
 
 to deploy everything in server
 
