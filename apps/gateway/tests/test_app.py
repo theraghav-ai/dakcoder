@@ -299,6 +299,49 @@ async def test_health_needs_no_token(client: httpx.AsyncClient) -> None:
     assert (await client.get("/v1/health")).status_code == 200
 
 
+async def test_health_publishes_the_model_behind_each_role(
+    client: httpx.AsyncClient,
+) -> None:
+    """For the same reason it publishes the limits: which model answers as the
+    Planner is a config change now, and one nobody can verify took effect is
+    one people re-apply and re-argue about."""
+    payload = (await client.get("/v1/health")).json()
+    assert payload["models"]["planner"] == "Qwen3.8-27B"
+    assert payload["models"]["coder"] == "Qwen3.8-27B"
+
+
+async def test_health_publishes_no_endpoint_and_no_key(
+    client: httpx.AsyncClient,
+) -> None:
+    """It is unauthenticated. Internal hostnames are reconnaissance and the
+    credential is nobody's business outside the gateway process."""
+    body = (await client.get("/v1/health")).text
+    assert API_KEY not in body
+    assert "ai.cept.gov.in" not in body
+
+
+async def test_the_routing_table_is_published_to_a_signed_in_caller(
+    client: httpx.AsyncClient,
+) -> None:
+    """"Did my override take effect?" — otherwise answerable only by watching
+    behaviour, which is the thing the routing table replaces."""
+    session = await sign_in(client)
+    payload = (
+        await client.get(
+            "/v1/models", headers={"Authorization": f"Bearer {session['access_token']}"}
+        )
+    ).json()
+
+    assert payload["roles"]["planner"]["model"] == "Qwen3.8-27B"
+    assert payload["roles"]["planner"]["endpoint"] == "https://ai.cept.gov.in/v1"
+    assert payload["roles"]["planner"]["overrides"] == []
+    assert API_KEY not in str(payload)
+
+
+async def test_the_routing_table_needs_a_token(client: httpx.AsyncClient) -> None:
+    assert (await client.get("/v1/models")).status_code == 401
+
+
 async def test_the_tool_catalogue_is_published(client: httpx.AsyncClient) -> None:
     payload = (await client.get("/v1/tools")).json()
     assert payload["contract"] == "C1"

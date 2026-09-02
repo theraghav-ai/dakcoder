@@ -155,6 +155,18 @@ class ModeConfig:
     #: Sampling temperature. Go boilerplate rewards determinism, so this sits
     #: below the frontend agent's 0.2.
     temperature: float
+    #: The model role this mode's turns are dispatched as.
+    #:
+    #: Separate from the mode because they answer different questions: the mode
+    #: decides what the model may *do* this turn, the role decides *which model*
+    #: does it. They happen to line up one-to-one today, and keeping them apart
+    #: is what lets an operator put the Planner on a bigger model without any of
+    #: the mode's budgets or tool rules moving with it.
+    #:
+    #: Every turn used to dispatch as ``coder`` whatever mode it was in, so the
+    #: gateway's per-role table had entries nothing could ever reach — planning
+    #: and answering were billed, logged and routed as coding.
+    role: str = "coder"
 
     def __post_init__(self) -> None:
         # Rule 2 of section 4.4: any thinking-on call gets at least 6,144 output
@@ -202,13 +214,13 @@ PROMPT_BUDGET = 245_760
 #: ceiling is free.
 MODES: dict[Mode, ModeConfig] = {
     # Answers a question. No write tools, so its ceiling is about prose.
-    Mode.ASK: ModeConfig(Mode.ASK, PROMPT_BUDGET, 4096, False, 0.1),
+    Mode.ASK: ModeConfig(Mode.ASK, PROMPT_BUDGET, 4096, False, 0.1, role="ask"),
     # Emits a plan through ``submit_plan``, which is structured output, and the
     # spike found no quality gain from thinking on structured output.
-    Mode.PLANNER: ModeConfig(Mode.PLANNER, PROMPT_BUDGET, 4096, False, 0.1),
+    Mode.PLANNER: ModeConfig(Mode.PLANNER, PROMPT_BUDGET, 4096, False, 0.1, role="planner"),
     # Every tool, including ``write_file``. The largest budget, because this is
     # the only mode that ever has to emit a whole file.
-    Mode.AGENT: ModeConfig(Mode.AGENT, PROMPT_BUDGET, 6144, False, 0.1),
+    Mode.AGENT: ModeConfig(Mode.AGENT, PROMPT_BUDGET, 6144, False, 0.1, role="coder"),
 }
 
 

@@ -29,7 +29,8 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
@@ -41,7 +42,9 @@ from dakcoder_shared.llm import (
     UpstreamError,
 )
 
-__all__ = ["Status", "ProbeResult", "ProbeReport", "CapabilityProbe"]
+from .routing import ModelRoute, RoleRouter
+
+__all__ = ["Status", "ProbeResult", "ProbeReport", "CapabilityProbe", "EndpointProbes"]
 
 #: Documented in plan.md §4.2, surfaced verbatim in the 400 on an over-large
 #: max_tokens. A ceiling, not a target — the agent caps its own prompts at 32k.
@@ -379,6 +382,49 @@ class CapabilityProbe:
             "unknown parameters are now silently dropped instead of refused, so a "
             "malformed request fails quietly rather than loudly",
         )
+
+
+class EndpointProbes:
+    """Every distinct endpoint the routing table names, probed in turn.
+
+    One model on one host was an assumption, not a decision, and now that a role
+    can be pointed anywhere it is a wrong one. The probe's whole value is that
+    endpoint drift becomes a legible failure at startup rather than a week of
+    "the Planner behaves oddly"; probing only the default endpoint would hand
+    that guarantee back for every role moved elsewhere.
+
+    Distinct means *distinct*: six roles on one endpoint cost one pass, which is
+    what almost every deployment will do.
+
+    The report keeps the single-endpoint shape when there is one endpoint —
+    check names unprefixed, exactly as ``/v1/health`` has always served them —
+    and labels each check with the roles that share the endpoint when there is
+    more than one. A red row has to say which endpoint it is red about.
+    """
+
+    def __init__(
+        self,
+        router: RoleRouter,
+        *,
+        connect: Callable[[ModelRoute], LLMClient] = lambda route: LLMClient(route.as_config()),
+    ) -> None:
+        self._router = router
+        self._connect = connect
+
+    def run(self) -> ProbeReport:
+        endpoints = self._router.endpoints()
+        merged = ProbeReport()
+        started = time.monotonic()
+        for label, route in endpoints:
+            # A client per pass, closed when the pass ends. The probe runs once
+            # at startup in a thread nobody joins, and a pool left open behind
+            # it is a socket held for the life of the process for no reason.
+            with self._connect(route) as client:
+                report = CapabilityProbe(client).run()
+            suffix = f" [{label}]" if len(endpoints) > 1 else ""
+            merged.results.extend(replace(r, name=r.name + suffix) for r in report.results)
+        merged.duration_ms = int((time.monotonic() - started) * 1000)
+        return merged
 
 
 def probe_json(report: ProbeReport) -> str:

@@ -10,6 +10,7 @@ casually is one where the next thing to cross is something nobody decided about.
     POST /v1/auth/refresh    rotate, re-checking the account          (C3)
     GET  /v1/quota           the window snapshot                      (C4)
     GET  /v1/health          capabilities and the limits in force
+    GET  /v1/models          the role -> model routing in force
     GET  /v1/tools           the tool schemas                         (C1)
     POST /v1/llm/{path}      the model proxy                          (§15.4)
 
@@ -33,7 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .auth import AuthError, AuthService, Claims
 from .ledger import Ledger, MemoryLedger
-from .probe import CapabilityProbe
+from .probe import CapabilityProbe, EndpointProbes
 from .proxy import ModelProxy, ProxyError
 from .quota import Lane, QuotaExceeded, QuotaPolicy, StoreUnavailable
 from .quota.store import Conflict
@@ -51,7 +52,10 @@ class Gateway:
         proxy: ModelProxy | None = None,
         *,
         ledger: Ledger | None = None,
-        probe: CapabilityProbe | None = None,
+        #: Either form: one endpoint, or every endpoint the routing table names.
+        #: Both answer ``run() -> ProbeReport``, which is all the startup hook
+        #: asks of them.
+        probe: CapabilityProbe | EndpointProbes | None = None,
         tool_catalog: dict[str, Any] | None = None,
         version: str = "dev",
     ) -> None:
@@ -211,7 +215,31 @@ def create_app(gateway: Gateway) -> FastAPI:
             "version": gateway.version,
             "capabilities": gateway.capabilities,
             "limits": gateway.quota.limits.as_dict(),
+            # Role -> model, for the same reason the limits are here: which
+            # model answers as the Planner is a config change now, and a config
+            # change nobody can verify took effect is one people re-apply and
+            # re-argue about. Names only — this route is unauthenticated, so the
+            # endpoints and the key sources stay behind /v1/models.
+            "models": gateway.proxy.routes.models if gateway.proxy else {},
         }
+
+    @app.get("/v1/models")
+    async def models(_claims: Claims = Depends(caller)) -> dict[str, Any]:
+        """The routing table in force: role, model, endpoint, what was overridden.
+
+        Authenticated, unlike /v1/health, because the endpoints are internal
+        hostnames and a listing of them is reconnaissance. Never the keys —
+        ``overrides`` says whether a role has one of its own, which is the only
+        thing anyone needs to check, and the key itself is nobody's business
+        outside this process.
+
+        Not to be confused with LiteLLM's ``/v1/models``, which is deliberately
+        not proxied: this says what *this gateway* will route, not what some
+        upstream would serve.
+        """
+        if gateway.proxy is None:
+            raise ProxyError("this gateway has no model proxy configured", status=503)
+        return {"roles": gateway.proxy.routes.as_dict()}
 
     @app.get("/v1/tools")
     async def tools() -> dict[str, Any]:

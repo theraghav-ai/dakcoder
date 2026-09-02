@@ -72,7 +72,7 @@ def complete(
     client: LLMClient,
     *,
     tools: Sequence[dict[str, Any]] | None = None,
-    role: str = "coder",
+    role: str | None = None,
     enforce_budget: bool = True,
     session_id: str = "",
     on_delta: Callable[[str], None] | None = None,
@@ -105,8 +105,14 @@ def complete(
     the loop's -- it is the one component that knows whether this mode may end a
     turn with prose -- and the decision of how to spell it on the wire is the
     client's. This is the seam between them, and it holds nothing of its own.
+
+    ``role`` defaults to the mode's own -- Planner turns dispatch as ``planner``,
+    Ask turns as ``ask`` -- so that the gateway's per-role routing can actually
+    be reached. It stays overridable for the calls that are not a mode's turn at
+    all: the intent classifier and the summariser each name their own.
     """
     mode_config = config_for(context.mode)
+    role = role or mode_config.role
     usage = context.usage()
 
     if enforce_budget and usage.total > usage.budget:

@@ -27,6 +27,13 @@ past, acted on afterwards.
 it through would let a developer route to a model nobody has budgeted for, on a
 shared GPU, with our key attached.
 
+**A role resolves to a whole route, not just a name.** Model, endpoint and key
+all come from ``RoleRouter``, which reads them from the environment, so the
+planner can sit on a different model on a different host with a different
+credential without a line of this file changing. Every request is metered,
+ledgered and quota-checked identically whichever route it takes — the routing
+decides where the tokens are bought, never whether they are counted.
+
 **Fail closed.** If quota cannot be checked, the request does not go. An agent
 that keeps working when quota and audit are unavailable is precisely the hole
 this section exists to close.
@@ -39,13 +46,14 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from .ledger import Ledger, MemoryLedger, UsageEvent
 from .quota import Lane, QuotaExceeded, QuotaPolicy, Reservation
+from .routing import ModelRoute, RoleRouter
 
-__all__ = ["ModelProxy", "ProxyError", "RoleModels", "TeedUsage"]
+__all__ = ["ModelProxy", "ModelRoute", "ProxyError", "RoleRouter", "TeedUsage"]
 
 log = logging.getLogger(__name__)
 
@@ -59,32 +67,6 @@ class ProxyError(Exception):
     def __init__(self, message: str, *, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
-
-
-@dataclass(frozen=True, slots=True)
-class RoleModels:
-    """Role → model name. The only models this gateway will ever ask for."""
-
-    models: dict[str, str] = field(
-        default_factory=lambda: {
-            "planner": "Qwen3.8-27B",
-            "coder": "Qwen3.8-27B",
-            "verifier": "Qwen3.8-27B",
-            "debugger": "Qwen3.8-27B",
-            "fast": "Qwen3.8-27B",
-            "summariser": "Qwen3.8-27B",
-        }
-    )
-
-    def resolve(self, role: str) -> str:
-        model = self.models.get(role)
-        if model is None:
-            raise ProxyError(
-                f"{role!r} is not a configured role. Available: "
-                f"{', '.join(sorted(self.models))}.",
-                status=400,
-            )
-        return model
 
 
 @dataclass
@@ -136,7 +118,7 @@ class ModelProxy:
         quota: QuotaPolicy,
         *,
         ledger: Ledger | None = None,
-        roles: RoleModels | None = None,
+        routes: RoleRouter | None = None,
         http: Any = None,
         # Above the agent client's read timeout, so the client is the side that
         # gives up first on a long prefill. Reversed — which is how it shipped,
@@ -145,16 +127,21 @@ class ModelProxy:
         # error frame. See `LLMConfig.read_timeout`.
         timeout: float = 600.0,
     ) -> None:
-        if not api_key:
+        #: ``upstream`` and ``api_key`` are the single-endpoint form: every role
+        #: on one host with one key. A deployment that routes roles differently
+        #: passes a ``RoleRouter`` built from the environment instead — see
+        #: ``from_routes``, which is what ``deploy/gateway_main.py`` uses.
+        self.routes = routes or RoleRouter.uniform(upstream, api_key)
+        unpaid = sorted(role for role, route in self.routes.routes.items() if not route.api_key)
+        if unpaid:
             raise ValueError(
-                "the gateway has no model API key. It is the only process that may "
-                "hold one (§15.4); without it there is nothing to proxy."
+                f"the gateway has no model API key for {', '.join(unpaid)}. It is the "
+                "only process that may hold one (§15.4); without it there is nothing "
+                "to proxy."
             )
-        self.upstream = upstream.rstrip("/")
-        self._api_key = api_key
+        self.upstream = self.routes.default.base_url
         self.quota = quota
         self.ledger = ledger or MemoryLedger()
-        self.roles = roles or RoleModels()
         self.timeout = timeout
         self._http = http
         #: Built lazily and kept, rather than built per request and dropped.
@@ -170,10 +157,40 @@ class ModelProxy:
         #: ``drain`` needs something to wait on at shutdown.
         self._settling: set[asyncio.Task] = set()
 
+    @classmethod
+    def from_routes(cls, routes: RoleRouter, quota: QuotaPolicy, **kwargs: Any) -> ModelProxy:
+        """Build from a routing table, which is what a real deployment has."""
+        return cls(
+            routes.default.base_url, routes.default.api_key, quota, routes=routes, **kwargs
+        )
+
     # -- the request --------------------------------------------------------
 
-    def prepare(self, path: str, body: dict[str, Any], sub: str) -> dict[str, Any]:
-        """Shape the upstream request. The only place the real model is named.
+    def route_for(self, role: str) -> ModelRoute:
+        """Resolve a role, or say what the configured ones are.
+
+        The list is in the error because the alternative is a developer reading
+        "not a configured role" and having nowhere to look. Roles are an
+        operator's choice now — the set on this gateway is whatever the
+        environment declared — so the message has to carry it.
+        """
+        try:
+            return self.routes.resolve(role)
+        except KeyError:
+            raise ProxyError(
+                f"{role!r} is not a configured role. Available: "
+                f"{', '.join(sorted(self.routes.routes))}.",
+                status=400,
+            ) from None
+
+    def prepare(
+        self, path: str, body: dict[str, Any], sub: str
+    ) -> tuple[dict[str, Any], ModelRoute]:
+        """Shape the upstream request, and say where it is going.
+
+        The route comes back with the body because the two are one decision: the
+        role names the model *and* the endpoint *and* the key, and a caller that
+        could take the body without the route could send it to the wrong one.
 
         ``user`` is set to the subject so LiteLLM's own spend tables attribute
         correctly even before per-user virtual keys exist (§16.6, phase 1). It
@@ -187,8 +204,8 @@ class ModelProxy:
             )
 
         outgoing = dict(body)
-        role = str(outgoing.pop("model", "coder"))
-        outgoing["model"] = self.roles.resolve(role)
+        route = self.route_for(str(outgoing.pop("model", "coder")))
+        outgoing["model"] = route.model
         outgoing["user"] = sub
 
         if outgoing.get("stream"):
@@ -198,14 +215,7 @@ class ModelProxy:
             options = dict(outgoing.get("stream_options") or {})
             options["include_usage"] = True
             outgoing["stream_options"] = options
-        return outgoing
-
-    def headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
+        return outgoing, route
 
     # -- the round trip -----------------------------------------------------
 
@@ -232,8 +242,7 @@ class ModelProxy:
         ``_schedule_settlement`` for why awaiting it in the ``finally`` looks
         right and is not.
         """
-        role = str(body.get("model", "coder"))
-        outgoing = self.prepare(path, body, sub)
+        outgoing, route = self.prepare(path, body, sub)
         reservation = await self.quota.reserve(
             sub, estimated, lane=lane, idempotency_key=idempotency_key, body=body
         )
@@ -244,7 +253,7 @@ class ModelProxy:
         scheduled = False
 
         try:
-            async for chunk in self._relay(path, outgoing):
+            async for chunk in self._relay(path, outgoing, route):
                 opened = True
                 _observe(chunk, teed)
                 if teed.saw_usage and not scheduled:
@@ -258,7 +267,7 @@ class ModelProxy:
                     # the accounting is owed and where it is taken.
                     scheduled = True
                     self._schedule_settlement(
-                        reservation, teed, sub, session_id, turn, mode, role, lane, started
+                        reservation, teed, sub, session_id, turn, mode, route, lane, started
                     )
                 yield chunk
         except QuotaExceeded:
@@ -275,7 +284,7 @@ class ModelProxy:
             # usage at all. Both produced tokens, so both are owed a settlement.
             if opened and not scheduled:
                 self._schedule_settlement(
-                    reservation, teed, sub, session_id, turn, mode, role, lane, started
+                    reservation, teed, sub, session_id, turn, mode, route, lane, started
                 )
 
     # -- settlement ---------------------------------------------------------
@@ -358,11 +367,20 @@ class ModelProxy:
         if owned is not None:
             await owned.aclose()
 
-    async def _relay(self, path: str, body: dict[str, Any]) -> AsyncIterator[bytes]:
+    async def _relay(
+        self, path: str, body: dict[str, Any], route: ModelRoute
+    ) -> AsyncIterator[bytes]:
+        """One client, many endpoints.
+
+        The pool is shared across routes rather than split per endpoint: httpx
+        keys keep-alive connections by origin already, so a second upstream gets
+        its own connections without a second client — and a second client would
+        be a second thing to close, which is how the leak in ``_client`` started.
+        """
         client = self._client()
 
         async with client.stream(
-            "POST", f"{self.upstream}/{path}", json=body, headers=self.headers()
+            "POST", route.url(path), json=body, headers=route.headers()
         ) as response:
             if response.status_code >= 400:
                 raw = await response.aread()
@@ -385,7 +403,7 @@ class ModelProxy:
         session_id: str,
         turn: int,
         mode: str,
-        role: str,
+        route: ModelRoute,
         lane: Lane,
         started: float,
     ) -> None:
@@ -410,8 +428,12 @@ class ModelProxy:
                 sub=sub,
                 session_id=session_id,
                 turn=turn,
-                model=teed.model or self.roles.resolve(role),
-                role=role,
+                # What the endpoint said it used, and what we asked for if it
+                # said nothing. With roles on different models the two can
+                # legitimately differ, and the ledger is the only place that
+                # would ever show it.
+                model=teed.model or route.model,
+                role=route.role,
                 mode=mode,
                 lane=str(lane),
                 prompt_tokens=teed.prompt_tokens,

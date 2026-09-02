@@ -65,6 +65,10 @@ class FakeUpstream:
     def __init__(self) -> None:
         self.requests: list[dict] = []
         self.headers: list[dict] = []
+        #: Recorded because a role's endpoint is now configurable, and "the
+        #: planner's traffic went to the planner's host" is only assertable if
+        #: the fake remembers where it was asked.
+        self.urls: list[str] = []
         self.status = 200
         self.error_body = b'{"error":{"message":"model not found"}}'
         self.chunks: list[str] = [
@@ -81,6 +85,7 @@ class FakeUpstream:
     def stream(self, method, url, *, json=None, headers=None):
         self.requests.append(json)
         self.headers.append(headers or {})
+        self.urls.append(url)
         return _Response(self)
 
 

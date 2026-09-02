@@ -10,10 +10,43 @@ where that is checked rather than assumed.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 
-__all__ = ["Deployment", "LLMConfig", "MissingCredential", "CredentialLeak"]
+__all__ = [
+    "ROLES",
+    "Deployment",
+    "LLMConfig",
+    "MissingCredential",
+    "CredentialLeak",
+    "leaked_model_credentials",
+]
+
+#: Every role either half of the system may name, and the only names the
+#: gateway's routing table is built from by default.
+#:
+#: One tuple, in one place, because the two halves have to agree: the runtime
+#: sends a role and the gateway resolves it, so a name known to one and not the
+#: other is a turn that fails with "not a configured role". That is not
+#: hypothetical — the summariser spent its whole life sending ``summariser``
+#: to a client that only accepted ``coder``, ``fast`` and ``embed``, and every
+#: compaction in production silently fell back to a canned recap.
+#:
+#: Adding a name here makes it configurable at the gateway
+#: (``DAKCODER_MODEL_<ROLE>``) and requestable from the runtime. Nothing else
+#: is needed, and nothing else should be.
+ROLES: tuple[str, ...] = (
+    "planner",
+    "coder",
+    "ask",
+    "verifier",
+    "debugger",
+    "fast",
+    "summariser",
+    "embed",
+)
 
 
 class Deployment(StrEnum):
@@ -59,6 +92,15 @@ class LLMConfig:
     model_coder: str = "Qwen3.8-27B"
     model_fast: str = "Qwen3.8-27B"
     model_embed: str = "Qwen3.8-27B"
+    #: Role → model, consulted before the three fields above.
+    #:
+    #: The three named fields predate per-role routing and are kept because they
+    #: read well at a call site that only has one endpoint. This mapping is what
+    #: a gateway built from the environment fills in, and it can carry any role
+    #: in `ROLES` rather than only the original three — which is the difference
+    #: between "the planner can have its own model" and "the planner can have
+    #: its own model once someone adds a field and redeploys".
+    models: Mapping[str, str] = field(default_factory=dict)
 
     temperature_coder: float = 0.1
     temperature_fast: float = 0.0
@@ -97,21 +139,41 @@ class LLMConfig:
         and refuses it — so every call from a local runtime failed with "is not
         a configured role". The resolution belongs on the side that holds the
         key, and this method is the seam that says which side that is.
-        """
-        if self.deployment is Deployment.LOCAL:
-            if role not in ("coder", "fast", "embed"):
-                raise ValueError(f"unknown model role {role!r}; use coder, fast or embed")
-            return role
 
-        match role:
-            case "coder":
-                return self.model_coder
+        The local check is against `ROLES` — the shared vocabulary — rather than
+        the three roles this class happens to have fields for. A name in that
+        tuple is one the gateway's routing table has an entry for, so passing it
+        through is safe; a name outside it would be refused upstream anyway, and
+        catching the typo here costs a round trip less.
+        """
+        key = role.strip().lower()
+        if self.deployment is Deployment.LOCAL:
+            if key not in ROLES:
+                raise ValueError(
+                    f"unknown model role {role!r}; the roles this system knows are "
+                    f"{', '.join(ROLES)}"
+                )
+            return key
+
+        if key in self.models:
+            return self.models[key]
+        # The named fields are tiers, not roles: a role this configuration was
+        # not given an explicit model for gets the general-purpose one, which is
+        # what every role got before any of them could be routed separately. A
+        # name outside the vocabulary still raises — that is a typo or a bare
+        # model name, and neither should quietly become a request.
+        match key:
             case "fast":
                 return self.model_fast
             case "embed":
                 return self.model_embed
+            case _ if key in ROLES:
+                return self.model_coder
             case _:
-                raise ValueError(f"unknown model role {role!r}; use coder, fast or embed")
+                raise ValueError(
+                    f"unknown model role {role!r}; the roles this system knows are "
+                    f"{', '.join(ROLES)}"
+                )
 
     def temperature_for(self, role: str) -> float:
         return self.temperature_fast if role == "fast" else self.temperature_coder
@@ -125,9 +187,43 @@ MODEL_CREDENTIAL_VARS = (
     "ANTHROPIC_API_KEY",
 )
 
+#: The per-role form of the same secret: ``DAKCODER_MODEL_PLANNER_API_KEY`` and
+#: friends.
+#:
+#: A fixed list stopped being sufficient the moment a role could carry its own
+#: key. A list is only as good as whoever remembers to extend it, and the thing
+#: it guards — the one credential that makes quota and audit unbypassable — is
+#: the worst possible place to rely on that. So the shape is matched instead of
+#: the names enumerated.
+MODEL_CREDENTIAL_PATTERN = re.compile(r"^DAKCODER_MODEL(_[A-Z0-9_]+)?_API_KEY$")
+
+
+def leaked_model_credentials(env: Mapping[str, str]) -> list[str]:
+    """Every model credential set in ``env``, named, in a stable order.
+
+    Used by the local runtime to refuse to start and by the launcher to decide
+    what to strip. Returning the names rather than a bool is deliberate: the
+    developer has to be told *which* variable to remove, and "a model credential
+    is set" sends them looking through a shell profile at random.
+    """
+    found = {
+        name
+        for name in env
+        if name in MODEL_CREDENTIAL_VARS or MODEL_CREDENTIAL_PATTERN.match(name)
+    }
+    return sorted(name for name in found if str(env.get(name, "") or "").strip())
+
 
 def gateway_config(env: dict[str, str] | None = None, **overrides) -> LLMConfig:
-    """Build the gateway's configuration. Reads the shared model key."""
+    """Build the gateway's configuration for a *single* endpoint.
+
+    The shared default: one base URL, one key, one model for every role. A
+    gateway that routes roles to different endpoints builds one of these per
+    endpoint instead — see ``dakcoder_gateway.routing.RoleRouter``, which owns
+    the ``DAKCODER_MODEL_<ROLE>_*`` variables and hands each route back as one
+    of these. This stays because a probe, a script or a test with one endpoint
+    should not have to think about a routing table.
+    """
     env = os.environ if env is None else env
     key = env.get("DAKCODER_MODEL_API_KEY", "").strip()
     if not key:
@@ -152,14 +248,14 @@ def local_config(gateway_url: str, jwt: str, env: dict[str, str] | None = None, 
     matters most.
     """
     env = os.environ if env is None else env
-    for var in MODEL_CREDENTIAL_VARS:
-        if env.get(var, "").strip():
-            raise CredentialLeak(
-                f"{var} is set in a local runtime's environment. Model traffic goes "
-                f"through the gateway's /v1/llm proxy, which holds the real key; a "
-                f"credential here would be an unmetered bypass around quota and audit. "
-                f"Part B §4.6 should have stripped it before spawn."
-            )
+    leaked = leaked_model_credentials(env)
+    if leaked:
+        raise CredentialLeak(
+            f"{', '.join(leaked)} set in a local runtime's environment. Model traffic "
+            f"goes through the gateway's /v1/llm proxy, which holds the real key; a "
+            f"credential here would be an unmetered bypass around quota and audit. "
+            f"Part B §4.6 should have stripped it before spawn."
+        )
     if not jwt.strip():
         raise MissingCredential("a local runtime needs a dakcoder JWT to reach the gateway")
 

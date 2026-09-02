@@ -9,6 +9,13 @@ lives outside ``apps/`` so nothing here can end up inside a wheel.
                               holds, and the only process that may (§15.4)
     DAKCODER_MODEL_BASE_URL   LiteLLM's OpenAI-compatible base, e.g.
                               http://127.0.0.1:4000/v1
+    DAKCODER_MODEL            the model every role gets unless it names its own
+    DAKCODER_MODEL_<ROLE>[_BASE_URL|_API_KEY]
+                              per-role overrides — planner, coder, ask,
+                              verifier, debugger, fast, summariser, embed. Each
+                              falls back to the three above, so a one-model
+                              deployment sets none of them. See
+                              ``dakcoder_gateway.routing``.
     DAKCODER_JWT_SECRET       our own signing secret, >= 32 chars
     DAKCODER_REDIS_URL        quota counters; falls back to MemoryStore
     DAKCODER_POSTGRES_DSN     the usage ledger; falls back to MemoryLedger
@@ -36,11 +43,10 @@ from dakcoder_gateway.app import Gateway, create_app
 from dakcoder_gateway.auth import AuthService, RoleMap, TokenMinter
 from dakcoder_gateway.auth.identity import GitLabIdentity, Profile
 from dakcoder_gateway.ledger import MemoryLedger, PostgresLedger
-from dakcoder_gateway.probe import CapabilityProbe
+from dakcoder_gateway.probe import EndpointProbes
 from dakcoder_gateway.proxy import ModelProxy
 from dakcoder_gateway.quota import Limits, MemoryStore, QuotaPolicy, RedisStore
-from dakcoder_shared.config import gateway_config
-from dakcoder_shared.llm import LLMClient
+from dakcoder_gateway.routing import RoleRouter
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -182,9 +188,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     identity, kind = build_identity(args.host)
-    # Raises if DAKCODER_MODEL_API_KEY is absent — the gateway has no reason to
-    # exist without it.
-    config = gateway_config()
+    # Which model answers for which role, on which endpoint, with whose key —
+    # all of it from the environment. Raises if any role would be left without a
+    # credential, because the gateway has no reason to exist without one.
+    router = RoleRouter.from_env()
     # Read from the environment rather than hard-coded, so the ceilings can be
     # opened for a pilot and tightened afterwards with a restart instead of a
     # deploy. DAKCODER_QUOTA_ENFORCE=false turns every one of them off; the
@@ -199,14 +206,14 @@ def main(argv: list[str] | None = None) -> int:
         store, store_name = await build_store(limits)
         ledger, ledger_name = await build_ledger()
         quota = QuotaPolicy(store, limits)
-        proxy = ModelProxy(config.base_url, config.api_key, quota, ledger=ledger)
+        proxy = ModelProxy.from_routes(router, quota, ledger=ledger)
 
         gateway = Gateway(
             AuthService(identity, build_minter(), roles=RoleMap()),
             quota,
             proxy,
             ledger=ledger,
-            probe=CapabilityProbe(LLMClient(config)),
+            probe=EndpointProbes(router),
             tool_catalog=tool_catalog(),
             version=os.environ.get("DAKCODER_VERSION", "local"),
         )
@@ -224,8 +231,13 @@ def main(argv: list[str] | None = None) -> int:
                     # from the bill.
                     "quota": "enforced" if limits.any_enforced else "UNMETERED (counting only)",
                     "ledger": ledger_name,
-                    "upstream": config.base_url,
-                    "model": config.model_coder,
+                    "upstream": router.default.base_url,
+                    # The whole table, not one model. "Which model is the
+                    # planner on today?" is now an operator's question with an
+                    # operator's answer, and a startup line that named only the
+                    # coder's would be the same guess it replaced.
+                    "models": router.models,
+                    "endpoints": [label for label, _ in router.endpoints()],
                 }
             ),
             flush=True,

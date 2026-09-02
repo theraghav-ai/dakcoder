@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from dakcoder_gateway import CapabilityProbe, Status
+from dakcoder_gateway import CapabilityProbe, EndpointProbes, RoleRouter, Status
 from dakcoder_shared.config import Deployment, LLMConfig
 from dakcoder_shared.llm import LLMClient
 
@@ -230,3 +230,57 @@ def test_each_drift_fails_exactly_the_check_that_owns_it(endpoint, flag, expecte
     assert failed == {expected_failure}, (
         f"{flag} should fail only {expected_failure}, but failed {failed}"
     )
+
+
+# ── every endpoint the routing table names ──────────────────────────────────
+
+
+def endpoint_probes(endpoint, env: dict) -> EndpointProbes:
+    return EndpointProbes(
+        RoleRouter.from_env(env),
+        connect=lambda route: LLMClient(
+            route.as_config(),
+            transport=endpoint.transport(),
+            sleep=lambda _s: None,
+            jitter=lambda: 0.0,
+        ),
+    )
+
+
+def test_one_endpoint_probes_once_and_keeps_the_names_it_always_had(endpoint):
+    """Almost every deployment. The report shape /v1/health serves must not
+    change because a feature nobody turned on now exists."""
+    report = endpoint_probes(endpoint, {"DAKCODER_MODEL_API_KEY": "sk-test"}).run()
+
+    assert report.ok, report.summary()
+    assert status_of(report, "completes") is Status.PASS
+    # Unlabelled: there is only one endpoint, so there is nothing to tell apart.
+    assert not any("[" in result.name for result in report.results)
+
+
+def test_a_role_pointed_elsewhere_is_probed_too(endpoint):
+    """An endpoint nobody probes is one whose drift presents as inexplicable
+    agent behaviour — which is the failure mode the probe exists to prevent."""
+    report = endpoint_probes(
+        endpoint,
+        {
+            "DAKCODER_MODEL_API_KEY": "sk-test",
+            "DAKCODER_MODEL_PLANNER_BASE_URL": "http://10.0.0.9:4000/v1",
+        },
+    ).run()
+
+    names = {result.name for result in report.results}
+    assert any(name.endswith("[planner]") for name in names), names
+    # And the roles left on the default endpoint are still one pass between them.
+    assert any("coder" in name and "ask" in name for name in names), names
+
+
+def test_a_route_is_probed_against_its_own_model(endpoint):
+    """The checks name `coder` and `fast` because that is what they were written
+    against. A planner on another model still has to be exercised as itself."""
+    endpoint_probes(
+        endpoint,
+        {"DAKCODER_MODEL_API_KEY": "sk-test", "DAKCODER_MODEL_PLANNER": "Phi-4"},
+    ).run()
+
+    assert {request["model"] for request in endpoint.requests} == {"Qwen3.8-27B", "Phi-4"}

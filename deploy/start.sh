@@ -77,7 +77,18 @@ fi
 
 # The runtime is a *local* deployment and refuses to start holding a model key
 # (§4.7). `env -u` is that rule enforced by the launcher rather than trusted.
-RUNTIME_ENV="env -u DAKCODER_MODEL_API_KEY -u OPENAI_API_KEY -u LITELLM_API_KEY -u ANTHROPIC_API_KEY"
+#
+# Built from the environment rather than written out, because a role can carry
+# its own key now — DAKCODER_MODEL_PLANNER_API_KEY and any other an operator
+# adds — and a hand-maintained list is only as good as whoever remembers to
+# extend it. The shape is matched instead: every DAKCODER_MODEL*_API_KEY there
+# is, plus the names other tools use.
+RUNTIME_ENV="env"
+_others="OPENAI_API_KEY LITELLM_API_KEY ANTHROPIC_API_KEY AZURE_OPENAI_API_KEY"
+for _var in $(compgen -v | grep -E '^DAKCODER_MODEL[A-Z0-9_]*_API_KEY$') $_others; do
+  RUNTIME_ENV="$RUNTIME_ENV -u $_var"
+done
+unset _var _others
 
 tmux new-session -d -s "$SESSION" -n gateway -c "$ROOT"
 tmux send-keys -t "$SESSION:gateway" \

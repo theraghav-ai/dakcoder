@@ -15,6 +15,7 @@ import pytest
 from dakcoder_gateway.ledger import MemoryLedger
 from dakcoder_gateway.proxy import ModelProxy, ProxyError, TeedUsage
 from dakcoder_gateway.quota import Lane, Limits, MemoryStore, QuotaExceeded, QuotaPolicy
+from dakcoder_gateway.routing import RoleRouter
 
 from fakes import API_KEY, FakeUpstream
 
@@ -99,6 +100,99 @@ async def test_an_unknown_role_is_refused_with_the_list(proxy: ModelProxy) -> No
         await consume(proxy, body={"model": "gpt-4o", "messages": [], "stream": True})
     assert "not a configured role" in str(caught.value)
     assert "coder" in str(caught.value)
+
+
+# ── a role is a model, an endpoint and a key ────────────────────────────────
+
+
+def routed(quota: QuotaPolicy, ledger: MemoryLedger, upstream: FakeUpstream, env: dict):
+    return ModelProxy.from_routes(
+        RoleRouter.from_env(env), quota, ledger=ledger, http=upstream
+    )
+
+
+async def test_a_role_goes_to_its_own_model_endpoint_and_key(
+    quota: QuotaPolicy, ledger: MemoryLedger, upstream: FakeUpstream
+) -> None:
+    """The whole point of the routing table, end to end: an operator moves the
+    planner to another model on another host with another credential, and the
+    only thing that changed was the environment."""
+    proxy = routed(
+        quota,
+        ledger,
+        upstream,
+        {
+            "DAKCODER_MODEL_BASE_URL": "http://127.0.0.1:4000/v1",
+            "DAKCODER_MODEL_API_KEY": API_KEY,
+            "DAKCODER_MODEL_PLANNER": "Qwen3-235B-A22B",
+            "DAKCODER_MODEL_PLANNER_BASE_URL": "http://10.0.0.9:4000/v1",
+            "DAKCODER_MODEL_PLANNER_API_KEY": "sk-planner-only",
+        },
+    )
+
+    await consume(proxy, body={"model": "planner", "messages": [], "stream": True})
+    assert upstream.requests[0]["model"] == "Qwen3-235B-A22B"
+    assert upstream.urls[0] == "http://10.0.0.9:4000/v1/chat/completions"
+    assert upstream.headers[0]["Authorization"] == "Bearer sk-planner-only"
+
+    await consume(proxy, body={"model": "coder", "messages": [], "stream": True})
+    assert upstream.requests[1]["model"] == "Qwen3.8-27B"
+    assert upstream.urls[1] == "http://127.0.0.1:4000/v1/chat/completions"
+    assert upstream.headers[1]["Authorization"] == f"Bearer {API_KEY}"
+
+
+async def test_a_second_endpoints_key_never_reaches_the_first(
+    quota: QuotaPolicy, ledger: MemoryLedger, upstream: FakeUpstream
+) -> None:
+    """Splitting the credential must not widen where each half travels. A key
+    attached to the wrong host is a key disclosed to that host."""
+    proxy = routed(
+        quota,
+        ledger,
+        upstream,
+        {"DAKCODER_MODEL_API_KEY": API_KEY, "DAKCODER_MODEL_FAST_API_KEY": "sk-fast-only"},
+    )
+
+    await consume(proxy, body={"model": "coder", "messages": [], "stream": True})
+    assert "sk-fast-only" not in str(upstream.headers[0])
+
+
+async def test_the_ledger_records_the_role_and_the_model_it_resolved_to(
+    quota: QuotaPolicy, ledger: MemoryLedger, upstream: FakeUpstream
+) -> None:
+    """With roles on different models, "which model did this turn cost" stops
+    being answerable from the role alone — and the ledger is the system of
+    record for exactly that question."""
+    proxy = routed(
+        quota,
+        ledger,
+        upstream,
+        {"DAKCODER_MODEL_API_KEY": API_KEY, "DAKCODER_MODEL_PLANNER": "Qwen3-235B-A22B"},
+    )
+    # The fake reports its own model in the stream, as a real endpoint does.
+    upstream.chunks[0] = 'data: {"model":"Qwen3-235B-A22B","choices":[{"delta":{}}]}'
+
+    await consume(proxy, body={"model": "planner", "messages": [], "stream": True})
+    assert ledger.events[0].role == "planner"
+    assert ledger.events[0].model == "Qwen3-235B-A22B"
+
+
+async def test_an_endpoint_that_reports_no_model_is_billed_against_the_route(
+    quota: QuotaPolicy, ledger: MemoryLedger, upstream: FakeUpstream
+) -> None:
+    """A stream with no `model` field used to fall back to resolving the role
+    again. It still does — through the route, which is the only thing that
+    knows which model this role was actually sent to."""
+    proxy = routed(
+        quota,
+        ledger,
+        upstream,
+        {"DAKCODER_MODEL_API_KEY": API_KEY, "DAKCODER_MODEL_ASK": "Phi-4"},
+    )
+    upstream.chunks = [c.replace('"model":"Qwen3.8-27B",', "") for c in upstream.chunks]
+
+    await consume(proxy, body={"model": "ask", "messages": [], "stream": True})
+    assert ledger.events[0].model == "Phi-4"
 
 
 async def test_only_the_two_declared_paths_are_proxied(proxy: ModelProxy) -> None:

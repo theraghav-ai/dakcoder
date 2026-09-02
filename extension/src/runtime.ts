@@ -33,13 +33,22 @@ import { API_VERSION, type Health } from './protocol';
 
 /** Variables that must never reach the child, whatever the developer's shell holds. */
 const FORBIDDEN_IN_CHILD = [
-  'DAKCODER_MODEL_API_KEY',
-  'DAKCODER_MODEL_BASE_URL',
   'OPENAI_API_KEY',
   'LITELLM_API_KEY',
   'ANTHROPIC_API_KEY',
   'AZURE_OPENAI_API_KEY',
 ] as const;
+
+/**
+ * The same rule for the whole `DAKCODER_MODEL*` family, matched by shape.
+ *
+ * A role can carry its own endpoint and key now —
+ * `DAKCODER_MODEL_PLANNER_BASE_URL`, `DAKCODER_MODEL_PLANNER_API_KEY`, and
+ * whatever else an operator adds — so the list above stopped being able to name
+ * them all. A list is only as good as whoever remembers to extend it, and what
+ * it guards is the one credential that makes quota and audit unbypassable.
+ */
+const FORBIDDEN_PREFIX_IN_CHILD = /^DAKCODER_MODEL(_|$)/;
 
 export interface Announcement {
   port: number;
@@ -333,7 +342,12 @@ export class Runtime implements vscode.Disposable {
     };
     if (jwt) env.DAKCODER_JWT = jwt;
 
-    for (const name of FORBIDDEN_IN_CHILD) {
+    const forbidden = Object.keys(env).filter(
+      (name) =>
+        (FORBIDDEN_IN_CHILD as readonly string[]).includes(name) ||
+        FORBIDDEN_PREFIX_IN_CHILD.test(name),
+    );
+    for (const name of forbidden) {
       if (env[name]) {
         this.opts.log.warn(
           `${name} is set in this shell and was removed from the runtime's environment. ` +

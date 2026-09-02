@@ -928,14 +928,17 @@ export class Doctor implements vscode.Disposable {
       };
     }
 
-    const inShell = [
-      'DAKCODER_MODEL_API_KEY',
-      'DAKCODER_MODEL_BASE_URL',
-      'OPENAI_API_KEY',
-      'LITELLM_API_KEY',
-      'ANTHROPIC_API_KEY',
-      'AZURE_OPENAI_API_KEY',
-    ].filter((key) => !!process.env[key]);
+    // Matched by shape, not enumerated: a role can carry its own endpoint and
+    // key (`DAKCODER_MODEL_PLANNER_API_KEY`), so a fixed list would go quietly
+    // out of date every time an operator adds a role.
+    const inShell = Object.keys(process.env).filter(
+      (key) =>
+        !!process.env[key] &&
+        (/^DAKCODER_MODEL(_|$)/.test(key) ||
+          ['OPENAI_API_KEY', 'LITELLM_API_KEY', 'ANTHROPIC_API_KEY', 'AZURE_OPENAI_API_KEY'].includes(
+            key,
+          )),
+    );
 
     if (inShell.length) {
       return {

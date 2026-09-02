@@ -951,6 +951,9 @@ nobody has budgeted for, on a shared GPU, with our key attached. Only two paths
 are proxied — `chat/completions` and `embeddings` — so a new upstream capability
 cannot become reachable by accident.
 
+A role resolves to a whole *route* — model, endpoint and key — not just a name;
+see D-94.
+
 `stream_options.include_usage` is forced on every stream rather than trusted from
 the client. Without the usage chunk there is no accounting and quota could only
 be enforced from reservations, which is exactly S18.
@@ -1615,6 +1618,54 @@ outcome as well. The fold is scoped to a turn: the marker is cleared on
 `RunState`'s copy stays. It is the derivation every other surface reads, and two
 implementations of one rule is the lesser problem — one surface that quietly
 ignores it is what this was.
+
+---
+**D-94 · A role names a model, an endpoint and a key, and all three come from
+the environment**
+
+`DAKCODER_MODEL_<ROLE>`, `_BASE_URL`, `_API_KEY`, each falling back to the
+`DAKCODER_MODEL`, `DAKCODER_MODEL_BASE_URL` and `DAKCODER_MODEL_API_KEY`
+defaults. `RoleRouter.from_env` is the only place they are read.
+
+**Why**: the seam was built and never connected. `LLMConfig` had three model
+fields, the proxy had a six-entry role table with the same model name typed six
+times, and both were literals in source — so "put the Planner on a bigger
+model" meant editing the shared config, editing the proxy, editing the probe
+wiring, and shipping a release. A tiering seam that costs a deploy to move is
+one nobody moves, which is the same as not having it.
+
+Three consequences, each of which is the reason the change is not just a
+lookup table:
+
+- **Every turn dispatches as its mode's role.** `_complete` sent `coder` from
+  every mode, so `planner` and `ask` were entries nothing could reach: planning
+  and answering were billed, logged and routed as coding. `ModeConfig.role`
+  carries it now, separate from the mode because they answer different
+  questions — what the model may *do* this turn, and *which model* does it.
+- **The probe runs against every distinct endpoint.** One model on one host was
+  an assumption, not a decision. An endpoint nobody probes is one whose drift
+  presents as inexplicable agent behaviour, which is what §4.5 exists to
+  prevent; six roles sharing an endpoint still cost one pass.
+- **The credential guards match a shape, not a list.** A per-role key is still
+  a key only the gateway may hold, so `start.sh`, the extension's spawn, the
+  runtime's own refusal and the `.vsix` scanner all match
+  `DAKCODER_MODEL*_API_KEY`. A hand-maintained list guarding the one credential
+  that makes quota unbypassable is only as good as whoever remembers to extend
+  it.
+
+`ROLES` in `dakcoder_shared.config` is the vocabulary both halves share — the
+runtime sends a name, the gateway resolves it, and a name known to one and not
+the other is a turn refused with "not a configured role". That is the exact
+shape of the compaction defect above, so the two sides now read the same tuple
+and a test asserts it; `summariser` went back to being its own role, because a
+summariser worth pointing at a small model is one that can be told apart from
+the intent classifier.
+
+`GET /v1/models` publishes the table in force — role, model, endpoint, and what
+was overridden, never the keys — behind authentication, because the endpoints
+are internal hostnames. `/v1/health` publishes role → model only. Same reason
+the quota limits are published: a config change nobody can verify took effect
+is one people re-apply and re-argue about.
 
 ---
 **D-93 · A mode that restates its plan proves the plan was an answer**

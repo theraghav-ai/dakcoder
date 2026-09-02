@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **A model, an endpoint and a key per role, all from `deploy/dakcoder.env`.**
+  `DAKCODER_MODEL_PLANNER=Qwen3-235B-A22B` and a restart is now the whole of
+  "put the Planner on a bigger model"; add `_BASE_URL` and `_API_KEY` and it
+  can live on another host on another credential. Anything a role does not name
+  it inherits from `DAKCODER_MODEL`, `DAKCODER_MODEL_BASE_URL` and
+  `DAKCODER_MODEL_API_KEY`, so a one-model deployment sets three variables and
+  is done. The roles are `planner`, `coder`, `ask`, `fast`, `summariser`,
+  `embed`, plus `verifier` and `debugger` kept for older clients;
+  `DAKCODER_MODEL_ROLES` adds more. See `deploy/README.md` and D-94.
+- **`GET /v1/models`** (authenticated) — the routing table in force: role,
+  model, endpoint, and which of the three the role overrode. Never the keys.
+  `/v1/health` gains role → model, and `deploy/status.sh` prints it.
+
+### Fixed
+
+- **Every turn dispatched as `coder` whatever mode it was in**, so `planner`
+  and `ask` were role-table entries nothing could reach — planning and
+  answering were billed, logged and routed as coding. A mode now carries its
+  own role.
+- **Compaction recaps ask for `summariser` again.** The role was moved to
+  `fast` because the client's vocabulary was three names long and this was not
+  one of them. Both halves now read the same `ROLES` tuple, with a test
+  asserting they agree, so the name that §6.5 specifies resolves — and the
+  summariser can be pointed at a small model without moving the intent
+  classifier with it.
+- **The capability probe covers every distinct endpoint**, not just the
+  default. A role pointed elsewhere was previously unprobed, which is the
+  failure mode §4.5 exists to prevent. Endpoints shared between roles still
+  cost one pass.
+- **The credential guards match `DAKCODER_MODEL*_API_KEY` by shape** rather
+  than from a fixed list — in the launcher, the extension's spawn, the
+  runtime's own startup refusal and the `.vsix` scanner. A per-role key is
+  still a key only the gateway may hold, and a list would have gone quietly out
+  of date the first time a role was added.
+- **A role with no key anywhere stops the gateway at startup**, naming the role
+  and the variable, instead of surfacing as a 502 hours later to whichever
+  developer reached that role first.
+
 ## 0.3.0 — 2026-09-02
 
 Runtime API **1.1**. Extension `0.3.0`, `dakcoder-agent` `0.3.0`,

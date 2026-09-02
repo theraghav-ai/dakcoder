@@ -35,7 +35,9 @@ const PATTERNS = [
     // codebase precisely because the runtime deletes them from the child
     // environment, and flagging those would make the check cry wolf until
     // someone turned it off.
-    re: /(DAKCODER_MODEL_API_KEY|OPENAI_API_KEY|LITELLM_API_KEY|ANTHROPIC_API_KEY)\s*[:=]\s*['"][^'"\s]{8,}/,
+    // `DAKCODER_MODEL_<ROLE>_API_KEY` too: a role can carry its own key, and a
+    // per-role one in the .vsix is the same leak as the shared one.
+    re: /(DAKCODER_MODEL[A-Z0-9_]*_API_KEY|OPENAI_API_KEY|LITELLM_API_KEY|ANTHROPIC_API_KEY)\s*[:=]\s*['"][^'"\s]{8,}/,
   },
 ];
 

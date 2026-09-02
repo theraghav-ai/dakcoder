@@ -2143,12 +2143,15 @@ class AgentLoop:
         try:
             reply = self.client.chat(
                 [{"role": "user", "content": _RECAP_PROMPT + transcript}],
-                # `fast`, which is what section 6.5 specifies and what
-                # `LLMConfig.model_for` actually accepts. This said "summariser"
-                # for its whole life, `model_for` rejects that on both
-                # deployments, and every compaction in production silently
-                # returned the fallback recap.
-                role="fast",
+                # `summariser`, which is what section 6.5 specifies. It said
+                # exactly this for its whole life and every compaction in
+                # production silently returned the fallback recap, because the
+                # role vocabulary was three names long and this was not one of
+                # them; it was moved to `fast` to make it work at all. Both
+                # halves now share `ROLES`, so the name resolves — and a
+                # summariser worth pointing at a small model is one that can be
+                # told apart from the intent classifier, which `fast` still is.
+                role="summariser",
                 max_tokens=1024,
                 enable_thinking=False,
                 response_format=_RECAP_SCHEMA,

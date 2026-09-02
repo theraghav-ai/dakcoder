@@ -67,6 +67,64 @@ is what every tmux pane sources, and is worth sourcing by hand too — it sets
 `PATH` for `go`/`gotools`, keeps the corporate proxy away from loopback, and
 exports the minted `DAKCODER_JWT`.
 
+## Choosing a model per role
+
+Which model answers as the Planner, the Coder, the summariser and the rest is
+an operator's decision, taken in `deploy/dakcoder.env` and applied by
+restarting the gateway. There is no code change and no redeploy: the runtime
+sends a *role* name and the gateway is the only side that resolves it to a
+model — which is also the control that stops a developer routing to a model
+nobody budgeted for (§15.4).
+
+Three defaults cover the common case, one endpoint serving everything:
+
+```bash
+DAKCODER_MODEL_BASE_URL=http://127.0.0.1:4000/v1
+DAKCODER_MODEL_API_KEY=sk-…
+DAKCODER_MODEL=Qwen3.8-27B
+```
+
+Any role can then name its own model, its own endpoint and its own key, and
+inherits whatever it does not name:
+
+```bash
+DAKCODER_MODEL_PLANNER=Qwen3-235B-A22B            # a bigger model to plan with
+DAKCODER_MODEL_PLANNER_BASE_URL=http://10.0.0.9:4000/v1   # …on another host
+DAKCODER_MODEL_PLANNER_API_KEY=sk-…               # …with its own credential
+DAKCODER_MODEL_SUMMARISER=Phi-4-mini-instruct     # a small one for recaps
+```
+
+| role | where it is used |
+| --- | --- |
+| `planner` | Plan mode turns |
+| `coder` | Agent mode turns — reading, writing, running the gates |
+| `ask` | Ask mode turns, which hold no write tool |
+| `fast` | the intent classifier: one call, a two-key schema, 64 tokens |
+| `summariser` | compaction recaps |
+| `embed` | the embeddings endpoint |
+| `verifier`, `debugger` | retired as modes, kept as roles so an older runtime or a stored session naming one is routed rather than refused |
+
+`DAKCODER_MODEL_ROLES=reviewer` adds a role beyond these; it is additive, so
+the built-in ones are always configured — the runtime calls `fast` and
+`summariser` on its own and a table missing them would fail the first
+compaction of the day.
+
+Two things make a change here verifiable rather than something you infer from
+behaviour, which is the whole reason it is configuration:
+
+- **`GET /v1/models`** (authenticated) publishes the table in force — role,
+  model, endpoint, and which of the three the role overrode. Never the keys.
+  `/v1/health` publishes role → model only, since it is unauthenticated.
+- **The capability probe runs against every distinct endpoint**, not just the
+  default. A second endpoint that has stopped sending the usage chunk or
+  rejects `chat_template_kwargs` shows up as a named failure at startup, which
+  is what §4.5 exists for; probing only the default would leave every role
+  pointed elsewhere unchecked.
+
+A role left without a key anywhere stops the gateway at startup, naming the
+role and the variable. The alternative is a 502 hours later, for whichever
+developer happens to reach that role first.
+
 ## Two things this deployment does that production must not
 
 **The identity provider is a local stand-in.** No GitLab OAuth application is
@@ -81,10 +139,13 @@ and rotating them is the extension's job (§15.2); nothing here does that, so
 `start.sh` mints a long one with `gateway_main.py --mint`. That is also why the
 dev IdP is loopback-only — the two decisions are the same decision.
 
-The credential invariant is *not* relaxed. The gateway is the only process
-holding the LiteLLM key; `start.sh` strips every model-credential variable from
-the runtime's environment before spawning it (`env -u …`), and `local_config`
-refuses to build a configuration that has one (§4.7).
+The credential invariant is *not* relaxed, and per-role keys do not relax it
+either — they widen the *shape* that has to be kept off a laptop, not the set
+of processes that may hold one. The gateway is still the only process holding a
+model key; `start.sh` strips every `DAKCODER_MODEL*_API_KEY` in the environment
+before spawning the runtime (matched by shape, not from a list that would go
+out of date the first time a role was added), the extension does the same at
+spawn, and `local_config` refuses to build a configuration that has one (§4.7).
 
 ## Verifying it works
 

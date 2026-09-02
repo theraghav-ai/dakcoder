@@ -56,6 +56,29 @@ def test_a_local_runtime_refuses_to_start_holding_a_model_key():
             local_config("https://aiops.cept.gov.in/coder/backend", "jwt", env={var: "sk-leaked"})
 
 
+def test_a_per_role_key_is_as_forbidden_as_the_shared_one():
+    """A role can carry its own credential now. A list of names would have gone
+    quietly out of date the first time an operator added one — so the shape is
+    matched, and the developer is told which variable to remove."""
+    with pytest.raises(CredentialLeak, match="DAKCODER_MODEL_PLANNER_API_KEY"):
+        local_config(
+            "https://aiops.cept.gov.in/coder/backend",
+            "jwt",
+            env={"DAKCODER_MODEL_PLANNER_API_KEY": "sk-leaked"},
+        )
+
+
+def test_the_variables_that_are_not_credentials_are_left_alone():
+    """A runtime that refused to start over a model *name* would be refusing
+    over nothing, and the fix would look like turning the check off."""
+    cfg = local_config(
+        "https://aiops.cept.gov.in/coder/backend",
+        "jwt",
+        env={"DAKCODER_MODEL_PLANNER": "Qwen3-235B", "DAKCODER_MODEL_ROLES": "reviewer"},
+    )
+    assert cfg.deployment is Deployment.LOCAL
+
+
 def test_a_local_runtime_needs_a_jwt():
     with pytest.raises(MissingCredential):
         local_config("https://aiops.cept.gov.in/coder/backend", "", env={})
@@ -94,8 +117,13 @@ def test_a_local_runtime_sends_the_role_and_lets_the_gateway_name_the_model():
     local = local_config("https://aiops.cept.gov.in/coder/backend", "jwt", env={})
     assert local.model_for("coder") == "coder"
     assert local.model_for("fast") == "fast"
+    # Every name in the shared vocabulary passes through, because the gateway
+    # has a route for every one of them. A name outside it is a typo, and
+    # catching it here costs a round trip less than being refused upstream.
+    assert local.model_for("planner") == "planner"
+    assert local.model_for("summariser") == "summariser"
     with pytest.raises(ValueError, match="unknown model role"):
-        local.model_for("planner")
+        local.model_for("gpt-4o")
 
     gw = gateway_config(env={"DAKCODER_MODEL_API_KEY": "sk-real"})
     assert gw.model_for("coder") == "Qwen3.8-27B"
@@ -105,8 +133,28 @@ def test_models_resolve_by_role_never_by_a_bare_name():
     cfg = LLMConfig(Deployment.GATEWAY, "u", "k", model_fast="Phi-4-mini-instruct")
     assert cfg.model_for("fast") == "Phi-4-mini-instruct"
     assert cfg.model_for("coder") == "Qwen3.8-27B"
+    # A role with no model of its own gets the general-purpose one — which is
+    # what every role got before any of them could be routed separately.
+    assert cfg.model_for("planner") == "Qwen3.8-27B"
+    # A model name is not a role, however plausible it looks.
     with pytest.raises(ValueError, match="unknown model role"):
-        cfg.model_for("planner")
+        cfg.model_for("Qwen3.8-27B")
+
+
+def test_a_role_a_gateway_config_carries_beats_the_named_fields():
+    """What per-role routing is built on: a config can resolve any role in the
+    vocabulary, not only the three this class happens to have fields for."""
+    cfg = LLMConfig(
+        Deployment.GATEWAY,
+        "u",
+        "k",
+        models={"planner": "Qwen3-235B", "coder": "Qwen3.8-27B"},
+        model_coder="ignored-because-models-wins",
+    )
+    assert cfg.model_for("planner") == "Qwen3-235B"
+    assert cfg.model_for("coder") == "Qwen3.8-27B"
+    # Untouched by `models`, so the named field still answers.
+    assert cfg.model_for("fast") == "Qwen3.8-27B"
 
 
 # ── request shaping ─────────────────────────────────────────────────────────
