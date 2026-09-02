@@ -34,10 +34,12 @@ blocks on violations that were there before the session started.
 from __future__ import annotations
 
 import shutil
+import subprocess
 import time
 from collections.abc import Callable, Sequence
 from pathlib import PurePosixPath
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from dakcoder_shared.envelope import ToolResult
@@ -123,6 +125,20 @@ class Baseline:
     findings: dict[str, frozenset[str]] = field(default_factory=dict)
     #: stage tool -> whether it passed before the run started.
     passed: dict[str, bool] = field(default_factory=dict)
+    #: stage tool -> the *rule classes* already violated anywhere in the module.
+    #:
+    #: The coarser half of the judgement, and on a legacy service the half that
+    #: carries it. A vertical slice writes a *new* file, so every finding in it
+    #: is a new key by construction and key comparison alone excuses nothing --
+    #: which is how `rules_lint` came to block every run on a service whose
+    #: thirty existing handlers trip `domain-tags` and whose new one, written to
+    #: mirror them, trips it too. Mirroring the house style is what the agent is
+    #: told to do when the contract is silent; it is not a regression this change
+    #: introduced.
+    #:
+    #: So a finding blocks only when its *rule* is one nothing in the service was
+    #: violating before. That is the thing this run actually did.
+    rule_classes: dict[str, frozenset[str]] = field(default_factory=dict)
     #: Compliance violations already present, as ``rule|path|message`` keys.
     #: Passed *into* `swagger_check` rather than compared after it, because that
     #: stage does the discounting itself.
@@ -132,7 +148,25 @@ class Baseline:
     taken: bool = False
 
     def excuses(self, tool: str, current: frozenset[str]) -> bool:
-        """Whether every finding in ``current`` was already there."""
+        """Whether every finding in ``current`` is one this run is not answerable for.
+
+        Two tests, and the second is what makes this usable on a legacy service.
+
+        A finding is excused when its **key** was already present -- the same
+        rule, in the same file, with the same message, before the run touched
+        anything. That covers an edit to a file that was already violating.
+
+        It is also excused when its **rule class** was already being violated
+        somewhere in the module. That covers the case key comparison cannot: a
+        vertical slice writes a new file, so its findings are new keys however
+        faithfully it copied the file next door. Blocking there fails the agent
+        for doing what the system prompt tells it to do -- "when the contract is
+        silent, copy the shape of the nearest existing resource".
+
+        What still blocks is a rule *nothing* in the service was violating and
+        this change now does. That is a regression, and it is the only thing here
+        that is.
+        """
         if not self.taken:
             return False
         if self.passed.get(tool, True):
@@ -146,7 +180,15 @@ class Baseline:
             # Treated as the same failure: the alternative is charging this run
             # for a stage that was red when it arrived.
             return True
-        return not (current - known)
+
+        introduced = current - known
+        if not introduced:
+            return True
+
+        classes = self.rule_classes.get(tool)
+        if not classes:
+            return False
+        return all(key.split("|", 1)[0] in classes for key in introduced)
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +257,11 @@ class StageResult:
     content: str
     seconds: float = 0.0
     skipped: str = ""
+    #: The stage's findings as baseline-comparable keys, when it produced any.
+    #: Carried on the result so a caller can ask "is this new?" without
+    #: re-deriving it from prose -- which is what the inner loop needs, and what
+    #: `_stage_findings` already computes for the gate.
+    findings: frozenset[str] = frozenset()
 
     @property
     def blocked(self) -> bool:
@@ -393,11 +440,11 @@ def _tests_can_run(ctx: GateContext) -> str:
     """
     if not _needs_containers(ctx):
         return ""
-    if shutil.which("docker") or shutil.which("podman"):
+    if _container_runtime() is not None:
         return ""
     return (
         "these tests start containers (testcontainers) and no container runtime "
-        "was found, so a failure here is about this machine, not the change"
+        "is available here, so a failure is about this machine, not the change"
     )
 
 
@@ -515,7 +562,26 @@ GATE: tuple[Stage, ...] = (
         halts=True,
         baseline_key="go_build",
     ),
-    Stage("rules_lint", "rules_lint", _scoped, when=_has_go, skip_reason=_NO_MODULE),
+    # Baselined, like every other blocking stage, and for the reason the others
+    # are: without one it reports whatever it finds and the loop reads every
+    # finding as the run's own.
+    #
+    # This stage could not fail at all until `_lint_is_clean` was fixed to read
+    # the counts out of `meta` -- it was parsing a body that has been rendered
+    # prose since `_render_lint` landed, so the decode raised on every call and
+    # the check fell back to `result.ok`, which is True whenever the sidecar ran.
+    # Fixing that without also baselining it turned "the headline promise is
+    # inert" into "no legacy service can ever clear the gate": one field run
+    # wrote nine correct files and was blocked by 98 findings, most of them in
+    # `handler/paogen.go`, which it never opened.
+    Stage(
+        "rules_lint",
+        "rules_lint",
+        _scoped,
+        when=_has_go,
+        skip_reason=_NO_MODULE,
+        baseline_key="rules_lint",
+    ),
     # Scoped, like the other lint stages. Unscoped it reported every legacy
     # handler in the service as a blocker, so no change to a service that
     # predates the contract could ever clear the gate — the exact failure the
@@ -616,9 +682,89 @@ def full_gate(
 _BASELINE_STAGES: tuple[tuple[str, dict[str, Any]], ...] = (
     ("go_build", {}),
     ("go_vet", {}),
-    ("go_test", {}),
     ("go_mod", {"op": "tidy", "check": "true"}),
+    # Unscoped deliberately, and it is the one stage where that matters most:
+    # the whole point is to learn which rules this service already violates
+    # *anywhere*, so a new file written in the house style is not charged for
+    # a pattern the house has used thirty times.
+    ("rules_lint", {}),
 )
+
+#: ``go_test`` is measured separately, and off by default.
+#:
+#: It is 74 of the baseline's 80 seconds on a legacy service, and the first gate
+#: blocks on the baseline finishing. Which buys what, exactly? A baseline for a
+#: stage that is *already* advisory whenever its tests need a container runtime
+#: this machine does not have -- so on the corpus where 74 seconds hurts most,
+#: the 74 seconds establishes something the stage had already decided.
+#:
+#: Taken only when the tests can actually run and could actually block, which is
+#: what ``take_baseline`` now checks. Everything else about the baseline is
+#: unchanged: it is still taken before the first edit, still on a background
+#: thread, and still joined before the first gate.
+_BASELINE_TEST_STAGE = ("go_test", {})
+
+
+@lru_cache(maxsize=1)
+def _container_runtime() -> str | None:
+    """The container runtime that is actually *running*, or None.
+
+    ``shutil.which("docker")`` was the old test and it is the wrong question.
+    Docker Desktop leaves the binary on PATH whether or not the daemon is up, so
+    on a machine with it installed and stopped -- the ordinary state of a
+    developer laptop -- the probe said yes, `go_test` stayed blocking, and the
+    baseline spent 74 seconds discovering that testcontainers cannot reach a
+    daemon. Measured on this machine: `which docker` succeeds, `docker info`
+    exits 1.
+
+    Cached for the process. The daemon can come up mid-run and this will not
+    notice, which is the right trade: the alternative is a subprocess on every
+    gate, and a run that starts without Docker is not going to grow tests that
+    need it halfway through.
+    """
+    for name in ("docker", "podman"):
+        if not shutil.which(name):
+            continue
+        try:
+            done = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                [name, "info"],
+                capture_output=True,
+                timeout=8,
+                check=False,
+                shell=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if done.returncode == 0:
+            return name
+    return None
+
+
+def _tests_are_worth_baselining(router: Router) -> bool:
+    """Whether a ``go test`` baseline can tell us anything the gate will use.
+
+    It costs 74 seconds on a legacy service and the first gate waits for it, so
+    it has to earn that. It does not when the stage is going to be advisory
+    anyway: `_tests_can_run` downgrades `go_test` whenever the tests in scope
+    need a container runtime and none is installed, and an advisory stage never
+    consults a baseline. Measured: 80s with, 6s without, same verdict.
+    """
+    root = router.workspace.root
+    if not any(root.rglob("*_test.go")):
+        return False
+    if _container_runtime() is not None:
+        return True
+    # No container runtime. If any test file stands one up, `go_test` is advisory
+    # for the whole run and its baseline would be 74 seconds spent on a question
+    # nobody asks.
+    for test in root.rglob("*_test.go"):
+        try:
+            body = test.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(marker in body for marker in _CONTAINER_IMPORTS):
+            return False
+    return True
 
 
 def take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
@@ -638,15 +784,18 @@ def take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
     recorded as *not taken*, because "we did not look" and "nothing was wrong"
     must not read the same to `excuses`.
     """
+    before = router.mutations
     findings: dict[str, frozenset[str]] = {}
     passed: dict[str, bool] = {}
+    rule_classes: dict[str, frozenset[str]] = {}
     compliance: frozenset[str] = frozenset()
 
     root_is_module = (router.workspace.root / "go.mod").is_file()
-    for tool, args in _BASELINE_STAGES:
+    stages = list(_BASELINE_STAGES)
+    if include_tests and root_is_module and _tests_are_worth_baselining(router):
+        stages.append(_BASELINE_TEST_STAGE)
+    for tool, args in stages:
         if not root_is_module:
-            continue
-        if tool == "go_test" and not include_tests:
             continue
         try:
             outcome = router.run_gate_tool(tool, dict(args))
@@ -661,6 +810,20 @@ def take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
             keys = outcome.meta.get("findings") or ()
             findings[tool] = frozenset(str(k) for k in keys)
             continue
+
+        if tool == "rules_lint":
+            # A lint that ran is a lint that succeeded; the verdict is the
+            # count, exactly as `_lint_is_clean` reads it.
+            count = int(outcome.meta.get("violations") or 0)
+            passed[tool] = outcome.ok and count == 0
+            findings[tool] = frozenset(
+                str(k) for k in (outcome.meta.get("violation_keys") or ())
+            )
+            rule_classes[tool] = frozenset(
+                str(r) for r in (outcome.meta.get("violation_rules") or ())
+            )
+            continue
+
         passed[tool] = outcome.ok
         if not outcome.ok:
             findings[tool] = _finding_keys(outcome.for_model())
@@ -672,7 +835,18 @@ def take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
     except Exception:  # noqa: BLE001 - see above
         pass
 
-    return Baseline(findings=findings, passed=passed, compliance=compliance, taken=True)
+    if router.mutations != before:
+        # Something was written while this was being measured, so it is not a
+        # picture of the workspace as the run found it. Better none than one
+        # that excuses the run's own damage.
+        return Baseline()
+    return Baseline(
+        findings=findings,
+        passed=passed,
+        rule_classes=rule_classes,
+        compliance=compliance,
+        taken=True,
+    )
 
 
 def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
@@ -718,7 +892,12 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
                     "this change's failure. Fix it only if it bears on the work."
                 )
 
-        results.append(StageResult(stage.name, ok, blocking, content, elapsed))
+        results.append(
+            StageResult(
+                stage.name, ok, blocking, content, elapsed,
+                findings=frozenset() if ok else _stage_findings(stage, result),
+            )
+        )
 
         if blocking and not ok and stage.halts:
             # Fail-fast, but only where "fast" is also "correct". Running
@@ -750,6 +929,11 @@ def _stage_findings(stage: Stage, result: ToolResult) -> frozenset[str]:
     """The failing stage's findings, keyed the same way the baseline keyed them."""
     if stage.tool == "go_mod":
         return frozenset(str(k) for k in (result.meta.get("findings") or ()))
+    if stage.tool == "rules_lint":
+        # `rule|path|message`, the same shape the baseline recorded. Never the
+        # rendered prose: that is grouped, elided and worst-first, so it does not
+        # contain the findings at all past the third of each rule.
+        return frozenset(str(k) for k in (result.meta.get("violation_keys") or ()))
     return _finding_keys(result.for_model())
 
 

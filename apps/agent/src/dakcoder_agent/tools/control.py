@@ -1,4 +1,4 @@
-"""The two tools that end the planning phase.
+"""The tools a mode ends its turn with.
 
 They are the whole of Track A item 3, and the reason they exist is worth stating
 plainly, because "make the plan a tool call" sounds like a refactor and is not.
@@ -21,7 +21,17 @@ happened. What is deleted along with the guessing: ``_STEP``, ``_count_steps``,
 ``_asks_the_developer``, ``_refuses_to_plan``, ``_restated_the_plan``,
 ``_plan_targets``, ``_is_scaffold_plan``.
 
-Neither tool touches the workspace. They are handlers rather than something the
+``finish`` is the same idea for ``ask`` and ``agent``, and it is here because
+the live endpoint settled an argument. In those two modes "I am finished" meant
+*not calling a tool*, and past about six fruitless calls Qwen3.8-27B cannot
+produce a non-action: it repeats its last call, 5 times out of 5, and no wording
+in the tool's answer changes that. Suppressing the tools is worse -- with
+``tool_choice: "none"`` vLLM turns off its tool parser while the schemas stay in
+the prompt, so the model's ``<tool_call>`` markup lands in ``content`` as text;
+with ``tools: []`` it invents ``Grep`` from another harness. Giving it a call
+that *means* stopping works 5/5. That is the whole fix.
+
+None of these tools touches the workspace. They are handlers rather than something the
 loop intercepts before dispatch so that argument validation, coercion, the
 malformed-arguments message and the tool-result envelope are the same ones every
 other tool gets -- an intercept would be a second, quietly different code path
@@ -153,7 +163,32 @@ def ask_developer(inv: Invocation) -> ToolResult:
     )
 
 
+def finish(inv: Invocation) -> ToolResult:
+    """End the turn with an answer.
+
+    The counterpart of `submit_plan` for the modes that were never given one.
+    A phase ends when the model says it ends, and it says so the only way this
+    model reliably can -- by calling something.
+
+    The answer is echoed straight back rather than summarised. It is what the
+    developer reads, and a tool that paraphrased it would be editing the reply.
+    """
+    answer = str(inv.arg("answer") or "").strip()
+    if not answer:
+        return ToolResult.failure(
+            "finish was called with no answer.",
+            fix="Put what you found or did in `answer`; it is what the developer "
+            "reads. If something stopped you, say what in `blocked`.",
+        )
+    blocked = str(inv.arg("blocked") or "").strip()
+    body = answer if not blocked else f"{answer}\n\nBlocked: {blocked}"
+    return ToolResult.success(
+        body, meta={"control": "finish", "answer": answer, "blocked": blocked}
+    )
+
+
 HANDLERS: dict[str, Any] = {
     "submit_plan": submit_plan,
     "ask_developer": ask_developer,
+    "finish": finish,
 }

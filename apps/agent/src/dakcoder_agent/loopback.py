@@ -62,7 +62,19 @@ __all__ = ["API_VERSION", "Loopback", "PendingApproval", "create_app"]
 #: The contract version the extension pins against. Bumped when a response shape
 #: changes in a way a client could not have anticipated — never for an additive
 #: field, because C2's rule is that unknown types and fields are ignored.
-API_VERSION = "1.0"
+#:
+#: **1.1** — the mode vocabulary changed. Five modes (`planner`, `scaffolder`,
+#: `coder`, `verifier`, `debugger`) became three (`ask`, `planner`, `agent`), so
+#: a 1.0 client's `Mode` union does not contain the values it will now be sent.
+#: It degrades rather than crashes — an unknown mode is displayed raw — but the
+#: guard exists precisely so that half-working is not the outcome nobody
+#: suspects.
+#:
+#: Additive in the same release, and *not* on their own a reason to bump:
+#: `POST /v1/tasks` accepts `intent` (with `mode` still read as a synonym),
+#: `POST /v1/credential` is new, `turn_start` carries `intent`, and the tool
+#: catalog gained `finish`, `submit_plan` and `ask_developer`.
+API_VERSION = "1.1"
 
 #: How long a run waits for an approval before giving up. Long enough for someone
 #: to read a seven-file scaffold; short enough that a developer who closed the
@@ -139,6 +151,9 @@ class Loopback:
         self.gateway_url = gateway_url
         self.approvals: dict[str, PendingApproval] = {}
         self.contexts: dict[str, Any] = {}
+        #: The loop that last ran for each session, so a follow-up can inherit
+        #: its ledgers the way it already inherits its context.
+        self.loops: dict[str, Any] = {}
         self.ready: dict[str, Any] = {"prewarmed": False}
         #: The developer's gateway JWT, as the extension last refreshed it.
         #: Read per request by the LLM client rather than captured at spawn —
@@ -251,6 +266,15 @@ class Loopback:
             prior = self.contexts.get(session.id)
             if prior is not None:
                 agent.context = prior
+            # And the ledgers, for the same reason. The working set remembering
+            # a search while the ledger that knows it was exhausted starts empty
+            # is how "where is the plan?" reproduced the previous message's loop
+            # verbatim. See ``AgentLoop.carry_from`` for what does and does not
+            # travel.
+            previous = self.loops.get(session.id)
+            if previous is not None:
+                agent.carry_from(previous)
+        self.loops[session.id] = agent
         agent.on_pending = register
         agent.cancelled = session.cancel.is_set
         agent.winding_down = session.winding_down.is_set

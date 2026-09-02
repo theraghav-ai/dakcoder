@@ -518,6 +518,48 @@ _SPECS: tuple[ToolSpec, ...] = (
         required=("questions",),
         modes=frozenset({_PLAN}),
     ),
+    # -- ending a turn ------------------------------------------------------
+    #
+    # The move this model did not have, and the whole of the loop's worst
+    # failure class.
+    #
+    # In `ask` and `agent`, "I am finished" used to mean *not calling a tool* --
+    # a non-action. Measured on the live endpoint: past about six fruitless tool
+    # calls, Qwen3.8-27B cannot produce one. It repeats its last call 5/5, and no
+    # wording changes that: not the tool's message, not a message without the
+    # directory listing, not one naming the glob, not one saying in plain words
+    # "do not search for it again; tell the developer what you have established".
+    # All 5/5 loop.
+    #
+    # Suppressing the tools does not work either, and is worse. With
+    # `tool_choice: "none"` vLLM disables its tool parser while the schemas stay
+    # in the prompt, so the model emits `<tool_call>` markup that lands in
+    # `content` as text -- which the loop then served to a developer as the
+    # answer. With `tools: []` it emits markup for `Grep` with an `output_mode`
+    # parameter, a tool from a different harness entirely, remembered from
+    # training.
+    #
+    # What works, 5/5, is giving it a call that *means* stopping. `planner` has
+    # had this all along -- `submit_plan` and `ask_developer` are terminal
+    # actions, which is precisely why the planning phase is the one that
+    # behaves. This is the same thing for the other two.
+    ToolSpec(
+        name="finish",
+        description=(
+            "End your turn and hand the developer your answer. Call this when the "
+            "work is done, or when going further will not help."
+        ),
+        parameters=_obj(
+            answer=_str("What you found or did, in full. This is what they read."),
+            blocked=_str("What stopped you, if anything did. Omit when nothing did."),
+        ),
+        required=("answer",),
+        # Every mode. `planner` has two terminal actions of its own, and this is
+        # the third: a planner that has established there is nothing to plan
+        # needs to say so, and used to do it by falling silent -- which is the
+        # non-action this model cannot reliably produce either.
+        modes=_READERS,
+    ),
     # -- editing ------------------------------------------------------------
     ToolSpec(
         name="write_file",

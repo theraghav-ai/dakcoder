@@ -10,7 +10,16 @@
  */
 
 /** Contract version this build pins against. Compared with `/v1/health`. */
-export const API_VERSION = '1.0';
+/**
+ * The runtime contract this build speaks. A mismatch is refused at connect
+ * time rather than discovered later in a way nobody attributes.
+ *
+ * **1.1** — the mode vocabulary changed: five modes became `ask`, `planner`
+ * and `agent`. A 1.0 client is sent values its `Mode` union does not carry.
+ * The extension and the runtime ship in the same `.vsix`, so this only ever
+ * fires on a hand-mixed pair — which is exactly when it should.
+ */
+export const API_VERSION = '1.1';
 
 // ── events (C2) ─────────────────────────────────────────────────────────────
 

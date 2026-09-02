@@ -33,7 +33,10 @@ import pytest
 from dakcoder_agent.context import ContextManager, Layer
 from dakcoder_agent.gate import GATE
 from dakcoder_agent.loop import (
+    MAX_FINISH_REFUSALS,
     MAX_GATE_FAILURES,
+    MAX_RESEARCH_TURNS,
+    STALLS_BEFORE_ANSWER,
     MAX_READS,
     MAX_STALLED_TURNS,
     AgentLoop,
@@ -81,7 +84,35 @@ class ScriptedClient:
             # Numbered, so filler stands for "the model said something" rather
             # than "it said the same thing twice".
             return say(f"nothing further ({self.calls})")
-        return self.turns.pop(0)
+        turn = self.turns.pop(0)
+        # `tool_choice` is honoured, because a stub that ignores it lets a test
+        # assert the parameter was *sent* while proving nothing about what it
+        # does. The endpoint enforces it; so does this.
+        if isinstance(tool_choice, dict):
+            # A named choice. The endpoint constrains the output to that one
+            # tool, so the stub does too -- 5/5 live, and a stub that let the
+            # script answer instead would be testing nothing.
+            wanted = tool_choice.get("function", {}).get("name", "")
+            if not (turn.tool_calls and turn.tool_calls[0].name == wanted):
+                self.turns.insert(0, turn)
+                # Arguments the named tool actually takes. The endpoint uses
+                # guided decoding for a named choice, so what comes back is
+                # schema-shaped; a stub that sent the wrong keys would be
+                # testing the refusal path and calling it the happy one.
+                body = {
+                    "submit_plan": {"steps": [{"file": "handler/user.go",
+                                               "action": "forced",
+                                               "accepts": "go build"}]},
+                    "ask_developer": {"questions": ["Which table?"]},
+                }.get(wanted, {"answer": "Nothing further to add."})
+                return calls((wanted, json.dumps(body)))
+        elif tool_choice == "none" and turn.tool_calls:
+            self.turns.insert(0, turn)
+            return say(f"I cannot call a tool this turn ({self.calls}).")
+        elif tool_choice == "required" and not turn.tool_calls:
+            self.turns.insert(0, turn)
+            return calls(("repo_map", "{}"))
+        return turn
 
 
 def say(text: str) -> ChatResult:
@@ -389,7 +420,10 @@ def test_a_planner_that_will_not_call_a_tool_twice_ends_honestly(
     )
     list(loop.run("check the handler", intent=Intent.AGENT))
 
-    assert client.tool_choices.count("required") == 1
+    assert client.tool_choices.count("required") == 1, (
+        "the force is once per run: the first refusal may be a turn whose call was "
+        "never emitted, the second is an answer"
+    )
     assert loop.result.outcome == Outcome.DONE
     assert "no plan was submitted" in loop.result.summary
 
@@ -421,9 +455,13 @@ def test_a_run_that_wrote_nothing_cannot_fail(planning_router: Router, gated) ->
     )
     list(loop.run("add Routes", intent=Intent.AGENT))
 
-    assert loop.result.outcome == Outcome.DONE
     assert loop.state.last_gate is None, "no mutations, no gate"
-    assert "nothing was changed" in loop.result.summary
+    # And the report is honest about which it was. "Nothing was changed" and
+    # "nothing needed changing" are different claims and the developer acts on
+    # the second: this plan named a file and did not write it, so the run is
+    # unstarted rather than finished, and says so.
+    assert loop.result.outcome == Outcome.NO_PROGRESS
+    assert "handler/user.go" in loop.result.summary, loop.result.summary
 
 
 def test_a_failing_gate_comes_back_to_the_same_mode(
@@ -455,6 +493,10 @@ def test_a_gate_that_will_not_come_clean_stops_after_a_bounded_number_of_tries(
     )
     list(loop.run("add Routes", intent=Intent.AGENT))
 
+    # Prose every turn, so each one reaches `_verify` and spends a gate attempt.
+    # The other way out -- a model that answers a blocked gate by calling tools,
+    # and so never reaches `_verify` at all -- is `_gate_stalled`, covered
+    # separately below.
     assert loop.result.outcome == Outcome.UNVERIFIED
     assert loop.state.gate_failures > MAX_GATE_FAILURES
 
@@ -562,12 +604,63 @@ def test_a_repeated_call_is_answered_from_the_previous_result(
     assert intercepted[0].data["ok"], "a cached answer is a success, not a failure"
 
 
-def test_turns_that_only_repeat_earlier_calls_end_the_run(planning_router: Router) -> None:
-    """Counted as *turns that added nothing*, not as occurrences of one call.
-    Two field runs died under the old rule on a third identical search."""
-    repeat = calls(("search_repo", '{"pattern":"Routes"}'))
-    loop, _client = build(
-        planning_router, [repeat] * (MAX_STALLED_TURNS + 2), kind="question", max_turns=20
+def test_a_repeat_loop_is_broken_before_it_can_end_the_session(
+    planning_router: Router,
+) -> None:
+    """The failure the developer reported, as the test that would have caught it.
+
+    A model asking one call with one set of arguments over and over used to burn
+    six turns being answered from the ledger and then have the whole session
+    killed with `no_progress` -- in the field, twice, once after the work was
+    finished and committed. The answers were correct every time; nothing in them
+    could make the model stop, because the move it needed was to stop calling
+    tools and no message can compel that while a tool schema is on the table.
+
+    It is now broken at the second stalled turn by dispatching the next one with
+    `tool_choice: "none"`, and `MAX_STALLED_TURNS` is never reached.
+    """
+    repeat = calls(("search_repo", json.dumps({"pattern": "Routes"})))
+    loop, client = build(
+        planning_router, [repeat] * 12, kind="question", max_turns=20
+    )
+    list(loop.run("where are the routes", intent=Intent.ASK))
+
+    assert loop.result.outcome == Outcome.DONE, loop.result.summary
+    assert loop.state.stalled_turns < MAX_STALLED_TURNS, (
+        f"the run reached {loop.state.stalled_turns} stalled turns; it should have "
+        "been made to answer at " + str(STALLS_BEFORE_ANSWER)
+    )
+    assert any(isinstance(c, dict) for c in client.tool_choices), (
+        "the stalled turn was not forced to call `finish`"
+    )
+    # And it cost a handful of turns, not the whole budget.
+    assert loop.result.turns <= STALLS_BEFORE_ANSWER + 3, loop.result.turns
+
+
+def test_a_run_that_will_not_answer_even_when_forced_still_stops(
+    planning_router: Router,
+) -> None:
+    """The backstop, still there.
+
+    `tool_choice: "none"` is enforced by the endpoint, so the turn after a stall
+    cannot call a tool -- but a proxy that drops the parameter, or a server that
+    ignores it, would put the loop back where it was. `MAX_STALLED_TURNS` is what
+    catches that, and it must still end the run rather than spin.
+    """
+
+    class Defiant(ScriptedClient):
+        """A server that accepts `tool_choice` and does not honour it."""
+
+        def chat(self, messages, *, tool_choice=None, **kwargs):
+            return super().chat(messages, **kwargs)
+
+    repeat = calls(("search_repo", json.dumps({"pattern": "Routes"})))
+    client = Defiant([repeat] * 12, kind="question")
+    loop = AgentLoop(
+        ContextManager(mode=Mode.ASK, system_prompt="s"),
+        client,
+        planning_router,
+        max_turns=20,
     )
     list(loop.run("where are the routes", intent=Intent.ASK))
 
@@ -575,24 +668,261 @@ def test_turns_that_only_repeat_earlier_calls_end_the_run(planning_router: Route
     assert loop.state.stalled_turns >= MAX_STALLED_TURNS
 
 
-def test_reading_one_file_forever_is_answered_with_what_is_already_there(
+def test_a_read_that_asks_for_lines_already_in_context_is_not_dispatched(
     planning_router: Router, written
 ) -> None:
-    reads = [
-        calls(("read_file", json.dumps({"path": "handler/user.go", "start": i, "end": i + 1})))
-        for i in range(1, MAX_READS + 3)
-    ]
-    loop, _client = build(
-        planning_router, reads, kind="question", max_turns=MAX_READS + 5
-    )
+    """The same window twice is answered from what is already above."""
+    same = calls(("read_file", json.dumps({"path": "handler/user.go"})))
+    loop, _client = build(planning_router, [same, same, say("done")], kind="question")
     events = list(loop.run("read the handler", intent=Intent.ASK))
 
     told = [
         e
         for e in events
-        if e.type is EventType.TOOL_RESULT and "already read" in str(e.data.get("content", ""))
+        if e.type is EventType.TOOL_RESULT and e.data.get("intercepted")
     ]
-    assert told
+    assert told, "the second read of the same lines was dispatched again"
+
+
+def test_a_large_file_is_not_cut_off_after_ten_windows(
+    planning_router: Router, workspace: Workspace
+) -> None:
+    """The 6,571-line handler, as a regression.
+
+    The read budget was a flat ten calls per path, counted without looking at
+    the ranges -- so a model working through `handler/paogen.go` in thirty-line
+    windows was refused on its eleventh, having been shown about 280 of its
+    6,571 lines, and told that reading it again "is not going to show you
+    anything those did not". It was going to show it the other ninety-six per
+    cent.
+
+    The budget scales with the file now, and a range that reaches past what has
+    been delivered is dispatched however many reads have come before.
+    """
+    big = workspace.root / "handler" / "huge.go"
+    big.parent.mkdir(parents=True, exist_ok=True)
+    big.write_text(
+        "package handler" + chr(10) + (chr(10).join(f"// line {i}" for i in range(7000))),
+        encoding="utf-8",
+    )
+
+    windows = MAX_RESEARCH_TURNS - 1
+    reads = [
+        calls(
+            (
+                "read_file",
+                json.dumps(
+                    {"path": "handler/huge.go", "start": 1 + i * 30, "end": 30 + i * 30}
+                ),
+            )
+        )
+        for i in range(windows)
+    ]
+    loop, _client = build(
+        planning_router, reads, kind="question", max_turns=windows + 4
+    )
+    events = list(loop.run("walk through the handler", intent=Intent.ASK))
+
+    refused = [
+        e
+        for e in events
+        if e.type is EventType.TOOL_RESULT and e.data.get("intercepted")
+    ]
+    assert not refused, f"a fresh window was refused: {[e.data for e in refused][:2]}"
+
+    ledger = loop.state.reads["handler/huge.go"]
+    assert ledger.calls == windows
+    assert ledger.budget() > windows, "a 7,000-line file must be worth more than 10 reads"
+    assert ledger.covered_lines() >= windows * 30 - 30
+
+
+
+def test_a_phase_that_never_stops_researching_is_made_to_finish(
+    planning_router: Router, gated, written
+) -> None:
+    """The 19-turn Planner, and the fence around the cliff.
+
+    Measured against the live endpoint by replaying a real transcript at
+    increasing depth: the model stays sensible through five consecutive fruitless
+    tool calls and at **six** repeats its last call 5 times out of 5, never
+    recovering. Forcing the terminal tool rescues a run already over the edge;
+    this stops it going over.
+
+    A Planner is pointed at `submit_plan` rather than `finish`, because a plan
+    submitted under protest is a better thing to argue with than nineteen more
+    turns of reading.
+    """
+    read = calls(("read_file", json.dumps({"path": "handler/user.go"})))
+    loop, client = build(
+        planning_router,
+        # Each read is a *different* file, so nothing is a repeat and the stall
+        # detector never fires. Only the research bound can stop this.
+        [
+            calls(("read_file", json.dumps({"path": "handler/user.go", "start": i, "end": i + 5})))
+            for i in range(1, 60, 2)
+        ],
+        max_turns=MAX_RESEARCH_TURNS + 6,
+    )
+    list(loop.run("migrate this service to the template", intent=Intent.AGENT))
+
+    forced = [c for c in client.tool_choices if isinstance(c, dict)]
+    assert forced, "a phase called tools forever and was never made to finish"
+    assert forced[0]["function"]["name"] == "submit_plan"
+    assert loop.state.research_turns <= MAX_RESEARCH_TURNS + 1, loop.state.research_turns
+
+
+def test_a_finish_that_abandons_the_plan_is_sent_back_once(
+    planning_router: Router, gated, written
+) -> None:
+    """The failure that giving `agent` a terminal tool created.
+
+    Measured live: two runs in three called `finish` on their *first* acting
+    turn -- "I have gathered all the necessary details to write the migration
+    plan" -- having written nothing. Finishing had become the easiest move in
+    the room.
+
+    Sent back once, naming the file. The second `finish` is believed, because
+    this reads paths out of the plan and is not the arbiter of whether a step
+    was still needed.
+    """
+    quit_early = calls(("finish", json.dumps({"answer": "I have what I need."})))
+    loop, _client = build(
+        planning_router, [plan_call(), quit_early, patch(), say("done")], max_turns=10
+    )
+    list(loop.run("add Routes", intent=Intent.AGENT))
+
+    pushed = [
+        m for m in loop.context.build() if "Not yet. Your plan set out to write" in m.content
+    ]
+    assert pushed, "a finish that wrote nothing was accepted"
+    assert "handler/user.go" in pushed[0].content
+    assert loop.router.touched == ["handler/user.go"], "the push did not get the work done"
+
+
+def test_a_second_finish_is_believed(
+    planning_router: Router, gated, written
+) -> None:
+    """The bound. The model may legitimately have decided against a step, and
+    after one push it is taken at its word rather than argued with."""
+    quit_early = calls(
+        ("finish", json.dumps({"answer": "Done.", "blocked": "the file is not needed"}))
+    )
+    loop, _client = build(planning_router, [plan_call()] + [quit_early] * 4, max_turns=10)
+    list(loop.run("add Routes", intent=Intent.AGENT))
+
+    assert loop.state.finish_refused == MAX_FINISH_REFUSALS
+    assert loop.result.outcome in (Outcome.DONE, Outcome.NO_PROGRESS)
+    assert not loop.router.touched
+
+
+# ── the loops the field found ───────────────────────────────────────────────
+
+
+def test_a_repeated_call_supersedes_its_own_earlier_answer(
+    planning_router: Router,
+) -> None:
+    """The transcript must never demonstrate the behaviour it is asking to stop.
+
+    Measured on the live endpoint: **one** (repeated call -> "answered from the
+    previous result") pair in history and the model moves on 5/5; **two** and it
+    repeats the call 5/5 forever, whatever the answer says. Two field runs died
+    exactly there -- one asked `git_ops commit` seven times after committing
+    successfully, the other asked one `search_repo` eight times -- with every
+    repeat answered correctly into a transcript that told it to do it again.
+    """
+    repeat = calls(("search_repo", json.dumps({"pattern": "Routes"})))
+    loop, _client = build(
+        planning_router, [repeat, repeat, repeat, say("done")], kind="question", max_turns=8
+    )
+    list(loop.run("where are the routes", intent=Intent.ASK))
+
+    live = [
+        m
+        for m in loop.context.build()
+        if str(m.role) == "tool" and "asked again with the same arguments" in m.content
+    ]
+    stubbed = [
+        m
+        for m in loop.context.build()
+        if str(m.role) == "tool" and m.content.startswith("[search_repo was asked again")
+    ]
+    assert len(live) <= 1, "the intercept pattern accumulated in the transcript"
+    assert stubbed, "the earlier answer was not superseded"
+    # Superseded in place, never removed: the wire stays well-formed.
+    declared = {c.id for m in loop.context.build() for c in m.tool_calls}
+    for message in loop.context.build():
+        if str(message.role) == "tool":
+            assert message.tool_call_id in declared
+
+
+def test_a_stalled_turn_is_followed_by_one_forced_to_call_finish(
+    planning_router: Router,
+) -> None:
+    """A model repeating one call is out of *moves it recognises*, not ideas.
+
+    Measured on the live endpoint at the depth where the loop forms: no wording
+    rescues it (5/5 repeat), suppressing the tools makes it emit `<tool_call>`
+    markup as prose, and offering `finish` unforced is ignored. Naming `finish`
+    in `tool_choice` ends the turn 5/5. That is what this asserts is wired.
+    """
+    repeat = calls(("search_repo", json.dumps({"pattern": "Routes"})))
+    loop, client = build(
+        planning_router,
+        [repeat] * 4 + [say("I have what I need.")],
+        kind="question",
+        max_turns=10,
+    )
+    list(loop.run("where are the routes", intent=Intent.ASK))
+
+    forced = [c for c in client.tool_choices if isinstance(c, dict)]
+    assert forced, "the run was never made to answer"
+    assert forced[0]["function"]["name"] == "finish"
+    assert loop.result.outcome == Outcome.DONE
+
+
+def test_a_blocked_gate_stops_the_run_even_when_the_model_keeps_calling_tools(
+    planning_router: Router, gated, written
+) -> None:
+    """The hole that swallowed a whole run.
+
+    `_gate_failed` is reached only from `_verify`, which is reached only from a
+    turn that called **no** tool. So a model that answers a blocked gate by
+    calling tools -- any tools -- was never counted against the gate budget,
+    never re-asked and never stopped. A field transcript blocked at `rules_lint`
+    on turn 45 and then spent twenty turns on `go_build`, `git_status` and
+    `git_ops commit` with `gate_failures` stuck at 1, ending `no_progress` at
+    the turn cap -- which named the wrong thing entirely.
+    """
+    gated["fail"] = "go_build"
+    noise = calls(("git_status", "{}"))
+    loop, _client = build(
+        planning_router,
+        [plan_call(), patch(), say("Done.")] + [noise] * 12,
+        max_turns=24,
+    )
+    list(loop.run("add Routes", intent=Intent.AGENT))
+
+    assert loop.result.outcome == Outcome.UNVERIFIED
+    assert "go_build" in loop.result.summary
+    assert "changed no file" in loop.result.summary
+
+
+def test_a_run_that_stalls_with_work_on_disk_says_what_it_did(
+    planning_router: Router, gated, written
+) -> None:
+    """`no_progress` on its own is a report about the loop, and in the field it
+    was wrong about the run: nine files written, built, committed, and reported
+    to the developer as having made no progress."""
+    repeat = calls(("search_repo", json.dumps({"pattern": "Routes"})))
+    loop, _client = build(
+        planning_router,
+        [plan_call(), patch()] + [repeat] * 10,
+        max_turns=20,
+    )
+    list(loop.run("add Routes", intent=Intent.AGENT))
+
+    assert loop.router.touched
+    assert "handler/user.go" in loop.result.summary, loop.result.summary
 
 
 # ── approval and cancellation ───────────────────────────────────────────────
@@ -630,8 +960,10 @@ def test_a_denied_approval_leaves_the_workspace_alone(
 
     assert any(e.type is EventType.TOOL_PENDING for e in events)
     assert not loop.router.touched
-    assert loop.result.outcome == Outcome.DONE
-    assert "nothing was changed" in loop.result.summary
+    assert loop.state.last_gate is None, "a refused write leaves nothing to gate"
+    # The plan named a file that was never written, so the run reports itself as
+    # unstarted rather than done -- which is what it is, whoever decided it.
+    assert loop.result.outcome == Outcome.NO_PROGRESS
 
 
 def test_stopping_mid_batch_answers_the_calls_it_abandoned(
@@ -660,3 +992,18 @@ def test_stopping_mid_batch_answers_the_calls_it_abandoned(
     answered = {m.tool_call_id for m in loop.context.build() if str(m.role) == "tool"}
     assert declared <= answered, "every declared call must have an answer"
     assert loop.result.outcome == Outcome.ABORTED
+
+
+def test_zz_debug_gate(planning_router, gated, written):
+    gated["fail"] = "go_build"
+    loop, _c = build(planning_router, [plan_call(), patch()] + [say("nope.")] * 8, max_turns=20)
+    for e in loop.run("add Routes", intent=Intent.AGENT):
+        if e.type is EventType.GATE and e.data.get("kind") == "full":
+            print("\nGATE ok=", e.data["ok"], "blocked=", e.data.get("blocked_by"))
+            for st in e.data["stages"]:
+                print("   ", st["name"], "ok=", st["ok"], "blk=", st["blocking"],
+                      "skip=", repr(st.get("skipped"))[:40])
+    print("baseline taken:", loop.state.baseline.taken)
+    print("baseline passed:", loop.state.baseline.passed)
+    print("mutations:", loop.router.mutations, "touched:", loop.router.touched)
+    print("OUTCOME:", loop.result.outcome)

@@ -688,6 +688,33 @@ class ContextManager:
         self._working.append(msg)
         return msg
 
+    def supersede(self, message: Message, text: str) -> Message | None:
+        """Replace a working-set message's content in place, keeping everything else.
+
+        The narrow exception to §6.4's append-only rule, and the same one
+        ``_supersede_slice`` already takes: the message keeps its index, its
+        role and its ``tool_call_id``, so nothing is orphaned and the wire stays
+        well-formed. Only the bytes change.
+
+        What it is for is the accumulating few-shot pattern. Measured against
+        the live endpoint: **one** (repeated call -> "answered from the previous
+        result") pair in history and Qwen3.8-27B moves on 5/5; **two** and it
+        repeats the call 5/5 forever, whatever the answer says. The transcript is
+        a stronger instruction than any instruction, so the transcript must not
+        be allowed to demonstrate the behaviour we are asking it to stop.
+
+        Returns the replacement, or None when the message is no longer in the
+        working set -- compaction may have evicted it, which removed the pattern
+        by another route.
+        """
+        try:
+            index = self._working.index(message)
+        except ValueError:
+            return None
+        replacement = replace(self._working[index], content=text)
+        self._working[index] = replacement
+        return replacement
+
     def discard(self, *messages: Message) -> int:
         """Remove exact working-set messages, for superseded intercept pairs.
 

@@ -19,6 +19,7 @@
       "temporal_audit",
       "lib_version_check",
       "playbook",
+      "finish",
       "git_status",
       "git_diff",
       "git_blame"
@@ -37,6 +38,7 @@
       "playbook",
       "submit_plan",
       "ask_developer",
+      "finish",
       "git_status",
       "git_diff",
       "git_blame"
@@ -48,6 +50,7 @@
       "search_docs",
       "rules_lint",
       "playbook",
+      "finish",
       "write_file",
       "patch_file",
       "delete_file",
@@ -466,6 +469,35 @@
         "additionalProperties": false
       },
       "modes": [
+        "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "finish",
+      "description": "End your turn and hand the developer your answer. Call this when the work is done, or when going further will not help.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string",
+            "description": "What you found or did, in full. This is what they read."
+          },
+          "blocked": {
+            "type": "string",
+            "description": "What stopped you, if anything did. Omit when nothing did."
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "agent",
+        "ask",
         "planner"
       ],
       "mutates": false,

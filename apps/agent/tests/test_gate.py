@@ -19,6 +19,7 @@ from dakcoder_agent.gate import (
     _finding_keys,
     full_gate,
     inner_loop,
+    take_baseline,
 )
 from dakcoder_agent.tools.router import Router
 from dakcoder_shared.envelope import ToolResult
@@ -457,6 +458,34 @@ def test_a_violation_this_run_introduced_still_blocks(
     assert "handler/pension.go" in after.content
 
 
+def test_an_absent_paths_argument_scopes_to_nothing_rather_than_to_None(
+    router: Router, sidecar, workspace: Workspace
+) -> None:
+    """The bug that kept `swagger_check`'s baseline empty for its whole life.
+
+    `_list` turned a missing argument into `["None"]` via `str(None)`, so an
+    *unscoped* `swagger_check` -- the call `take_baseline` makes, and the only
+    one that can see what was already broken -- was silently scoped to a file
+    named "None". It matched nothing, every real finding was reported
+    out-of-scope, and the baseline came back with zero violations. Every legacy
+    handler's missing `Routes()` then blocked the gate as though this change had
+    caused it: precisely the failure the baseline exists to prevent, arriving
+    through the baseline.
+    """
+    from dakcoder_agent.tools.gotools import _list
+
+    assert _list(None) == []
+    assert _list("") == []
+    assert _list("handler/user.go") == ["handler/user.go"]
+    assert _list(["a.go", "b.go"]) == ["a.go", "b.go"]
+
+    _configs(workspace)
+    _lint(sidecar, _violation("handler/message.go"))
+    unscoped = router.run_gate_tool("swagger_check", {})
+    assert unscoped.meta["violations"], "the unscoped baseline saw nothing"
+    assert "None" not in json.dumps(sidecar.calls), "a path called 'None' reached the sidecar"
+
+
 def test_the_gate_hands_the_baseline_to_the_stage(gate: Recorder, router: Router) -> None:
     """Threaded end to end, not merely accepted by the signature."""
     full_gate(
@@ -505,6 +534,122 @@ def test_a_finding_this_run_added_still_blocks(gate: Recorder, router: Router) -
     report = full_gate(router, ["handler/user.go"], baseline=baseline)
     assert not report.ok
     assert report.blocked_by.name == "go_vet"
+
+
+def test_a_lint_finding_the_service_already_makes_elsewhere_does_not_block(
+    gate: Recorder, router: Router
+) -> None:
+    """The regression that cost a whole run, and the one my own T1 fix caused.
+
+    `_lint_is_clean` could never fail on a finding -- it parsed a body that has
+    been rendered prose since `_render_lint` landed, so the decode raised every
+    time and the check fell back to `result.ok`, which is True whenever the
+    sidecar ran. Fixing that without also baselining the stage turned "the
+    headline promise is inert" into "no legacy service can ever clear the gate":
+    a field run wrote nine correct files and was blocked by 98 findings, most of
+    them in `handler/paogen.go`, which it never opened.
+
+    A vertical slice writes a *new* file, so its findings are new keys however
+    faithfully it copied the file next door -- which is what the system prompt
+    tells it to do when the contract is silent. So the rule class carries the
+    judgement: `domain-tags` on a new handler, in a service whose thirty
+    existing handlers all trip `domain-tags`, is the house style and not this
+    change's regression.
+    """
+    gate.answer(
+        "rules_lint",
+        ToolResult.success(
+            "3 blocking finding(s)",
+            meta={
+                "violations": 3,
+                "violation_keys": [
+                    "domain-tags|core/domain/employee.go|EmployeeRequest is missing ID",
+                    "handler-signature|handler/employee.go|takes *gin.Context",
+                ],
+                "violation_rules": ["domain-tags", "handler-signature"],
+            },
+        ),
+    )
+    baseline = Baseline(
+        # Nothing about `employee.go` -- it did not exist when the run started.
+        findings={"rules_lint": frozenset({"domain-tags|core/domain/objection.go|x"})},
+        passed={"rules_lint": False},
+        rule_classes={"rules_lint": frozenset({"domain-tags", "handler-signature"})},
+        taken=True,
+    )
+
+    report = full_gate(router, ["core/domain/employee.go"], baseline=baseline)
+
+    lint = next(r for r in report.results if r.name == "rules_lint")
+    assert not lint.ok, "the findings are still reported"
+    assert not lint.blocking, "the service already violates both rules elsewhere"
+    assert report.ok
+
+
+def test_a_lint_rule_this_change_introduced_still_blocks(
+    gate: Recorder, router: Router
+) -> None:
+    """What the baseline must not excuse: a kind of violation nothing in the
+    service was making until this change made it."""
+    gate.answer(
+        "rules_lint",
+        ToolResult.success(
+            "1 blocking finding(s)",
+            meta={
+                "violations": 1,
+                "violation_keys": [
+                    "layer-sql-boundary|handler/employee.go|SQL in the handler layer"
+                ],
+                "violation_rules": ["layer-sql-boundary"],
+            },
+        ),
+    )
+    baseline = Baseline(
+        findings={"rules_lint": frozenset({"domain-tags|core/domain/objection.go|x"})},
+        passed={"rules_lint": False},
+        rule_classes={"rules_lint": frozenset({"domain-tags"})},
+        taken=True,
+    )
+
+    report = full_gate(router, ["handler/employee.go"], baseline=baseline)
+    assert not report.ok
+    assert report.blocked_by.name == "rules_lint"
+
+
+def test_a_baseline_taken_after_an_edit_is_discarded(
+    gate: Recorder, router: Router
+) -> None:
+    """The race that moving the baseline off the critical path introduced.
+
+    It is measured on a background thread so the planning phase does not wait
+    six seconds for it, which makes "before the run touched anything" a race
+    rather than a fact -- and losing it is silent and exactly backwards: the
+    snapshot picks up the run's own breakage and the gate then excuses it. Found
+    in a scripted run where the first edit landed inside those six seconds; it
+    would have reached the field as a gate that waves through the thing it was
+    asked to catch.
+
+    The loop closes the race by joining before it enters the writing mode. This
+    is the second lock: a baseline whose measurement spans a mutation is thrown
+    away rather than trusted.
+    """
+    seen = {"n": 0}
+
+    def counting(_inv):
+        # The workspace changes underneath the baseline, exactly as a `patch_file`
+        # landing mid-measurement would.
+        # A `patch_file` landing mid-measurement, as the counter sees it.
+        seen["n"] += 1
+        router.mutations += 1
+        return ToolResult.success("go_build: clean")
+
+    router.handlers["go_build"] = counting
+
+    baseline = take_baseline(router, include_tests=False)
+    assert not baseline.taken, "a baseline that spans an edit must not be trusted"
+    assert not baseline.passed
+    # And an untaken baseline excuses nothing, so the run is still answerable.
+    assert not baseline.excuses("go_build", frozenset({"x|y|z"}))
 
 
 def test_a_baseline_that_was_never_taken_excuses_nothing(

@@ -15,9 +15,9 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 
 | Mode | Tools | Schema cost |
 |---|---|---|
-| **ask** | 14 | ~1,529 tokens |
-| **planner** | 16 | ~1,892 tokens |
-| **agent** | 22 | ~2,645 tokens |
+| **ask** | 15 | ~1,656 tokens |
+| **planner** | 17 | ~2,019 tokens |
+| **agent** | 23 | ~2,772 tokens |
 
 ## The catalogue
 
@@ -38,6 +38,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `playbook` | AAP |  |  | agent | Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before. |
 | `submit_plan` | P |  |  | agent | Submit the plan and start the work. Each step names one file, what changes in it, and how you will know it worked. |
 | `ask_developer` | P |  |  | agent | Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base. |
+| `finish` | AAP |  |  | agent | End your turn and hand the developer your answer. Call this when the work is done, or when going further will not help. |
 | `write_file` | A | ✓ | if protected | agent | Create a new file. Refuses to overwrite an existing one — use patch_file for that. Write complete, compiling Go, not a sketch. |
 | `patch_file` | A | ✓ | if protected | agent | Replace an exact unique string in a file. Include enough surrounding lines to make old unique; the call fails rather than guessing. |
 | `delete_file` | A | ✓ | **always** | agent | Delete a file. Always needs the developer's approval; say why in reason. |
@@ -183,6 +184,15 @@ Stop and ask, when something cannot be inferred. Use only for what you genuinely
 |---|---|---|---|
 | `questions` | array | yes | The questions, at most four. One decision each. |
 | `assumed` | string |  | What you inferred rather than asking about. |
+
+### `finish`
+
+End your turn and hand the developer your answer. Call this when the work is done, or when going further will not help.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `answer` | string | yes | What you found or did, in full. This is what they read. |
+| `blocked` | string |  | What stopped you, if anything did. Omit when nothing did. |
 
 ### `write_file`
 

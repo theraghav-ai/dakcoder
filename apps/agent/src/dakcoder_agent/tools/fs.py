@@ -375,32 +375,50 @@ def search_repo(inv: Invocation) -> ToolResult:
             break
 
     if not hits:
-        # Zero hits is a finding, not a failed attempt.
+        # Zero hits is a finding, not a failed attempt -- and it is a finding
+        # about *what was searched*, which is the part this used to leave out.
         #
-        # This used to close with "Loosen the pattern, or scope a new one with
-        # glob", which is an instruction to search again — and a model obeys it.
-        # A Planner establishing that a legacy service has no `Routes()` method
-        # was told five times in a row to loosen a pattern that was already
-        # right, and went `func \(.*\) Routes\(\)` -> `func \(.*\) Routes` ->
-        # `Routes` -> +glob -> +max until the run was killed for making no
-        # progress. Every one of those searches returned the truthful answer to
-        # the question it asked.
+        # It said "no matches for X in N files -- this pattern is not in the
+        # searched files. If you were checking whether something exists here,
+        # that is your answer: it does not." Two problems, and the second is
+        # the one that misleads. It never named the glob, so a scoped fact read
+        # as a fact about the repository; and it stated an existential negative
+        # from a search that had sometimes examined **zero files**, then listed
+        # the workspace's directories -- including the one holding the answer --
+        # which reads as an invitation to search again.
         #
-        # So the answer now says what zero matches means first, and offers the
-        # workspace's top level as orientation rather than as a prompt to
-        # re-search. Aiming somewhere real is still worth having; being told to
-        # try again is not.
-        top = _top_level(root)
-        body = (
-            f"no matches for {pattern!r} in {scanned} files — this pattern is not "
-            "in the searched files. If you were checking whether something exists "
-            "here, that is your answer: it does not."
-        )
-        if top:
-            body += (
-                "\n\nThe workspace's top level, if you need somewhere else to look:\n"
-                + "\n".join(f"  {entry}" for entry in top)
+        # Measured against the live endpoint: the wording is worth having and it
+        # is not a cure. One step after a zero-file answer the current text got
+        # 3 of 5 samples to widen correctly and this text got 5 of 5. Six
+        # fruitless searches deep, both loop 5/5 -- what recovers a run from
+        # there is `finish` being forced, not anything said here.
+        if glob and scanned == 0:
+            return ToolResult.success(
+                f"nothing was searched: the glob {glob!r} matched no files, so this "
+                f"says nothing about whether {pattern!r} exists.\n\n"
+                + "Drop the glob to search the whole workspace, or check it -- globs "
+                "are matched against workspace-relative paths.",
+                meta={"scanned": 0, "empty_glob": glob},
             )
+
+        where = (
+            f"the {scanned} file(s) matching {glob!r}" if glob else f"all {scanned} files"
+        )
+        body = (
+            f"no matches for {pattern!r} in {where}."
+            + (
+                " The glob restricted this; the pattern may still exist elsewhere."
+                if glob
+                else " It is not in this workspace."
+            )
+        )
+        if not glob:
+            top = _top_level(root)
+            if top:
+                body += (
+                    "\n\nThe workspace's top level, for orientation:\n"
+                    + "\n".join(f"  {entry}" for entry in top)
+                )
         return ToolResult.success(body, meta={"scanned": scanned})
 
     header = f"{len(hits)} match(es) in {scanned} files"

@@ -51,11 +51,23 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from dakcoder_shared.envelope import DeltaCoalescer, Event, EventType, ToolResult
-from dakcoder_shared.llm import LLMClient, Metering, ToolCall
+from dakcoder_shared.llm import (
+    LLMClient,
+    Metering,
+    ToolCall,
+    UnsupportedParameterError,
+)
 from dakcoder_shared.tokens import estimate_tokens
 
 from .context import ContextManager, Message, OverBudgetError, Recap
-from .gate import Baseline, GateReport, full_gate, inner_loop, take_baseline
+from .gate import (
+    Baseline,
+    GateReport,
+    StageResult,
+    full_gate,
+    inner_loop,
+    take_baseline,
+)
 from .llm import TurnResult, complete, reasoning_leaked
 from .modes import Intent, Mode, config_for
 from .prompts import mode_instruction, system_prompt
@@ -120,6 +132,67 @@ class RunResult:
 
 
 @dataclass
+class _ReadLedger:
+    """What a run has already been shown of one file.
+
+    Intervals, not a count. The question "have you seen these lines" has an
+    exact answer and this holds enough to give it; the flat ten-reads-per-path
+    rule this replaces could only answer "have you asked ten times", which on a
+    6,571-line handler is a different question with a very different answer.
+
+    Merged as they arrive, so the union stays small however many windows a model
+    works through -- a file read front to back in fifty pieces ends up as one
+    interval.
+    """
+
+    #: Disjoint, sorted, inclusive ``[low, high]`` line ranges.
+    covered: list[tuple[int, int]] = field(default_factory=list)
+    #: The file's length, once a read has reported it. 0 while unknown.
+    lines: int = 0
+    #: Dispatched reads of this path, for the backstop ceiling.
+    calls: int = 0
+
+    def add(self, low: int, high: int) -> None:
+        if high < low:
+            low, high = high, low
+        merged: list[tuple[int, int]] = []
+        placed = (low, high)
+        for span in sorted([*self.covered, placed]):
+            if merged and span[0] <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], span[1]))
+            else:
+                merged.append(span)
+        self.covered = merged
+
+    def covers(self, low: int, high: int) -> bool:
+        """Whether every line in ``[low, high]`` has already been delivered."""
+        if high < low:
+            low, high = high, low
+        return any(span[0] <= low and high <= span[1] for span in self.covered)
+
+    def covered_lines(self) -> int:
+        return sum(high - low + 1 for low, high in self.covered)
+
+    def budget(self) -> int:
+        """How many separate reads this file is worth.
+
+        Proportional to its length, because that is what a model working through
+        one honestly needs, and bounded at both ends so a small file still gets
+        a sensible number of looks and a generated monster cannot buy unbounded
+        turns.
+        """
+        if not self.lines:
+            return MIN_READS
+        want = -(-self.lines // LINES_PER_READ)  # ceil
+        return max(MIN_READS, min(MAX_READS, want))
+
+    def summary(self) -> str:
+        shown = ", ".join(f"{low}-{high}" for low, high in self.covered[:4])
+        more = "" if len(self.covered) <= 4 else f" and {len(self.covered) - 4} more"
+        return f"earlier reads covering lines {shown}{more}"
+
+
+@dataclass
 class _State:
     """Everything the loop tracks that is not in the context manager.
 
@@ -174,8 +247,11 @@ class _State:
     #: Consecutive tool-calling turns that added nothing new -- every call in
     #: them answered from a ledger rather than dispatched.
     stalled_turns: int = 0
-    #: How many times each path has been read, and at what ranges.
-    reads: dict[str, list[str]] = field(default_factory=dict)
+    #: What has already been delivered of each path, as line intervals. See
+    #: ``_ReadLedger``: the old form was a list of range *labels* and a count,
+    #: which could say how often a file had been asked for and not how much of
+    #: it the model had actually seen.
+    reads: dict[str, _ReadLedger] = field(default_factory=dict)
     #: What each ``search_docs`` query returned, as section citations.
     retrievals: list[tuple[str, frozenset[str]]] = field(default_factory=list)
     retrieval_repeats: int = 0
@@ -189,10 +265,41 @@ class _State:
     #: Failing gates in a row with no new edit between them.
     gate_failures: int = 0
     dependencies_changed: bool = False
-    #: Whether this turn has already been re-asked with ``tool_choice:
-    #: required``. One force per turn: the second refusal is information, not a
-    #: reason to keep asking.
+    #: Whether a turn has already been re-asked with ``tool_choice: required``.
+    #:
+    #: Once per **run**, not once per turn. Forcing on every prose turn reads as
+    #: harmless and is not: a Planner that has decided there is nothing to plan
+    #: says so, is forced, complies with some call it does not need, says so
+    #: again, is forced again -- two model calls a turn to relitigate a decision
+    #: it has already made twice. The first refusal might be a turn whose call
+    #: was never emitted; the second is an answer, and the loop already knows
+    #: what to do with it.
     forced: bool = False
+    #: The most recent intercept result per fingerprint, so the next repeat can
+    #: supersede it rather than stack beside it. Measured: one such pair in
+    #: history and the model moves on; two and it repeats forever. See
+    #: ``ContextManager.supersede``.
+    echoes: dict[str, Message] = field(default_factory=dict)
+    #: Set when a turn asked for nothing it had not already been given, and the
+    #: next turn must therefore answer rather than call. Cleared once used.
+    must_answer: bool = False
+    #: ``router.mutations`` as of the last failing gate, so turns that follow it
+    #: without editing anything can be counted. See ``_gate_stalled``.
+    gate_mutations: int = 0
+    #: Turns since a failing gate in which nothing was written.
+    idle_since_gate: int = 0
+    #: Tool-calling turns in this phase that have not reached a terminal tool.
+    #: Reset when a phase ends, because the next one starts its own count.
+    research_turns: int = 0
+    #: How many times a `finish` that abandoned the plan has been sent back.
+    #: Bounded: the model may have decided a step is unnecessary, and this reads
+    #: paths out of the plan rather than out of the work, so it is not the
+    #: arbiter of who is right.
+    finish_refused: int = 0
+    #: Terminal calls forced that did not land -- the model was made to call
+    #: `submit_plan` and sent arguments the schema refused, say. Bounded,
+    #: because forcing the same call again is the loop this exists to escape.
+    forced_terminal: int = 0
 
 
 _RECAP_PROMPT = """Summarise this agent transcript for a handover to a fresh context.
@@ -311,6 +418,58 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
 #: fact about the work rather than about the phrasing.
 MAX_STALLED_TURNS = 6
 
+#: How many stalled turns before the next one is dispatched with tool calls
+#: forbidden, so prose is the only reply available.
+#:
+#: Two, because the first is an ordinary re-ask and the second is the start of
+#: the loop. Ending a run at six was measured to be far too late and, worse,
+#: to be the wrong remedy: a model repeating one call is not out of ideas, it
+#: is out of *moves it recognises*, and the move it needs -- stop and say where
+#: you are -- is one no message can make it take. A named `tool_choice` on
+#: `finish` does, 5/5.
+STALLS_BEFORE_ANSWER = 2
+
+#: How many turns a phase may spend calling tools without reaching a terminal
+#: one before it is made to reach one.
+#:
+#: Twelve, and the number is measured rather than chosen. Replaying a real
+#: transcript against the live endpoint at increasing depth, the model stays
+#: sensible through five consecutive fruitless tool calls -- widening a glob,
+#: re-scoping, trying a different pattern -- and at **six** it repeats its last
+#: call 5 times out of 5 and never recovers. The trap is a cliff, not a slope.
+#:
+#: So this is not a budget for *research*: it is a fence around the cliff, and
+#: it counts turns rather than failures because a turn that found something
+#: resets nothing here -- a Planner nineteen turns into reading a service is in
+#: the same place whether or not its reads succeeded. Twelve leaves room for the
+#: dozen calls orienting in a large service genuinely takes, and stops the
+#: run that spent nineteen turns on `search_docs` and never planned.
+#:
+#: What happens at the limit is a forced terminal call, not the end of the run:
+#: the Planner submits or asks, the acting mode finishes and the gate runs, and
+#: each of those is an outcome the developer can act on.
+MAX_RESEARCH_TURNS = 12
+
+#: How many refused terminal calls before the run stops trying.
+#:
+#: The escape hatch needs one of its own. A forced ``submit_plan`` whose
+#: arguments the schema refuses would otherwise be forced again next turn, and
+#: again -- the exact loop the forcing exists to break, arriving through it. Two:
+#: the first refusal switches the target to ``finish``, whose schema is one
+#: required string, and a second refusal after that is not an arguments problem.
+MAX_FORCED_TERMINAL = 2
+
+#: How many times a `finish` that abandons the plan is sent back.
+#:
+#: One. The acting mode gained a terminal tool to escape a loop and
+#: promptly found it the easiest move in the room: measured live, two runs
+#: in three called `finish` on their first acting turn, having read the
+#: service and written nothing. One push is enough to distinguish "I forgot
+#: to do the work" from "I decided against it" -- and the second `finish`
+#: is believed, because this reads paths out of the plan and is not the
+#: arbiter of whether a step was still needed.
+MAX_FINISH_REFUSALS = 1
+
 #: How many failing gates in a row, with nothing edited between them, end the
 #: run.
 #:
@@ -325,9 +484,26 @@ MAX_STALLED_TURNS = 6
 #: nothing.
 MAX_GATE_FAILURES = 3
 
-#: How many times one path may be read before the loop answers with what it
-#: already has instead of dispatching the read again.
-MAX_READS = 10
+#: How much of a file one read is worth, for the purpose of budgeting reads.
+#:
+#: The old rule was a flat ten reads per path, counted as *calls* and ignoring
+#: the ranges entirely -- so a model working through `handler/paogen.go`, which
+#: is 6,571 lines, was refused on its eleventh window having been shown about
+#: 280 of them. Four per cent of the file, and the loop told it "reading it
+#: again is not going to show you anything those did not".
+#:
+#: What actually needs bounding is asking for lines you have already been given,
+#: and that is now checked directly: `_re_reading` refuses a range only when the
+#: union of what has already been delivered contains it. The ceiling below is a
+#: backstop against a model reading one line at a time forever, and it scales
+#: with the file so a large one gets a proportionate budget.
+LINES_PER_READ = 150
+
+#: The floor on that budget, so a small file still gets a sensible number of
+#: looks, and the ceiling, so a 60,000-line generated file cannot buy unbounded
+#: turns.
+MIN_READS = 10
+MAX_READS = 60
 
 #: How many retrievals in a row may return nothing new before ``search_docs`` is
 #: withdrawn for the rest of the run. The corpus does not acquire new sections
@@ -342,9 +518,25 @@ RETRIEVAL_OVERLAP = 0.5
 COMPACTION_WINDOW = 8
 MAX_CLOSE_COMPACTIONS = 3
 
-#: The tools that end the planning phase. Handled by name because the loop has
-#: to know what happened, not because the router treats them specially.
-_PLAN_TOOLS = frozenset({"submit_plan", "ask_developer"})
+#: The tools that end a phase. Handled by name because the loop has to know
+#: what happened, not because the router treats them specially.
+#:
+#: ``finish`` joined them once the live endpoint settled the question. In ``ask``
+#: and ``agent``, ending a turn meant *not* calling a tool, and past about six
+#: fruitless calls this model cannot produce a non-action -- it repeats its last
+#: call, 5/5, and no wording changes that. Giving it a call that means stopping
+#: works 5/5. See ``tools/control.py``.
+_TERMINAL = frozenset({"submit_plan", "ask_developer", "finish"})
+
+#: What a mode is forced to call when it has stopped asking for anything new.
+#:
+#: Named, not ``"required"``: ``required`` would let it pick a research tool and
+#: carry on. Named choice is the only lever measured to work here -- 5/5 on the
+#: live endpoint at the depth where every wording fails.
+_FORCE_FINISH: dict[str, Any] = {
+    "type": "function",
+    "function": {"name": "finish"},
+}
 
 
 class AgentLoop:
@@ -590,8 +782,18 @@ class AgentLoop:
             self.context.pin_directive(correction)
             yield Event(EventType.STEER, {"text": correction, "turn": self.context.turn})
 
+        if reason := self._gate_stalled():
+            self.result = RunResult(
+                Outcome.UNVERIFIED,
+                reason,
+                self.context.turn,
+                tuple(self.router.touched),
+                self.state.last_gate,
+            )
+            yield Event(EventType.ERROR, {"message": reason})
+            return
+
         turn = self.context.begin_turn()
-        self.state.forced = False
         yield Event(
             EventType.TURN_START,
             {
@@ -608,6 +810,70 @@ class AgentLoop:
         tools = self._tools()
         self.context.observe_tool_schemas(estimate_tokens(json.dumps(tools)))
 
+        # Two reasons a turn is made to reach a terminal tool, and they are
+        # exclusive: one message, never both.
+        #
+        # A *stall* is the model asking for what it has already been given. A
+        # *long phase* is it working productively and never stopping. Both end
+        # the same way -- a named `tool_choice` on the phase's terminal tool,
+        # which is the one lever measured to work here -- but they are different
+        # situations and the model is told which one it is in.
+        answering, self.state.must_answer = self.state.must_answer, False
+        forced_choice: str | None = None
+        if answering:
+            # Measured live at the depth where the loop forms: the instruction
+            # alone breaks the repeat but the model keeps acting (it has no other
+            # move); the tool alone is ignored; the two together end the turn
+            # 5/5, and the named `tool_choice` makes it 5/5 regardless.
+            self.context.append_user(
+                "Stop searching. That call has already been answered and asking it "
+                "again returns the same thing.\n\n"
+                "Give the developer what you have established now, and say what you "
+                "could not find out."
+            )
+        elif self.state.research_turns >= MAX_RESEARCH_TURNS:
+            # Walked to the fence rather than off the cliff. See
+            # MAX_RESEARCH_TURNS: past six consecutive fruitless calls this
+            # model repeats itself 5/5 and nothing recovers it.
+            #
+            # Where it is *pointed* depends on whether there is outstanding
+            # work, and getting that wrong wastes the whole run. Measured live:
+            # an acting mode twelve turns into reading a service, with a plan
+            # saying "write migration.md" and nothing written, was forced to
+            # `finish` -- and finished, honestly and uselessly, with "nothing
+            # was changed". The bound had fired correctly and pointed at the
+            # exit instead of at the work.
+            outstanding = (
+                self._unwritten_targets() if self.state.mode is Mode.AGENT else []
+            )
+            answering = True
+            if outstanding:
+                # Not a terminal call: a tool call, any tool call, with the
+                # message naming what is missing. `required` rather than a named
+                # choice because the right move is `write_file` or `patch_file`
+                # and which one depends on whether the file exists yet.
+                forced_choice = "required"
+                self.context.append_user(
+                    f"You have spent {self.state.research_turns} turns reading and "
+                    "have written nothing. You have read enough.\n\n"
+                    "Your plan set out to write " + ", ".join(outstanding) + ". "
+                    + ("Write them now" if len(outstanding) > 1 else "Write it now")
+                    + ", from what you already have. If a file genuinely cannot be "
+                    "written, say which and why in one line and call `finish`."
+                )
+            else:
+                self.context.append_user(
+                    f"You have spent {self.state.research_turns} turns calling tools "
+                    "in this phase without finishing it. That is enough to act on -- "
+                    "reading more will not make the decision easier.\n\n"
+                    + (
+                        "Submit the plan now, or ask the developer what you cannot "
+                        "infer."
+                        if self.state.mode is Mode.PLANNER
+                        else "Say what you have done and what you found."
+                    )
+                )
+
         if self.context.should_compact():
             yield from self._compact()
             if reason := self._thrashing():
@@ -620,7 +886,12 @@ class AgentLoop:
                 )
                 return
 
-        outcome = yield from self._complete(tools)
+        outcome = yield from self._complete(
+            tools,
+            tool_choice=(
+                (forced_choice or self._terminal_choice()) if answering else None
+            ),
+        )
         if outcome is None:
             return
         result = outcome
@@ -635,7 +906,7 @@ class AgentLoop:
         # `tool_choice: "required"`; asking again with it costs one call and
         # deletes `_narrating`, `MAX_IDLE_EXECUTING`, `EXECUTING_RESEARCH_*` and
         # `PLANNER_RESEARCH_*` between them.
-        if not result.chat.tool_calls and tools and self._must_call_a_tool():
+        if not answering and not result.chat.tool_calls and tools and self._must_call_a_tool():
             self.state.forced = True
             yield Event(
                 EventType.GATE,
@@ -670,6 +941,7 @@ class AgentLoop:
             return
 
         if result.chat.tool_calls:
+            self.state.research_turns += 1
             yield from self._tool_calls(result.chat.tool_calls, assistant_msg)
             return
 
@@ -698,6 +970,27 @@ class AgentLoop:
             )
 
         try:
+            return dispatch()
+        except UnsupportedParameterError:
+            # The endpoint does not take this `tool_choice`. Both uses of it here
+            # are recoveries from a run that is otherwise going to loop, so
+            # falling back is worth a prefill: "required" degrades to asking
+            # again plainly, and a named choice degrades to `required`, which at
+            # least keeps a tool call on the table.
+            #
+            # Deliberately *not* falling back to `tools=[]`. Measured on the live
+            # endpoint: with no tools the model emits markup for `Grep` with an
+            # `output_mode` parameter -- a tool from another harness, remembered
+            # from training -- and the loop would serve that to a developer as an
+            # answer. An unconstrained retry is a worse turn; that is a worse
+            # product.
+            if tool_choice is None:
+                raise
+            yield Event(
+                EventType.GATE,
+                {"kind": "tool_choice_unsupported", "value": str(tool_choice)},
+            )
+            tool_choice = "required" if isinstance(tool_choice, dict) else None
             return dispatch()
         except OverBudgetError as exc:
             # The context manager exists to prevent this, so reaching it means
@@ -882,7 +1175,29 @@ class AgentLoop:
 
             if intercepted := self._intercept(call, fingerprint):
                 body, said = intercepted
-                self.context.append_tool_result(call.name, body, tool_call_id=call.id)
+                # The previous answer to this same question is stubbed out
+                # before the new one is appended.
+                #
+                # Not deleted -- the message keeps its place and its
+                # `tool_call_id`, so nothing is orphaned. What is removed is the
+                # *pattern*: N identical (call -> "answered from the previous
+                # result") pairs sitting in history are a few-shot demonstration
+                # of exactly the behaviour the answer is asking the model to
+                # stop, and the transcript wins that argument. Measured on the
+                # live endpoint: one pair and the model moves on 5/5; two and it
+                # repeats forever 5/5. A field run made the same `git_ops
+                # commit` call seven times and another the same `search_repo`
+                # eight times, each intercepted correctly and each answered into
+                # a transcript that told it to do it again.
+                if (prior := self.state.echoes.get(fingerprint)) is not None:
+                    self.context.supersede(
+                        prior,
+                        f"[{call.name} was asked again with these arguments and answered "
+                        "from the earlier result; the newest answer is below]",
+                    )
+                self.state.echoes[fingerprint] = self.context.append_tool_result(
+                    call.name, body, tool_call_id=call.id
+                )
                 yield Event(
                     EventType.TOOL_RESULT,
                     {
@@ -953,6 +1268,14 @@ class AgentLoop:
                 self.state.reads.pop(mutation.path, None)
 
             slice_path, slice_range = _slice_path(call, outcome)
+            if slice_path is not None:
+                # Recorded from the result, not the request: the tool clamps the
+                # range to the file, so a call for lines 1-9999 of a 200-line file
+                # has been given all of it, and a ledger built from the arguments
+                # would not know that.
+                self._record_read(
+                    slice_path, slice_range, int(outcome.meta.get("lines") or 0)
+                )
             self.context.append_tool_result(
                 call.name,
                 outcome.for_model(),
@@ -977,10 +1300,28 @@ class AgentLoop:
                 {"id": call.id, "name": call.name, **outcome.as_dict()},
             )
 
-            # The planning phase ends on its own tool call, not on its prose.
-            if call.name in _PLAN_TOOLS and outcome.ok:
-                yield from self._plan_submitted(call.name, outcome)
-                return
+            # A phase ends on its own tool call, not on its prose.
+            if call.name in _TERMINAL:
+                if outcome.ok:
+                    yield from self._phase_ended(call.name, outcome)
+                    return
+                # It reached for the exit and missed -- arguments the schema
+                # refused. Counted, so the next force picks a tool that cannot
+                # be got wrong, and so a run cannot spend its budget being made
+                # to call something it keeps failing to call.
+                self.state.forced_terminal += 1
+                if self.state.forced_terminal >= MAX_FORCED_TERMINAL:
+                    self.result = RunResult(
+                        Outcome.NO_PROGRESS,
+                        f"asked {self.state.forced_terminal} times to end the phase "
+                        f"with {call.name} and the arguments were refused each time: "
+                        f"{outcome.for_model()[:200]}",
+                        self.context.turn,
+                        tuple(self.router.touched),
+                        self.state.last_gate,
+                    )
+                    return
+                self.state.must_answer = True
 
         # Turn-level progress, judged on the batch rather than on any one call.
         # A batch that dispatched nothing -- every call a verbatim repeat or a
@@ -989,27 +1330,88 @@ class AgentLoop:
             self.state.stalled_turns = 0
         else:
             self.state.stalled_turns += 1
+            # Made to answer before it is killed.
+            #
+            # The old ending was six stalled turns and `no_progress`, and two
+            # field runs reached it with the work already done: one had written
+            # nine files and committed them and then asked `git_ops commit`
+            # seven times; the other had read what it needed and asked one
+            # `search_repo` eight times. Every repeat was intercepted correctly
+            # and every answer said "move to the next step", and the model had
+            # no next step -- what it needed was to stop calling tools, which is
+            # the one thing prose does and the one thing nothing asked it for.
+            #
+            # So the turn after a stalled one is dispatched with tool calls
+            # forbidden. Prose is then the only reply available, and the loop
+            # already knows what prose means: in ASK it is the answer, in AGENT
+            # it is "I am done, run the gate". Both are decisions. This is the
+            # mirror of the `tool_choice: "required"` re-ask, using the same
+            # primitive in the other direction.
+            if self.state.stalled_turns >= STALLS_BEFORE_ANSWER:
+                self.state.must_answer = True
             if self.state.stalled_turns >= MAX_STALLED_TURNS:
-                worst_key, worst_n = max(
-                    self.state.seen_calls.items(), key=lambda item: item[1], default=("", 0)
-                )
-                detail = (
-                    f"; {worst_key.split(':', 1)[0]} was asked {worst_n} times"
-                    if worst_n > 1
-                    else ""
-                )
-                self.result = RunResult(
-                    Outcome.NO_PROGRESS,
-                    f"the last {MAX_STALLED_TURNS} tool-calling turns only repeated "
-                    f"earlier calls or known dead ends, and added nothing new{detail}",
-                    self.context.turn,
-                    tuple(self.router.touched),
-                    self.state.last_gate,
-                )
+                self.result = self._stalled()
                 return
 
         if mutated:
             yield from self._inner_loop()
+
+    def _stalled(self) -> RunResult:
+        """End a run that stopped asking for anything new, and say what it did.
+
+        `no_progress` on its own is a report about the *loop*, and in both field
+        transcripts it was wrong about the run: one had written nine files,
+        passed the build, regenerated the swagger docs and committed, and was
+        reported to the developer as having made no progress. What the developer
+        needs to know is what is on disk and what the gate said about it.
+        """
+        worst_key, worst_n = max(
+            self.state.seen_calls.items(), key=lambda item: item[1], default=("", 0)
+        )
+        detail = (
+            f"; {worst_key.split(':', 1)[0]} was asked {worst_n} times" if worst_n > 1 else ""
+        )
+        stuck = (
+            f"the last {MAX_STALLED_TURNS} tool-calling turns only repeated earlier "
+            f"calls or known dead ends, and added nothing new{detail}"
+        )
+
+        report = self.state.last_gate
+        if report is not None and not report.ok:
+            # The gate is the more useful headline: the run stopped, and there
+            # is a named reason it had not finished.
+            return RunResult(
+                Outcome.UNVERIFIED,
+                f"the gate did not come clean and the run stopped making progress"
+                + (f"; blocked at {report.blocked_by.name}" if report.blocked_by else "")
+                + f". {stuck}"
+                + self._unfinished(),
+                self.context.turn,
+                tuple(self.router.touched),
+                report,
+            )
+        if self.router.touched:
+            files = "\n".join(f"  - {p}" for p in self.router.touched)
+            verdict = (
+                "the gate has not run on them yet"
+                if report is None
+                else "the gate was clean when it last ran"
+            )
+            return RunResult(
+                Outcome.NO_PROGRESS,
+                f"{stuck}. {len(self.router.touched)} file(s) were changed and "
+                f"{verdict}:\n{files}",
+                self.context.turn,
+                tuple(self.router.touched),
+                report,
+            )
+        return RunResult(
+            Outcome.NO_PROGRESS,
+            stuck,
+            self.context.turn,
+            tuple(self.router.touched),
+            report,
+        )
 
     def _intercept(self, call: ToolCall, fingerprint: str) -> tuple[str, str] | None:
         """What to answer without dispatching, or None to dispatch.
@@ -1065,27 +1467,44 @@ class AgentLoop:
                 "previous result",
             )
 
-        # The eleventh read of one file, at an eleventh set of line numbers.
-        # `_fingerprint` covers the whole call, so re-reading one file at four
-        # ranges is four different calls and invisible to the ledger above.
-        if ranges := self._re_reading(call):
-            return (
-                f"You have read this file {len(ranges)} times this run, at "
-                f"{', '.join(ranges)}, and every one of those reads is still in context "
-                "above.\n\nReading it again is not going to show you anything those did "
-                "not. Act on what you have, or say plainly what you are looking for and "
-                "cannot find.",
-                f"already read {len(ranges)} times this run; not re-read",
-            )
+        # A read that asks for lines already delivered. `_fingerprint` covers
+        # the whole call, so one file read at four ranges is four different
+        # calls and invisible to the ledger above; this asks the question the
+        # fingerprint cannot, and asks it about coverage rather than about how
+        # many times the file has come up.
+        if why := self._re_reading(call):
+            return why, "asks for lines already in context; not re-read"
         return None
 
-    def _plan_submitted(self, tool: str, outcome: ToolResult) -> Iterator[Event]:
-        """Act on the tool call that ends the planning phase.
+    def _terminal_choice(self) -> dict[str, Any]:
+        """The tool this mode is forced to call when it must stop.
 
-        A typed event, so there is nothing to interpret. ``submit_plan`` pins the
-        plan and hands the run to the acting mode; ``ask_developer`` ends the run
-        with the questions on screen, where the developer's answer arrives as a
-        follow-up on this transcript.
+        Named rather than ``"required"``: required would let it pick a research
+        tool and carry on, which is the behaviour being escaped.
+
+        The Planner is pointed at ``submit_plan`` first, because that is the
+        outcome the developer asked for and a plan submitted under protest is a
+        better thing to argue with than nineteen more turns of reading. **Once**:
+        if those arguments do not satisfy the schema, the second force is
+        ``finish``, whose schema is one required string and which therefore
+        cannot fail the same way. Forcing a call that keeps being refused is the
+        loop this whole mechanism exists to escape, arriving through the escape.
+        """
+        if self.state.mode is Mode.PLANNER and not self.state.forced_terminal:
+            return {"type": "function", "function": {"name": "submit_plan"}}
+        return _FORCE_FINISH
+
+    def _phase_ended(self, tool: str, outcome: ToolResult) -> Iterator[Event]:
+        """Act on the tool call that ends a phase.
+
+        A typed event, so there is nothing to interpret.
+
+        ``submit_plan`` pins the plan and hands the run to the acting mode.
+        ``ask_developer`` ends the run with the questions on screen, where the
+        developer's answer arrives as a follow-up on this transcript.
+        ``finish`` is the answer: in ``ask`` it ends the run, and in ``agent`` it
+        means "I am done" and hands over to the gate, which is the same thing
+        prose used to mean there and is the thing this model can reliably say.
         """
         if tool == "ask_developer":
             self.result = RunResult(
@@ -1097,6 +1516,59 @@ class AgentLoop:
             )
             return
 
+        if tool == "finish":
+            answer = str(outcome.meta.get("answer") or "").strip()
+            blocked = str(outcome.meta.get("blocked") or "").strip()
+
+            # A `finish` that walks away from the plan is sent back, once.
+            #
+            # Giving the acting mode a terminal tool fixed the loop and opened
+            # this: finishing became the easiest move available, and measured
+            # live, two runs in three called `finish` on their first acting turn
+            # -- "I have gathered all the necessary details to write the
+            # migration plan" -- without writing anything. Honest, and useless.
+            #
+            # Bounded at MAX_FINISH_REFUSALS because this reads paths out of the
+            # plan rather than out of the work: the model may have decided a
+            # step is unnecessary, and it is entitled to say so and be believed.
+            # What it is not entitled to is silence.
+            missing = (
+                self._unwritten_targets() if self.state.mode is Mode.AGENT else []
+            )
+            if missing and self.state.finish_refused < MAX_FINISH_REFUSALS:
+                self.state.finish_refused += 1
+                self.context.append_user(
+                    "Not yet. Your plan set out to write " + ", ".join(missing)
+                    + " and " + ("none of them have" if len(missing) > 1 else "it has not")
+                    + " been written.\n\n"
+                    + "You have read enough to write "
+                    + ("them" if len(missing) > 1 else "it")
+                    + " now. Do that. If a file genuinely should not be written after "
+                    "all, call `finish` again and say which and why in `blocked` -- "
+                    "that will be taken at face value."
+                )
+                return
+
+            # Emitted as the assistant's own words, because that is what it is:
+            # the developer reads this, and a `finish` whose answer only appeared
+            # inside a tool result would be an answer nobody was shown.
+            if answer:
+                yield Event(EventType.ASSISTANT, {"text": answer})
+            if self.state.mode is Mode.AGENT:
+                # The acting mode saying it is done is the gate's cue, exactly as
+                # a tool-free turn was. The gate still cannot be skipped.
+                yield from self._verify()
+                return
+            self.result = RunResult(
+                Outcome.DONE,
+                (f"answered; blocked on: {blocked}" if blocked else "answered"),
+                self.context.turn,
+                tuple(self.router.touched),
+            )
+            return
+
+        self.state.research_turns = 0
+        self.state.forced_terminal = 0
         steps = steps_from_meta(dict(outcome.meta))
         self.state.plan = steps
         self.state.plan_summary = str(outcome.meta.get("summary") or "")
@@ -1110,17 +1582,56 @@ class AgentLoop:
     def _inner_loop(self) -> Iterator[Event]:
         """Format and lint what was just written, sub-second.
 
-        The result goes into context as a message rather than being merely
-        reported, because its whole purpose is to be in front of the model on the
-        next turn while the edit is still what it is thinking about.
+        Its whole purpose is to put a problem the edit *introduced* in front of
+        the model while the edit is still what it is thinking about. Anything
+        else it says is noise, and noise here is uniquely expensive because this
+        runs after every edit batch.
+
+        It was not filtering at all. On a legacy service, one edit to
+        `core/domain/objection.go` produced a thousand-token report headlined
+        "199 blocking and 480 advisory findings across 49 files", with examples
+        from `handler/paogen.go` -- a file the run never opened. The model read
+        that as a mountain of work in its own change and set about fixing it,
+        which is where "code written in 20 turns, verifier running to 85" comes
+        from.
+
+        Two filters, and between them they take the common case to nothing.
+        `_render_lint` no longer quotes files outside the change. And the
+        run-start baseline is consulted here as well as at the gate: a legacy
+        file's 166 pre-existing `domain-tags` violations are not news, and
+        repeating them after every edit teaches the model that its own work is
+        the problem.
         """
         report = inner_loop(self.router, self.router.touched)
         yield Event(EventType.GATE, {"kind": "inner", **report.as_dict()})
-        if not report.ok or report.warnings:
-            self.context.append_user(
-                "The formatter and the contract linter ran on what you just "
-                f"changed:\n\n{report.summary()}"
-            )
+        if report.ok and not report.warnings:
+            return
+
+        lint = next((r for r in report.results if r.name == "rules_lint"), None)
+        if lint is not None and not lint.ok and self._lint_is_old_news(lint):
+            # Everything it found was already being done in this service before
+            # the run started. Say nothing: the gate will still report it, once,
+            # at the end, where a summary belongs.
+            return
+
+        self.context.append_user(
+            "The formatter and the contract linter ran on what you just "
+            f"changed:\n\n{report.summary()}"
+        )
+
+    def _lint_is_old_news(self, result: StageResult) -> bool:
+        """Whether an inner-loop lint found only what the service already does.
+
+        The same judgement the gate makes, asked one level down and off the same
+        baseline. It leans on the rule classes rather than the exact keys for the
+        reason the gate does: an edit moves line numbers and a new file has no
+        history, so key comparison alone excuses nothing on the work this agent
+        actually does.
+        """
+        return bool(result.findings) and self.state.baseline.excuses(
+            "rules_lint", result.findings
+        )
+
 
     # -- ending a turn ----------------------------------------------------
 
@@ -1175,6 +1686,23 @@ class AgentLoop:
         vet and swagger_check arriving at the report already in context.
         """
         if self.router.mutations == 0:
+            # A run that wrote nothing cannot fail the gate -- but "nothing was
+            # changed" and "nothing needed changing" are different claims, and
+            # the developer acts on the second. A plan that named files and
+            # wrote none of them is an *unstarted* run, and saying so is the
+            # difference between a report and a shrug.
+            missing = self._unwritten_targets()
+            if missing:
+                self.result = RunResult(
+                    Outcome.NO_PROGRESS,
+                    "the plan set out to write " + ", ".join(missing) + " and "
+                    + ("none of them were" if len(missing) > 1 else "it was not")
+                    + " written, so there was nothing to verify. The run read the "
+                    "repository and stopped short of the work",
+                    self.context.turn,
+                    tuple(self.router.touched),
+                )
+                return
             self.result = RunResult(
                 Outcome.DONE,
                 "nothing was changed, so there was nothing to verify. If work was "
@@ -1229,6 +1757,8 @@ class AgentLoop:
         fail identically, and asking again is asking the same question.
         """
         self.state.gate_failures += 1
+        self.state.gate_mutations = self.router.mutations
+        self.state.idle_since_gate = 0
         if self.state.gate_failures > MAX_GATE_FAILURES:
             self.result = RunResult(
                 Outcome.UNVERIFIED,
@@ -1258,6 +1788,78 @@ class AgentLoop:
                 "Nothing will move until a file does. Make the edit, or say plainly "
                 "what is stopping you from making it."
             )
+
+    def _gate_stalled(self) -> str:
+        """Why a run standing on a failing gate should stop, or ``""``.
+
+        The hole this closes is narrow and it swallowed a whole run. The
+        gate-failure budget lives in `_gate_failed`, which is reached only from
+        `_verify`, which is reached only from a turn that called **no** tool. So
+        a model that answers a blocked gate by calling tools -- any tools -- is
+        never counted against that budget, never re-asked, and never stopped.
+
+        A field transcript did exactly that: the gate blocked at `rules_lint` on
+        turn 45 and the model spent turns 46 to 65 calling `go_build`,
+        `git_status`, `run_terminal` and finally `git_ops commit` seven times,
+        with `gate_failures` stuck at 1 the whole way. It ended `no_progress` at
+        the turn cap, which named the wrong thing entirely: the run had done its
+        work and was standing in front of a gate nobody had told it it could not
+        clear.
+
+        Counted in turns that changed nothing, because the gate is a function of
+        the files: given no new edit its verdict cannot move, so a run that is
+        not editing is not going to clear it however many tools it calls.
+        """
+        report = self.state.last_gate
+        if report is None or report.ok:
+            return ""
+        if self.router.mutations != self.state.gate_mutations:
+            self.state.gate_mutations = self.router.mutations
+            self.state.idle_since_gate = 0
+            return ""
+        self.state.idle_since_gate += 1
+        if self.state.idle_since_gate <= MAX_GATE_FAILURES:
+            return ""
+        blocked = f"; blocked at {report.blocked_by.name}" if report.blocked_by else ""
+        return (
+            f"the gate did not come clean{blocked}, and the last "
+            f"{self.state.idle_since_gate - 1} turns changed no file, so its verdict "
+            "cannot have moved" + self._unfinished()
+        )
+
+    def carry_from(self, previous: "AgentLoop") -> None:
+        """Inherit the previous message's ledgers, the way the context is inherited.
+
+        The context manager already carries across a follow-up -- every file
+        read, every answer given -- and ``_State`` did not, because it is built
+        with the loop and a loop is built per message. So the working set
+        remembered a search and the ledger that knows it was exhausted did not.
+
+        A field transcript shows the cost. A run ended on a `search_repo` it had
+        asked eight times; the developer typed "where is the plan?"; the new run
+        started with empty ledgers, dispatched the identical search, was answered
+        from nothing, and reproduced the same loop over the same four turns. The
+        transcript makes it look like the agent has no memory. It has memory and
+        no *record*.
+
+        Only what remains true between messages. ``last_results`` and
+        ``dead_ends`` are deliberately **not** carried: the developer edits files
+        between messages and nothing here watches for that, so a cached answer
+        could outlive the thing that made it true. What carries is the fact that
+        a question has already been asked, which does not go stale -- and the
+        read coverage, which the context still holds the reads for.
+        """
+        self.state.seen_calls = dict(previous.state.seen_calls)
+        self.state.reads = dict(previous.state.reads)
+        self.state.retrievals = list(previous.state.retrievals)
+        self.state.retrieval_repeats = previous.state.retrieval_repeats
+        self.state.baseline = previous.state.baseline
+        self.state.plan = previous.state.plan
+        self.state.plan_summary = previous.state.plan_summary
+        self.state.dependencies_changed = previous.state.dependencies_changed
+        # `mutations_seen` travels with them, or the first mutation of the new
+        # message clears ledgers that were never synced and the carry is undone.
+        self.state.mutations_seen = previous.state.mutations_seen
 
     def _abort(self) -> RunResult:
         return RunResult(
@@ -1301,6 +1903,17 @@ class AgentLoop:
         """
         if mode is self.state.mode and mode is self.context.mode and self.context.turn > 0:
             return
+        if mode is Mode.AGENT:
+            # The last moment before anything can be written.
+            #
+            # The baseline is a picture of the workspace *as the run found it*,
+            # and it is taken on a background thread so the planning phase does
+            # not wait six seconds for it. That makes "before the first edit" a
+            # race, and losing it is silent and backwards: the snapshot picks up
+            # the run's own breakage and the gate excuses it. Joining here costs
+            # nothing in practice -- the planning phase is many turns and the
+            # baseline is seconds -- and it makes the ordering a fact again.
+            self._await_baseline()
         self.state.mode = mode
         self.context.switch_mode(mode, mode_instruction(mode))
 
@@ -1379,27 +1992,89 @@ class AgentLoop:
             "say which step and what you need, in one line."
         )
 
-    def _re_reading(self, call: ToolCall) -> list[str]:
-        """The ranges a path has already been read at, once that is too many.
+    def _re_reading(self, call: ToolCall) -> str:
+        """Why this read asks for nothing new, or ``""`` to dispatch it.
 
-        Returns empty until the limit is reached, so the ordinary read-edit-read
-        cycle is untouched; the ledger is cleared for a path the moment that path
-        is written.
+        Judged on **coverage**, not on a call count. The old rule allowed ten
+        reads of a path and then refused every one after, whatever range it
+        asked for -- so a model working through a 6,571-line handler in
+        thirty-line windows was cut off having seen about 280 lines, and told
+        that reading it again "is not going to show you anything those did not".
+        It was going to show it the other ninety-six per cent.
+
+        What is worth refusing is a range already delivered. That is a question
+        about intervals and it has an exact answer, so there is no threshold to
+        get wrong: a read whose span is inside the union of earlier spans is
+        answered from what is already in context, and a read that reaches past
+        them is dispatched however many have come before.
+
+        The call-count ceiling that remains is a backstop against a model
+        reading one line at a time, and it scales with the file.
         """
         if call.name != "read_file":
-            return []
+            return ""
         parsed = _safe_args(call)
-        path = parsed.get("path") if isinstance(parsed, dict) else None
+        if not isinstance(parsed, dict):
+            return ""
+        path = parsed.get("path")
         if not isinstance(path, str) or not path:
-            return []
+            return ""
 
-        start, end = parsed.get("start"), parsed.get("end")
-        where = f"lines {start}-{end}" if start or end else "the whole file"
-        seen = self.state.reads.setdefault(path, [])
-        if len(seen) >= MAX_READS:
-            return seen
-        seen.append(where)
-        return []
+        ledger = self.state.reads.get(path)
+        if ledger is None:
+            return ""
+
+        start, end = _as_line(parsed.get("start")), _as_line(parsed.get("end"))
+        if start is None and end is None:
+            # A whole-file read. Only redundant once the whole file has been
+            # delivered, which `covers` can answer exactly when the length is
+            # known and cannot when it is not.
+            if ledger.lines and ledger.covers(1, ledger.lines):
+                return (
+                    f"You have already read all {ledger.lines:,} lines of this file this "
+                    "run, and every one of those reads is still in context above.\n\n"
+                    "Act on what you have, or say plainly what you are looking for and "
+                    "cannot find."
+                )
+            return ""
+
+        low = start or 1
+        high = end or (ledger.lines or low)
+        if ledger.covers(low, high):
+            return (
+                f"Lines {low}-{high} of this file are already in context above, from "
+                f"{ledger.summary()}.\n\n"
+                "This read was not dispatched because it asks for nothing new. A range "
+                "reaching past what you have already been given is read normally, so "
+                "widen it or move to a part of the file you have not seen."
+            )
+
+        if ledger.calls >= ledger.budget():
+            return (
+                f"You have read this file {ledger.calls} times this run, covering "
+                f"{ledger.covered_lines():,} of its {ledger.lines or '?'} lines, and "
+                "that is as many separate reads as one file gets.\n\n"
+                "Read a wider range in one call if you need more of it, or act on what "
+                "you have."
+            )
+        return ""
+
+    def _record_read(self, path: str, span: tuple[int, int] | None, total: int) -> None:
+        """Remember what a dispatched read actually delivered.
+
+        Recorded from the *result's* span rather than the call's arguments,
+        because the tool clamps the range to the file: a model asking for lines
+        1-9999 of a 200-line file has been given the whole thing, and a ledger
+        built from the request would not know that.
+        """
+        ledger = self.state.reads.setdefault(path, _ReadLedger())
+        ledger.calls += 1
+        if total > 0:
+            ledger.lines = total
+        if span is not None:
+            ledger.add(*span)
+        elif total > 0:
+            ledger.add(1, total)
 
     def _thrashing(self) -> str:
         """Whether the run is spending its turns on eviction rather than work.
@@ -1587,6 +2262,17 @@ def _safe_args(call: ToolCall) -> Any:
 #: A tuple, not a set: `_volume` returns the first one present, and a set's
 #: iteration order would make that answer depend on the hash seed.
 _VOLUME_PARAMS = ("max", "limit")
+
+
+def _as_line(value: Any) -> int | None:
+    """A 1-based line number from a tool argument, or None when absent."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip()) or None
+    return None
 
 
 def _volume(call: ToolCall) -> int:

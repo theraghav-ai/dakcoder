@@ -399,3 +399,348 @@ That is the right direction for the stage the product's promise rests on, but it
 means a `rules_lint` producer that forgets to set `meta` will block the gate. The
 real path sets it twice over (`gotools._report` copies the counts, and
 `_render_lint` opens with "clean"), and both are asserted.
+
+
+---
+
+# Round 2 — what `error.md` showed
+
+Two runs in that transcript ended `Stopped - no progress` and one read was
+refused after ten windows of a 6,571-line file. Five distinct causes, and one of
+them was mine.
+
+## R2.1 - `rules_lint` could fail but had no baseline (a regression I introduced)
+
+`_lint_is_clean` used to parse a body that has been rendered prose since
+`_render_lint` landed, so the decode raised on every call and the check fell back
+to `result.ok`, which is True whenever the sidecar ran. Fixing that (T1) without
+also baselining the stage turned *"the headline promise is inert"* into *"no
+legacy service can ever clear the gate"*: turn 45 of the transcript shows 98
+blocking findings, most of them in `handler/paogen.go`, which the run never
+opened.
+
+Every other blocking stage got a baseline in round 1. This one did not.
+
+- `_report` now returns `violation_keys` (`rule|path|message`, the shape
+  `swagger_check` has always used) and `violation_rules` in `meta`.
+- `rules_lint` joins `_BASELINE_STAGES`, measured **unscoped**, because the
+  point is to learn which rules the service already violates *anywhere*.
+- `Baseline.excuses` gained a second test. Key comparison alone excuses nothing
+  on a vertical slice: a new file's findings are new keys however faithfully it
+  copied the file next door — which is what the system prompt tells it to do
+  ("when the contract is silent, copy the shape of the nearest existing
+  resource"). So a finding is also excused when its **rule class** was already
+  violated somewhere in the module. What still blocks is a rule *nothing* was
+  violating and this change now does.
+
+Measured on `pao-back-end-development`: 199 findings in two touched legacy files,
+all advisory; a synthetic `layer-sql-boundary` finding still blocks.
+
+## R2.2 - `swagger_check`'s baseline was empty on every run ever
+
+`_list(None)` returned `["None"]` via `str(None)`. `_swagger_check` builds its
+`paths` from `_list(inv.arg("paths"))`, and `arg` returns `None` when the caller
+passed none — so the **unscoped** call, which is the one `take_baseline` makes
+and the only one that can see what was already broken, was silently scoped to a
+file named `"None"`. It matched nothing, all nine real findings were reported
+out-of-scope, and the baseline came back empty. Every legacy handler's missing
+`Routes()` then blocked the gate as this change's fault: exactly the failure the
+baseline exists to prevent, arriving through the baseline.
+
+With both fixed, the full gate on `pao-back-end-development` scoped to two
+touched legacy files now returns **PASS** — `rules_lint`, `go_vet` and
+`go mod tidy` advisory, `swagger_check` clean. It returned `blocked_by:
+rules_lint` before.
+
+## R2.3 - the gate budget could not be spent while the model kept calling tools
+
+`_gate_failed` is reached only from `_verify`, which is reached only from a turn
+that called **no** tool. So a model that answers a blocked gate by calling tools
+was never counted against `MAX_GATE_FAILURES`, never re-asked, never stopped. In
+the transcript the gate blocked on turn 45 and the run spent turns 46-65 on
+`go_build`, `git_status` and `git_ops commit` with `gate_failures` stuck at 1,
+ending at the turn cap. `_gate_stalled` now counts turns that changed no file
+while a failing gate stands, and ends `unverified` naming the stage.
+
+## R2.4 - the repeat intercept was feeding the loop it was built to stop
+
+Round 1 removed `collapse`/`intercepts` under "stop deleting history". That
+removal reintroduced a measured failure the report itself records: **one**
+(repeated call -> "answered from the previous result") pair in history and the
+model moves on 5/5; **two** and it repeats the call 5/5 forever, whatever the
+answer says. Both transcript loops are that shape — `git_ops commit` seven
+times, `search_repo` eight times, every repeat answered correctly into a
+transcript that told it to do it again.
+
+`ContextManager.supersede` replaces the earlier answer's *content* in place. The
+message keeps its index, its role and its `tool_call_id`, so nothing is orphaned
+and the wire stays well-formed — the same discipline `_supersede_slice` uses,
+and a different thing from the ledgers that deleted messages by identity.
+
+And the escalation was wrong even when it fired. A model repeating one call is
+out of *moves it recognises*, not out of ideas, and the move it needs — stop
+calling tools and say where you are — is one no message can make it take while a
+tool schema is on the table. After `STALLS_BEFORE_ANSWER` (2) the next turn is
+dispatched with `tool_choice: "none"`, so prose is the only reply available, and
+the loop already knows what prose means: in ASK it is the answer, in AGENT it is
+"I am done, run the gate". The mirror of the `tool_choice: "required"` re-ask,
+with a `tools=[]` fallback if the endpoint refuses the parameter.
+
+## R2.5 - the read budget counted calls, not lines
+
+`MAX_READS = 10` per path, ignoring the ranges entirely. `handler/paogen.go` is
+6,571 lines; the run was cut off on its eleventh thirty-line window having seen
+about 280 of them — four per cent — and told that reading it again "is not going
+to show you anything those did not".
+
+`_ReadLedger` holds the delivered line ranges as merged intervals, recorded from
+the *result's* span rather than the request (the tool clamps to the file). A read
+is refused only when its range is already inside the union; the call ceiling is a
+backstop that scales with the file (`LINES_PER_READ = 150`, floor 10, cap 60), so
+a 6,571-line file is worth 44 reads instead of 10.
+
+## R2.6 - the outcome was a lie
+
+`no_progress` is a report about the loop. The first transcript had written nine
+files, built them, regenerated the swagger docs and committed — and was reported
+as having made no progress. `_stalled` now leads with the gate verdict when one
+is failing, and otherwise names the files on disk and what the gate last said
+about them.
+
+**645 passed, 16 skipped, 0 failed**, including seven new regressions taken
+directly from the transcript.
+
+
+## R2.7 - verified against the reported shape, and one more found doing it
+
+Asked directly whether the repeat loop still kills the session, I found the test
+I had written for it was weak: `ScriptedClient` ignored `tool_choice`, so it
+asserted the parameter was *sent* and proved nothing about what it does. Making
+the stub honour `tool_choice` — the endpoint enforces it, so the stub should —
+changed three outcomes, and each was informative:
+
+- The repeat loop now ends `done` in 4 turns instead of `no_progress` at 6.
+  `MAX_STALLED_TURNS` is never reached.
+- The blocked-gate case stops via the gate budget when the model answers in
+  prose, and via `_gate_stalled` when it answers with tool calls. Two paths, two
+  tests.
+- **The planner force was not once per run**, as its own docstring claimed:
+  `state.forced` was reset every turn, so a Planner that had decided there was
+  nothing to plan said so, was forced, complied with a call it did not need,
+  said so again, and was forced again — two model calls a turn to relitigate a
+  decision it had already made twice. Now once per run: the first refusal may be
+  a turn whose call was never emitted, the second is an answer.
+
+Traced end to end through the real loop, both shapes from the transcript:
+
+    where is the cbds loop        (ASK, one search_repo forever)
+      turn 1  dispatched search_repo
+      turn 2  intercepted
+      turn 3  intercepted          <- stall 2, next turn is forced to answer
+      turn 4  model answers
+      done - "answered", 4 turns   (was: no_progress at 6)
+
+    add an employee resource      (AGENT, git_ops commit forever after the work)
+      turn 1  submit_plan
+      turn 2  patch_file
+      turn 3  git_ops
+      turn 4  intercepted
+      turn 5  intercepted          <- stall 2
+      turn 6  model answers -> FULL GATE ok
+      done - "1 file(s) changed and the gate is clean", 6 turns
+                                   (was: no_progress at 65)
+
+And the backstop is still tested: a server that accepts `tool_choice` and does
+not honour it still hits `MAX_STALLED_TURNS` and stops, rather than spinning.
+
+**646 passed, 16 skipped, 0 failed.** Wheels and `.vsix` rebuilt.
+
+
+---
+
+# Round 3 — verified against the live gateway
+
+A valid JWT changed how this works. Everything below was measured against
+`ai.cept.gov.in/dakcoder` and Qwen3.8-27B, not inferred. The capability matrix is
+in [docs/ENDPOINT-CAPABILITIES.md](docs/ENDPOINT-CAPABILITIES.md) and the
+executable half is `apps/agent/tests/test_live_endpoint.py`, behind
+`DAKCODER_LIVE=1`.
+
+## What the live model settled
+
+**The model is not the problem.** It honours `tool_choice` in every working
+mode, returns parallel calls, and scored 3/3 on schema-constrained intent
+classification including the bare `"go"`.
+
+**Both of my tool-suppression levers are broken.**
+- `tool_choice: "none"` returns zero tool calls and puts `<tool_call>` markup in
+  `content`. That was round 2's fix, and it has a 100% failure rate here — it is
+  what produced the `<toolcall>` text served to the developer as an answer.
+- `tools: []`, which I proposed as the replacement, leaks the same way *and*
+  invents `<function=Grep>` with `output_mode` — Claude Code's tool, remembered
+  from training.
+
+The mechanism is visible in the id shapes: `auto` returns `call_<hex>` (vLLM's
+tool parser), `required`/named return `chatcmpl-tool-<hex>` (guided decoding).
+`"none"` disables the parser while leaving the schemas in the prompt, so the
+model writes the call and nothing is listening.
+
+**The loop was a cliff, not a slope.** Replaying the real transcript at
+increasing depth: sensible through five fruitless calls, and at six it repeats
+its last call 4–5 times in 5 and does not recover.
+
+**No wording is dependable at that depth**, including an explicit *"do not
+search for it again"* — 5/5 loop in one session, 0/5 in another. **A named
+`tool_choice` on a terminal tool has been 5/5 in every session measured.**
+
+Which is the whole diagnosis in one sentence: **`ask` and `agent` had no way to
+say "I am finished"** — finishing meant *not* calling a tool, a non-action this
+model cannot reliably produce. `planner` never had the problem because
+`submit_plan` and `ask_developer` gave it typed terminal actions.
+
+## The six fixes
+
+**1 — `finish` for `ask` and `agent`.** A terminal tool alongside `submit_plan`,
+in every mode. Stall recovery is now `tool_choice: {name: "finish"}` plus the
+message, never suppression. *Live: `hi` answers in 1 turn; `explain the
+bootstrapper` in 6 (was 10); `does any handler have Routes()` in 5, no loop.*
+
+**2 — the inner loop stopped drowning the model.** It appended ~1,000 tokens
+after **every edit**, headlined "199 blocking and 480 advisory findings across
+49 files" with examples from `handler/paogen.go` — a file the run never opened.
+98% of those warnings were outside the change. `_render_lint` now quotes only
+files in scope and counts the rest in one line, and the run-start baseline is
+consulted here too. *Measured: 816 tokens → 0 when the findings predate the run.*
+**This is the "verifier running till 85".**
+
+**3 — the baseline went from 80.1s to 6.4s.** `go_test` was 74 of those seconds
+and is now taken only when the tests can actually run. The container probe was
+`shutil.which("docker")`, which finds Docker Desktop's binary with the daemon
+stopped — it runs `docker info` now, cached. *Same gate verdict, 12x faster.*
+
+**4 — a research bound at 12 turns per phase.** A fence around the measured
+cliff at six. When the acting mode hits it with unwritten plan targets the
+message names them and forces `required` (write it) rather than `finish` (leave).
+
+**5 — the ledgers carry across messages**, as the context already did. This is
+why "where is the plan?" replayed the previous message's loop verbatim.
+`dead_ends` and `last_results` deliberately do *not* carry: you edit files
+between messages and nothing watches for that.
+
+**6 — `search_repo` says what it searched.** "no matches for 'Routes' in 0
+files … that is your answer: it does not" is now "nothing was searched: the glob
+matched no files, so this says nothing about whether 'Routes' exists". *Live: 5/5
+correct vs 3/5 at the first step. Zero effect at depth 6 — which is why it is
+sixth, not first.*
+
+## Two bugs the live testing found that I had shipped
+
+**The baseline raced the run.** Moving it to a background thread made "before
+the run touched anything" a race, and losing it is silent and backwards: the
+snapshot picks up the run's own breakage and the gate then excuses it. Caught in
+a scripted run where the first edit landed inside the six seconds. Now the thread
+is joined before entering the writing mode, *and* a baseline whose measurement
+spans a mutation is discarded.
+
+**`finish` made quitting the easiest move.** Two runs in three then called it on
+their first acting turn — "I have gathered all the necessary details to write the
+migration plan" — having written nothing. A `finish` that abandons the plan is
+now sent back once, naming the unwritten files; a second is believed.
+
+## Three corrections the live testing forced on me
+
+**"No wording works" was too strong.** The same explicit instruction got 5/5
+loop in one session and 0/5 in another. Wording helps and cannot be depended on;
+only the named `tool_choice` has been 5/5 in every session. The live test now
+asserts the *comparison* (forcing is never worse) rather than a flaky negative,
+and `docs/ENDPOINT-CAPABILITIES.md` records both numbers.
+
+**`tools=[]` has two failure modes, not one.** Sometimes it writes markup for a
+foreign tool; sometimes it refuses outright — *"I don't have access to file
+system tools or code search capabilities in this environment"*, which is L11
+word for word. The test asserts the property that rules the lever out (the reply
+is not usable as an answer) rather than either symptom.
+
+**Three "agent failures" were my harness crashing.** A `UnicodeEncodeError` on a
+`→` in a cp1252 console killed the live runner mid-run, and I nearly recorded
+three clean runs as failures. The runner now forces UTF-8 on stdout. Worth
+stating because it is the same mistake in miniature as everything else here:
+a tool broke, and the first instinct was to blame what the tool was watching.
+
+## Honest status
+
+**651 unit tests pass. 9 of 9 live endpoint tests pass.**
+
+Live scenarios against `pao-back-end-development` and the real model:
+
+| scenario | before | now |
+|---|---|---|
+| `hi` | (n/a) | **1 turn** |
+| `explain the bootstrapper…` | 10 turns | **6 turns**, no gate, no writes |
+| `does any handler have Routes()?` | looped to `no_progress` | **5 turns**, answered |
+| `write a migration.md…` | 29 turns, no file, `<toolcall>` as the answer | **3 of 3 runs wrote it** — 16/17/28 turns, `done`, clean gate, 13–17 KB |
+
+The 28-turn run is the research bound doing its job in both phases rather than
+anything going wrong: 12 planning turns, forced `submit_plan`, then the acting
+phase reading and writing.
+
+I am not going to claim this is the final fix for everything — that claim is what
+produced rounds 1 and 2. What is different now is that the next problem is
+diagnosable in minutes instead of days: there is a live harness, a capability
+matrix with dates on it, and every constant in the loop traces to a measurement
+rather than to an argument.
+
+
+---
+
+## Release 0.3.0
+
+Versions were stuck at 0.2.11 across every build this session, which is exactly
+how a reinstall silently keeps the old copy — VS Code keys the extension on
+version. Bumped coherently:
+
+| artifact | was | now |
+|---|---|---|
+| extension | 0.2.11 | **0.3.0** |
+| `dakcoder-agent` | 0.2.11 | **0.3.0** |
+| `dakcoder-shared` | 0.1.1 | **0.2.0** |
+| runtime API | 1.0 | **1.1** |
+
+The API bump is not cosmetic. `API_VERSION` is documented as moving only "when a
+response shape changes in a way a client could not have anticipated", and the
+mode vocabulary did exactly that: a 1.0 client's `Mode` union does not contain
+`ask` or `agent`. It degrades rather than crashes, but the guard exists so that
+half-working is not the outcome nobody suspects. The additive changes in the
+same release — `intent` on `POST /v1/tasks`, `POST /v1/credential`, `intent` on
+`turn_start`, the three control tools — would not on their own have justified it.
+
+Added `CHANGELOG.md`; there wasn't one.
+
+Rebuilt from a clean tree (`apps/*/build` removed first — that directory shipped
+four retired prompt files in an earlier build):
+
+- `dakcoder_agent-0.3.0-py3-none-any.whl`, `dakcoder_shared-0.2.0-py3-none-any.whl`
+- `extension/dist/extension.js`, l10n bundle (767 strings)
+- `extension/dakcoder-go-0.3.0.vsix`, 21.2 MB, old `.vsix` removed
+
+Verified rather than assumed:
+
+- The wheels **install into a clean venv** and resolve `dakcoder-shared 0.2.0`
+  on their own; `dakcoderd` entry point present; the installed package reports
+  API 1.1, three modes, three intents, `finish` in all of them.
+- The `.vsix` carries **only** the 0.3.0/0.2.0 wheels — no stale copies — and
+  its bundled runtime reports 1.1, matching the bundled extension.
+- The venv cache key changed (`runtime-e9ff7c16…` → `runtime-5b4ef360…`), so the
+  stale venv holding the pre-round-3 agent is replaced and pruned on first run.
+- 651 unit tests, `npm run verify` green end to end (typecheck, 62 extension
+  tests, credential scan, 53/53 commands, l10n, gotools manifest).
+
+Install:
+
+```bash
+code --uninstall-extension dop.dakcoder-go
+code --install-extension "D:/desktop/dakcoder-go/extension/dakcoder-go-0.3.0.vsix"
+```
+
+Then reload the window. The version change means VS Code will not serve a cached
+copy this time.

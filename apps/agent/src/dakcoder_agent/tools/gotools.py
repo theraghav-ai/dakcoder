@@ -31,7 +31,7 @@ import os
 import shutil
 import subprocess
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -391,16 +391,22 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
         # A finding is not a tool failure — it is the tool succeeding. Marking it
         # ok=False would make the loop treat a lint report as a broken tool and
         # retry it, which wastes a turn and reads as noise in a transcript.
+        scoped = _list(inv.arg("paths"))
         return _report(
             sidecar.call("rules_lint", args),
-            lambda p: _render_lint(p, scope_hint="pass paths= to scope the lint"),
+            lambda p: _render_lint(
+                p, scope_hint="pass paths= to scope the lint", scope=scoped
+            ),
         )
 
     def legacy_audit(inv: Invocation) -> ToolResult:
         args = {"paths": _list(inv.arg("paths"))} if inv.arg("paths") else {}
+        scoped = _list(inv.arg("paths"))
         return _report(
             sidecar.call("legacy_audit", args),
-            lambda p: _render_lint(p, scope_hint="pass paths= to scope the audit"),
+            lambda p: _render_lint(
+                p, scope_hint="pass paths= to scope the audit", scope=scoped
+            ),
         )
 
     def fx_wire(inv: Invocation) -> ToolResult:
@@ -738,9 +744,24 @@ def _list(raw: Any) -> list[str]:
     generator produced one from a []string field. The seam is here, and it is the
     only place the two shapes have to agree.
     """
+    if raw is None:
+        return []
     if isinstance(raw, list):
-        return [str(x) for x in raw]
-    return [part.strip() for part in str(raw).split(",") if part.strip()]
+        return [str(x) for x in raw if str(x).strip()]
+    text = str(raw).strip()
+    if not text or text == "None":
+        # `str(None)` is the shape this used to return as a *path*, and it cost
+        # more than it looks. `_swagger_check` builds `paths` from
+        # `_list(inv.arg("paths"))`, and `arg` returns None when the caller did
+        # not pass one -- so an *unscoped* swagger_check was silently scoped to
+        # a file called "None", matched nothing, and reported every real finding
+        # as out-of-scope. That call is the one `take_baseline` makes, so the
+        # baseline of pre-existing swagger violations was empty on every run
+        # since it was written, and every legacy handler's missing `Routes()`
+        # blocked the gate as though this change had caused it. Exactly the
+        # failure the baseline exists to prevent, arriving through the baseline.
+        return []
+    return [part.strip() for part in text.split(",") if part.strip()]
 
 
 def _plain(reply: Reply) -> ToolResult:
@@ -784,12 +805,27 @@ def _elided(shown: int, total: int, how: str) -> list[str]:
     return [f"… {total - shown:,} more not shown — {how}"]
 
 
-def _render_lint(payload: Mapping[str, Any], *, scope_hint: str) -> str:
+def _render_lint(
+    payload: Mapping[str, Any], *, scope_hint: str, scope: Sequence[str] = ()
+) -> str:
     """Group findings by rule, worst-first, with examples.
 
     Grouped rather than listed because the shape of the answer is what a review
     needs first: "1,085 missing db tags" is one decision, and the same
     information as eleven hundred lines that crowd out everything else.
+
+    **Examples come from the files in scope.** Measured on a legacy service: a
+    lint scoped to two touched files returns 199 violations in those two files
+    and 480 *warnings*, 98% of them in files the run never opened. Merging both
+    into one grouping meant the examples the model saw after every single edit
+    were `repo/postgres/paogen.go` and `handler/paogen.go`, under a headline
+    saying 199 things were blocking. It read that as a mountain of work in its
+    own change and set about fixing it -- which is where "code written in 20
+    turns, verifier running to 85" comes from. Roughly a thousand tokens of
+    other people's problems, appended after every edit batch.
+
+    Out-of-scope findings are still *counted*, in one line. The number is worth
+    knowing; the three hundred examples are not.
     """
     findings = list(payload.get("violations") or [])
     findings += list(payload.get("out_of_scope") or [])
@@ -799,15 +835,30 @@ def _render_lint(payload: Mapping[str, Any], *, scope_hint: str) -> str:
     if not findings and not warnings:
         return f"clean — nothing to report across {files} file(s)."
 
+    wanted = {str(p).replace(chr(92), "/") for p in scope}
+
+    def in_scope(f: Mapping[str, Any]) -> bool:
+        return not wanted or str(f.get("path", "")).replace(chr(92), "/") in wanted
+
+    shown = [f for f in findings if in_scope(f)]
+    shown_warnings = [w for w in warnings if in_scope(w)]
+    elsewhere = (len(findings) - len(shown)) + (len(warnings) - len(shown_warnings))
+
     by_rule: dict[str, list[Mapping[str, Any]]] = {}
-    for f in findings + warnings:
+    for f in shown + shown_warnings:
         by_rule.setdefault(str(f.get("rule", "?")), []).append(f)
     ranked = sorted(by_rule.items(), key=lambda kv: -len(kv[1]))
 
+    where = f" in the {len(wanted)} file(s) you changed" if wanted else ""
     out = [
-        f"{len(findings):,} blocking and {len(warnings):,} advisory finding(s) "
-        f"across {files} file(s), in {len(by_rule)} rule(s). Grouped, worst first."
+        f"{len(shown):,} blocking and {len(shown_warnings):,} advisory finding(s)"
+        f"{where}, in {len(by_rule)} rule(s). Grouped, worst first."
     ]
+    if elsewhere:
+        out.append(
+            f"({elsewhere:,} more in files this run has not touched — not yours to "
+            "fix, and not shown.)"
+        )
     for rule, group in ranked[:_MAX_GROUPS]:
         out.append("")
         out.append(f"{rule} — {len(group):,}")
@@ -820,7 +871,6 @@ def _render_lint(payload: Mapping[str, Any], *, scope_hint: str) -> str:
     out.append("")
     out.extend(_elided(_MAX_GROUPS, len(ranked), f"{scope_hint}, or pass only= for one rule"))
     return "\n".join(out)
-
 
 def _render_rows(
     payload: Mapping[str, Any],
@@ -851,6 +901,11 @@ def _render_rows(
 #: every call.
 _REPORT_FACTS = ("files_scanned", "count", "ok", "generation", "est_tokens")
 
+#: How many violation keys travel back with a report. An unscoped lint of one
+#: legacy service returns 1,650, and every one of them would sit in `meta` on
+#: the tool result for the life of the run.
+_MAX_VIOLATION_KEYS = 400
+
 
 def _report(reply: Reply, render) -> ToolResult:
     """Turn a sidecar report into readable text, never raising on shape.
@@ -879,6 +934,26 @@ def _report(reply: Reply, render) -> ToolResult:
     for key in ("violations", "out_of_scope", "warnings"):
         if isinstance(payload.get(key), list):
             meta[key] = len(payload[key])
+
+    # The violations as *keys*, not just a count.
+    #
+    # A count says the stage failed; it cannot say whether this run caused it.
+    # `swagger_check` has had `_violation_key` since it was baselined, and
+    # `rules_lint` -- the blocking stage the product's promise rests on -- had
+    # only a number, so the gate had no way to tell "this change broke it" from
+    # "this service has always been like that". On a legacy repository that is
+    # the difference between a gate no edit can clear and a gate that works.
+    #
+    # Capped, because an unscoped lint of one legacy service returns 1,650 of
+    # them and `meta` travels with the tool result. Past the cap the baseline
+    # falls back to comparing rule classes, which is the coarser half of the
+    # judgement and is what actually carries it (see `Baseline.excuses`).
+    if isinstance(payload.get("violations"), list):
+        keys = [_violation_key(v) for v in payload["violations"] if isinstance(v, dict)]
+        meta["violation_keys"] = sorted(set(keys))[:_MAX_VIOLATION_KEYS]
+        meta["violation_rules"] = sorted(
+            {str(v.get("rule", "")) for v in payload["violations"] if isinstance(v, dict)}
+        )
     return ToolResult.success(rendered, meta=meta)
 
 
