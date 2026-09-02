@@ -5,6 +5,15 @@ to mint the gateway token
 cd /mnt/data/raghav/dakcoder && . deploy/shellenv.sh
 .venv/bin/python deploy/gateway_main.py --mint dev:localdev --mint-hours 168
 
+to deploy everything in server
+
+cd /mnt/data/raghav/dakcoder
+git pull
+setsid bash -c 'cd /mnt/data/raghav/dakcoder && \
+  deploy/build-gotools.sh && deploy/stop.sh && deploy/start.sh' \
+  < /dev/null > deploy/logs/redeploy.log 2>&1 &
+
+
 
 Everything the server side needs, and one command that brings it up.
 
