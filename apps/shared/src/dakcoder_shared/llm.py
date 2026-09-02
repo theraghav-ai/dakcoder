@@ -57,6 +57,20 @@ BACKOFF_SECONDS = (1.5, 3.5)
 #: second discovering that again.
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
+#: Errors the gateway raises about *itself* rather than about the request, and
+#: which take longer than a couple of seconds to clear.
+#:
+#: A 503 was retried on the ordinary 1.5s/3.5s backoff, so a Redis failover -
+#: which is what `quota_unavailable` means - burned all three attempts in about
+#: six seconds and ended the run ERROR. The developer saw a broken agent; the
+#: cause was a cache restart that would have finished on its own. The gateway
+#: sends `Retry-After: 30` for exactly this and nothing read it.
+SLOW_TO_CLEAR = frozenset({"quota_unavailable"})
+
+#: The longest a `Retry-After` may hold a turn. Beyond this the honest answer is
+#: to fail and say why rather than to sit silently for minutes.
+MAX_RETRY_AFTER = 45.0
+
 _HTML_TAG = re.compile(r"<[^>]+>")
 _WHITESPACE = re.compile(r"\s+")
 
@@ -104,12 +118,20 @@ class Metering:
 
 
 class UpstreamError(RuntimeError):
-    """A non-retryable HTTP failure from the proxy or the model."""
+    """An HTTP failure from the proxy or the model."""
 
-    def __init__(self, status: int, detail: str) -> None:
+    def __init__(
+        self, status: int, detail: str, *, kind: str = "", retry_after: float = 0.0
+    ) -> None:
         super().__init__(f"upstream returned {status}: {detail}")
         self.status = status
         self.detail = detail
+        #: The gateway's own error name (`quota_unavailable`, `unauthorized`),
+        #: when it sent one. Distinguishes an outage of the gateway from a
+        #: refusal of this request, which the client has to wait differently for.
+        self.kind = kind
+        #: Seconds the server asked us to wait. Honoured, within reason.
+        self.retry_after = retry_after
 
 
 class UnsupportedParameterError(UpstreamError):
@@ -307,10 +329,26 @@ class LLMClient:
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         jitter: Callable[[], float] = lambda: random.uniform(0.0, 0.5),
+        credential: Callable[[], str] | None = None,
     ) -> None:
         self._config = config
         self._sleep = sleep
         self._jitter = jitter
+        #: Where the bearer token comes from, asked *per request*.
+        #:
+        #: It used to be baked into the client's default headers at construction
+        #: and never looked at again. A local runtime's token is the developer's
+        #: dakcoder JWT, the daemon outlives it, and from the moment it expired
+        #: every call was a 401 — which is not in `RETRYABLE_STATUS`, so it
+        #: surfaced as an immediate run ERROR, and (before the extension fix)
+        #: as a panel frozen on "Working…". Restarting the runtime was the only
+        #: cure, and nothing on screen said so.
+        #:
+        #: A callable rather than a setter because the freshest token lives in
+        #: the process that can mint one; this side should ask rather than be
+        #: told. Defaults to the configured key, which is the gateway's own
+        #: long-lived credential and correctly never changes.
+        self._credential = credential or (lambda: config.api_key)
         self._client = httpx.Client(
             base_url=config.base_url,
             timeout=httpx.Timeout(
@@ -328,7 +366,6 @@ class LLMClient:
             # the corporate proxy must never be inherited for internal hosts.
             trust_env=False,
             transport=transport,
-            headers={"Authorization": f"Bearer {config.api_key}"},
         )
 
     def close(self) -> None:
@@ -355,12 +392,25 @@ class LLMClient:
         enable_thinking: bool,
         tools: Sequence[dict[str, Any]] | None = None,
         temperature: float | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> dict[str, Any]:
         """Assemble the request body.
 
         Separated from sending so a test — and the capability probe — can assert
         on the exact shape without a round trip. Every field here is
         load-bearing; the comments say which and why.
+
+        ``tool_choice``, ``response_format`` and ``parallel_tool_calls`` are the
+        three primitives an agent loop is actually built on, and this codebase
+        used none of them. Without ``tool_choice`` a model that narrates instead
+        of calling a tool can only be *counted* and eventually killed; with it,
+        the turn is simply re-asked with the call made mandatory. Without
+        ``response_format`` a plan is free prose parsed by regex. vLLM supports
+        all three; they are sent only when a caller asks for them, so the
+        request shape for an ordinary turn is byte-identical to before and the
+        prefix cache is undisturbed.
         """
         body: dict[str, Any] = {
             "model": self._config.model_for(role),
@@ -378,6 +428,15 @@ class LLMClient:
         }
         if tools:
             body["tools"] = list(tools)
+            # Only meaningful alongside tools, and only sent when asked for: an
+            # unconditional "auto" is a parameter LiteLLM may reject with
+            # `drop_params` off, for a value that is already the default.
+            if tool_choice is not None:
+                body["tool_choice"] = tool_choice
+            if parallel_tool_calls is not None:
+                body["parallel_tool_calls"] = parallel_tool_calls
+        if response_format is not None:
+            body["response_format"] = response_format
         if self._config.user:
             # Attribution at the proxy, so LiteLLM's own spend tables are
             # per-user even before per-user virtual keys exist.
@@ -393,6 +452,9 @@ class LLMClient:
         enable_thinking: bool = False,
         tools: Sequence[dict[str, Any]] | None = None,
         temperature: float | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
         recover_empty: bool = True,
         metering: Metering | None = None,
         on_delta: Callable[[str], None] | None = None,
@@ -426,15 +488,40 @@ class LLMClient:
             enable_thinking=enable_thinking,
             tools=tools,
             temperature=temperature,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            parallel_tool_calls=parallel_tool_calls,
         )
         headers = metering.headers() if metering else None
         try:
             return self._send(body, headers, on_delta)
         except EmptyCompletionError:
-            if not recover_empty or not enable_thinking:
+            # T3: recovered whether or not *we* asked for thinking.
+            #
+            # The guard used to be ``not enable_thinking -> raise``, on the
+            # reasoning that an empty completion can only be a reasoning block
+            # eating the budget. That is the cause, not the trigger: if the
+            # endpoint ignores ``chat_template_kwargs`` — which is exactly the
+            # condition ``reasoning_leaked`` exists to alert on — reasoning runs
+            # in a mode configured for thinking-off, eats a 2,048-token budget,
+            # and returns ``content: null``. With the old guard that propagated
+            # to ``_turn``'s catch-all and ended the run ERROR on a transport
+            # condition the design had already anticipated.
+            #
+            # The retry is worth making in both cases and costs one call: it
+            # re-states thinking-off explicitly and, when the budget is the
+            # binding constraint, raises it enough to hold an answer.
+            if not recover_empty:
                 raise
             retry = dict(body)
             retry["chat_template_kwargs"] = {"enable_thinking": False}
+            if not enable_thinking:
+                # We already asked for thinking off and got nothing back, so the
+                # parameter is not reaching the model. The only other lever is
+                # room: give the reasoning block somewhere to go that is not the
+                # answer's budget. Bounded, because this is a recovery and not a
+                # new policy.
+                retry["max_tokens"] = max(int(body.get("max_tokens") or 0), 6144)
             # Still streamed. An empty completion is by definition one that
             # produced no content, so there is nothing already said that the
             # recovered answer would be talking over.
@@ -490,9 +577,26 @@ class LLMClient:
                 last = exc
 
             delay = BACKOFF_SECONDS[min(attempt - 1, len(BACKOFF_SECONDS) - 1)]
+            # A server asking us to wait *longer* is obeyed; one asking for less
+            # does not get to shorten a backoff chosen against a thundering
+            # herd. The case this exists for is `quota_unavailable`, where the
+            # gateway sends `Retry-After: 30` and nothing read it: three retries
+            # 1.5s apart burned the run in about six seconds and reported a
+            # cache restart as the agent being broken.
+            if isinstance(last, UpstreamError):
+                asked = last.retry_after or (30.0 if last.kind in SLOW_TO_CLEAR else 0.0)
+                delay = max(delay, min(asked, MAX_RETRY_AFTER))
             self._sleep(delay + self._jitter())
 
         raise last or RuntimeError("request failed with no recorded cause")
+
+    def _auth(self, headers: dict[str, str] | None) -> dict[str, str]:
+        """The request headers, with a credential read at send time."""
+        out = dict(headers or {})
+        token = (self._credential() or "").strip()
+        if token:
+            out["Authorization"] = f"Bearer {token}"
+        return out
 
     def _stream_once(
         self,
@@ -501,7 +605,7 @@ class LLMClient:
         on_delta: Callable[[str], None] | None = None,
     ) -> ChatResult:
         with self._client.stream(
-            "POST", "/chat/completions", json=body, headers=headers
+            "POST", "/chat/completions", json=body, headers=self._auth(headers)
         ) as response:
             if response.status_code >= 400:
                 response.read()
@@ -533,7 +637,29 @@ class LLMClient:
 
         if response.status_code == 400 and "unsupportedparams" in detail.lower().replace(" ", ""):
             return UnsupportedParameterError(response.status_code, detail)
-        return UpstreamError(response.status_code, detail)
+
+        kind = ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+                kind = payload["error"]
+        except (json.JSONDecodeError, ValueError):
+            pass
+        try:
+            retry_after = float(response.headers.get("retry-after") or 0)
+        except (TypeError, ValueError):
+            retry_after = 0.0
+
+        if kind in SLOW_TO_CLEAR:
+            # Said in the words a developer needs, because this is the one
+            # failure they will otherwise read as "the agent is broken".
+            detail = (
+                f"{detail} This is the gateway's quota service, not your code and not "
+                "this request; it usually clears within a minute."
+            )
+        return UpstreamError(
+            response.status_code, detail, kind=kind, retry_after=retry_after
+        )
 
 
 def _consume_stream(
@@ -584,6 +710,35 @@ def _consume_stream(
         except json.JSONDecodeError:
             # A malformed frame is a proxy bug, not a reason to lose the turn.
             continue
+        if not isinstance(chunk, dict):
+            continue
+
+        # An in-band failure, and the one case where a `data:` frame is not a
+        # chunk of an answer.
+        #
+        # The status code is spent by the time the gateway knows something has
+        # gone wrong upstream, so it says so in the only channel still open:
+        # `event: error` with `{"error": ..., "reason": ...}`. This loop skipped
+        # it — no `choices`, no `usage`, nothing to fold in — and returned
+        # `ChatResult("")`. The loop then read an empty reply as "the model had
+        # nothing to say", ended the run DONE, and the panel showed "Done · N
+        # turns" with nothing on screen. Every mid-flight gateway failure, and
+        # every upstream timeout, presented as the agent silently returning
+        # nothing.
+        #
+        # Raised rather than recorded, because a turn that failed is not a turn
+        # that answered. `_send` decides whether it is worth another attempt.
+        if error := chunk.get("error"):
+            detail = (
+                error.get("message")
+                if isinstance(error, dict)
+                else (str(error) if error else "")
+            )
+            reason = chunk.get("reason") or chunk.get("detail") or ""
+            raise UpstreamError(
+                int(chunk.get("status") or 502),
+                f"{detail or 'upstream failure'}{f': {reason}' if reason else ''}"[:400],
+            )
 
         if model := chunk.get("model"):
             result.model = model

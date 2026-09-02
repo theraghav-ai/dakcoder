@@ -15,49 +15,49 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 
 | Mode | Tools | Schema cost |
 |---|---|---|
-| **planner** | 13 | ~1,428 tokens |
-| **scaffolder** | 11 | ~1,315 tokens |
-| **coder** | 17 | ~1,994 tokens |
-| **verifier** | 11 | ~1,217 tokens |
-| **debugger** | 19 | ~2,205 tokens |
+| **ask** | 14 | ~1,529 tokens |
+| **planner** | 16 | ~1,892 tokens |
+| **agent** | 22 | ~2,645 tokens |
 
 ## The catalogue
 
 | Tool | Modes | Mutates | Approval | Runs in | Description |
 |---|---|---|---|---|---|
-| `repo_map` | CDPSV |  |  | gotools | Get the module path, package tree, exported symbols and FX providers. Call this first in an unfamiliar repository. Pass package to see one directory in full. |
-| `read_file` | CDPSV |  |  | agent | Read a slice of one file. Always pass start and end when you know roughly where to look; whole-file reads crowd out everything else in context. |
-| `search_repo` | CDPV |  |  | agent | Search file contents by regular expression. Use this instead of grep, and prefer it over reading files to find something. |
-| `search_docs` | CDPS |  |  | agent | Search the n-api-template knowledge base for the contract rule behind a pattern. Use it before inventing an approach, not after. |
-| `go_symbols` | CDPV |  |  | gopls | Find a symbol's definition, references or package API through gopls. Use this rather than searching for a name textually. _(not yet available: gopls is not yet wired (Part A section 8.3). Use search_repo, or go_build for type errors.)_ |
-| `go_diagnostics` | CDV |  |  | gopls | Type-check the workspace incrementally and report errors. This is the fast inner-loop signal; run it after every edit batch. _(not yet available: gopls is not yet wired (Part A section 8.3). Use go_build, which is authoritative but takes about four seconds.)_ |
-| `rules_lint` | CDPV |  |  | gotools | Check Go against the n-api-template contract: layer boundaries, handler signatures, repository idiom, FX registration. Pass paths to scope it. |
-| `legacy_audit` | PV |  |  | gotools | Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating; then search_docs 'legacy migration' and follow that SOP. |
-| `db_roundtrip_audit` | PV |  |  | gotools | Profile every repository method: database calls, any inside a loop, batched, in a transaction, with a verdict. Worst first. Use before optimising by eye. |
-| `validation_audit` | CPV |  |  | gotools | List every request field, its validate tag, and what the tag leaves unbounded. `required` alone means only 'not empty', so a 10MB string passes. |
-| `temporal_audit` | P |  |  | gotools | List inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only — it makes no recommendation. |
-| `lib_version_check` | P |  |  | gotools | Report CEPT library drift: which are behind, which are superseded by n-api-*. Reports only — never edit go.mod on it, tell the user. |
-| `playbook` | CDV |  |  | agent | Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before. |
-| `write_file` | CDS | ✓ | if protected | agent | Create a new file. Refuses to overwrite an existing one — use patch_file for that. Write complete, compiling Go, not a sketch. |
-| `patch_file` | CD | ✓ | if protected | agent | Replace an exact unique string in a file. Include enough surrounding lines to make old unique; the call fails rather than guessing. |
-| `delete_file` | CD | ✓ | **always** | agent | Delete a file. Always needs the developer's approval; say why in reason. |
+| `repo_map` | AAP |  |  | gotools | Get the module path, package tree, exported symbols and FX providers. Call this first in an unfamiliar repository. Pass package to see one directory in full. |
+| `read_file` | AAP |  |  | agent | Read a slice of one file. Always pass start and end when you know roughly where to look; whole-file reads crowd out everything else in context. |
+| `search_repo` | AAP |  |  | agent | Search file contents by regular expression. Use this instead of grep, and prefer it over reading files to find something. |
+| `search_docs` | AAP |  |  | agent | Search the n-api-template knowledge base for the contract rule behind a pattern. Use it before inventing an approach, not after. |
+| `go_symbols` | AAP |  |  | gopls | Find a symbol's definition, references or package API through gopls. Use this rather than searching for a name textually. _(not yet available: gopls is not yet wired (Part A section 8.3). Use search_repo, or go_build for type errors.)_ |
+| `go_diagnostics` | A |  |  | gopls | Type-check the workspace incrementally and report errors. This is the fast inner-loop signal; run it after every edit batch. _(not yet available: gopls is not yet wired (Part A section 8.3). Use go_build, which is authoritative but takes about four seconds.)_ |
+| `rules_lint` | AAP |  |  | gotools | Check Go against the n-api-template contract: layer boundaries, handler signatures, repository idiom, FX registration. Pass paths to scope it. |
+| `legacy_audit` | AP |  |  | gotools | Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating; then search_docs 'legacy migration' and follow that SOP. |
+| `db_roundtrip_audit` | AP |  |  | gotools | Profile every repository method: database calls, any inside a loop, batched, in a transaction, with a verdict. Worst first. Use before optimising by eye. |
+| `validation_audit` | AP |  |  | gotools | List every request field, its validate tag, and what the tag leaves unbounded. `required` alone means only 'not empty', so a 10MB string passes. |
+| `temporal_audit` | AP |  |  | gotools | List inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only — it makes no recommendation. |
+| `lib_version_check` | AP |  |  | gotools | Report CEPT library drift: which are behind, which are superseded by n-api-*. Reports only — never edit go.mod on it, tell the user. |
+| `playbook` | AAP |  |  | agent | Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before. |
+| `submit_plan` | P |  |  | agent | Submit the plan and start the work. Each step names one file, what changes in it, and how you will know it worked. |
+| `ask_developer` | P |  |  | agent | Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base. |
+| `write_file` | A | ✓ | if protected | agent | Create a new file. Refuses to overwrite an existing one — use patch_file for that. Write complete, compiling Go, not a sketch. |
+| `patch_file` | A | ✓ | if protected | agent | Replace an exact unique string in a file. Include enough surrounding lines to make old unique; the call fails rather than guessing. |
+| `delete_file` | A | ✓ | **always** | agent | Delete a file. Always needs the developer's approval; say why in reason. |
 | `gofmt` | gate | ✓ |  | agent | Format Go files and fix their imports. Runs automatically after edits; call it directly only to clean up a file you did not just touch. |
-| `resource_scaffold` | S | ✓ | **always** | gotools | Write a whole CRUD resource — domain, DDL, repository, DTOs, handler — from a field spec. Produce the spec; the templates produce the code. |
-| `project_scaffold` | S | ✓ | **always** | gotools | Create a new n-api-template service in an empty directory, with configs, bootstrap and one working resource. Credential fields are left empty. |
-| `fx_wire` | CDS | ✓ |  | gotools | Register a repository or handler in bootstrap/bootstrapper.go with the right annotations. Run this after adding either, or FX fails at startup. |
-| `govalid_gen` | CDS | ✓ |  | agent | Regenerate handler/request/request_*_validator.go from the request structs. Run it whenever a validate tag changes; never hand-edit the generated files. |
-| `go_build` | CDV |  |  | agent | Build every package. This is the authoritative signal: nothing is done until it is clean, whatever the other tools say. |
-| `go_vet` | D |  |  | agent | Run go vet over the workspace. Gate only — it takes about thirty seconds, so never run it in the edit loop. |
-| `go_test` | D |  |  | agent | Run tests. Pass pattern to scope to one package when output is large. |
+| `resource_scaffold` | A | ✓ | **always** | gotools | Write a whole CRUD resource — domain, DDL, repository, DTOs, handler — from a field spec. Produce the spec; the templates produce the code. |
+| `project_scaffold` | A | ✓ | **always** | gotools | Create a new n-api-template service in an empty directory, with configs, bootstrap and one working resource. Credential fields are left empty. |
+| `fx_wire` | A | ✓ |  | gotools | Register a repository or handler in bootstrap/bootstrapper.go with the right annotations. Run this after adding either, or FX fails at startup. |
+| `govalid_gen` | A | ✓ |  | agent | Regenerate handler/request/request_*_validator.go from the request structs. Run it whenever a validate tag changes; never hand-edit the generated files. |
+| `go_build` | A |  |  | agent | Build every package. This is the authoritative signal: nothing is done until it is clean, whatever the other tools say. |
+| `go_vet` | A |  |  | agent | Run go vet. Pass pattern to scope it to one package; unscoped it takes about thirty seconds, so never run that in the edit loop. |
+| `go_test` | A |  |  | agent | Run tests. Pass pattern to scope to one package when output is large. |
 | `golangci_lint` | gate |  |  | agent | Run golangci-lint if the repository configures it. Advisory: its findings never block, so do not spend turns on them. |
 | `govulncheck` | gate |  |  | agent | Scan dependencies for known vulnerabilities. Run it on a new service and after any dependency change, not routinely. |
 | `swagger_check` | gate |  |  | agent | Check that routes are named and swagger generation is enabled, so endpoints reach /docs/v3Doc.json. This checks; it does not generate. |
-| `go_mod` | CD | ✓ | if protected | agent | Run tidy, or add a dependency. Tidy is free and must be a no-op at the gate; adding a direct dependency needs approval. |
-| `git_status` | CDPSV |  |  | agent | List changed, staged and untracked files. Cheap; use it to confirm what you changed. |
-| `git_diff` | CDPSV |  |  | agent | Show the diff of the working tree, or of one path. Read this before claiming a change is done. |
-| `git_blame` | DP |  |  | agent | Show who last changed each line of a file, and when. Use it to date a legacy pattern. |
-| `git_ops` | CS | ✓ | if protected | agent | Stage, commit, or switch to the session branch. Never pushes and never rewrites history, so nothing here can lose committed work. |
-| `run_terminal` | D |  | if protected | agent | Run one allow-listed binary with explicit arguments. There is no shell, so no pipes, globs or redirection. Prefer a purpose-built tool. |
+| `go_mod` | A | ✓ | if protected | agent | Run tidy, or add a dependency. Tidy is free and must be a no-op at the gate; adding a direct dependency needs approval. |
+| `git_status` | AAP |  |  | agent | List changed, staged and untracked files. Cheap; use it to confirm what you changed. |
+| `git_diff` | AAP |  |  | agent | Show the diff of the working tree, or of one path. Read this before claiming a change is done. |
+| `git_blame` | AAP |  |  | agent | Show who last changed each line of a file, and when. Use it to date a legacy pattern. |
+| `git_ops` | A | ✓ | if protected | agent | Stage, commit, or switch to the session branch. Never pushes and never rewrites history, so nothing here can lose committed work. |
+| `run_terminal` | A |  | if protected | agent | Run one allow-listed binary with explicit arguments. There is no shell, so no pipes, globs or redirection. Prefer a purpose-built tool. |
 
 Modes: **P**lanner · **C**oder · **S**caffolder · **V**erifier · **D**ebugger. `gate` means the verification gate runs it on a fixed schedule and the model never chooses it (Part A §9.3).
 
@@ -166,6 +166,24 @@ Get the known-good fix procedure for a failure class or rule id. Consult this be
 |---|---|---|---|
 | `rule` | string |  | Rule id or failure class, e.g. 'fx-registration' or 'pgx-no-rows'. |
 
+### `submit_plan`
+
+Submit the plan and start the work. Each step names one file, what changes in it, and how you will know it worked.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `steps` | array | yes | The steps, in order. At most eight. |
+| `summary` | string |  | One sentence on what the whole plan achieves. |
+
+### `ask_developer`
+
+Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `questions` | array | yes | The questions, at most four. One decision each. |
+| `assumed` | string |  | What you inferred rather than asking about. |
+
 ### `write_file`
 
 Create a new file. Refuses to overwrite an existing one — use patch_file for that. Write complete, compiling Go, not a sketch.
@@ -242,9 +260,11 @@ _No parameters._
 
 ### `go_vet`
 
-Run go vet over the workspace. Gate only — it takes about thirty seconds, so never run it in the edit loop.
+Run go vet. Pass pattern to scope it to one package; unscoped it takes about thirty seconds, so never run that in the edit loop.
 
-_No parameters._
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `pattern` | string |  | Package pattern, e.g. './handler/...'. Omit for './...'. |
 
 ### `go_test`
 
@@ -298,7 +318,7 @@ Show the diff of the working tree, or of one path. Read this before claiming a c
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `path` | string |  | Limit the diff to one path. |
-| `staged` | string |  | Pass 'true' to diff the index instead of the working tree. |
+| `staged` | boolean |  | True to diff the index instead of the working tree. |
 
 ### `git_blame`
 

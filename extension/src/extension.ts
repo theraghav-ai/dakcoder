@@ -99,6 +99,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // refusal off stderr turns the very first task after install into "the
     // runtime exited with 2", which is the worst possible first impression and
     // tells the developer nothing about what to do.
+    /*
+     * Every path out of here that returns false also says so *in the panel*.
+     *
+     * It used to say so in a toast, a log line, or nothing at all: not signed
+     * in, sign-in cancelled, runtime failed to start - `submit` simply returned
+     * and the composer sat there. `chatView.setOffline` and the offline card
+     * existed and were never called from this function. From the panel, every
+     * pre-flight failure was "your message, then nothing", which is
+     * indistinguishable from the agent being broken and gives the developer
+     * nothing to act on.
+     *
+     * Toasts stay where they are useful - they carry the buttons - but they are
+     * no longer the only place a failure appears.
+     */
     if (!(await authProvider.accessToken())) {
       const signIn = vscode.l10n.t('Sign in');
       const picked = await vscode.window.showInformationMessage(
@@ -107,27 +121,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ),
         signIn,
       );
-      if (picked !== signIn) return false;
+      if (picked !== signIn) {
+        chatView.setOffline(
+          vscode.l10n.t('Not signed in. Run "dakcoder: Sign in" to start working.'),
+        );
+        return false;
+      }
       try {
         await vscode.authentication.getSession(auth.AUTH_PROVIDER_ID, [...auth.DAKCODER_SCOPES], {
           createIfNone: true,
         });
       } catch (err) {
         log.warn(`sign-in did not complete: ${String(err)}`);
+        chatView.setOffline(
+          vscode.l10n.t('Sign-in did not complete: {0}', String(err)),
+        );
         return false;
       }
-      if (!(await authProvider.accessToken())) return false;
+      if (!(await authProvider.accessToken())) {
+        chatView.setOffline(vscode.l10n.t('Sign-in did not produce a token.'));
+        return false;
+      }
     }
 
     try {
       await runtime.ensure();
       announced = true;
       statusBar.clearGatewayOffline();
+      chatView.setOffline(undefined);
+      // The runtime holds the developer's gateway JWT and outlives it. Pushing
+      // the current one on every task is what keeps a long-lived daemon from
+      // 401-ing every call once the original expires - which used to make every
+      // task fail until someone restarted the runtime, with nothing on screen
+      // saying so. Failure here is not fatal: the token it already has may well
+      // still be good.
+      void refreshCredential();
       return true;
     } catch (err) {
       const message = err instanceof RuntimeError ? err.message : String(err);
       const remedy = err instanceof RuntimeError ? err.remedy : undefined;
       statusBar.setGatewayOffline(message);
+      chatView.setOffline(remedy ? `${message} ${remedy}` : message);
       const runDoctor = vscode.l10n.t('Run Doctor');
       const picked = await vscode.window.showErrorMessage(
         remedy ? `${message} ${remedy}` : message,
@@ -135,6 +169,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       if (picked === runDoctor) await vscode.commands.executeCommand('dakcoder.doctor');
       return false;
+    }
+  }
+
+  /** Hand the runtime a fresh gateway token. Best-effort; see `ready`. */
+  async function refreshCredential(): Promise<void> {
+    try {
+      const jwt = await authProvider.accessToken();
+      if (jwt) await runtime.client.setCredential(jwt);
+    } catch (err) {
+      log.warn(`could not refresh the runtime credential: ${String(err)}`);
     }
   }
 
@@ -226,7 +270,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       startTask: async (task, options) => {
         if (!(await ready())) return;
         const session = await runtime.client.startTask(task, {
-          mode: options?.mode ?? 'debugger',
+          intent: options?.intent ?? 'agent',
           acceptance: options?.acceptance ?? [],
         });
         state.hydrate(session);
@@ -248,7 +292,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // the model's job here is to relay a spec it did not have to invent.
       scaffold: async (request) => {
         if (!(await ready())) return;
-        const session = await runtime.client.startTask(request.task, { mode: 'scaffolder' });
+        const session = await runtime.client.startTask(request.task, { intent: 'agent' });
         state.hydrate(session);
         state.attach(session.id);
         treeSet.sessions.refresh();
@@ -260,7 +304,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           .join('\n');
         const session = await runtime.client.startTask(
           `Migrate these units to the n-api-template contract, in this order:\n${listed}`,
-          { mode: 'planner' },
+          { intent: 'agent' },
         );
         state.hydrate(session);
         state.attach(session.id);
@@ -382,10 +426,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * the check and the post, and the whole point of steering is that a correction
    * typed at turn 12 arrives before turn 13 rather than after the run.
    */
+  /**
+   * True while a `submit` is between the first `await` and its answer.
+   *
+   * There was no such guard, and the first Enter of a session is the slowest
+   * thing the extension ever does: venv creation, an offline pip install, and
+   * two sixty-second windows with no progress in the panel. A second Enter in
+   * that window started a *second* conversation whose `showSession` wiped the
+   * first one's rows off the screen, and the developer was left watching a run
+   * they could no longer see.
+   *
+   * Guarding the whole call rather than debouncing the keystroke: the race is
+   * over the round trip, not over the typing.
+   */
+  let submitting = false;
+
   async function submit(text: string, _steering: boolean): Promise<void> {
-    if (!(await ready())) return;
     const trimmed = text.trim();
     if (!trimmed) return;
+    if (submitting) {
+      chatView.note(
+        'info',
+        vscode.l10n.t('Still starting the last message. It will be sent in a moment.'),
+      );
+      return;
+    }
+    submitting = true;
+    try {
+      await submitOnce(trimmed);
+    } finally {
+      submitting = false;
+    }
+  }
+
+  async function submitOnce(trimmed: string): Promise<void> {
+    if (!(await ready())) return;
 
     // Read before the round trip. The runtime decides what the message means
     // from the state it finds, and this is only used to interpret the answer:
@@ -419,17 +494,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           await startConversation(trimmed);
           return;
         } catch (retry) {
-          reportRunError(retry, log);
+          reportRunError(retry, log, chatView);
           return;
         }
       }
-      reportRunError(err, log);
+      reportRunError(err, log, chatView);
     }
   }
 
   async function startConversation(task: string): Promise<void> {
     const session = await runtime.client.startTask(task, {
-      mode: modeFor(config().get<string>('defaultMode') ?? 'multi'),
+      intent: intentFor(config().get<string>('defaultMode') ?? 'auto'),
     });
     chatView.showSession(session.id);
     state.hydrate(session);
@@ -490,28 +565,65 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       treeSet.sessions.refresh();
       await focusPanel();
     } catch (err) {
-      reportRunError(err, log);
+      reportRunError(err, log, chatView);
     }
   }
 
+  /**
+   * Run a slash command, or send it to the model.
+   *
+   * Four of these used to dispatch to command ids that do not exist -
+   * `dakcoder.scaffoldService`, `dakcoder.migrate`, `dakcoder.debugLastFailure`,
+   * `dakcoder.runTests` - and `executeCommand` rejects with a promise nothing
+   * awaited, so the rejection was discarded and the command did nothing at all,
+   * silently. Two of the four (`/migrate`, `/debug`) are among the four
+   * suggestions the empty panel offers as a first action.
+   *
+   * Two were typos for ids that do exist and are corrected. The other two name
+   * things the *agent* does perfectly well as an ordinary request, and that is
+   * now what happens: anything not in the table below - including a command
+   * nobody has heard of - is submitted as a message rather than dropped. A
+   * slash command that quietly does nothing is worse than no slash command.
+   */
   function slash(command: string, argument: string): void {
     const routed: Record<string, string> = {
       scaffold: 'dakcoder.scaffoldResource',
-      service: 'dakcoder.scaffoldService',
       audit: 'dakcoder.auditTemplate',
       legacy: 'dakcoder.auditLegacy',
-      migrate: 'dakcoder.migrate',
-      debug: 'dakcoder.debugLastFailure',
+      // `dakcoder.migrate` was never registered; `migrateHandler` is.
+      migrate: 'dakcoder.migrateHandler',
+      // `dakcoder.debugLastFailure` was never registered; `debugDiagnostic` is.
+      debug: 'dakcoder.debugDiagnostic',
       compact: 'dakcoder.compactContext',
-      test: 'dakcoder.runTests',
       wire: 'dakcoder.wireIntoFx',
-      explain: 'dakcoder.explainRule',
       fix: 'dakcoder.fixDiagnostic',
       rule: 'dakcoder.explainRule',
     };
+
+    // Asked of the agent, not of a command. `/explain` opened a *rule document*
+    // - so asking "explain this handler" got the text of a lint rule, or
+    // nothing when the argument matched no rule id. `/rule` above is the one
+    // that means "look up a rule by id"; this one means what it says.
+    const asked: Record<string, (arg: string) => string> = {
+      explain: (arg) => (arg ? `Explain ${arg}` : 'Explain this project'),
+      service: (arg) =>
+        `Scaffold a new n-api-template service${arg ? `: ${arg}` : ''}. Use project_scaffold.`,
+      test: (arg) => (arg ? `Write or run tests for ${arg}` : 'Run the tests and report what fails'),
+    };
+
     const id = routed[command];
-    if (id) void vscode.commands.executeCommand(id, argument);
-    // No else: an unknown slash command is the developer typing, not an error.
+    if (id) {
+      void Promise.resolve(vscode.commands.executeCommand(id, argument)).then(undefined, (err) => {
+        // Never silent again. A command that is registered can still fail, and
+        // the developer typed something and is owed an answer either way.
+        log.error(`/${command} failed: ${String(err)}`);
+        chatView.note('error', vscode.l10n.t('/{0} could not run: {1}', command, String(err)));
+      });
+      return;
+    }
+
+    const phrase = asked[command];
+    void submit(phrase ? phrase(argument.trim()) : `/${command} ${argument}`.trim(), false);
   }
 
   async function openWorkspacePath(relative: string): Promise<void> {
@@ -635,26 +747,58 @@ export function deactivate(): void {
   disposeAll = [];
 }
 
-/** `multi` means "let the agent choose", which on the wire is the planner. */
-function modeFor(setting: string): string {
-  return setting === 'multi' ? 'planner' : setting;
+/**
+ * Turn the setting into the intent the runtime understands.
+ *
+ * `modeFor` used to map "multi" - "let the agent choose" - to `planner`, which
+ * is also the backend's own default. So the server could not tell "the
+ * developer wants the Planner" from "nobody said", and every message, question
+ * or not, entered a mode whose instruction is "emit numbered steps". That one
+ * line is the head of the causal chain in section 2 of the failure report.
+ *
+ * The three that mean anything now: `auto` classifies before the first turn,
+ * `ask` is read-only, `agent` plans and then does the work. The five retired
+ * mode names are still accepted, here and on the server, because a developer's
+ * saved setting should not need editing for the extension to keep working.
+ */
+function intentFor(setting: string): string {
+  switch (setting) {
+    case 'ask':
+    case 'agent':
+    case 'auto':
+      return setting;
+    case 'multi':
+      return 'auto';
+    case 'verifier':
+      return 'ask';
+    // planner, coder, scaffolder, debugger: all statements that work is wanted.
+    default:
+      return 'agent';
+  }
 }
 
-function reportRunError(err: unknown, log: vscode.LogOutputChannel): void {
+function reportRunError(
+  err: unknown,
+  log: vscode.LogOutputChannel,
+  panel?: { note(level: 'info' | 'warn' | 'error', text: string): void },
+): void {
   if (err instanceof HttpError && err.isQuota) {
     // The server writes one human sentence for exactly this. Never dump the
     // JSON body into the chat.
     const wait = err.retryAfter ? humanDuration(err.retryAfter) : undefined;
-    void vscode.window.showWarningMessage(
-      wait ? `${err.detail} ${vscode.l10n.t('Try again in {0}.', wait)}` : err.detail,
-      vscode.l10n.t('Show quota'),
-    );
+    const text = wait ? `${err.detail} ${vscode.l10n.t('Try again in {0}.', wait)}` : err.detail;
+    panel?.note('warn', text);
+    void vscode.window.showWarningMessage(text, vscode.l10n.t('Show quota'));
     return;
   }
   log.error(String(err));
-  void vscode.window.showErrorMessage(
-    err instanceof Error ? err.message : vscode.l10n.t('The task could not be started.'),
-  );
+  const text =
+    err instanceof Error ? err.message : vscode.l10n.t('The task could not be started.');
+  // Into the transcript as well as into a toast. A toast is gone in five
+  // seconds and is not where anyone looks when a message appears to have done
+  // nothing; the panel is.
+  panel?.note('error', text);
+  void vscode.window.showErrorMessage(text);
 }
 
 function humanDuration(seconds: number): string {

@@ -7,6 +7,22 @@
     "max_description": 200
   },
   "visible_per_mode": {
+    "ask": [
+      "repo_map",
+      "read_file",
+      "search_repo",
+      "search_docs",
+      "rules_lint",
+      "legacy_audit",
+      "db_roundtrip_audit",
+      "validation_audit",
+      "temporal_audit",
+      "lib_version_check",
+      "playbook",
+      "git_status",
+      "git_diff",
+      "git_blame"
+    ],
     "planner": [
       "repo_map",
       "read_file",
@@ -18,65 +34,25 @@
       "validation_audit",
       "temporal_audit",
       "lib_version_check",
+      "playbook",
+      "submit_plan",
+      "ask_developer",
       "git_status",
       "git_diff",
       "git_blame"
     ],
-    "scaffolder": [
+    "agent": [
       "repo_map",
       "read_file",
+      "search_repo",
       "search_docs",
+      "rules_lint",
+      "playbook",
       "write_file",
+      "patch_file",
+      "delete_file",
       "resource_scaffold",
       "project_scaffold",
-      "fx_wire",
-      "govalid_gen",
-      "git_status",
-      "git_diff",
-      "git_ops"
-    ],
-    "coder": [
-      "repo_map",
-      "read_file",
-      "search_repo",
-      "search_docs",
-      "rules_lint",
-      "validation_audit",
-      "playbook",
-      "write_file",
-      "patch_file",
-      "delete_file",
-      "fx_wire",
-      "govalid_gen",
-      "go_build",
-      "go_mod",
-      "git_status",
-      "git_diff",
-      "git_ops"
-    ],
-    "verifier": [
-      "repo_map",
-      "read_file",
-      "search_repo",
-      "rules_lint",
-      "legacy_audit",
-      "db_roundtrip_audit",
-      "validation_audit",
-      "playbook",
-      "go_build",
-      "git_status",
-      "git_diff"
-    ],
-    "debugger": [
-      "repo_map",
-      "read_file",
-      "search_repo",
-      "search_docs",
-      "rules_lint",
-      "playbook",
-      "write_file",
-      "patch_file",
-      "delete_file",
       "fx_wire",
       "govalid_gen",
       "go_build",
@@ -86,6 +62,7 @@
       "git_status",
       "git_diff",
       "git_blame",
+      "git_ops",
       "run_terminal"
     ]
   },
@@ -111,11 +88,9 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "planner",
-        "scaffolder",
-        "verifier"
+        "agent",
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -148,11 +123,9 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "planner",
-        "scaffolder",
-        "verifier"
+        "agent",
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -185,10 +158,9 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "planner",
-        "verifier"
+        "agent",
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -211,10 +183,9 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "planner",
-        "scaffolder"
+        "agent",
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -246,10 +217,9 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "planner",
-        "verifier"
+        "agent",
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -272,9 +242,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "verifier"
+        "agent"
       ],
       "mutates": false,
       "approval": "none",
@@ -301,10 +269,9 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "planner",
-        "verifier"
+        "agent",
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -325,8 +292,8 @@
         "additionalProperties": false
       },
       "modes": [
-        "planner",
-        "verifier"
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -342,8 +309,8 @@
         "additionalProperties": false
       },
       "modes": [
-        "planner",
-        "verifier"
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -359,9 +326,8 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "planner",
-        "verifier"
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -377,6 +343,7 @@
         "additionalProperties": false
       },
       "modes": [
+        "ask",
         "planner"
       ],
       "mutates": false,
@@ -393,6 +360,7 @@
         "additionalProperties": false
       },
       "modes": [
+        "ask",
         "planner"
       ],
       "mutates": false,
@@ -414,9 +382,91 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "verifier"
+        "agent",
+        "ask",
+        "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "submit_plan",
+      "description": "Submit the plan and start the work. Each step names one file, what changes in it, and how you will know it worked.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "steps": {
+            "type": "array",
+            "description": "The steps, in order. At most eight.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": {
+                  "type": "string",
+                  "description": "Workspace-relative path this step changes, e.g. 'handler/pension.go'."
+                },
+                "action": {
+                  "type": "string",
+                  "description": "What changes in it, in one sentence."
+                },
+                "accepts": {
+                  "type": "string",
+                  "description": "How this step is checked once done."
+                }
+              },
+              "required": [
+                "file",
+                "action",
+                "accepts"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 8
+          },
+          "summary": {
+            "type": "string",
+            "description": "One sentence on what the whole plan achieves."
+          }
+        },
+        "required": [
+          "steps"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "ask_developer",
+      "description": "Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "questions": {
+            "type": "array",
+            "description": "The questions, at most four. One decision each.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 4
+          },
+          "assumed": {
+            "type": "string",
+            "description": "What you inferred rather than asking about."
+          }
+        },
+        "required": [
+          "questions"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -444,9 +494,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "scaffolder"
+        "agent"
       ],
       "mutates": true,
       "approval": "conditional",
@@ -480,8 +528,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger"
+        "agent"
       ],
       "mutates": true,
       "approval": "conditional",
@@ -510,8 +557,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger"
+        "agent"
       ],
       "mutates": true,
       "approval": "always",
@@ -554,7 +600,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "scaffolder"
+        "agent"
       ],
       "mutates": true,
       "approval": "always",
@@ -582,7 +628,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "scaffolder"
+        "agent"
       ],
       "mutates": true,
       "approval": "always",
@@ -614,9 +660,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "scaffolder"
+        "agent"
       ],
       "mutates": true,
       "approval": "none",
@@ -632,9 +676,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "scaffolder"
+        "agent"
       ],
       "mutates": true,
       "approval": "none",
@@ -650,9 +692,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "verifier"
+        "agent"
       ],
       "mutates": false,
       "approval": "none",
@@ -660,15 +700,20 @@
     },
     {
       "name": "go_vet",
-      "description": "Run go vet over the workspace. Gate only — it takes about thirty seconds, so never run it in the edit loop.",
+      "description": "Run go vet. Pass pattern to scope it to one package; unscoped it takes about thirty seconds, so never run that in the edit loop.",
       "parameters": {
         "type": "object",
-        "properties": {},
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Package pattern, e.g. './handler/...'. Omit for './...'."
+          }
+        },
         "required": [],
         "additionalProperties": false
       },
       "modes": [
-        "debugger"
+        "agent"
       ],
       "mutates": false,
       "approval": "none",
@@ -693,7 +738,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "debugger"
+        "agent"
       ],
       "mutates": false,
       "approval": "none",
@@ -779,8 +824,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger"
+        "agent"
       ],
       "mutates": true,
       "approval": "conditional",
@@ -796,11 +840,9 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "planner",
-        "scaffolder",
-        "verifier"
+        "agent",
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -817,19 +859,17 @@
             "description": "Limit the diff to one path."
           },
           "staged": {
-            "type": "string",
-            "description": "Pass 'true' to diff the index instead of the working tree."
+            "type": "boolean",
+            "description": "True to diff the index instead of the working tree."
           }
         },
         "required": [],
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "debugger",
-        "planner",
-        "scaffolder",
-        "verifier"
+        "agent",
+        "ask",
+        "planner"
       ],
       "mutates": false,
       "approval": "none",
@@ -862,7 +902,8 @@
         "additionalProperties": false
       },
       "modes": [
-        "debugger",
+        "agent",
+        "ask",
         "planner"
       ],
       "mutates": false,
@@ -899,8 +940,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "coder",
-        "scaffolder"
+        "agent"
       ],
       "mutates": true,
       "approval": "conditional",
@@ -929,7 +969,7 @@
         "additionalProperties": false
       },
       "modes": [
-        "debugger"
+        "agent"
       ],
       "mutates": false,
       "approval": "conditional",

@@ -36,7 +36,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, statSync } from 'node:fs';
 import * as vscode from 'vscode';
 
-import type { GateEvent, Mode } from './protocol';
+import type { GateEvent, Intent } from './protocol';
 
 // ── the gotools JSON contract ───────────────────────────────────────────────
 
@@ -163,7 +163,7 @@ export interface DiagnosticsDeps {
    * started from a lightbulb appears in the panel like any other — a task the
    * developer cannot see in the transcript is a task they cannot steer or stop.
    */
-  startTask(task: string, options?: { mode?: Mode; acceptance?: string[] }): Promise<void>;
+  startTask(task: string, options?: { intent?: Intent; acceptance?: string[] }): Promise<void>;
   /**
    * Folder `[0]`, matching what `extension.ts` spawns the runtime against. A
    * different folder would publish findings about a workspace the agent cannot
@@ -562,7 +562,7 @@ export class GoDiagnostics implements vscode.Disposable {
       .join('\n');
 
     await this.deps.startTask(task, {
-      mode: 'debugger',
+      intent: 'agent',
       acceptance: [`gotools lint --only ${violation.rule} --paths ${relative} reports no violations`],
     });
   }
@@ -640,7 +640,7 @@ export class GoDiagnostics implements vscode.Disposable {
         .filter(Boolean)
         .join('\n'),
       {
-        mode: 'coder',
+        intent: 'agent',
         acceptance: [`gotools legacy-audit --paths ${relative} reports no violations`],
       },
     );
@@ -678,7 +678,7 @@ export class GoDiagnostics implements vscode.Disposable {
         'These are gopls / compiler errors from the editor, quoted verbatim.',
         'Fix the cause, not the symptom, and do not silence an error by deleting the code that reports it.',
       ].join('\n'),
-      { mode: 'debugger', acceptance: ['go build ./... succeeds'] },
+      { intent: 'agent', acceptance: ['go build ./... succeeds'] },
     );
   }
 
@@ -760,7 +760,7 @@ export class GoDiagnostics implements vscode.Disposable {
         'not import database/sql, pgx or squirrel when you are done.',
       ].join('\n'),
       {
-        mode: 'coder',
+        intent: 'agent',
         acceptance: [
           `gotools lint --only layer-sql-boundary --paths ${relative} reports no violations`,
           'go build ./... succeeds',

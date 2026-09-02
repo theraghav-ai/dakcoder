@@ -81,6 +81,9 @@ def create_app(gateway: Gateway) -> FastAPI:
         yield
         if gateway.proxy is not None:
             await gateway.proxy.drain()
+            # And the upstream connection pool, after the settlements that may
+            # still be using it.
+            await gateway.proxy.aclose()
 
     app = FastAPI(title="dakcoder gateway", version=gateway.version, lifespan=lifespan)
     app.state.gateway = gateway

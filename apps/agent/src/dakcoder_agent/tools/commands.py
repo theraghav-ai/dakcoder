@@ -34,7 +34,7 @@ from pathlib import Path
 from dakcoder_shared.config import MODEL_CREDENTIAL_VARS
 from dakcoder_shared.envelope import Mutation, MutationKind, ToolResult
 
-from .router import Invocation
+from .router import Invocation, MissingToolchain
 
 __all__ = ["HANDLERS", "Completed", "run"]
 
@@ -133,7 +133,7 @@ def run(
 
     binary = shutil.which(argv[0])
     if binary is None:
-        raise FileNotFoundError(argv[0])
+        raise MissingToolchain(argv[0])
 
     started = time.monotonic()
     try:
@@ -214,19 +214,38 @@ def go_build(inv: Invocation) -> ToolResult:
     )
 
 
+def _patterns(raw: str | None) -> list[str]:
+    """Package patterns as separate argv entries.
+
+    The gate scopes these stages to the directories the run actually changed, so
+    ``pattern`` can name several — ``./handler/... ./repo/postgres/...``. Passed
+    through as one string it becomes a single argument and the toolchain reports
+    a package that does not exist, which reads as a broken change rather than a
+    broken call.
+    """
+    parts = [p for p in (raw or "").replace(",", " ").split() if p]
+    return parts or ["./..."]
+
+
 def go_vet(inv: Invocation) -> ToolResult:
-    done = run(["go", "vet", "./..."], inv.workspace.root, timeout=GATE_TIMEOUT)
-    return _result(done, what="go vet ./...", fix_on_fail="Address each finding, then re-run.")
+    packages = _patterns(inv.arg("pattern"))
+    done = run(["go", "vet", *packages], inv.workspace.root, timeout=GATE_TIMEOUT)
+    return _result(
+        done,
+        what=f"go vet {' '.join(packages)}",
+        fix_on_fail="Address each finding, then re-run.",
+    )
 
 
 def go_test(inv: Invocation) -> ToolResult:
-    argv = ["go", "test", inv.arg("pattern") or "./..."]
+    packages = _patterns(inv.arg("pattern"))
+    argv = ["go", "test", *packages]
     if inv.arg("run"):
         argv += ["-run", inv.arg("run")]
     done = run(argv, inv.workspace.root, timeout=GATE_TIMEOUT)
     return _result(
         done,
-        what="go test",
+        what=f"go test {' '.join(packages)}",
         fix_on_fail="Read the first FAIL block; pass run= to iterate on one test.",
     )
 
@@ -322,9 +341,26 @@ def go_mod(inv: Invocation) -> ToolResult:
     root = inv.workspace.root
 
     if op == "tidy":
+        # At the gate, tidy *checks*; it does not write.
+        #
+        # Part A §9.3 says tidy must be a no-op at the gate, and this ran the
+        # real thing to find out — so on any workspace where it was not already
+        # a no-op, the gate's own diagnostic edited the repository. A field run
+        # that asked a question and changed nothing finished "32 turns · 1 file:
+        # go.mod", written by this line. The verdict is identical either way:
+        # what tidy would have done is what tidy did, and the bytes are put back
+        # before anything else can observe them.
+        #
+        # A gate-only parameter, so a developer who deliberately calls
+        # `go_mod op=tidy` — a mutating tool, behind approval — still gets the
+        # tidy they asked for.
+        checking = str(inv.arg("check", "")).strip().lower() in ("true", "1", "yes")
+        snapshot = _snapshot_mod(root)
         before = _read_mod(root)
         done = run(["go", "mod", "tidy"], root, timeout=GATE_TIMEOUT)
         after = _read_mod(root)
+        if checking:
+            _restore_mod(root, snapshot)
         if not done.ok:
             return _result(
                 done,
@@ -343,10 +379,21 @@ def go_mod(inv: Invocation) -> ToolResult:
             # from it lands here — and "go.mod drifted" would read as something
             # this run did, when it is a defect the service inherited. Naming the
             # modules lets the reader tell the two apart in one glance.
+            body = "go mod tidy changed go.mod:\n" + _mod_diff(before, after)
+            if checking:
+                body += (
+                    "\n\ngo.mod was put back as it was — the gate runs tidy to see "
+                    "what it would do, not to do it. Fix the imports that caused the "
+                    "drift, or say which dependency genuinely needs to change."
+                )
             return ToolResult.success(
-                "go mod tidy changed go.mod:\n" + _mod_diff(before, after),
-                mutations=[Mutation("go.mod", MutationKind.MODIFY)],
-                meta={"changed": True},
+                body,
+                # No mutation when checking: nothing on disk changed, and
+                # claiming one would put go.mod into `router.touched`, scope
+                # every later stage to it, and report to the developer a file
+                # this run did not edit.
+                mutations=[] if checking else [Mutation("go.mod", MutationKind.MODIFY)],
+                meta={"changed": True, "findings": _mod_findings(before, after)},
             )
         return ToolResult.success("go mod tidy: no change", meta={"changed": False})
 
@@ -420,6 +467,66 @@ def _read_mod(root: Path) -> str:
         return (root / "go.mod").read_text(encoding="utf-8")
     except OSError:
         return ""
+
+
+def _snapshot_mod(root: Path) -> dict[str, bytes | None]:
+    """The module files as raw bytes, so restoring them is byte-exact.
+
+    Bytes, not text: `go.mod` may be checked out CRLF, and a restore that went
+    through Python's universal newlines would put back a file that differs from
+    the one it replaced in every line. That is the same mistake `gofmt` is
+    already careful about, one file over.
+
+    ``None`` for a file that is not there, which is different from an empty one:
+    tidy creates `go.sum` on a module that had none, and the restore has to be
+    able to remove it again.
+    """
+    out: dict[str, bytes | None] = {}
+    for name in ("go.mod", "go.sum"):
+        try:
+            out[name] = (root / name).read_bytes()
+        except OSError:
+            out[name] = None
+    return out
+
+
+def _restore_mod(root: Path, snapshot: dict[str, bytes | None]) -> None:
+    """Put the module files back exactly as tidy found them."""
+    for name, raw in snapshot.items():
+        target = root / name
+        try:
+            if raw is None:
+                target.unlink(missing_ok=True)
+            elif target.read_bytes() != raw:
+                target.write_bytes(raw)
+        except OSError:
+            # Best-effort by nature. Failing here would replace a cosmetic
+            # problem with a lost gate.
+            pass
+
+
+def _mod_findings(before: str, after: str) -> list[str]:
+    """The drift as stable keys, for the baseline to compare against.
+
+    A module that was already missing from ``require`` before this run started
+    is not something this run did, and the baseline needs a key that does not
+    move. The module path is that key; the version is not, because a bump
+    changes it while describing the same drift.
+    """
+
+    def requires(text: str) -> set[str]:
+        out: set[str] = set()
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("//", "module ", "go ", "require (", ")")):
+                continue
+            parts = stripped.removeprefix("require ").split()
+            if len(parts) >= 2 and "/" in parts[0]:
+                out.add(parts[0])
+        return out
+
+    was, now = requires(before), requires(after)
+    return sorted({f"-{m}" for m in was - now} | {f"+{m}" for m in now - was})
 
 
 def govalid_gen(inv: Invocation) -> ToolResult:
@@ -556,7 +663,7 @@ def _has_diff(output: str) -> bool:
 
 def git_diff(inv: Invocation) -> ToolResult:
     argv = ["git", "diff"]
-    if str(inv.arg("staged", "")).lower() in ("true", "1", "yes"):
+    if str(inv.arg("staged", "")).strip().lower() in ("true", "1", "yes"):
         argv.append("--cached")
     if inv.arg("path"):
         argv += ["--", inv.arg("path")]

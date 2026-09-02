@@ -90,37 +90,38 @@ async def test_a_follow_up_keeps_the_context_the_first_message_built(
     ), "the follow-up never reached the model"
 
 
-async def test_a_follow_up_re_enters_its_mode_rather_than_inheriting_the_last_one(
+async def test_a_follow_up_decides_its_own_mode_rather_than_inheriting_the_last_one(
     client: httpx.AsyncClient, scripted: Loopback
 ) -> None:
-    """A conversation that ended in one mode must not answer the next message
-    under it.
+    """A follow-up is a new request, not a continuation of the last phase.
 
-    ``_switch`` skips work when the loop is already in the mode asked for, and a
-    follow-up builds a *new* loop that defaults to Planner while the context is
-    still wherever the previous run left it. Guarding on the loop's copy alone
-    left the Debugger's overlay and prompt budget in force under a loop
-    dispatching the Planner's tools.
+    Two bugs met here. `follow_up` defaulted to the Planner, so a session that
+    had produced a plan and stopped answered "go" by planning it again; the fix
+    for that returned *the mode the previous run ended in*, so a conversation
+    that had finished in the Debugger answered its next message with the
+    Debugger's overlay, budget and tool set whatever the message said. Neither
+    is a decision about what was asked.
+
+    Now the intent is decided per message -- stated by the client, or classified
+    -- and the mode follows from that. Here the client states it.
     """
     from dakcoder_agent.modes import Mode
 
     session = await start(client)
     await settle(session["id"], scripted)
     context = scripted.contexts[session["id"]]
-    context.switch_mode(Mode.DEBUGGER, "debugging")
-    assert context.mode is Mode.DEBUGGER
+    # The previous run left the conversation in the acting mode.
+    context.switch_mode(Mode.AGENT, "still acting")
+    assert context.mode is Mode.AGENT
 
     await client.post(
         f"/v1/sessions/{session['id']}/messages",
-        json={"text": "and now the handler", "mode": "planner"},
+        json={"text": "what does the handler do", "intent": "ask"},
     )
     await settle(session["id"], scripted)
 
-    # Asserted on the overlays rather than on the mode the run ended in: this
-    # run advances Planner -> Coder like any other, and the question is whether
-    # it *entered* the Planner at all or carried on under the Debugger.
     overlays = [m.source for m in context.build() if m.source.startswith("mode:")]
-    assert "mode:planner" in overlays[overlays.index("mode:debugger") :], (
+    assert overlays[-1] == "mode:ask", (
         f"the follow-up never left the previous run's mode: {overlays}"
     )
 
@@ -429,7 +430,7 @@ async def test_a_follow_up_with_no_mode_carries_on_where_the_conversation_is(
     session = await start(client)
     await settle(session["id"], scripted)
     context = scripted.contexts[session["id"]]
-    context.switch_mode(Mode.CODER, "coding")
+    context.switch_mode(Mode.AGENT, "coding")
 
     response = await client.post(
         f"/v1/sessions/{session['id']}/messages", json={"text": "go"}

@@ -76,6 +76,7 @@ def complete(
     enforce_budget: bool = True,
     session_id: str = "",
     on_delta: Callable[[str], None] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> TurnResult:
     """Dispatch one turn from a context manager.
 
@@ -99,6 +100,11 @@ def complete(
     ``on_delta`` is handed straight through to the transport. Nothing is decided
     about it here, because this module is the wiring between three components
     that each own their own decisions and a sink is none of their business.
+
+    ``tool_choice`` likewise. The decision of *when* a tool call is mandatory is
+    the loop's -- it is the one component that knows whether this mode may end a
+    turn with prose -- and the decision of how to spell it on the wire is the
+    client's. This is the seam between them, and it holds nothing of its own.
     """
     mode_config = config_for(context.mode)
     usage = context.usage()
@@ -116,6 +122,7 @@ def complete(
         max_tokens=mode_config.max_tokens,
         enable_thinking=mode_config.enable_thinking,
         tools=tools,
+        tool_choice=tool_choice,
         temperature=mode_config.temperature,
         on_delta=on_delta,
         metering=Metering(

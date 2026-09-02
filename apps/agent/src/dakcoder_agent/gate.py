@@ -33,8 +33,10 @@ blocks on violations that were there before the session started.
 
 from __future__ import annotations
 
+import shutil
 import time
 from collections.abc import Callable, Sequence
+from pathlib import PurePosixPath
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,7 +44,15 @@ from dakcoder_shared.envelope import ToolResult
 
 from .tools.router import Router
 
-__all__ = ["GateReport", "Stage", "StageResult", "full_gate", "inner_loop"]
+__all__ = [
+    "Baseline",
+    "GateReport",
+    "Stage",
+    "StageResult",
+    "full_gate",
+    "inner_loop",
+    "take_baseline",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +78,75 @@ class Stage:
     #: complete -- so a failure there stops blocking the run's report on stages
     #: it has nothing to do with.
     halts: bool = False
+    #: Which entry of the run-start baseline excuses a failure here.
+    #:
+    #: A blocking stage that fails only in ways it was *already* failing before
+    #: this run touched anything is reported and does not block. This is the
+    #: whole of §3: `go_vet` failed on a tab character in a struct tag that
+    #: predates the session, `go_test` failed because the suite needs a Docker
+    #: Postgres, `go build` can be red on arrival — and every one of those was
+    #: charged to the run, which then spent two Coder attempts and three Debugger
+    #: cycles trying to fix a machine.
+    #:
+    #: Empty means "no baseline applies", which is right for stages that are
+    #: already scoped to the files this run touched.
+    baseline_key: str = ""
+    #: Whether this stage may block on this run, given the environment. A stage
+    #: that cannot honestly run here is reported as advisory with this reason
+    #: rather than failing the change. Returning ``""`` keeps it blocking.
+    advisory_when: Callable[["GateContext"], str] = lambda _ctx: ""
+
+
+@dataclass(frozen=True, slots=True)
+class Baseline:
+    """What was already broken before this run touched anything.
+
+    The single most consequential thing missing from the gate. Four blocking
+    stages ran unscoped over the whole module with no baseline, so on any
+    repository that was not already green — which is every legacy service this
+    agent exists to help with — a run was failed for damage it did not cause,
+    told the failure was its own, and spent its whole escalation budget trying
+    to fix a machine. §3 measures the result: 100% of coding tasks on the legacy
+    corpus ended `unverified`, `no_progress`, or in the ladder.
+
+    Findings are held as *stable keys*, not as output. A line number moves the
+    moment anything above it is edited, so a key that contains one matches
+    nothing on the second look; ``_finding_keys`` strips them.
+
+    ``ok`` is kept alongside the keys because a stage can fail with output this
+    cannot key at all — a timeout, a toolchain that is not installed. In that
+    case "it was already failing" is still the honest reading, and the whole
+    stage is excused rather than none of it.
+    """
+
+    #: stage tool -> the finding keys present before the run started.
+    findings: dict[str, frozenset[str]] = field(default_factory=dict)
+    #: stage tool -> whether it passed before the run started.
+    passed: dict[str, bool] = field(default_factory=dict)
+    #: Compliance violations already present, as ``rule|path|message`` keys.
+    #: Passed *into* `swagger_check` rather than compared after it, because that
+    #: stage does the discounting itself.
+    compliance: frozenset[str] = frozenset()
+    #: True once the baseline has actually been taken. A gate that runs before
+    #: it is ready must not read an empty baseline as "nothing was broken".
+    taken: bool = False
+
+    def excuses(self, tool: str, current: frozenset[str]) -> bool:
+        """Whether every finding in ``current`` was already there."""
+        if not self.taken:
+            return False
+        if self.passed.get(tool, True):
+            return False
+        known = self.findings.get(tool)
+        if known is None:
+            # Failing before, with nothing keyable. Excused whole.
+            return True
+        if not current:
+            # Failing before, and we cannot key what it is failing on now.
+            # Treated as the same failure: the alternative is charging this run
+            # for a stage that was red when it arrived.
+            return True
+        return not (current - known)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,12 +157,23 @@ class GateContext:
     touched: tuple[str, ...]
     #: A greenfield scaffold or a dependency change, which turns on govulncheck.
     dependencies_changed: bool = False
-    #: Compliance violations that were already present when this run began, as
-    #: ``rule|path|message`` keys. Reported by the stages, never blocked on: a
-    #: vertical slice has to edit a legacy handler, and the moment it does, that
-    #: file's pre-existing violation would otherwise become this run's blocker
-    #: and stay one for the life of the run.
-    baseline: frozenset[str] = frozenset()
+    #: What was already broken when this run began. Reported by the stages,
+    #: never blocked on: a vertical slice has to edit a legacy handler, and the
+    #: moment it does, that file's pre-existing violation would otherwise become
+    #: this run's blocker and stay one for the life of the run.
+    baseline: Baseline = field(default_factory=Baseline)
+
+    @property
+    def touched_packages(self) -> tuple[str, ...]:
+        """``./dir/...`` for every directory this run changed a Go file in.
+
+        What `go test` and `go vet` should be asked about. Unscoped, `go test
+        ./...` on the legacy corpus takes 67 seconds and fails because the suite
+        wants a Docker Postgres — a verdict about the machine, delivered as a
+        verdict about the change.
+        """
+        dirs = sorted({str(PurePosixPath(p).parent) for p in self.go_files})
+        return tuple(f"./{d}/..." if d not in (".", "") else "./..." for d in dirs)
 
     @property
     def go_files(self) -> tuple[str, ...]:
@@ -258,17 +348,108 @@ def _scoped_with_baseline(ctx: GateContext) -> dict[str, Any] | None:
     """Scoped like every other lint stage, plus what was already broken.
 
     Separated from ``_scoped`` rather than folded into it because the other
-    stages have no use for a baseline: ``gofmt`` rewrites what it is given, and
-    ``rules_lint`` is advisory here and already discounts out-of-scope findings
-    itself. Only the blocking compliance stage needs to tell "this run broke it"
-    from "it was broken when we arrived".
+    stages have no use for a baseline of *this* shape: ``gofmt`` rewrites what
+    it is given, and ``rules_lint`` already discounts out-of-scope findings
+    itself. Only the compliance stage needs the violation keys passed in, and it
+    does the discounting on the far side.
     """
     args = _scoped(ctx)
     if args is None:
         return None
-    if ctx.baseline:
-        args["baseline"] = sorted(ctx.baseline)
+    if ctx.baseline.compliance:
+        args["baseline"] = sorted(ctx.baseline.compliance)
     return args
+
+
+def _packages(ctx: GateContext) -> dict[str, Any] | None:
+    """Scope a package-level stage to the directories this run changed.
+
+    ``None`` when nothing Go changed, which records the stage as "nothing in
+    scope" rather than running it over a module the run never opened.
+    """
+    packages = ctx.touched_packages
+    return {"pattern": " ".join(packages)} if packages else None
+
+
+def _tests_can_run(ctx: GateContext) -> str:
+    """Why ``go test`` must not block this run, or ``""`` if it may.
+
+    The single most expensive line in the report. `go_test` was blocking and
+    unscoped; the legacy corpus's suite stands up Postgres through
+    testcontainers, which needs a Docker daemon. On a machine without one the
+    stage fails after 67 seconds, every time, whatever the change was — so **no
+    change to the loop, the prompts or the model could produce a passing run on
+    that corpus**, and the escalation ladder then spent five slots trying to fix
+    a test suite that cannot execute here.
+
+    A test that cannot run has not failed. It has not been asked. So the stage
+    is downgraded to advisory and says which of the two it is, rather than
+    reporting an environment fact as a defect in the diff.
+
+    Probing Docker is deliberately cheap and deliberately last: `shutil.which`
+    only, no daemon round trip. A `docker` binary with a dead daemon still fails
+    the tests, and that failure is now advisory anyway; what this must never do
+    is add seconds to a gate to answer a question about the machine.
+    """
+    if not _needs_containers(ctx):
+        return ""
+    if shutil.which("docker") or shutil.which("podman"):
+        return ""
+    return (
+        "these tests start containers (testcontainers) and no container runtime "
+        "was found, so a failure here is about this machine, not the change"
+    )
+
+
+#: Import paths that mean a test package needs a container runtime to run.
+_CONTAINER_IMPORTS = ("testcontainers", "dockertest", "ory/dockertest")
+
+
+def _needs_containers(ctx: GateContext) -> bool:
+    """Whether any test file in scope stands up a container.
+
+    Read off the imports rather than assumed, so a service whose tests are pure
+    unit tests keeps a blocking `go test` — which is the behaviour anyone would
+    want and the behaviour the unscoped version could never deliver.
+    """
+    root = ctx.router.workspace.root
+    for package in ctx.touched_packages:
+        directory = root / package.removeprefix("./").removesuffix("/...")
+        if not directory.is_dir():
+            continue
+        for test in directory.rglob("*_test.go"):
+            try:
+                body = test.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if any(marker in body for marker in _CONTAINER_IMPORTS):
+                return True
+    return False
+
+
+#: Findings a failing stage reported, as keys that survive an edit above them.
+#:
+#: ``go build`` and ``go vet`` both write ``path:line[:col]: message``. The line
+#: number is the part that moves — insert a function and every finding below it
+#: shifts — so a baseline keyed on the whole line matches nothing the second
+#: time it is consulted. Path and message together are stable and specific
+#: enough: two identical messages in one file are the same finding for this
+#: purpose.
+def _finding_keys(content: str) -> frozenset[str]:
+    keys: set[str] = set()
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "go: ")):
+            continue
+        parts = stripped.split(":")
+        if len(parts) >= 3 and parts[1].strip().isdigit():
+            path = parts[0].strip()
+            # Drop the line, and the column when there is one.
+            rest = parts[3:] if len(parts) >= 4 and parts[2].strip().isdigit() else parts[2:]
+            keys.add(f"{path}|{':'.join(rest).strip()}")
+        else:
+            keys.add(stripped)
+    return frozenset(keys)
 
 
 #: Why every Go stage sits out a workspace that is not itself a module, stated
@@ -308,6 +489,12 @@ GATE: tuple[Stage, ...] = (
         when=_has_go,
         skip_reason=_NO_MODULE,
         halts=True,
+        # Unscoped on purpose — a change in one package breaks another, and that
+        # is exactly what compilation is for — but baselined, so a module that
+        # was already red on arrival is not this run's failure. Without this a
+        # workspace that does not build is a workspace where no task can ever
+        # finish, and the run is told the breakage is its own.
+        baseline_key="go_build",
     ),
     Stage(
         "govalid_gen",
@@ -326,6 +513,7 @@ GATE: tuple[Stage, ...] = (
         when=_has_go,
         skip_reason=_NO_MODULE,
         halts=True,
+        baseline_key="go_build",
     ),
     Stage("rules_lint", "rules_lint", _scoped, when=_has_go, skip_reason=_NO_MODULE),
     # Scoped, like the other lint stages. Unscoped it reported every legacy
@@ -340,21 +528,38 @@ GATE: tuple[Stage, ...] = (
         when=_has_go,
         skip_reason=_NO_MODULE,
     ),
-    Stage("go_vet", "go_vet", lambda ctx: {}, when=_has_go, skip_reason=_NO_MODULE),
+    # Scoped to the packages this run changed, and baselined against what vet
+    # already said before it started. Unscoped and unbaselined, this stage
+    # failed every run on the legacy corpus for a tab character in a struct tag
+    # that predates the session.
+    Stage(
+        "go_vet",
+        "go_vet",
+        _packages,
+        when=_has_go,
+        skip_reason=_NO_MODULE,
+        baseline_key="go_vet",
+    ),
     Stage(
         "go_test",
         "go_test",
-        lambda ctx: {},
+        _packages,
         # `has_tests` already implies `is_go_module`, so this needs no _has_go.
         when=lambda ctx: ctx.has_tests,
         skip_reason="no test files",
+        baseline_key="go_test",
+        advisory_when=_tests_can_run,
     ),
     Stage(
         "go_mod tidy",
         "go_mod",
-        lambda ctx: {"op": "tidy"},
+        # `check`: report the drift, put go.mod back. A gate that edits the
+        # repository to find out whether the repository needs editing is not a
+        # gate. See `commands.go_mod`.
+        lambda ctx: {"op": "tidy", "check": "true"},
         when=_has_go,
         skip_reason=_NO_MODULE,
+        baseline_key="go_mod",
     ),
     Stage(
         "golangci_lint",
@@ -390,13 +595,84 @@ def full_gate(
     touched: Sequence[str],
     *,
     dependencies_changed: bool = False,
-    baseline: frozenset[str] = frozenset(),
+    baseline: Baseline | None = None,
 ) -> GateReport:
-    """The gate: ordered, fail-fast, authoritative."""
+    """The gate: ordered, fail-fast, authoritative — about *this run's* work.
+
+    "Authoritative" was doing damage without the baseline. Four blocking stages
+    ran over the whole module and reported whatever they found; the loop read
+    every finding as the run's own, and on a repository that was not already
+    green no change could ever clear it.
+    """
     return _run(
-        GateContext(router, tuple(touched), dependencies_changed, baseline),
+        GateContext(router, tuple(touched), dependencies_changed, baseline or Baseline()),
         GATE,
     )
+
+
+#: The stages worth measuring before the run starts, and the arguments to
+#: measure them with. Unscoped deliberately: the baseline has to cover whatever
+#: the run later touches, and it does not know yet what that will be.
+_BASELINE_STAGES: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("go_build", {}),
+    ("go_vet", {}),
+    ("go_test", {}),
+    ("go_mod", {"op": "tidy", "check": "true"}),
+)
+
+
+def take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
+    """Record what is already broken, before this run can break anything.
+
+    Correctness here is entirely a matter of timing: taken later, the snapshot
+    contains the run's own damage and excuses it. So it is taken once, at the
+    top of the run, when the workspace is definitely untouched — and, because
+    `go vet` alone is about thirty seconds, off the critical path (see
+    `AgentLoop._take_baseline`).
+
+    ``go_mod`` runs in check mode, so taking a baseline cannot itself be the
+    thing that rewrites `go.mod`.
+
+    Failure is not fatal. An empty baseline is exactly the behaviour that
+    shipped, so the worst case of not getting one is the status quo — but it is
+    recorded as *not taken*, because "we did not look" and "nothing was wrong"
+    must not read the same to `excuses`.
+    """
+    findings: dict[str, frozenset[str]] = {}
+    passed: dict[str, bool] = {}
+    compliance: frozenset[str] = frozenset()
+
+    root_is_module = (router.workspace.root / "go.mod").is_file()
+    for tool, args in _BASELINE_STAGES:
+        if not root_is_module:
+            continue
+        if tool == "go_test" and not include_tests:
+            continue
+        try:
+            outcome = router.run_gate_tool(tool, dict(args))
+        except Exception:  # noqa: BLE001 - a baseline is an optimisation, not a precondition
+            continue
+        if not isinstance(outcome, ToolResult):
+            continue
+        if tool == "go_mod":
+            # tidy "passes" as a ToolResult whatever it found; the verdict is in
+            # `meta.changed`, exactly as `_stage_passed` reads it.
+            passed[tool] = not outcome.meta.get("changed", False)
+            keys = outcome.meta.get("findings") or ()
+            findings[tool] = frozenset(str(k) for k in keys)
+            continue
+        passed[tool] = outcome.ok
+        if not outcome.ok:
+            findings[tool] = _finding_keys(outcome.for_model())
+
+    try:
+        outcome = router.run_gate_tool("swagger_check", {})
+        if isinstance(outcome, ToolResult):
+            compliance = frozenset(str(k) for k in (outcome.meta.get("violations") or ()))
+    except Exception:  # noqa: BLE001 - see above
+        pass
+
+    return Baseline(findings=findings, passed=passed, compliance=compliance, taken=True)
 
 
 def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
@@ -423,11 +699,28 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
 
         result = outcome if isinstance(outcome, ToolResult) else ToolResult.failure(str(outcome))
         ok = _stage_passed(stage, result)
-        results.append(
-            StageResult(stage.name, ok, stage.blocking, result.for_model(), elapsed)
-        )
+        blocking = stage.blocking
+        content = result.for_model()
 
-        if stage.blocking and not ok and stage.halts:
+        if not ok and blocking:
+            # Two reasons a blocking stage stops blocking, both of them about
+            # what this run is answerable for.
+            if reason := stage.advisory_when(ctx):
+                blocking = False
+                content = f"{content}\n\nAdvisory, not blocking: {reason}."
+            elif stage.baseline_key and ctx.baseline.excuses(
+                stage.baseline_key, _stage_findings(stage, result)
+            ):
+                blocking = False
+                content = (
+                    f"{content}\n\nAdvisory, not blocking: every finding here was "
+                    "already present before this run changed anything, so it is not "
+                    "this change's failure. Fix it only if it bears on the work."
+                )
+
+        results.append(StageResult(stage.name, ok, blocking, content, elapsed))
+
+        if blocking and not ok and stage.halts:
             # Fail-fast, but only where "fast" is also "correct". Running
             # `go vet` over code that does not compile produces pages of errors
             # that are all consequences of the one the model already has to fix.
@@ -438,6 +731,8 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
             )
 
         # Everything else that fails is recorded and the sequence carries on.
+        # (`blocking` above, not `stage.blocking`: a stage excused by the
+        # baseline must not halt the sequence either.)
         #
         # The report is still a failure -- `ok` reads the blocked results, not
         # this loop -- but the developer gets the whole picture rather than one
@@ -449,6 +744,13 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
         # `unverified` without ever asking them.
 
     return GateReport(tuple(results), (), time.monotonic() - started)
+
+
+def _stage_findings(stage: Stage, result: ToolResult) -> frozenset[str]:
+    """The failing stage's findings, keyed the same way the baseline keyed them."""
+    if stage.tool == "go_mod":
+        return frozenset(str(k) for k in (result.meta.get("findings") or ()))
+    return _finding_keys(result.for_model())
 
 
 def _stage_passed(stage: Stage, result: ToolResult) -> bool:
@@ -475,18 +777,58 @@ def _stage_passed(stage: Stage, result: ToolResult) -> bool:
 
 
 def _lint_is_clean(result: ToolResult) -> bool:
-    """Blocking violations only.
+    """Blocking violations only, read from ``meta`` rather than from the prose.
 
-    ``out_of_scope_count`` is pre-existing damage in files the agent never
-    touched. Blocking on it would make the first change to any legacy service
-    impossible, which is precisely the codebase this agent exists to help with.
+    This is the stage that carries the product's promise — "verified by a static
+    template linter before a human sees the diff" — and for its whole life it
+    could not fail on a finding.
+
+    It parsed ``result.content`` as JSON. That content has been *rendered prose*
+    since ``_render_lint`` landed: grouped by rule, worst first, with an elided
+    count. So the decode raised on every single call, the ``except`` fell back to
+    ``result.ok``, and ``result.ok`` is True whenever the sidecar ran — a lint is
+    a report, and a report full of violations is the tool succeeding. The
+    blocking contract-lint stage could therefore only fail on a sidecar crash.
+    The gate blocked on things the run did not cause and waved through the one
+    thing it was built to catch.
+
+    The machine-readable half was never lost: ``gotools._report`` copies the
+    counts into ``meta`` beside the rendered text, for exactly this. Reading it
+    there needs no parsing and cannot be broken by a change to the rendering.
+
+    ``out_of_scope`` is pre-existing damage in files the agent never touched, and
+    is deliberately not counted. Blocking on it would make the first change to
+    any legacy service impossible, which is precisely the codebase this agent
+    exists to help with.
     """
+    if not result.ok:
+        return False
+
+    meta = result.meta or {}
+    if "violations" in meta:
+        try:
+            return int(meta["violations"]) == 0
+        except (TypeError, ValueError):
+            return False
+    # `count` is the sidecar's own total, kept in meta by `_REPORT_FACTS`.
+    if "count" in meta:
+        try:
+            return int(meta["count"]) == 0
+        except (TypeError, ValueError):
+            return False
+
+    # No counts at all: the renderer fell through to raw JSON, which is the one
+    # case where the body really is the structured form.
     import json
 
     try:
         payload = json.loads(result.content)
-    except (json.JSONDecodeError, TypeError):
-        # Not the structured form; fall back to the tool's own verdict rather
-        # than guessing from the text.
-        return result.ok
-    return bool(payload.get("ok", True)) and int(payload.get("count", 0)) == 0
+    except (json.JSONDecodeError, TypeError, ValueError):
+        # Nothing to read. Refusing to pass is the safe direction for a blocking
+        # stage: a lint whose verdict cannot be established has not verified
+        # anything, and saying otherwise is the overclaim this stage exists to
+        # prevent. `_render_lint` says "clean" in so many words when it is.
+        return result.content.strip().startswith("clean")
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("ok", True)) and int(payload.get("count", 0) or 0) == 0

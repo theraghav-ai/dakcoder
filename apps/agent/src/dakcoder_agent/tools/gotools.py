@@ -50,6 +50,15 @@ CALL_TIMEOUT = 120.0
 class SidecarError(RuntimeError):
     """The sidecar is missing, would not start, or broke the protocol."""
 
+    #: Set when the cause is that the binary could not be found at all, so the
+    #: router can answer with the environment message rather than with a
+    #: generic "tool failed" the model will try to work around. The dedicated
+    #: "sidecar is not installed" branch in `Router._run` only fires on a
+    #: `FileNotFoundError`, and this path never raised one — so the one message
+    #: written for this case was unreachable, and what a developer actually saw
+    #: was `repo_map failed: SidecarError: …` with no fix line.
+    missing: bool = False
+
 
 @dataclass(frozen=True, slots=True)
 class Reply:
@@ -88,7 +97,7 @@ class GoTools:
 
     def _spawn(self) -> subprocess.Popen[str]:
         if self.binary is None:
-            raise SidecarError(
+            raise _missing_sidecar(
                 "the gotools binary could not be located: GOTOOLS_PATH is unset "
                 "or points at nothing, and there is no gotools on PATH. It ships "
                 "inside the extension; a missing one means a broken install, not "
@@ -261,6 +270,12 @@ class GoTools:
             proc.kill()
 
 
+def _missing_sidecar(message: str) -> SidecarError:
+    exc = SidecarError(message)
+    exc.missing = True
+    return exc
+
+
 def _find_binary() -> str | None:
     # The extension resolves the platform-suffixed binary it shipped
     # (`bin/gotools-win32-x64.exe`) and passes the full path, under the name
@@ -279,12 +294,64 @@ def _find_binary() -> str | None:
         found = shutil.which(name)
         if found:
             return found
-    # A development checkout, where the binary sits next to its source.
-    local = Path(__file__).resolve().parents[5] / "gotools"
-    for name in ("gotools.exe", "gotools"):
-        candidate = local / name
-        if candidate.is_file():
-            return str(candidate)
+    return _from_checkout()
+
+
+#: What the sidecar is actually called on disk, in the order worth trying.
+#:
+#: The old lookup asked for ``gotools`` and ``gotools.exe`` and nothing else,
+#: and neither of those names exists in this repository: the development build
+#: writes ``gotools-dev.exe`` and the release build writes the platform-suffixed
+#: ``gotools-win32-x64.exe`` the extension ships. So on a checkout the fallback
+#: matched nothing, ``repo_map`` — which ``planner.md`` tells the model to call
+#: first — failed on the first tool call of every task, and the blocking
+#: ``rules_lint`` stage failed after every edit.
+#:
+#: Platform-suffixed names are composed rather than listed, so a new platform
+#: needs no edit here.
+def _binary_names() -> tuple[str, ...]:
+    import platform
+    import sys
+
+    machine = platform.machine().lower()
+    arch = "arm64" if machine in ("arm64", "aarch64") else "x64"
+    plat = {"win32": "win32", "darwin": "darwin"}.get(sys.platform, "linux")
+    suffix = ".exe" if sys.platform == "win32" else ""
+    return (
+        f"gotools-{plat}-{arch}{suffix}",
+        f"gotools-dev{suffix}",
+        f"gotools{suffix}",
+        "gotools",
+    )
+
+
+def _from_checkout() -> str | None:
+    """The binary next to its source, in a development checkout.
+
+    Walked rather than computed. The old form was ``parents[5] / "gotools"``,
+    which is right for ``apps/agent/src/dakcoder_agent/tools/gotools.py`` in the
+    repository and lands somewhere inside ``site-packages`` for an installed
+    wheel — where it finds nothing, silently, which is the whole of T6. Walking
+    up looking for a directory that is actually there costs nothing and cannot
+    be wrong about how deep it is.
+    """
+    names = _binary_names()
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        root = parent / "gotools"
+        if not root.is_dir():
+            continue
+        for name in names:
+            candidate = root / name
+            if candidate.is_file():
+                return str(candidate)
+    # And beside the extension's own `bin/`, which is where a packaged install
+    # puts it when GOTOOLS_PATH was not passed for some reason.
+    for parent in here.parents:
+        for name in names:
+            candidate = parent / "bin" / name
+            if candidate.is_file():
+                return str(candidate)
     return None
 
 

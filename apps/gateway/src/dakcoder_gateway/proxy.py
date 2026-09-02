@@ -138,7 +138,12 @@ class ModelProxy:
         ledger: Ledger | None = None,
         roles: RoleModels | None = None,
         http: Any = None,
-        timeout: float = 300.0,
+        # Above the agent client's read timeout, so the client is the side that
+        # gives up first on a long prefill. Reversed — which is how it shipped,
+        # 300 here against 600 there — the gateway cuts a stream whose headers
+        # are already sent, and the only way it can report that is an in-band
+        # error frame. See `LLMConfig.read_timeout`.
+        timeout: float = 600.0,
     ) -> None:
         if not api_key:
             raise ValueError(
@@ -152,6 +157,14 @@ class ModelProxy:
         self.roles = roles or RoleModels()
         self.timeout = timeout
         self._http = http
+        #: Built lazily and kept, rather than built per request and dropped.
+        #:
+        #: `_relay` used to construct an `httpx.AsyncClient` inside itself and
+        #: never close it, so every model call leaked a connection pool: the
+        #: sockets survived until the garbage collector reached them, keep-alive
+        #: was never reused, and the gateway paid a fresh TCP and TLS handshake
+        #: upstream on every turn of every run.
+        self._owned: Any = None
         #: Settlements still in flight. Held as strong references because a task
         #: nobody is holding can be garbage-collected mid-await, and because
         #: ``drain`` needs something to wait on at shutdown.
@@ -324,12 +337,29 @@ class ModelProxy:
         if still_running:
             log.warning("%d settlement(s) did not finish before shutdown", len(still_running))
 
-    async def _relay(self, path: str, body: dict[str, Any]) -> AsyncIterator[bytes]:
-        client = self._http
-        if client is None:
+    def _client(self) -> Any:
+        """The upstream client: injected for tests, otherwise ours and reused."""
+        if self._http is not None:
+            return self._http
+        if self._owned is None:
             import httpx
 
-            client = httpx.AsyncClient(timeout=self.timeout, trust_env=False, http2=False)
+            self._owned = httpx.AsyncClient(
+                timeout=self.timeout,
+                trust_env=False,
+                http2=False,
+                limits=httpx.Limits(max_keepalive_connections=64, keepalive_expiry=300),
+            )
+        return self._owned
+
+    async def aclose(self) -> None:
+        """Close the upstream client. Called from the app's shutdown hook."""
+        owned, self._owned = self._owned, None
+        if owned is not None:
+            await owned.aclose()
+
+    async def _relay(self, path: str, body: dict[str, Any]) -> AsyncIterator[bytes]:
+        client = self._client()
 
         async with client.stream(
             "POST", f"{self.upstream}/{path}", json=body, headers=self.headers()

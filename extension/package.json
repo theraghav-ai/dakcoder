@@ -108,7 +108,7 @@
         "dakcoder.serverGatewayUrl": {
           "type": "string",
           "default": "https://ai.cept.gov.in/dakcoder",
-          "description": "The IT 2.0 gateway: sign-in, quota, and the model proxy. The agent itself always runs on this machine \u2014 your repository, build output and git history never leave it. The prompt the agent builds does go to the India Post model endpoint, over internal infrastructure only. This host publishes everything except sign-in: ask an administrator for a token and run \"dakcoder: Enter Gateway Token\"."
+          "description": "The IT 2.0 gateway: sign-in, quota, and the model proxy. The agent itself always runs on this machine — your repository, build output and git history never leave it. The prompt the agent builds does go to the India Post model endpoint, over internal infrastructure only. This host publishes everything except sign-in: ask an administrator for a token and run \"dakcoder: Enter Gateway Token\"."
         },
         "dakcoder.gatewayUrl": {
           "type": "string",
@@ -148,12 +148,12 @@
           "default": 40,
           "minimum": 10,
           "maximum": 400,
-          "markdownDescription": "How many turns one run may spend before it stops with `exhausted`. The default suits a single vertical slice; raise it (100\u2013200) for whole-service work such as a template migration. An exhausted session is never lost \u2014 **Resume** continues it on the same transcript with a fresh budget. Takes effect when the runtime restarts."
+          "markdownDescription": "How many turns one run may spend before it stops with `exhausted`. The default suits a single vertical slice; raise it (100–200) for whole-service work such as a template migration. An exhausted session is never lost — **Resume** continues it on the same transcript with a fresh budget. Takes effect when the runtime restarts."
         },
         "dakcoder.approvalTimeoutSeconds": {
           "type": "number",
           "default": 0,
-          "description": "How long an approval waits. 0 waits indefinitely \u2014 a slow review must never auto-reject."
+          "description": "How long an approval waits. 0 waits indefinitely — a slow review must never auto-reject."
         },
         "dakcoder.autoApproveTrivialPatches": {
           "type": "boolean",
@@ -163,35 +163,22 @@
         "dakcoder.defaultMode": {
           "type": "string",
           "enum": [
-            "multi",
-            "planner",
-            "scaffolder",
-            "coder",
-            "verifier",
-            "debugger"
+            "auto",
+            "ask",
+            "agent"
           ],
-          "default": "multi",
-          "description": "Which mode a new task starts in. Multi lets the agent switch as the work demands."
+          "enumDescriptions": [
+            "Work out from the message whether it is a question or a change.",
+            "Read-only. Answers questions and never edits.",
+            "Plan the work, then do it."
+          ],
+          "default": "auto",
+          "description": "What a new message is treated as. Auto decides from the message before the first turn."
         },
         "dakcoder.requestTimeoutSeconds": {
           "type": "number",
           "default": 600,
           "description": "How long a single model request may take."
-        },
-        "dakcoder.runtimeIdleTimeoutMinutes": {
-          "type": "number",
-          "default": 30,
-          "description": "Stop the local runtime after this long with no task. 0 never stops it."
-        },
-        "dakcoder.showTokenMeter": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show the context and reasoning meter in the chat header."
-        },
-        "dakcoder.verbose": {
-          "type": "boolean",
-          "default": false,
-          "description": "Log every tool call to the output channel."
         },
         "dakcoder.telemetry": {
           "type": "boolean",
@@ -930,7 +917,7 @@
     "viewsWelcome": [
       {
         "view": "dakcoder.doctor",
-        "contents": "Doctor checks the Go toolchain, private-module credentials, the local runtime and your sign-in \u2014 and offers a one-click fix for everything it finds.\n[Run Doctor](command:dakcoder.doctor)"
+        "contents": "Doctor checks the Go toolchain, private-module credentials, the local runtime and your sign-in — and offers a one-click fix for everything it finds.\n[Run Doctor](command:dakcoder.doctor)"
       },
       {
         "view": "dakcoder.migration",

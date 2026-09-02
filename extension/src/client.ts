@@ -82,6 +82,25 @@ abstract class Rest {
    */
   onUnauthorized?: (usedToken: string | undefined) => Promise<boolean>;
 
+  /**
+   * How long a single request may take before it is abandoned.
+   *
+   * There was no timeout at all. A runtime that had wedged - a child still
+   * running but no longer answering, a socket that accepted the connection and
+   * then went quiet - left every call pending forever, so the panel's spinner
+   * had nothing that could ever resolve it. The event stream is exempt, because
+   * it is *supposed* to stay open; every ordinary request is not.
+   *
+   * Sixty seconds is generous for a loopback call that should take
+   * milliseconds. It is a backstop against a hang, not a latency budget.
+   */
+  protected requestTimeoutMs = 60_000;
+
+  /** Set from `dakcoder.requestTimeoutSeconds`. */
+  setRequestTimeout(ms: number): void {
+    this.requestTimeoutMs = Math.max(1_000, Math.round(ms));
+  }
+
   protected async request<T>(
     method: string,
     path: string,
@@ -90,12 +109,32 @@ abstract class Rest {
     retried = false,
   ): Promise<T> {
     const sent = this.token();
-    const response = await this.fetcher(`${this.base}${path}`, {
-      method,
-      headers: this.headers(),
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      ...(signal ? { signal } : {}),
-    });
+    // The caller's signal and ours, whichever fires first. `AbortSignal.any` is
+    // available in the Node 20 that VS Code ships; the fallback keeps this
+    // working under an older host and under a test double.
+    const timer = new AbortController();
+    const alarm = setTimeout(() => timer.abort(new Error('request timed out')), this
+      .requestTimeoutMs);
+    const combined = signal ? anySignal([signal, timer.signal]) : timer.signal;
+
+    let response: Response;
+    try {
+      response = await this.fetcher(`${this.base}${path}`, {
+        method,
+        headers: this.headers(),
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: combined,
+      });
+    } catch (err) {
+      if (timer.signal.aborted && !signal?.aborted) {
+        throw new Error(
+          `${method} ${path} did not answer within ${Math.round(this.requestTimeoutMs / 1000)}s`,
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(alarm);
+    }
 
     if (response.status === 401 && !retried && this.onUnauthorized) {
       // Retried exactly once. A second 401 after a successful refresh means the
@@ -142,7 +181,10 @@ export class RuntimeClient extends Rest {
     return this.get('/v1/tools');
   }
 
-  startTask(task: string, opts: { mode?: string; acceptance?: string[] } = {}): Promise<SessionSummary> {
+  startTask(
+    task: string,
+    opts: { intent?: string; acceptance?: string[] } = {},
+  ): Promise<SessionSummary> {
     return this.post<SessionSummary>('/v1/tasks', { task, ...opts });
   }
 
@@ -231,6 +273,19 @@ export class RuntimeClient extends Rest {
    * controls back-pressure — the webview batches on `requestAnimationFrame` and
    * a push API would defeat that.
    */
+  /**
+   * Hand the runtime a fresh gateway JWT.
+   *
+   * The daemon is spawned with the token that was current at the time and used
+   * to hold it for its whole life, baked into the HTTP client's default
+   * headers. Once it expired every model call was a 401 - not retryable, so
+   * every task ended in an error - and restarting the runtime was the only
+   * cure. The extension is the only party that can mint a new one.
+   */
+  setCredential(jwt: string): Promise<{ ok: boolean }> {
+    return this.post<{ ok: boolean }>('/v1/credential', { jwt });
+  }
+
   async *events(
     sessionId: string,
     sinceId: number,
@@ -423,4 +478,34 @@ function decodeFrame(frame: string, lastId: number): WireEvent | null {
     return { id, type: type || 'error', data: { message: 'a malformed event was skipped' } };
   }
   return { id, type: type || 'message', data: parsed };
+}
+
+
+/**
+ * The first of several signals to abort.
+ *
+ * `AbortSignal.any` exists in the Node 20 VS Code ships and is used when it is
+ * there. The manual form is for an older host and, more usefully, for a test
+ * double that supplies its own signals.
+ */
+function anySignal(signals: AbortSignal[]): AbortSignal {
+  const native = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
+  if (typeof native === 'function') return native(signals);
+
+  const controller = new AbortController();
+  const stop = (reason: unknown) => {
+    for (const signal of signals) signal.removeEventListener('abort', onAbort);
+    controller.abort(reason);
+  };
+  function onAbort(this: AbortSignal): void {
+    stop(this.reason);
+  }
+  for (const signal of signals) {
+    if (signal.aborted) {
+      stop(signal.reason);
+      break;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
+  return controller.signal;
 }

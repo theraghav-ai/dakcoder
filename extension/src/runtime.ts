@@ -86,6 +86,17 @@ export class Runtime implements vscode.Disposable {
 
   constructor(private readonly opts: RuntimeOptions) {
     this.client = new RuntimeClient('', () => this.loopbackToken);
+    // `dakcoder.requestTimeoutSeconds` was declared in package.json and read by
+    // nobody: there was no request timeout anywhere, so a wedged runtime left
+    // every call pending forever behind a spinner that could not resolve. It
+    // now bounds an ordinary loopback request. The event stream is deliberately
+    // exempt - it is meant to stay open.
+    const seconds = vscode.workspace
+      .getConfiguration('dakcoder')
+      .get<number>('requestTimeoutSeconds', 600);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      this.client.setRequestTimeout(seconds * 1000);
+    }
   }
 
   get running(): boolean {
@@ -184,7 +195,23 @@ export class Runtime implements vscode.Disposable {
         finish(new RuntimeError(`the runtime could not be started: ${err.message}`)),
       );
       child.on('exit', (code) => {
-        if (this.announced) return;
+        if (this.announced) {
+          // The child died *after* it had announced its port. This branch used
+          // to `return` and say nothing, so the only trace of a runtime that had
+          // gone was every subsequent request failing to connect - and on the
+          // event stream a connection refusal is not an `HttpError`, so it was
+          // retried forever behind a spinner that could not resolve.
+          //
+          // `ensure()` already respawns once `running` goes false; what was
+          // missing was anyone knowing. Clearing the announcement makes the
+          // stale port unreadable and the log line makes the cause visible.
+          this.announced = undefined;
+          this.opts.log.warn(
+            `the runtime exited with ${code} after starting; ` +
+              'it will be restarted on the next request',
+          );
+          return;
+        }
         // stderr is the actionable part: the runtime refuses to start with a
         // named reason (a model key present, no gateway URL) and that sentence
         // is worth far more than "exited with 2".
@@ -279,7 +306,6 @@ export class Runtime implements vscode.Disposable {
   private childEnv(gotools: string | undefined, jwt: string | undefined): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
-      DAKCODER_MODE: 'local',
       DAKCODER_GATEWAY_URL: this.opts.gatewayUrl,
       DAKCODER_GATEWAY_TOKEN: this.loopbackToken,
       DAKCODER_VERSION: extensionVersion(this.opts.extensionPath),

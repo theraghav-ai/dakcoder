@@ -67,7 +67,7 @@ def test_a_warning_with_no_diff_reports_no_changes(
 ) -> None:
     """The field failure, exactly: exit 0, a CRLF warning, and no diff."""
     _answer(monkeypatch, CRLF_WARNING)
-    out = router.dispatch("git_diff", {"path": "go.mod"}, mode=Mode.CODER)
+    out = router.dispatch("git_diff", {"path": "go.mod"}, mode=Mode.AGENT)
 
     assert out.ok
     assert "no changes" in out.content, (
@@ -83,7 +83,7 @@ def test_an_empty_diff_reports_no_changes(
     router: Router, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _answer(monkeypatch, "")
-    out = router.dispatch("git_diff", {}, mode=Mode.CODER)
+    out = router.dispatch("git_diff", {}, mode=Mode.AGENT)
     assert out.ok
     assert "no changes" in out.content
 
@@ -92,7 +92,7 @@ def test_a_real_diff_is_passed_through_untouched(
     router: Router, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _answer(monkeypatch, REAL_DIFF)
-    out = router.dispatch("git_diff", {"path": "go.mod"}, mode=Mode.CODER)
+    out = router.dispatch("git_diff", {"path": "go.mod"}, mode=Mode.AGENT)
     assert out.ok
     assert "no changes" not in out.content
     assert "+go 1.22" in out.content
@@ -104,7 +104,7 @@ def test_a_failing_git_diff_is_still_a_failure(
     """The no-changes path is for success only; a real error must not be
     laundered into 'no changes'."""
     _answer(monkeypatch, "fatal: not a git repository", code=128)
-    out = router.dispatch("git_diff", {}, mode=Mode.CODER)
+    out = router.dispatch("git_diff", {}, mode=Mode.AGENT)
     assert not out.ok
     assert "not a git repository" in out.content
 
@@ -114,6 +114,6 @@ def test_staged_is_named_in_the_no_changes_message(
 ) -> None:
     """'no changes' and 'nothing staged' are different facts."""
     _answer(monkeypatch, "")
-    out = router.dispatch("git_diff", {"staged": "true"}, mode=Mode.CODER)
+    out = router.dispatch("git_diff", {"staged": "true"}, mode=Mode.AGENT)
     assert out.ok
     assert "no staged changes" in out.content

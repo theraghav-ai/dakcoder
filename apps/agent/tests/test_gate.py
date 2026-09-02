@@ -12,7 +12,14 @@ import json
 
 import pytest
 
-from dakcoder_agent.gate import GATE, _NO_MODULE, full_gate, inner_loop
+from dakcoder_agent.gate import (
+    GATE,
+    Baseline,
+    _NO_MODULE,
+    _finding_keys,
+    full_gate,
+    inner_loop,
+)
 from dakcoder_agent.tools.router import Router
 from dakcoder_shared.envelope import ToolResult
 from dakcoder_shared.paths import Workspace
@@ -28,12 +35,36 @@ class Recorder:
         for name in {stage.tool for stage in GATE} | {"gofmt", "rules_lint", "go_diagnostics"}:
             self._install(name)
 
+    #: What a passing stage returns, per tool.
+    #:
+    #: `rules_lint` carries `meta` because the real one does: `gotools._report`
+    #: copies the sidecar's counts there beside the rendered prose, and
+    #: `_stage_passed` reads them. A stub returning bare text was modelling a
+    #: tool that does not exist -- and while `_lint_is_clean` fell back to
+    #: `result.ok`, which is True whenever the sidecar ran at all, the
+    #: difference was invisible: the blocking contract-lint stage could not fail
+    #: on a finding either way. That is defect T1.
+    CLEAN_META: dict[str, dict] = {
+        "rules_lint": {"violations": 0, "out_of_scope": 0, "warnings": 0, "files_scanned": 1},
+    }
+
     def _install(self, name: str) -> None:
         def handler(inv, _name=name):
             self.calls.append((_name, dict(inv.arguments)))
-            return self.answers.get(_name, ToolResult.success(f"{_name}: clean"))
+            return self.answers.get(
+                _name,
+                ToolResult.success(
+                    f"{_name}: clean", meta=dict(self.CLEAN_META.get(_name, {}))
+                ),
+            )
 
         self.router.handlers[name] = handler
+
+    def lint_finds(self, count: int, body: str) -> None:
+        """A lint that ran and found something. Not a lint that broke."""
+        self.answers["rules_lint"] = ToolResult.success(
+            body, meta={"violations": count, "files_scanned": 1}
+        )
 
     def fails(self, name: str, content: str = "boom") -> None:
         self.answers[name] = ToolResult.failure(content)
@@ -428,10 +459,67 @@ def test_a_violation_this_run_introduced_still_blocks(
 
 def test_the_gate_hands_the_baseline_to_the_stage(gate: Recorder, router: Router) -> None:
     """Threaded end to end, not merely accepted by the signature."""
-    full_gate(router, ["handler/user.go"], baseline=frozenset({"r|handler/user.go|m"}))
+    full_gate(
+        router,
+        ["handler/user.go"],
+        baseline=Baseline(compliance=frozenset({"r|handler/user.go|m"}), taken=True),
+    )
     args = dict(gate.calls)["swagger_check"]
     assert args["baseline"] == ["r|handler/user.go|m"]
     assert args["paths"] == "handler/user.go"
+
+
+def test_a_stage_that_was_already_failing_is_advisory_not_blocking(
+    gate: Recorder, router: Router
+) -> None:
+    """The single most expensive defect in the report, as a regression.
+
+    `go_vet` was blocking, unscoped and unbaselined, so a pre-existing tab in a
+    struct tag failed every run on the legacy corpus -- and the run was told the
+    failure was its own, then spent two Coder attempts and three Debugger cycles
+    trying to fix a file it had never opened.
+    """
+    finding = "core/domain/transferentry.go:19:2: struct field tag not compatible with reflect"
+    gate.fails("go_vet", finding)
+    baseline = Baseline(
+        findings={"go_vet": _finding_keys(finding)}, passed={"go_vet": False}, taken=True
+    )
+
+    report = full_gate(router, ["handler/user.go"], baseline=baseline)
+
+    vet = next(r for r in report.results if r.name == "go_vet")
+    assert not vet.ok, "the finding is still reported"
+    assert not vet.blocking, "but it is not this run's to fix"
+    assert report.ok, "a run whose only failure predates it has passed"
+
+
+def test_a_finding_this_run_added_still_blocks(gate: Recorder, router: Router) -> None:
+    """The baseline excuses what was already there and nothing else."""
+    was = "core/domain/transferentry.go:19:2: struct field tag not compatible"
+    now = was + chr(10) + "handler/user.go:41:1: unreachable code"
+    gate.fails("go_vet", now)
+    baseline = Baseline(
+        findings={"go_vet": _finding_keys(was)}, passed={"go_vet": False}, taken=True
+    )
+
+    report = full_gate(router, ["handler/user.go"], baseline=baseline)
+    assert not report.ok
+    assert report.blocked_by.name == "go_vet"
+
+
+def test_a_baseline_that_was_never_taken_excuses_nothing(
+    gate: Recorder, router: Router
+) -> None:
+    """"We did not look" and "nothing was wrong" must not read the same.
+
+    A default `Baseline()` is the first, and reading it as the second would
+    quietly excuse every failure on a run whose baseline thread had not
+    finished.
+    """
+    gate.fails("go_vet", "handler/user.go:41:1: unreachable code")
+    report = full_gate(router, ["handler/user.go"], baseline=Baseline())
+    assert not report.ok
+    assert report.blocked_by.name == "go_vet"
 
 def test_the_model_cannot_pass_a_baseline() -> None:
     """A baseline asserted by the model would clear the gate by claiming its own

@@ -110,11 +110,25 @@ MAX_DIRECTIVES = 6
 
 #: How many mode instructions the pinned head may carry at once.
 #:
-#: There are five modes and a healthy run visits four or five of them, so this
-#: never binds on one. It binds on a run that ping-pongs — and because the layer
-#: is pinned, an unbounded one is the one part of the prompt that grows forever
-#: and that compaction is forbidden to touch. See ``switch_mode``.
-MAX_MODE_MESSAGES = 6
+#: **One.** The head carries the instruction that is in force and nothing else.
+#:
+#: It was six, with each new overlay opening "This replaces the mode
+#: instructions above it", and that was a bound on a problem rather than a fix
+#: for it. A run walking the escalation ladder switched mode on almost every
+#: turn -- fourteen switches in fifteen turns in the field transcript -- so the
+#: un-evictable head accumulated five Coder overlays and four Verifier ones,
+#: each contradicting the one above. The Verifier, whose overlay opens "Report;
+#: do not fix anything here", announced "My job is to make the edit" on four
+#: separate turns: it was reading the Coder's instruction, still sitting two
+#: messages up. A 27B model at temperature 0.1 picks whichever instruction it
+#: saw most recently, and the preamble asking it not to is one more sentence in
+#: the pile.
+#:
+#: There are three modes now and a run visits at most two, so this rarely fires;
+#: keeping it at one is what makes the head's meaning unambiguous when it does.
+#: The cost is a prefill on a mode switch, which is the correct price for the
+#: prompt saying what is true.
+MAX_MODE_MESSAGES = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,7 +434,7 @@ class ContextManager:
     def __init__(
         self,
         *,
-        mode: Mode | str = Mode.CODER,
+        mode: Mode | str = Mode.ASK,
         system_prompt: str,
         tool_schema_tokens: int = 0,
         calibration: Calibration | None = None,
@@ -637,36 +651,23 @@ class ContextManager:
         self._config = config_for(mode)
         text = instruction.strip()
 
-        # Bounding the stack was not enough on its own: six overlays is still
-        # six sets of instructions, and the model has no way to know which of
-        # them is now in force. In the field the Verifier — whose overlay opens
-        # "Report; do not fix anything here", and which is handed no write tool
-        # — announced "My job is to make the edit" on four separate turns. It
-        # was reading the Coder's instruction, which was still sitting in the
-        # head two messages above its own.
+        # One overlay, so there is never a question of which is in force.
         #
-        # So each overlay after the first says plainly that it replaces what came
-        # before. Cheap, and it keeps the append-only discipline: the earlier
-        # messages are not rewritten, they are just no longer ambiguous.
-        # Compared before the preamble is added, not after. The preamble only
-        # appears from the second overlay onwards, so comparing the rendered text
-        # would find the first Coder entry ("Execute one plan step.") different
-        # from the second ("You are now in coder mode… Execute one plan step.")
-        # and append a duplicate — turning the cheapest bound here into a no-op.
+        # Re-stating the instruction already there adds nothing, so it is
+        # skipped, which keeps the head byte-identical across a re-entry and
+        # costs no prefill. Anything else supersedes: see MAX_MODE_MESSAGES
+        # for what six of these did to a run.
         if self._mode_messages and self._last_mode_instruction == text:
             return
-
-        if self._mode_messages:
-            text = (
-                f"You are now in {self._config.mode} mode. This replaces the mode "
-                "instructions above it — where they differ, this one is right and the "
-                f"others describe phases that have already happened.\n\n{text}"
-            )
 
         self._mode_messages.append(
             Message(Role.USER, text, Layer.MODE, source=f"mode:{self._config.mode}")
         )
         self._last_mode_instruction = instruction.strip()
+        # The oldest go, so the head holds only what is in force. At
+        # MAX_MODE_MESSAGES = 1 that is the current instruction and nothing
+        # else, which is why the "this replaces the above" preamble that used
+        # to be prepended here is gone: there is no longer an above.
         del self._mode_messages[:-MAX_MODE_MESSAGES]
 
     def begin_turn(self) -> int:
@@ -764,30 +765,52 @@ class ContextManager:
 
     # ── the ledger ──────────────────────────────────────────────────────────
 
+    #: Whether a newer read replaces the earlier reads it contains.
+    #:
+    #: **On**, and this is a deliberate disagreement with the failure report,
+    #: which asks for it off ("keep the slice-stub behaviour only if you keep
+    #: the 32k budget; at 245k it has no purpose"). Measured, it has a purpose:
+    #: with it off, `test_budget_regression` puts P95 at 166,801 tokens against
+    #: a 128,000 target and the raw reduction falls from 2.4x to 1.6x on a
+    #: read-heavy run.
+    #:
+    #: What the report is right about is the *bug*, and that bug is separately
+    #: fixed. The version that broke two field runs superseded on the path
+    #: alone, so a read of lines 40-150 was stubbed by a later read of 3777-3840
+    #: over lines that then existed nowhere -- and the stub said "re-read if
+    #: needed" while the loop's repeat ledger refused exactly that. Two true
+    #: messages that could not both be obeyed.
+    #:
+    #: `_supersede_slice` now requires *containment*: a read is only replaced
+    #: when every line of it is inside a newer read further down, and the stub
+    #: says where those lines are rather than telling the model to fetch them
+    #: again. Nothing is removed -- the message stays, with its `tool_call_id`,
+    #: at its index. That is what section 6.4's append-only rule is protecting,
+    #: and it is a different thing from the `collapse`/`discard` ledgers that
+    #: deleted assistant messages and their results by identity, which are gone.
+    #:
+    #: Kept as a switch so the trade can be re-made if the stub is ever
+    #: implicated again.
+    SUPERSEDE_SLICES = True
+
     def _supersede_slice(self, path: str, line_range: tuple[int, int] | None) -> None:
         """Collapse the earlier reads of ``path`` that this one contains.
 
-        Containment, not identity of path. Superseding on the path alone is
-        correct only when every read of a file covers the same lines, and the
-        field disproved that: a Planner read one 6,571-line handler at 40-150,
-        153-205 and 3777-3840, and the first two were replaced by stubs reading
-        *"re-read if needed"* over lines that then existed nowhere in the
-        context. It asked for them again — the one thing the stub told it to do
-        — and ``AgentLoop._tool_calls`` answered from ``last_results`` with
-        *"Not run: you have already called read_file with exactly these
-        arguments"*. Both messages were true and they could not both be obeyed,
-        so the run alternated between them until the stall counter ended it.
+        A no-op unless ``SUPERSEDE_SLICES`` is on. The path ledger is still
+        maintained, because compaction reads it to say which files it is about
+        to evict; what is switched off is rewriting messages already sent.
 
-        A read that contains an earlier one makes it genuinely redundant: every
-        line of the old is in the new, a few messages further down. That is the
-        only case where collapsing costs the model nothing, so it is the only
-        case that collapses. Disjoint and partially-overlapping reads both stay.
-
-        Replaced in place rather than removed, because removing a message
-        renumbers everything after it — and a tool result whose matching
-        ``tool_call_id`` has vanished is a malformed conversation, not a
-        smaller one.
+        When it is on: containment, not identity of path. Superseding on the
+        path alone is correct only when every read of a file covers the same
+        lines, and the field disproved that -- a Planner read one 6,571-line
+        handler at 40-150, 153-205 and 3777-3840, and the first two were
+        replaced by stubs over lines that then existed nowhere in the context.
+        A read that contains an earlier one makes it genuinely redundant; a
+        disjoint or partially-overlapping one does not, and stays.
         """
+        if not self.SUPERSEDE_SLICES:
+            return
+
         live = self._slices.get(path)
         if not live:
             return
@@ -808,7 +831,7 @@ class ContextManager:
             self._working[index] = replace(
                 old,
                 content=(
-                    f"[stale read of {path}{where} — those lines are inside the "
+                    f"[stale read of {path}{where}: those lines are inside the "
                     f"newer read of this file below]"
                 ),
             )
@@ -919,6 +942,14 @@ class ContextManager:
         by_layer: dict[Layer, int] = {layer: 0 for layer in Layer}
         for msg in self.build():
             by_layer[msg.layer] += self._calibration.estimate(msg.content)
+            # Counted here as well as in the calibration, for the same reason:
+            # a turn whose whole content is a tool call has an empty `content`
+            # and a real cost, and a budget that cannot see it will happily
+            # assemble a prompt the endpoint refuses.
+            for call in msg.tool_calls:
+                by_layer[msg.layer] += self._calibration.estimate(
+                    f"{call.name}{call.arguments or ''}"
+                )
         total = sum(by_layer.values()) + self._tool_schema_tokens
         return Usage(
             by_layer=by_layer,
@@ -965,8 +996,29 @@ class ContextManager:
         reason ``stream_options: {"include_usage": true}`` is sent on every
         call: without it there is no measurement, and the estimate stays a
         guess for the life of the process.
+
+        **Both sides of the ratio have to describe the same prompt.** They did
+        not. The numerator counted message *content* only; the denominator is
+        the endpoint's ``prompt_tokens``, which includes the tool schemas and
+        every ``tool_calls`` arguments string as well. So the observed
+        characters-per-token came out systematically low, the calibrated ratio
+        was dragged toward its floor, and every estimate built on it ran high —
+        which matters twice over, because that estimate is what compaction fires
+        on and what ``X-Estimated-Tokens`` reserves against a 600k/hour quota. A
+        long run over-reserved its way into 429s it had not earned.
+
+        The schemas are already measured per turn by ``observe_tool_schemas``,
+        in tokens rather than characters, so they are converted back through the
+        current ratio rather than guessed at. That is circular in principle and
+        harmless in practice: it is one term of a smoothed average, and it is far
+        closer than omitting them entirely.
         """
         chars = sum(len(m.content) for m in self.build())
+        # The arguments the model sent travel on the wire and are charged for.
+        for msg in self.build():
+            for call in msg.tool_calls:
+                chars += len(call.name) + len(call.arguments or "")
+        chars += int(self._tool_schema_tokens * self._calibration.ratio)
         self._calibration.observe(estimated_chars=chars, actual_tokens=prompt_tokens)
 
     # ── compaction ──────────────────────────────────────────────────────────

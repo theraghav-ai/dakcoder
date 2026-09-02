@@ -29,3 +29,5 @@ error.txt
 
 # The deployment env holds the JWT secret and model key; only the example ships.
 deploy/dakcoder.env
+
+extension/dakcoder-go-0.2.10.vsix

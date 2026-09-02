@@ -42,7 +42,9 @@ export interface WireEvent {
 export interface TurnStart {
   turn: number;
   mode: Mode;
-  /** 1 or 2. The retry after a failed gate, which is what a developer is watching. */
+  /** Why the run is in that mode. Carried on every turn. */
+  intent?: Intent;
+  /** How many failing gates have come back with nothing edited between them. */
   attempt?: number;
 }
 
@@ -169,7 +171,33 @@ export interface FinishEvent {
   mutations: string[];
 }
 
-export type Mode = 'planner' | 'scaffolder' | 'coder' | 'verifier' | 'debugger';
+/**
+ * What the model may do this turn.
+ *
+ * Three, where there were five. Coder, Scaffolder, Verifier and Debugger were a
+ * fixed pipeline every request walked; they are one `agent` that holds every
+ * tool. The retired names are still in the union because a stored session and a
+ * saved setting can carry one, and the runtime coerces every one of them.
+ */
+export type Mode =
+  | 'ask'
+  | 'planner'
+  | 'agent'
+  /** Retired. Accepted on the wire, mapped by the runtime. */
+  | 'scaffolder'
+  | 'coder'
+  | 'verifier'
+  | 'debugger';
+
+/**
+ * What the developer asked for, decided before the first turn.
+ *
+ * `auto` classifies with one cheap schema-constrained call; `ask` is read-only;
+ * `agent` plans and then does the work. This is the field `POST /v1/tasks`
+ * takes now - `mode` is still read as a synonym for a client that has not been
+ * rebuilt.
+ */
+export type Intent = 'auto' | 'ask' | 'agent';
 
 export type SessionStatus =
   | 'running'

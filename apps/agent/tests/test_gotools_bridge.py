@@ -135,7 +135,7 @@ def test_a_comma_separated_path_list_becomes_an_array(live_router: Router) -> No
     The sidecar takes an array because Go generated it from a []string. This is
     the only place the two shapes have to agree."""
     out = live_router.dispatch(
-        "rules_lint", {"paths": "handler/user.go"}, mode=Mode.CODER
+        "rules_lint", {"paths": "handler/user.go"}, mode=Mode.AGENT
     )
     assert out.ok
     # Read off `meta`, not by parsing the content. `rules_lint` returns a
@@ -162,7 +162,7 @@ def test_repo_map_reads_the_generation_from_imports(live_router: Router) -> None
 def test_a_lint_finding_is_a_success_not_a_tool_failure(live_router: Router) -> None:
     """Marking a finding as ok=False would make the loop treat a lint report as
     a broken tool and retry it — a wasted turn, and noise in the transcript."""
-    out = live_router.dispatch("rules_lint", {}, mode=Mode.CODER)
+    out = live_router.dispatch("rules_lint", {}, mode=Mode.AGENT)
     assert out.ok
 
 
@@ -175,7 +175,7 @@ def test_an_invalid_scaffold_spec_comes_back_with_the_field_paths(
     out = live_router.dispatch(
         "resource_scaffold",
         {"spec": json.dumps({"name": "9bad", "fields": []})},
-        mode=Mode.SCAFFOLDER,
+        mode=Mode.AGENT,
         approved=True,
     )
     assert not out.ok

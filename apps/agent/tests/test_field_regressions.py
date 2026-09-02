@@ -31,8 +31,9 @@ from pathlib import Path
 import pytest
 
 from dakcoder_agent.context import ContextManager, Recap
-from dakcoder_agent.loop import _ACCEPTS, AgentLoop
+from dakcoder_agent.loop import AgentLoop, Intent
 from dakcoder_agent.modes import Mode
+from dakcoder_agent.tools import control
 from dakcoder_agent.tools.router import Router
 from dakcoder_shared.envelope import EventType
 from dakcoder_shared.llm import ChatResult, ToolCall, Usage
@@ -42,35 +43,97 @@ def say(text: str) -> ChatResult:
     return ChatResult(content=text, finish_reason="stop", usage=Usage(prompt_tokens=100))
 
 
-class Once:
-    """Replies with a script, then with distinct filler so nothing loops."""
+def calls_json(name: str, arguments: dict) -> ChatResult:
+    return ChatResult(
+        tool_calls=[ToolCall(id="chatcmpl-tool-00", name=name, arguments=json.dumps(arguments))],
+        finish_reason="tool_calls",
+        usage=Usage(prompt_tokens=100),
+    )
 
-    def __init__(self, turns: Sequence[ChatResult]) -> None:
+
+class Once:
+    """Replies with a script, then with distinct filler so nothing loops.
+
+    ``kind`` is what the intent classifier answers. It arrives as a separate
+    call carrying a ``response_format``, so it never consumes a scripted turn --
+    a test's script lines up with the turns it is actually about.
+    """
+
+    def __init__(self, turns: Sequence[ChatResult], *, kind: str = "change") -> None:
         self.turns = list(turns)
         self.n = 0
+        self.kind = kind
+        #: Every prompt the classifier was sent, for the tests that assert on it.
+        self.classified: list[str] = []
 
-    def chat(self, messages, *, tools=None, **kwargs) -> ChatResult:
+    def chat(self, messages, *, tools=None, response_format=None, **kwargs) -> ChatResult:
+        if response_format is not None:
+            if response_format.get("json_schema", {}).get("name") == "intent":
+                self.classified.append(messages[-1]["content"])
+                return say(json.dumps({"kind": self.kind}))
+            return say(json.dumps({"goal": "scripted"}))
         self.n += 1
         return self.turns.pop(0) if self.turns else say(f"nothing further ({self.n})")
 
 
-def drive(client, task: str, router: Router, *, max_turns: int = 12):
+def drive(client, task: str, router: Router, *, max_turns: int = 12, intent=Intent.AUTO):
     loop = AgentLoop(
-        ContextManager(mode=Mode.PLANNER, system_prompt="You are dakcoder."),
+        ContextManager(mode=Mode.ASK, system_prompt="You are dakcoder."),
         client,
         router,
         approve=lambda _r: True,
         max_turns=max_turns,
     )
-    events = list(loop.run(task))
+    events = list(loop.run(task, intent=intent))
     modes = sorted({e.data["mode"] for e in events if e.type is EventType.TURN_START})
     return modes, events
 
 
-# ── an explanation must never reach the Coder ───────────────────────────────
+# -- a question is answered; work is executed --------------------------------
+#
+# These used to assert on ~500 lines of regex over the task and the reply, and
+# the report measured what that was worth: 17 of 24 realistic read-only prompts
+# were classified as work, and each of those ran the full gate on an untouched
+# workspace and entered the escalation ladder.
+#
+# The classification is a model call now, so the corpus below no longer tests
+# *this* code -- it documents the phrasings the regex got wrong, and what is
+# asserted is the half the code still owns: given a classification, does the run
+# do the right thing, and does the classifier get what it needs to decide.
 
-#: The shape the Planner reaches for when asked to describe wiring code. Every
-#: paragraph opens with a third-person verb, which is what `_PLAN_EDITS` matched.
+#: Read-only phrasings a developer types every day. The report measured the
+#: regex classifying most of these as work.
+READ_ONLY_TASKS = [
+    "explain the bootstrapper and tell me how it deviates from the new template",
+    "explain me this project",
+    "what all have been done in this repo",
+    "give me an overview of the repo",
+    "analyse the objection handler",
+    "review the bootstrapper",
+    "explain what the build does",
+    "does the objection handler follow the template?",
+    "list the routes in this service",
+    "which files would I need to change to add a status filter?",
+    "is this handler correct?",
+    "check if go mod tidy is clean",
+]
+
+#: Requests that must still be executed. The guard against over-correcting: a
+#: classifier that answers everything is not a fix.
+WORK_TASKS = [
+    "write a new api that will store employee details, create everything required",
+    "add employee crud",
+    "write unit tests for the objection handler",
+    "fix the vet errors",
+    "review the objection handler and fix compilation errors",
+    "explain the bootstrapper, then migrate it to the new template",
+    "create employee table sql scripts",
+    "implement pagination on the list endpoint",
+]
+
+#: The shape a model reaches for when asked to describe wiring code. Every
+#: paragraph opens with a third-person verb, which is what `_PLAN_EDITS`
+#: matched -- so the answer to a question was pinned as a plan and executed.
 VERB_FIRST_ANSWER = """Here is what each module does.
 
 1. Creates the Temporal client and the worker on the PAO task queue.
@@ -88,67 +151,71 @@ BOLD_ANSWER = """## What the bootstrapper does
 **3. `FxHandler`** - provides all eight handlers.
 """
 
-READ_ONLY_TASKS = [
-    "explain the bootstrapper and tell me how it deviates from the new template",
-    "explain me this project",
-    "what all have been done in this repo",
-    "give me an overview of the repo",
-    "analyse the objection handler",
-    "review the bootstrapper",
-    "explain what the build does",
-    "walk me through the transfer entry flow",
-    "summarize the repo structure",
-]
-
 
 @pytest.mark.parametrize("task", READ_ONLY_TASKS)
 @pytest.mark.parametrize("answer", [VERB_FIRST_ANSWER, BOLD_ANSWER], ids=["verb-first", "bold"])
-def test_a_question_is_answered_and_never_executed(task, answer, router: Router):
-    """A read-only request must terminate in the Planner.
+def test_a_question_is_answered_whatever_its_answer_looks_like(task, answer, router: Router):
+    """The reply's shape must not be able to turn an answer into a plan.
 
-    Before: 13 of these 18 combinations reached the Coder. The verb-first answer
-    failed for *every* task, because `_PLAN_EDITS` had no trailing word boundary
-    and matched "Creates"/"Registers"/"Wires"/"Updates". The Coder then had
-    nothing to execute, `_verify` ran the gate on an untouched workspace, and in
-    one field transcript the run spent 22 further turns on a pre-existing defect
-    in a file the task never mentioned.
+    This is the failure the report calls unfixable by wording: "a description of
+    a deviation is indistinguishable from a proposal to remove it". The old loop
+    ran `_PLAN_EDITS` against the *reply*, matched "Creates"/"Registers"/
+    "Wires", pinned the answer as a plan, and went off to migrate a hundred
+    routes nobody had asked it to touch.
+
+    Nothing reads the reply now. A question runs one read-only loop and stops.
     """
-    modes, _ = drive(Once([say(answer)]), task, router)
-    assert modes == ["planner"], f"{task!r} reached {modes}"
+    modes, _events = drive(Once([say(answer)], kind="question"), task, router)
+    assert modes == ["ask"], f"{task!r} reached {modes}"
     assert not router.touched
 
 
-#: Requests that must still be executed. The guard against over-correcting: an
-#: adversarial review of the first attempt at this fix measured 14 of 20
-#: compound requests flipping from executed to answered.
-WORK_TASKS = [
-    "write a new api that will store employee details, create everything required",
-    "add employee crud",
-    "write unit tests for the objection handler",
-    "fix the vet errors",
-    "review the objection handler and fix compilation errors",
-    "explain the bootstrapper, then migrate it to the new template",
-    "create employee table sql scripts",
-    "implement pagination on the list endpoint",
-]
-
-
 @pytest.mark.parametrize("task", WORK_TASKS)
-def test_a_request_for_work_still_reaches_the_coder(task, router: Router):
+def test_a_request_for_work_reaches_the_acting_mode(task, router: Router):
     """The other half of the same judgement, and the one easy to lose.
 
-    A false "read-only" costs the developer one word ("go"); a false "work"
-    costs unrequested edits. But a classifier that answers everything is not a
-    fix, so both directions are asserted together.
+    A false "question" costs the developer one word; a false "change" costs
+    unrequested edits found later in a diff.
     """
-    plan = (
-        "1. `core/domain/employee.go` - add the Employee struct.\n"
-        "   Accepts: go build passes.\n"
-        "2. `repo/postgres/employee.go` - add the repository.\n"
-        "   Accepts: go build passes.\n"
+    router.handlers.update(control.HANDLERS)
+    plan = calls_json(
+        "submit_plan",
+        {
+            "steps": [
+                {
+                    "file": "core/domain/employee.go",
+                    "action": "add the Employee struct",
+                    "accepts": "go build passes",
+                }
+            ]
+        },
     )
-    modes, _ = drive(Once([say(plan)]), task, router)
-    assert "coder" in modes, f"{task!r} was answered instead of executed ({modes})"
+    modes, _events = drive(Once([plan], kind="change"), task, router)
+    assert "agent" in modes, f"{task!r} was answered instead of executed ({modes})"
+
+
+def test_the_classifier_is_given_the_conversation_as_well_as_the_message(
+    router: Router,
+) -> None:
+    """"go" is a question about nothing and an instruction about whatever was
+    just described, so it cannot be classified from the message alone.
+
+    The old loop had `_SAYS_GO` for this: a regex over pinned directives, whose
+    own comment concedes that one false match "authorises writes for every later
+    question in that session" -- a session-scoped write authorisation from a
+    one-word pattern match.
+    """
+    client = Once([say("answered")], kind="question")
+    loop = AgentLoop(
+        ContextManager(mode=Mode.ASK, system_prompt="s"), client, router, max_turns=4
+    )
+    list(loop.run("explain the bootstrapper", intent=Intent.AUTO))
+    list(loop.run("go", intent=Intent.AUTO, continued=True))
+
+    assert len(client.classified) == 2
+    assert "explain the bootstrapper" in client.classified[1], (
+        "the follow-up was classified without the conversation it follows"
+    )
 
 
 # ── a mode refusal is not an answer for the mode that can run the call ──────
@@ -175,13 +242,13 @@ def test_a_mode_refusal_is_not_replayed_to_the_mode_that_can_run_it(router: Rout
         approve=lambda _r: True,
     )
 
-    loop._switch(Mode.VERIFIER)
+    loop._switch(Mode.ASK)
     refused = list(loop._tool_calls([ToolCall(id="p1", name="patch_file", arguments=args)]))
     result = [e for e in refused if e.type is EventType.TOOL_RESULT][-1]
     assert result.data["ok"] is False
-    assert "not available in verifier mode" in result.data["content"]
+    assert "not available in ask mode" in result.data["content"]
 
-    loop._switch(Mode.CODER)
+    loop._switch(Mode.AGENT)
     ran = list(loop._tool_calls([ToolCall(id="p2", name="patch_file", arguments=args)]))
     kinds = [e.type for e in ran]
     assert EventType.TOOL_CALL in kinds, "the Coder's call was answered from the ledger"
@@ -198,7 +265,7 @@ def test_a_mutating_tool_refused_by_mode_is_not_offered_another_write_tool(route
     three turns truncating a 280-line `write_file` against a 2,048-token budget.
     """
     outcome = router.dispatch("patch_file", {"path": "a.go", "old": "x", "new": "y"},
-                              mode=Mode.VERIFIER)
+                              mode=Mode.ASK)
     assert outcome.ok is False
     assert outcome.meta.get("refused_by_mode") is True
     assert "write_file" not in outcome.for_model()
@@ -307,28 +374,6 @@ def test_compaction_never_cuts_between_a_call_and_its_result(assistant_chars, re
 # ── one binding, and an indent a real plan actually uses ────────────────────
 
 
-@pytest.mark.parametrize(
-    ("line", "matches"),
-    [
-        ("  - Accepts: build passes", True),
-        ("        - Accepts: nested under a numbered step", True),
-        ("   > - Accepts: quoted", True),
-        ("- [ ] Accepts: a checkbox list", True),
-        ("1. Accepts: a bare number", True),
-        ("**Accepts:** bold", True),
-        ("\t\tAccepts: tabs", True),
-        # Not a plan signal. `_ACCEPTS` is the whole reply-side test in
-        # `_is_explanation`, so a table row would pin an explanation that
-        # documents the step format and hand it to the Coder.
-        ("| Accepts: | the criterion |", False),
-        ("Accepts are discussed in the section below", False),
-        ("the plan Accepts: inline prose", False),
-    ],
-)
-def test_the_accepts_line_matches_what_a_planner_writes(line, matches):
-    assert bool(_ACCEPTS.search(line)) is matches
-
-
 def test_loop_binds_every_module_level_name_once():
     """`_ACCEPTS` was bound twice; Python took the second, so the pattern anyone
     read was not the pattern that ran. ruff is not installed in every dev
@@ -377,35 +422,47 @@ def test_a_search_that_returns_nothing_new_says_so_and_is_eventually_withdrawn(r
     searching = Router(router.workspace, handlers)
 
     class Rephraser:
+        """A model that keeps rewording one question the corpus cannot answer."""
+
         def __init__(self) -> None:
             self.n = 0
             self.offered: list[bool] = []
 
-        def chat(self, messages, *, tools=None, **kwargs):
+        def chat(self, messages, *, tools=None, response_format=None, **kwargs):
+            if response_format is not None:
+                return say(json.dumps({"kind": "question"}))
             self.n += 1
             names = {t["function"]["name"] for t in (tools or [])}
-            if self.n == 1:
-                return say("1. `handler/user.go` - add the handler.\n   Accepts: builds")
             self.offered.append("search_docs" in names)
             if "search_docs" not in names:
                 return say(f"nothing further ({self.n})")
             return ChatResult(
-                tool_calls=[ToolCall(
-                    id=f"s{self.n}", name="search_docs",
-                    arguments=json.dumps({"query": queries[min(self.n - 2, len(queries) - 1)]}),
-                )],
+                tool_calls=[
+                    ToolCall(
+                        id=f"s{self.n}",
+                        name="search_docs",
+                        arguments=json.dumps(
+                            {"query": queries[min(self.n - 1, len(queries) - 1)]}
+                        ),
+                    )
+                ],
                 finish_reason="tool_calls",
                 usage=Usage(prompt_tokens=100),
             )
 
     client = Rephraser()
-    context = ContextManager(mode=Mode.PLANNER, system_prompt="sys")
+    context = ContextManager(mode=Mode.ASK, system_prompt="sys")
     loop = AgentLoop(context, client, searching, approve=lambda _r: True, max_turns=20)
-    list(loop.run("write a new api that stores employee details"))
+    list(loop.run("how do repository timeouts work", intent=Intent.ASK))
 
+    # A `role: user` message, not a fabricated `role: tool` one. The old loop
+    # appended this as a result attributed to `search_docs` with no
+    # `tool_call_id` -- malformed on the wire, and a lie in the transcript that
+    # teaches the model `search_docs` replies with advice about itself.
     told = [
-        m.content for m in context.build()
-        if m.source == "tool:search_docs"
+        m.content
+        for m in context.build()
+        if str(m.role) == "user"
         and ("same sections" in m.content or "does not cover" in m.content)
     ]
     assert told, "the run was never told it was getting the same sections back"
@@ -414,112 +471,3 @@ def test_a_search_that_returns_nothing_new_says_so_and_is_eventually_withdrawn(r
 
 
 # ── a compound request is work, and a conjoined noun phrase is not ──────────
-
-
-@pytest.mark.parametrize(
-    ("task", "is_work"),
-    [
-        # "review X and fix Y" is how developers actually ask. The object rule
-        # that keeps "the update flow" a noun rejected the bare noun after the
-        # second verb, so 6 of these 8 were answered instead of executed.
-        ("review the objection handler and fix compilation errors", True),
-        ("explain the bootstrapper, then migrate it to the new template", True),
-        ("look at routes.go and add pagination", True),
-        ("check the handler then write unit tests", True),
-        ("review this file and remove dead code", True),
-        ("describe the flow and please fix vet errors", True),
-        ("explain the repo and add employee crud", True),
-        ("summarize routes.go then register the new handler", True),
-        # Two work words conjoined behind one determiner are a noun phrase.
-        ("describe the create and update handlers", False),
-        ("explain the add and remove handlers", False),
-        ("what are the create and delete endpoints", False),
-        # Nouns that happen to spell a work verb.
-        ("explain what the build does", False),
-        ("explain the change detection logic", False),
-        ("explain the port mapping and the wire protocol", False),
-        ("what does the register do", False),
-        ("describe the update flow and the build step", False),
-        ("explain the next change in the pipeline", False),
-        ("what is the generate step", False),
-        # A pasted list is data, not a command, even when a line is a work word.
-        ("explain these fields:\n- id\n- update\n- port", False),
-        ("describe the pipeline steps:\n1. build\n2. test\n3. deploy", False),
-    ],
-)
-def test_a_work_word_counts_only_where_a_command_could_begin(task, is_work):
-    from dakcoder_agent.loop import _asks_for_work
-
-    assert _asks_for_work(task) is is_work
-
-
-def test_courtesy_does_not_latch_write_authorisation_for_the_session():
-    """`_SAYS_GO` is ORed over `context.directives`, which `pin_directive` keeps
-    for the session. An earlier draft matched "thanks", "and" and "so", so one
-    courtesy reply after an answered question authorised writes for every later
-    question in that session.
-    """
-    from dakcoder_agent.loop import _asks_for_work
-
-    for courtesy in ["thanks", "thank you", "and", "so", "right?", "already", "hmm"]:
-        assert _asks_for_work("explain the bootstrapper", (courtesy,)) is False, courtesy
-    for affirmative in ["go", "go ahead", "yes", "do it", "proceed", "ok"]:
-        assert _asks_for_work("explain the bootstrapper", (affirmative,)) is True, affirmative
-
-
-# ── a question stays a question however its answer is phrased ───────────────
-
-
-#: The Planner's real answer to "how does it deviate from the new template".
-#: Naming a deviation means naming the change it implies, so the answer is
-#: indistinguishable from a plan by any regex over prose: `_PLAN_EDITS` matches
-#: "4. Register" and `_ACCEPTS` matches the line under it.
-DEVIATION_ANSWER = """## What the bootstrapper does
-
-1. `Fxvalidator` invokes handler.NewValidatorService.
-2. `FxRepo` provides all nine repositories.
-
-## How it deviates from the new template
-
-4. Register the eight handlers with fx.Annotate instead of plain fx.Provide.
-   Accepts: rules_lint(only=fx-registration) returns 0 findings
-5. Remove the TransferentryRepoInstance package-level global.
-"""
-
-REAL_PLAN = "1. `core/domain/employee.go` - add the struct.\n   Accepts: go build passes\n"
-
-
-@pytest.mark.parametrize("reply", [DEVIATION_ANSWER, REAL_PLAN, VERB_FIRST_ANSWER, BOLD_ANSWER],
-                         ids=["deviation", "plan-shaped", "verb-first", "bold"])
-@pytest.mark.parametrize("task", READ_ONLY_TASKS + [
-    "explain the bootsrapper used in this code. also tell how it deviates from new template",
-    "describe the create and update handlers",
-    "explain how the routes are registered",
-])
-def test_a_question_is_answered_whatever_the_reply_looks_like(task, reply):
-    """The field failure the reply test could not survive.
-
-    Asked to explain the bootstrapper and say how it deviates, the Planner
-    answered exactly that -- and the run went off to migrate a hundred routes,
-    ending blocked on a pre-existing go_vet failure, with the explanation the
-    developer wanted replaced on screen by a plan they never asked for.
-    """
-    from dakcoder_agent.loop import _is_explanation
-
-    assert _is_explanation(task, reply) is True
-
-
-@pytest.mark.parametrize("task", WORK_TASKS + [
-    "explain the bootstrapper then migrate it to the n-api template",
-    "explain the bootstrapper, then migrate it to the new template",
-    "check the handler then write unit tests",
-    "look at routes.go and add pagination",
-])
-def test_a_request_for_work_is_never_answered_whatever_the_reply_looks_like(task):
-    """The other side, and the reason dropping the reply test is safe: the work
-    test carries the whole judgement now, so it has to catch the preamble form.
-    """
-    from dakcoder_agent.loop import _is_explanation
-
-    assert _is_explanation(task, DEVIATION_ANSWER) is False
-    assert _is_explanation(task, REAL_PLAN) is False

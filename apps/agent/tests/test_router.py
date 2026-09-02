@@ -55,8 +55,11 @@ def test_every_mode_gets_only_its_own_tools(router: Router) -> None:
 
 
 def test_a_refused_mode_still_names_where_the_tool_lives(router: Router) -> None:
-    out = result(router.dispatch("run_terminal", {"argv": "[]"}, mode=Mode.CODER))
-    assert "debugger" in out.content
+    """A bare refusal costs a turn while the model guesses; a named alternative
+    costs nothing. `run_terminal` is the acting mode's, so asking for it from a
+    read-only phase must say which phase has it."""
+    out = result(router.dispatch("run_terminal", {"argv": "[]"}, mode=Mode.ASK))
+    assert "agent" in out.content
 
 
 def test_gate_tools_are_invisible_to_every_mode_but_still_dispatchable(router: Router) -> None:
@@ -71,7 +74,7 @@ def test_gate_tools_are_invisible_to_every_mode_but_still_dispatchable(router: R
         names = {s["function"]["name"] for s in router.schemas_for(mode)}
         assert not names & set(registry.gate_tools())
 
-    refused = result(router.dispatch("gofmt", {"paths": ""}, mode=Mode.CODER))
+    refused = result(router.dispatch("gofmt", {"paths": ""}, mode=Mode.AGENT))
     assert not refused.ok
     assert "run automatically" in refused.content
 
@@ -102,7 +105,7 @@ def test_habits_from_other_harnesses_are_redirected(
     find — they are correct tool names in *other* harnesses. A bare "unknown
     tool" costs a turn while the model guesses; naming the tool costs nothing.
     """
-    out = result(router.dispatch(called, {}, mode=Mode.CODER))
+    out = result(router.dispatch(called, {}, mode=Mode.AGENT))
     assert not out.ok
     assert expected in out.fix
 
@@ -144,7 +147,7 @@ def test_an_unimplemented_tool_says_so_and_offers_a_substitute(router: Router) -
     for mode in Mode:
         assert "go_symbols" not in {s["function"]["name"] for s in router.schemas_for(mode)}
 
-    out = result(router.dispatch("go_symbols", {"query": "x"}, mode=Mode.CODER))
+    out = result(router.dispatch("go_symbols", {"query": "x"}, mode=Mode.AGENT))
     assert not out.ok
     assert "search_repo" in out.fix
 
@@ -172,7 +175,7 @@ def test_a_wrong_type_is_refused_with_an_example(router: Router) -> None:
 
 
 def test_an_enum_violation_lists_the_allowed_values(router: Router) -> None:
-    out = result(router.dispatch("fx_wire", {"kind": "nope", "ctor": "x.New"}, mode=Mode.CODER))
+    out = result(router.dispatch("fx_wire", {"kind": "nope", "ctor": "x.New"}, mode=Mode.AGENT))
     assert not out.ok
     assert "repo" in out.fix and "handler" in out.fix
 

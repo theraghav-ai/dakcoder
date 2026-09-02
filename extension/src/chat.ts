@@ -663,11 +663,16 @@ function strings(): Record<string, string> {
     // Replaces the mode cell while a decision is outstanding: "coding" is true
     // but useless when the run is blocked on a person.
     consoleNeedsApproval: vscode.l10n.t('needs approval'),
+    'mode.ask': vscode.l10n.t('reading'),
     'mode.planner': vscode.l10n.t('planning'),
-    'mode.scaffolder': vscode.l10n.t('scaffolding'),
-    'mode.coder': vscode.l10n.t('coding'),
+    'mode.agent': vscode.l10n.t('working'),
+    // Retired, and kept for a stored session that still carries one. The panel
+    // showing "coding" for a transcript recorded under the old five modes is
+    // better than showing the raw name.
+    'mode.scaffolder': vscode.l10n.t('working'),
+    'mode.coder': vscode.l10n.t('working'),
     'mode.verifier': vscode.l10n.t('verifying'),
-    'mode.debugger': vscode.l10n.t('debugging'),
+    'mode.debugger': vscode.l10n.t('working'),
 
     // The changeset verb, and why a path is protected. The reason names the
     // better tool where there is one: a developer who knows to run govalid_gen

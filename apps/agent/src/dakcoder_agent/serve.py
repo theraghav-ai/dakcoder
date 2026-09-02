@@ -41,7 +41,7 @@ from .loop import AgentLoop
 from .loopback import Loopback, create_app
 from .modes import Mode
 from .prompts import system_prompt
-from .tools import commands, fs, knowledge
+from .tools import commands, control, fs, knowledge
 from .tools.catalog import as_json
 from .tools.gotools import GoTools, handlers_for
 from .tools.router import Router
@@ -89,6 +89,10 @@ def build(
         **fs.HANDLERS,
         **knowledge.HANDLERS,
         **commands.HANDLERS,
+        # `submit_plan` and `ask_developer`: the two calls that end the planning
+        # phase. Ordinary handlers on purpose, so they get the same argument
+        # validation and the same result envelope as everything else.
+        **control.HANDLERS,
         **handlers_for(sidecar),
     }
 
@@ -100,12 +104,28 @@ def build(
 
     turns = max_turns_from_env()
 
+    # One client for the process, not one per run.
+    #
+    # `build_loop` used to call `make_client` on every task, so every run paid a
+    # TCP and TLS handshake with no connection reuse and left a client nobody
+    # closed — the exact finding (S10) the class docstring warns about, made by
+    # the caller. It also fixed the credential at construction; the holder below
+    # is what lets the extension refresh it without a restart.
+    holder: dict[str, Any] = {"runtime": None}
+
+    def credential() -> str:
+        runtime = holder["runtime"]
+        fresh = runtime.credential() if runtime is not None else ""
+        return fresh or config.api_key
+
+    client = make_client(config, credential=credential)
+
     def build_loop(session, approve):
         router = Router(space, handlers)
-        context = ContextManager(mode=Mode.PLANNER, system_prompt=system_prompt())
+        context = ContextManager(mode=Mode.ASK, system_prompt=system_prompt())
         return AgentLoop(
             context,
-            make_client(config),
+            client,
             router,
             approve=approve,
             cancelled=session.cancel.is_set,
@@ -120,6 +140,9 @@ def build(
         version=version,
         gateway_url=gateway_url,
     )
+    holder["runtime"] = runtime
+    # Closed with the sidecar at shutdown; `main` already owns both.
+    runtime.close_client = client.close
     return runtime, sidecar
 
 
@@ -237,6 +260,16 @@ def main(argv: list[str] | None = None) -> int:
         server.run(sockets=[sock])
     finally:
         sidecar.close()
+        # The shared HTTP client too. Held open, its keep-alive pool survives
+        # the process's last request and the sockets are only closed when the
+        # interpreter tears down — which on Windows is not guaranteed to be
+        # graceful.
+        closer = getattr(runtime, "close_client", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
         sock.close()
     return 0
 

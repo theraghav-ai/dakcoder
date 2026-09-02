@@ -55,7 +55,7 @@ def bare_router() -> Router:
     return Router(Workspace(Path.cwd()))
 
 
-def loop_with(client, *, mode: Mode = Mode.CODER) -> AgentLoop:
+def loop_with(client, *, mode: Mode = Mode.AGENT) -> AgentLoop:
     context = ContextManager(mode=mode, system_prompt="s")
     return AgentLoop(context, client, bare_router())
 
@@ -121,7 +121,7 @@ def test_compaction_runs_end_to_end_through_the_context_manager():
             }
         )
     )
-    context = ContextManager(mode=Mode.CODER, system_prompt="s")
+    context = ContextManager(mode=Mode.AGENT, system_prompt="s")
     context.set_task("add a pension resource")
     for i in range(12):
         context.append_tool_result("read_file", "x" * 400, tool_call_id=str(i), path=f"f{i}.go")
@@ -138,7 +138,7 @@ def test_compaction_runs_end_to_end_through_the_context_manager():
 
 
 def _working_set(paths: Sequence[str]) -> list[Message]:
-    context = ContextManager(mode=Mode.CODER, system_prompt="s")
+    context = ContextManager(mode=Mode.AGENT, system_prompt="s")
     context.set_task("t")
     for i, path in enumerate(paths):
         context.append_tool_result("read_file", f"contents of {path}", tool_call_id=str(i), path=path)
@@ -273,6 +273,6 @@ def test_a_very_long_failure_is_truncated_and_says_so():
 def test_usage_carries_the_absolute_budget_not_only_a_percentage():
     """Two surfaces each dividing prompt_tokens by a percentage produced two
     different denominators on screen at low usage. There is one now."""
-    context = ContextManager(mode=Mode.CODER, system_prompt="s")
+    context = ContextManager(mode=Mode.AGENT, system_prompt="s")
     assert context.usage().budget > 0
     assert context.inspect()["budget"] == context.usage().budget

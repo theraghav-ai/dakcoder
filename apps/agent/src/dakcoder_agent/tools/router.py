@@ -73,7 +73,7 @@ class Invocation:
     workspace: Workspace
     #: Paths already resolved and confined, workspace-relative POSIX.
     paths: tuple[str, ...] = ()
-    mode: Mode = Mode.CODER
+    mode: Mode = Mode.AGENT
 
     def arg(self, name: str, default: Any = None) -> Any:
         return self.arguments.get(name, default)
@@ -202,7 +202,7 @@ class Router:
         name: str,
         arguments: Any,
         *,
-        mode: Mode | str = Mode.CODER,
+        mode: Mode | str = Mode.AGENT,
         approved: bool = False,
         gate: bool = False,
     ) -> ToolOutcome:
@@ -290,7 +290,7 @@ class Router:
         (Part A section 9.3) whose stages are not the model's to choose or
         refuse, so the checks that exist to constrain the model do not apply.
         """
-        return self.dispatch(name, arguments or {}, mode=Mode.VERIFIER, gate=True)
+        return self.dispatch(name, arguments or {}, mode=Mode.AGENT, gate=True)
 
     # -- the individual checks --------------------------------------------
 
@@ -459,6 +459,22 @@ class Router:
             return handler(invocation)
         except PathEscape as exc:
             return ToolResult.failure(f"{spec.name}: {exc.reason}.", fix=exc.fix)
+        except MissingToolchain as exc:
+            # The environment, not the repository. Distinguished from a missing
+            # workspace path because the advice is completely different and the
+            # wrong one is actively misleading: `_missing_path` offers the three
+            # closest *files*, which for "go" is three Go sources that have
+            # nothing to do with it.
+            return ToolResult.failure(
+                f"{exc.binary} is not installed, or not on this runtime's PATH. "
+                f"{spec.name} needs it and could not run.",
+                fix=f"This is an environment problem, not a code problem: install "
+                f"{exc.binary} and make sure it is on PATH, or set the matching "
+                "path override in the dakcoder settings. Do not try to work "
+                "around it in the code — say plainly that the toolchain is "
+                "missing.",
+                meta={"missing_toolchain": exc.binary},
+            )
         except FileNotFoundError as exc:
             missing = getattr(exc, "filename", None) or str(exc)
             if spec.provider is not Provider.PYTHON:
@@ -479,6 +495,18 @@ class Router:
                 fix="Use repo_map to list it, or name a file inside it.",
             )
         except Exception as exc:  # noqa: BLE001 - a tool crash must not end the session
+            if getattr(exc, "missing", False):
+                # The sidecar is not installed. An environment fact, and the one
+                # the model must not try to route around: every gotools-backed
+                # tool will fail the same way, so "try something else" wastes
+                # the rest of the run.
+                return ToolResult.failure(
+                    f"{spec.name} needs the gotools sidecar, which is not installed "
+                    f"on this machine: {exc}",
+                    fix="This is an environment problem, not a code problem. Say so "
+                    "plainly and stop; no other tool can substitute for it.",
+                    meta={"missing_sidecar": True},
+                )
             return ToolResult.failure(
                 f"{spec.name} failed: {type(exc).__name__}: {exc}",
                 meta={"traceback": True},
@@ -739,6 +767,30 @@ _ALIASES: dict[str, str] = {
 }
 
 
+class MissingToolchain(FileNotFoundError):
+    """The binary a command needs is not on PATH.
+
+    Its own class because the alternative reads as a defect in the repository.
+    ``commands.run`` raised a bare ``FileNotFoundError("go")``; the handler for
+    that below assumes a *workspace path* and answered "go does not exist. The
+    closest files that do: …", then marked the call a dead end — so on a machine
+    without the Go toolchain, ``go_build`` halted the gate on every run with a
+    message pointing at the wrong thing entirely, and the model had no way to
+    work out that the problem was the environment rather than the code.
+
+    Subclasses ``FileNotFoundError`` so nothing that already catches that stops
+    working; ``_run`` checks for this one first.
+
+    It lives here rather than in ``commands`` because ``commands`` imports
+    ``Invocation`` from this module, and a name defined there would need this
+    module to import it back.
+    """
+
+    def __init__(self, binary: str) -> None:
+        super().__init__(binary)
+        self.binary = binary
+
+
 class _ArgError(ValueError):
     def __init__(self, message: str, fix: str = "") -> None:
         super().__init__(message)
@@ -804,7 +856,16 @@ def _coerce(spec: ToolSpec, raw: Any, *, gate: bool = False) -> dict[str, Any]:
             f"{spec.name} accepts: {known}.",
         )
 
-    missing = [p for p in spec.required if raw.get(p) in (None, "")]
+    # Absent or null, never "empty".
+    #
+    # This read ``raw.get(p) in (None, "")``, so an empty string counted as
+    # missing — which makes ``patch_file(old=..., new="")`` impossible, and that
+    # call is how you delete a line. The model sent a well-formed deletion, was
+    # told ``new`` was missing, set it to something non-empty, and the deletion
+    # never happened. "Required" means the caller has to supply the parameter;
+    # it does not mean the value has to be truthy, and no schema here says it
+    # does.
+    missing = [p for p in spec.required if p not in raw or raw[p] is None]
     if missing:
         raise _ArgError(
             f"{spec.name}: missing required parameter(s) {', '.join(missing)}.",
@@ -848,8 +909,64 @@ def _coerce_one(tool: str, key: str, value: Any, schema: Mapping[str, Any]) -> A
             value = high
         return value
 
+    if expected == "array":
+        # A model that has been handed an array schema sometimes sends the array
+        # as a JSON *string* — the same lenient case `_coerce` already documents
+        # one level up — and sometimes sends a single item where a list was
+        # asked for. Both are unambiguous, and both would otherwise cost a turn
+        # on the one call that ends a phase.
+        if isinstance(value, str):
+            try:
+                value = json.loads(value.strip())
+            except json.JSONDecodeError as exc:
+                raise _ArgError(
+                    f"{tool}.{key} must be a JSON array ({exc.msg}).",
+                    f"Send {key} as an array, for example [{{...}}].",
+                ) from exc
+        if isinstance(value, (dict, str)):
+            value = [value]
+        if not isinstance(value, list):
+            raise _ArgError(
+                f"{tool}.{key} must be an array, got {type(value).__name__}.",
+                f"Send {key} as an array.",
+            )
+        items = schema.get("items") or {}
+        coerced = [_coerce_item(tool, key, index, item, items)
+                   for index, item in enumerate(value)]
+        limit = schema.get("maxItems")
+        if isinstance(limit, int) and len(coerced) > limit:
+            # Trimmed, not refused. The instruction says "at most eight steps";
+            # a ninth is the model being thorough, and throwing the whole plan
+            # away over it costs a turn to relearn a rule it nearly followed.
+            coerced = coerced[:limit]
+        return coerced
+
+    if expected == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("true", "yes", "1"):
+                return True
+            if lowered in ("false", "no", "0", ""):
+                return False
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        raise _ArgError(
+            f"{tool}.{key} must be true or false, got {value!r}.",
+            f"Pass {key} as a JSON boolean, for example true.",
+        )
+
     if expected == "string":
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # A boolean is not text, but a model sending one for a parameter this
+        # catalog types as a string is answering the question correctly in the
+        # wrong shape, and refusing costs a turn to learn nothing. Rendered
+        # lower-case because that is the spelling every such description asks
+        # for ("Pass 'true' to …"), and `True` would fail the comparison the
+        # handler makes.
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
             value = str(value)
         if isinstance(value, (list, dict)):
             value = json.dumps(value, separators=(",", ":"))
@@ -864,6 +981,48 @@ def _coerce_one(tool: str, key: str, value: Any, schema: Mapping[str, Any]) -> A
         return value
 
     return value
+
+
+def _coerce_item(tool: str, key: str, index: int, value: Any, schema: Mapping[str, Any]) -> Any:
+    """One element of an array parameter.
+
+    Objects are checked field by field against ``items.properties`` so a step
+    missing its ``accepts`` is named as such rather than accepted and silently
+    dropped later. Everything else falls through to the scalar rules.
+    """
+    where = f"{key}[{index}]"
+    if schema.get("type") != "object":
+        return _coerce_one(tool, where, value, schema)
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value.strip())
+        except json.JSONDecodeError:
+            raise _ArgError(
+                f"{tool}.{where} must be an object, got text.",
+                f"Each entry of {key} is an object with "
+                f"{', '.join(schema.get('required') or schema.get('properties', {}))}.",
+            ) from None
+    if not isinstance(value, dict):
+        raise _ArgError(
+            f"{tool}.{where} must be an object, got {type(value).__name__}.",
+            f"Each entry of {key} is an object.",
+        )
+
+    props: Mapping[str, Any] = schema.get("properties", {})
+    missing = [f for f in (schema.get("required") or ()) if not str(value.get(f, "")).strip()]
+    if missing:
+        raise _ArgError(
+            f"{tool}.{where} is missing {', '.join(missing)}.",
+            f"Every entry of {key} needs {' and '.join(missing)}.",
+        )
+    out: dict[str, Any] = {}
+    for field_name, field_value in value.items():
+        if field_name not in props:
+            continue  # extra keys are not worth a turn
+        out[field_name] = _coerce_one(tool, f"{where}.{field_name}", field_value,
+                                      props[field_name])
+    return out
 
 
 def mutation(workspace: Workspace, path: str, kind: str) -> Mutation:

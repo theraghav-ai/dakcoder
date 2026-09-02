@@ -1,11 +1,33 @@
-"""Per-mode configuration: budgets, output limits and reasoning control.
+"""The three modes, their budgets, and reasoning control.
 
-The reasoning setting is the consequential one, and it reverses this plan's
-earlier guidance. Qwen3.8-27B is a reasoning model: left at its default it
-returns ``reasoning_content`` with ``content: null``, and a ``max_tokens`` too
-small to finish reasoning burns the whole turn for nothing.
+Three, where there were five. The five -- Planner, Scaffolder, Coder, Verifier,
+Debugger -- were a fixed pipeline every request walked, and section 4 of the
+failure report is mostly an account of what that cost: a Verifier with no write
+tool announcing "my job is to make the edit", a Coder saying "I am in verifier
+mode", fourteen mode switches in fifteen turns, and six overlay messages stacked
+in the un-evictable head each contradicting the one above it. No mature agent
+ships a per-request planner-coder-verifier pipeline; they run one loop and let
+the model decide what this turn needs.
 
-The pre-implementation spike measured it (Part A §4.4). Identical prompt,
+What is left is the distinction that actually earns a mode, which is **what the
+model is allowed to do**:
+
+``ASK``      read-only. Answers a question and stops. Cannot write, cannot build.
+``PLANNER``  read-only, plus the two tools that end the phase: ``submit_plan``
+             and ``ask_developer``. A plan is a typed event, not prose.
+``AGENT``    everything. Edits, scaffolds, builds, vets, tests, debugs. The gate
+             runs after it, deterministically, and its report comes back as an
+             ordinary message.
+
+That is a tool allow-list, which is how Cline's Plan/Act and Cursor's Ask/Agent
+are built, rather than a persona a prompt asks the model to adopt.
+
+The reasoning setting below is unchanged and still consequential. Qwen3.8-27B is
+a reasoning model: left at its default it returns ``reasoning_content`` with
+``content: null``, and a ``max_tokens`` too small to finish reasoning burns the
+whole turn for nothing.
+
+The pre-implementation spike measured it (Part A section 4.4). Identical prompt,
 identical temperature, only ``max_tokens`` varied:
 
     thinking off, 1,000 tokens   ->   2.0s, a 517-character answer
@@ -13,16 +35,8 @@ identical temperature, only ``max_tokens`` varied:
     thinking on,  4,000 tokens   ->  31.4s, 9,948 chars of reasoning
     thinking on, 16,000 tokens   ->  15.4s, 4,828 chars of reasoning
 
-Two things to read off that. Reasoning expands to fill the available budget,
-non-deterministically — 1,247 then 9,948 then 4,828 characters for the same
-prompt, so it is not a cost anyone can budget for. And the answer did not
-improve: all three thinking-on runs returned the same ~330-character JSON that
-thinking-off produced in two seconds. A 15x latency penalty for nothing.
-
-It also failed outright twice in the spike, both times on a turn that had to
-produce structured output.
-
-So thinking is off by default, in every mode.
+Reasoning expands to fill the available budget, non-deterministically, and the
+answer did not improve. So thinking is off by default, in every mode.
 """
 
 from __future__ import annotations
@@ -30,23 +44,99 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-__all__ = ["Mode", "ModeConfig", "MODES", "config_for"]
+__all__ = ["Intent", "Mode", "ModeConfig", "MODES", "config_for"]
 
 
 class Mode(StrEnum):
-    """The five agent modes (Part A §10).
+    """What the model may do this turn.
 
-    One loop, one system prompt, five overlays. Modes narrow the tool schema and
-    sharpen the instruction; they do not fork the process, and they do not each
-    get their own system prompt — that is finding S6, and it cost the frontend
-    agent three cold prefills per task.
+    One system prompt, one overlay. Modes narrow the tool schema and sharpen the
+    instruction; they do not fork the process and they do not each get their own
+    system prompt -- that is finding S6, and it cost the frontend agent three
+    cold prefills per task.
     """
 
+    ASK = "ask"
     PLANNER = "planner"
-    SCAFFOLDER = "scaffolder"
-    CODER = "coder"
-    VERIFIER = "verifier"
-    DEBUGGER = "debugger"
+    AGENT = "agent"
+
+    @classmethod
+    def coerce(cls, value: "Mode | str") -> "Mode":
+        """Accept the retired names as well as the current ones.
+
+        A session's stored mode, a client that has not been rebuilt, and a
+        ``dakcoder.defaultMode`` a developer set months ago all carry one of the
+        five old names. Every one of them maps cleanly onto what the mode
+        *permitted*, which is the only thing the name ever meant: the three that
+        could write become ``AGENT``, the one that could not becomes ``ASK``.
+        """
+        if isinstance(value, Mode):
+            return value
+        key = str(value).strip().lower()
+        try:
+            return cls(key)
+        except ValueError:
+            pass
+        return _RETIRED.get(key, cls.ASK)
+
+
+#: The five that were, and what they were allowed to do.
+#:
+#: ``verifier`` maps to ASK rather than AGENT deliberately: it held no write
+#: tool, and a session resuming into it should not silently acquire one.
+_RETIRED: dict[str, Mode] = {
+    "coder": Mode.AGENT,
+    "scaffolder": Mode.AGENT,
+    "debugger": Mode.AGENT,
+    "verifier": Mode.ASK,
+    "multi": Mode.ASK,
+    "auto": Mode.ASK,
+}
+
+
+class Intent(StrEnum):
+    """What the developer asked for, decided **before** the first turn.
+
+    The old loop had no such thing. Every message started in the Planner, the
+    model answered, and only then did about 500 lines of regex over the reply
+    and the task try to work out what had been wanted -- badly: 17 of 24
+    realistic read-only prompts were classified as work, and each of those ran
+    the full gate on an untouched workspace and entered the escalation ladder.
+    "List the routes in this service" cost about eight turns and two minutes and
+    ended "Stopped -- no progress".
+
+    Intent belongs at the front, where it can be *asked* rather than guessed:
+    the panel's Ask/Agent toggle answers it directly, and ``AUTO`` answers it
+    with one cheap structured-output call before any tool is offered.
+    """
+
+    #: Classify once, up front, with a schema-constrained call.
+    AUTO = "auto"
+    #: Read-only, whatever the model decides it would like to do.
+    ASK = "ask"
+    #: Plan, then execute.
+    AGENT = "agent"
+
+    @classmethod
+    def coerce(cls, value: "Intent | str | None") -> "Intent":
+        if isinstance(value, Intent):
+            return value
+        key = str(value or "").strip().lower()
+        try:
+            return cls(key)
+        except ValueError:
+            pass
+        # A legacy mode name on the wire is still a statement of intent.
+        legacy = {
+            "planner": cls.AGENT,
+            "coder": cls.AGENT,
+            "scaffolder": cls.AGENT,
+            "debugger": cls.AGENT,
+            "verifier": cls.ASK,
+            "multi": cls.AUTO,
+            "": cls.AUTO,
+        }
+        return legacy.get(key, cls.AUTO)
 
 
 @dataclass(frozen=True)
@@ -54,7 +144,7 @@ class ModeConfig:
     """What a mode changes about a request."""
 
     mode: Mode
-    #: Hard cap on assembled prompt tokens (Part A §6.1).
+    #: Hard cap on assembled prompt tokens (Part A section 6.1).
     prompt_budget: int
     #: Cap on completion tokens. Budgeted separately from the prompt, because
     #: conflating the two is how a mode ends up with room to think and no room
@@ -67,11 +157,11 @@ class ModeConfig:
     temperature: float
 
     def __post_init__(self) -> None:
-        # Rule 2 of §4.4: any thinking-on call gets at least 6,144 output
+        # Rule 2 of section 4.4: any thinking-on call gets at least 6,144 output
         # tokens. The budget has to hold a runaway reasoning block *plus* the
         # answer, and the spike showed reasoning alone exceeding 2,500 tokens on
         # a trivial prompt. A thinking-on mode with a tight budget does not
-        # produce a worse answer — it produces no answer at all.
+        # produce a worse answer -- it produces no answer at all.
         if self.enable_thinking and self.max_tokens < 6144:
             raise ValueError(
                 f"{self.mode} enables thinking with max_tokens={self.max_tokens}; "
@@ -83,57 +173,45 @@ class ModeConfig:
 #: The prompt budget every mode gets. One number, because five copies of it is
 #: how the Planner came to have a different one that nobody noticed.
 #:
-#: 245,760 — the model's own window, minus room to answer. The endpoint serves
+#: 245,760 -- the model's own window, minus room to answer. The endpoint serves
 #: Qwen3.8-27B at ``max_model_len`` 262,144 (asserted by the gateway probe),
 #: prompt and completion share it, and the largest completion budget below is
 #: 6,144; the remaining ~10k is headroom for template overhead and estimator
 #: error, so a full prompt cannot push the answer out of the window.
 #:
-#: This supersedes 32,768, and the history is worth keeping because both of the
-#: old numbers were load-bearing:
+#: The history is worth keeping, because both of the old numbers were
+#: load-bearing. It was 24,000 for the Planner once, and that killed a
+#: seventy-one-turn run: compaction retains to ``budget * 0.35``, which at
+#: 24,000 could not hold one capped file read, so the mode re-read the same
+#: files forever. 32,768 fixed that case and was chosen against section 5.3's
+#: cost targets; what changed the decision is the field evidence that at 32,768
+#: real runs compacted at ~23k, the recap evicted the very answers the model was
+#: working from, and the repeat detector ended the run.
 #:
-#: It was 24,000 for the Planner once, and that killed a seventy-one-turn run:
-#: compaction retains to ``budget * 0.35``, which at 24,000 could not hold one
-#: capped file read, so the mode re-read the same files forever. 32,768 fixed
-#: that case and was chosen against §5.3's cost targets (P95 prompt <= 24k,
-#: effective prefill <= 180k); 65,536 was measured then and rejected for
-#: breaching them.
-#:
-#: What changed the decision is the field evidence: at 32,768 real runs
-#: compacted at ~23k, the recap evicted the very answers the model was working
-#: from, the model re-asked for them, and the repeat detector ended the run.
-#: Two transcripts died exactly this way. A budget that routinely destroys the
-#: working set of an ordinary task is mispriced however good its prefill
-#: numbers look, so the ceiling now defers to the model's window and the §5.3
-#: targets are re-baselined in ``test_budget_regression.py`` with the measured
-#: cost of this decision recorded next to them.
-#:
-#: The cost profile to keep in mind: the budget is a ceiling, not an
-#: allocation. Short runs are unchanged. Long runs now accumulate instead of
-#: compacting, so their per-turn prefill grows with the run; prefix caching
-#: absorbs most of it, and ``_thrashing`` still catches a working set that
-#: genuinely will not fit.
+#: The budget is a ceiling, not an allocation: short runs are unchanged, and
+#: prefix caching absorbs most of what a long one accumulates.
 PROMPT_BUDGET = 245_760
 
+#: Output budgets.
+#:
+#: Nothing below 4,096 any more. The Verifier's was 2,048, and a ``write_file``
+#: of a 280-line file does not fit in it -- so the same call was truncated three
+#: turns running, with no counter and nothing saying why. A mode that holds
+#: ``write_file`` needs room to use it, and a mode that does not costs nothing
+#: by having room it never spends: ``max_tokens`` is a ceiling, and an unused
+#: ceiling is free.
 MODES: dict[Mode, ModeConfig] = {
-    # Reversed from the earlier plan. The spike found no quality gain on
-    # structured output, and a plan *is* structured output.
+    # Answers a question. No write tools, so its ceiling is about prose.
+    Mode.ASK: ModeConfig(Mode.ASK, PROMPT_BUDGET, 4096, False, 0.1),
+    # Emits a plan through ``submit_plan``, which is structured output, and the
+    # spike found no quality gain from thinking on structured output.
     Mode.PLANNER: ModeConfig(Mode.PLANNER, PROMPT_BUDGET, 4096, False, 0.1),
-    # Emits a JSON spec, which resource_scaffold then validates.
-    Mode.SCAFFOLDER: ModeConfig(Mode.SCAFFOLDER, PROMPT_BUDGET, 2048, False, 0.1),
-    # Mechanical edits and tool dispatch — the bulk of all turns.
-    Mode.CODER: ModeConfig(Mode.CODER, PROMPT_BUDGET, 4096, False, 0.1),
-    # Runs commands, reads output, reports.
-    Mode.VERIFIER: ModeConfig(Mode.VERIFIER, PROMPT_BUDGET, 2048, False, 0.1),
-    # The one place reasoning might genuinely pay, because ranking hypotheses is
-    # the rare task where the reasoning text itself is the deliverable. Treated
-    # as a Phase-2 A/B with the eval suite as judge — NOT as a default. Left off
-    # here so that switching it on is a deliberate edit with a test behind it.
-    Mode.DEBUGGER: ModeConfig(Mode.DEBUGGER, PROMPT_BUDGET, 6144, False, 0.1),
+    # Every tool, including ``write_file``. The largest budget, because this is
+    # the only mode that ever has to emit a whole file.
+    Mode.AGENT: ModeConfig(Mode.AGENT, PROMPT_BUDGET, 6144, False, 0.1),
 }
 
 
 def config_for(mode: Mode | str) -> ModeConfig:
     """Look up a mode's configuration."""
-    key = Mode(mode)
-    return MODES[key]
+    return MODES[Mode.coerce(mode)]

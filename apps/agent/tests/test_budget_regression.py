@@ -136,7 +136,7 @@ def _run_managed() -> tuple[list[int], list[int], dict]:
     final snapshot.
     """
     cm = ContextManager(
-        mode=Mode.CODER,
+        mode=Mode.AGENT,
         system_prompt=SYSTEM_PROMPT,
         tool_schema_tokens=TOOL_SCHEMA_TOKENS,
     )
@@ -213,7 +213,7 @@ def test_no_single_turn_exceeds_the_hard_budget():
     and it is also the point past which the context-rot literature says accuracy
     is falling anyway."""
     prompts, _, _ = _run_managed()
-    budget = ContextManager(mode=Mode.CODER, system_prompt=SYSTEM_PROMPT).budget
+    budget = ContextManager(mode=Mode.AGENT, system_prompt=SYSTEM_PROMPT).budget
     assert max(prompts) <= budget, (
         f"peak prompt {max(prompts):,} exceeds the {budget:,}-token budget"
     )
@@ -335,7 +335,7 @@ def test_growth_is_bounded_rather_than_linear():
     # task completes *under the compaction threshold* on content the unmanaged
     # baseline pushes far past it: the managed cost is set by the distinct
     # artefacts touched, the unmanaged cost by the number of turns taken.
-    threshold = ContextManager(mode=Mode.CODER, system_prompt=SYSTEM_PROMPT).budget * 0.70
+    threshold = ContextManager(mode=Mode.AGENT, system_prompt=SYSTEM_PROMPT).budget * 0.70
     assert max(managed) <= threshold, (
         f"peak managed prompt {max(managed):,.0f} crossed the compaction "
         f"threshold {threshold:,.0f}; the slice ledger has stopped bounding the "

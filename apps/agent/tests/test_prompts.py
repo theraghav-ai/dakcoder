@@ -81,7 +81,7 @@ def test_a_mode_switch_appends_and_does_not_rewrite_the_head() -> None:
     before = context.prefix_signature()
     head = context.build()[0].content
 
-    for mode in (Mode.SCAFFOLDER, Mode.CODER, Mode.VERIFIER, Mode.DEBUGGER):
+    for mode in (Mode.AGENT, Mode.AGENT, Mode.ASK, Mode.AGENT):
         context.switch_mode(mode, mode_instruction(mode))
 
     assert context.prefix_signature() == before
@@ -139,19 +139,33 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 # ── the whole prefix ────────────────────────────────────────────────────────
 
 
+#: The prefix ceiling, per mode.
+#:
+#: §6.4 estimates system + schemas at ~2,400 tokens and two of the old five
+#: modes already exceeded it; D-43 accepted that, on the ground that the overage
+#: is in the *stable prefix* — paid once per prefix rather than per turn — and
+#: that buying it back means shortening tool descriptions that exist to stop the
+#: model misusing the tools.
+#:
+#: `agent` is higher than the rest, and that is the priced cost of collapsing
+#: Coder, Scaffolder, Verifier and Debugger into one mode. It holds 22 tools
+#: where the Coder held 14, and two of the eight it gained are `go_vet` and
+#: `go_test` — the checks the Coder was failed by and could not run. Read-only
+#: modes are unaffected and came *down*: `ask` is 2,533.
+#:
+#: Asserted per mode rather than as one number so that a mode growing is a test
+#: failure and not a rounding error absorbed by the loosest ceiling.
+PREFIX_CEILING = {Mode.ASK: 2_700, Mode.PLANNER: 3_100, Mode.AGENT: 3_800}
+
+
 @pytest.mark.parametrize("mode", list(Mode))
 def test_the_prefix_is_reported_honestly_against_the_target(mode: Mode) -> None:
-    """§6.4 estimates system + schemas at ~2,400 tokens. Two modes exceed it.
-
-    Asserted at the real ceiling rather than the estimate, and recorded in
-    ARCHITECTURE D-43: the overage is in the *stable prefix*, paid once per
-    prefix rather than per turn, and buying it back would mean shortening tool
-    descriptions that exist to stop the model misusing the tools.
-    """
+    """The stable prefix, measured against a ceiling recorded per mode."""
     prefix = estimate_tokens(system_prompt()) + estimate_tokens(
         json.dumps(registry.schemas_for(mode))
     )
-    assert prefix <= 3_100, f"{mode} prefix is {prefix} tokens"
+    ceiling = PREFIX_CEILING[mode]
+    assert prefix <= ceiling, f"{mode} prefix is {prefix} tokens, ceiling {ceiling}"
 
 
 def test_the_system_prompt_and_schemas_leave_the_working_set_intact() -> None:
@@ -160,9 +174,9 @@ def test_the_system_prompt_and_schemas_leave_the_working_set_intact() -> None:
     §6.1 allocates ~27,500 to the live working set. The prefix eating into it is
     the real cost of every token spent above, and this is where it shows up.
     """
-    context = ContextManager(mode=Mode.CODER, system_prompt=system_prompt())
+    context = ContextManager(mode=Mode.AGENT, system_prompt=system_prompt())
     context.set_task("Add a Pension resource", acceptance=["go build ./... clean"])
-    schemas = estimate_tokens(json.dumps(registry.schemas_for(Mode.CODER)))
+    schemas = estimate_tokens(json.dumps(registry.schemas_for(Mode.AGENT)))
 
     remaining = context.budget - context.usage().total - schemas
     assert remaining >= 26_000, f"only {remaining} tokens left for the working set"
@@ -196,7 +210,7 @@ def test_the_read_only_phase_names_the_one_that_writes() -> None:
     phase writes is what produced the wrong half of the answer."""
     text = mode_instruction(Mode.PLANNER).lower()
     assert "read-only" in text
-    assert "coder" in text, "the read-only phase must name the phase that writes"
+    assert "agent" in text, "the read-only phase must name the phase that writes"
 
 
 def test_the_planner_really_has_no_write_tool() -> None:
@@ -207,7 +221,7 @@ def test_the_planner_really_has_no_write_tool() -> None:
     """
     writes = {"write_file", "patch_file", "delete_file", "go_mod"}
     planner = {s["function"]["name"] for s in registry.schemas_for(Mode.PLANNER)}
-    coder = {s["function"]["name"] for s in registry.schemas_for(Mode.CODER)}
+    coder = {s["function"]["name"] for s in registry.schemas_for(Mode.AGENT)}
 
     assert not (planner & writes), f"the Planner can write: {sorted(planner & writes)}"
     assert writes <= coder, f"the Coder cannot write: {sorted(writes - coder)}"

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -44,6 +45,39 @@ class StoreUnavailable(Exception):
     """The counters could not be reached, so the answer is no."""
 
 
+#: How long the gateway keeps serving after the quota store stops answering.
+#:
+#: Failing closed is right for an outage and wrong for a blip, and the gateway
+#: could not tell them apart: one Redis hiccup 503'd every request, the client
+#: retried three times over six seconds, and every run in the building ended
+#: ERROR. To the developer that is indistinguishable from the agent being
+#: broken, and it is the one failure they cannot act on.
+#:
+#: So a bounded grace window. Inside it requests are served and every one of
+#: them is recorded as *unmetered* — the audit trail says plainly that these
+#: turns were not counted, which is the property §15.4 actually needs. Outside
+#: it the refusal returns, because an agent that keeps working indefinitely with
+#: quota and audit down is the hole §15.4 closes.
+#:
+#: **Off by default**, and that is a deliberate retreat from the first draft of
+#: this fix. The codebase holds an explicit, documented position -- "an agent
+#: that keeps working when quota and audit are down is the hole section 15.4
+#: closes" -- and three tests assert it. Serving unmetered turns is an operator's
+#: decision about their own billing and audit obligations, not one to make on
+#: their behalf while fixing a usability report.
+#:
+#: What the report actually complains about is legibility: the developer cannot
+#: tell a quota outage from a broken agent. That is fixed on the client, which
+#: now recognises `quota_unavailable`, backs off on `Retry-After` instead of
+#: burning three retries in six seconds, and says what happened.
+#:
+#: Set `DAKCODER_QUOTA_DEGRADE_SECONDS=60` to trade that invariant for
+#: availability during a Redis failover. Every turn served inside the window is
+#: marked `degraded` on the reservation and reaches the ledger saying so, so the
+#: audit trail records what was not counted rather than simply lacking it.
+DEGRADE_SECONDS = float(os.environ.get("DAKCODER_QUOTA_DEGRADE_SECONDS", "0") or 0)
+
+
 @dataclass(frozen=True, slots=True)
 class Reservation:
     """A provisional charge, to be settled by ``reconcile``."""
@@ -53,6 +87,10 @@ class Reservation:
     lane: Lane
     estimated: int
     at: datetime
+    #: True when the store was unreachable and this turn was served inside the
+    #: grace window. Carried all the way to the ledger row, so "we did not count
+    #: this" is a recorded fact rather than an inference from a gap.
+    degraded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +152,10 @@ class QuotaPolicy:
         #: twice. Kept here rather than on the frozen Reservation, which the
         #: caller holds and could not be updated in place anyway.
         self._settled: set[str] = set()
+        #: When the store was first seen to be down in the current outage, or
+        #: None. Reset by any successful store call, so an intermittent store
+        #: does not accumulate its blips into an expired grace window.
+        self._degraded_since: datetime | None = None
 
     # -- runs ---------------------------------------------------------------
 
@@ -220,10 +262,17 @@ class QuotaPolicy:
                 "tokens this week",
             ),
         ]
-        await self._apply(sub, checks, now, lane)
+        degraded = False
+        try:
+            await self._apply(sub, checks, now, lane)
+        except StoreUnavailable:
+            if not self._within_grace(now):
+                raise
+            degraded = True
 
         reservation = Reservation(
-            id=reservation_id, sub=sub, lane=lane, estimated=estimated, at=now
+            id=reservation_id, sub=sub, lane=lane, estimated=estimated, at=now,
+            degraded=degraded,
         )
         self._open[reservation.id] = reservation
         return reservation
@@ -257,7 +306,16 @@ class QuotaPolicy:
         # overshoot bites on the *next* reserve(), which is the right place.
         # Negative is the refund the frontend agent never makes (finding S18).
         for series in (Series.WINDOW_TOKENS, Series.HOUR_TOKENS, Series.WEEK_TOKENS):
-            await self._guarded(self.store.adjust(reservation.sub, series, delta, now))
+            try:
+                await self._guarded(self.store.adjust(reservation.sub, series, delta, now))
+            except StoreUnavailable:
+                # Settling is bookkeeping after the fact; the tokens are already
+                # spent. Refusing here would leave the reservation open forever
+                # and turn a store blip into a permanent leak of the caller's
+                # window. The row still records that it went unmetered.
+                if not self._within_grace(now):
+                    raise
+                break
 
         self._open.pop(reservation.id, None)
         self._settled.add(reservation.id)
@@ -284,9 +342,14 @@ class QuotaPolicy:
             return
         now = self._clock()
         for series in (Series.WINDOW_TOKENS, Series.HOUR_TOKENS, Series.WEEK_TOKENS):
-            await self._guarded(
-                self.store.adjust(reservation.sub, series, -reservation.estimated, now)
-            )
+            try:
+                await self._guarded(
+                    self.store.adjust(reservation.sub, series, -reservation.estimated, now)
+                )
+            except StoreUnavailable:
+                if not self._within_grace(now):
+                    raise
+                break
         self._open.pop(reservation.id, None)
         self._settled.add(reservation.id)
 
@@ -366,6 +429,20 @@ class QuotaPolicy:
     #: a client that trusts it retries a request that can never succeed.
     _OUR_BUGS = (TypeError, KeyError, IndexError, AttributeError, ValueError, AssertionError)
 
+    def _within_grace(self, now: datetime) -> bool:
+        """Whether a store outage is still young enough to serve through.
+
+        The clock starts at the first failure of an outage, not at process
+        start, so a gateway that has been up for a week still gets its full
+        window the first time Redis goes away.
+        """
+        if DEGRADE_SECONDS <= 0:
+            return False
+        if self._degraded_since is None:
+            self._degraded_since = now
+            return True
+        return (now - self._degraded_since).total_seconds() <= DEGRADE_SECONDS
+
     async def _guarded(self, awaitable):
         """Fail closed on infrastructure, fail loud on ourselves.
 
@@ -381,7 +458,7 @@ class QuotaPolicy:
         only clue they had.
         """
         try:
-            return await awaitable
+            result = await awaitable
         except (QuotaExceeded, Conflict):
             # Both are answers, not outages. Turning a 409 into a 503 would tell
             # the caller to retry the one request that must not be retried.
@@ -398,9 +475,15 @@ class QuotaPolicy:
         except Exception as exc:  # noqa: BLE001 - a store failure is a refusal
             raise StoreUnavailable(
                 "the quota store is unreachable, so this request cannot be metered. "
-                "Requests are refused rather than allowed unmetered — an agent that "
-                "keeps working when quota and audit are down is the hole §15.4 closes."
+                "This is an outage of ours, not a problem with the request or with "
+                "your code — retry in a minute. Requests are refused rather than "
+                "allowed unmetered: an agent that keeps working when quota and audit "
+                "are down is the hole §15.4 closes."
             ) from exc
+        # The store answered. Whatever outage was in progress is over, so the
+        # next one gets a full grace window of its own.
+        self._degraded_since = None
+        return result
 
 
 def _hash(body: Any) -> str:

@@ -64,7 +64,15 @@ class LLMConfig:
     temperature_fast: float = 0.0
 
     connect_timeout: float = 5.0
-    read_timeout: float = 600.0
+    #: Deliberately *below* the gateway's own upstream timeout, so that on a
+    #: prefill long enough to hit a ceiling it is this client that gives up
+    #: first. The two used to be 600 here against 300 there, so the gateway
+    #: always cut first — and because its headers were already sent, it could
+    #: only say so with an in-band `event: error` frame that the client read as
+    #: an empty success. A client that times out first raises `ReadTimeout`,
+    #: which `_send` retries; a gateway that times out first is a turn silently
+    #: lost. Keep this strictly less than `ModelProxy.timeout`.
+    read_timeout: float = 540.0
     write_timeout: float = 30.0
 
     max_attempts: int = 3

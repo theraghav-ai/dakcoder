@@ -49,8 +49,27 @@ MAX_DESCRIPTION = 200
 
 _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
-_ALL: frozenset[Mode] = frozenset(Mode)
-_P, _C, _S, _V, _D = Mode.PLANNER, Mode.CODER, Mode.SCAFFOLDER, Mode.VERIFIER, Mode.DEBUGGER
+#: The three modes, and the aliases that keep the catalog readable.
+#:
+#: There were five (``_P, _C, _S, _V, _D``) and every spec below named a subset
+#: of them, which is how the Coder came to hold ``patch_file`` while ``go_vet``
+#: and ``go_test`` -- the checks the gate would fail it on -- belonged to the
+#: Debugger alone. A mode that cannot run the check it is judged by is a mode
+#: set up to fail.
+_ASK, _PLAN, _AGENT = Mode.ASK, Mode.PLANNER, Mode.AGENT
+
+#: Every read-only mode. What a tool that only looks at things is offered in.
+_READERS = frozenset({_ASK, _PLAN, _AGENT})
+#: The one mode that acts. Writing, building, verifying and debugging are all
+#: the same phase now, so they are all the same allow-list.
+_ACTS = frozenset({_AGENT})
+
+#: The whole-service surveys. Offered where a question about the service is
+#: being asked, and deliberately not in AGENT: a tool's description sits in the
+#: prompt for every mode it appears in, and a mode that is editing one method
+#: does not need a profile of every repository method in the service. This is
+#: the one place the old per-mode reasoning about prompt cost still applies.
+_SURVEY = frozenset({_ASK, _PLAN})
 
 
 class Approval(StrEnum):
@@ -201,6 +220,14 @@ def _int(desc: str, **extra: Any) -> dict[str, Any]:
     return {"type": "integer", "description": desc, **extra}
 
 
+def _bool(desc: str, **extra: Any) -> dict[str, Any]:
+    return {"type": "boolean", "description": desc, **extra}
+
+
+def _array(desc: str, items: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    return {"type": "array", "description": desc, "items": items, **extra}
+
+
 # ── the catalog ─────────────────────────────────────────────────────────────
 #
 # Ordered as Part A section 7.2 lists them: read-only first, then mutating, then
@@ -220,7 +247,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             package=_str("Directory to expand in full, e.g. 'handler'. Omit for the whole tree."),
             max_tokens=_int("Budget for the map. Defaults to 4000.", minimum=500, maximum=20000),
         ),
-        modes=_ALL,
+        modes=_READERS,
         provider=Provider.GOTOOLS,
     ),
     ToolSpec(
@@ -235,7 +262,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             end=_int("Last line, inclusive.", minimum=1),
         ),
         required=("path",),
-        modes=_ALL,
+        modes=_READERS,
     ),
     ToolSpec(
         name="search_repo",
@@ -249,7 +276,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             max=_int("Maximum matches to return. Defaults to 40.", minimum=1, maximum=200),
         ),
         required=("pattern",),
-        modes=frozenset({_P, _C, _V, _D}),
+        modes=_READERS,
     ),
     ToolSpec(
         name="search_docs",
@@ -261,7 +288,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             query=_str("What you need to know, e.g. 'repository timeout constants'."),
         ),
         required=("query",),
-        modes=frozenset({_P, _C, _S, _D}),
+        modes=_READERS,
     ),
     # -- the compiler and the linter ---------------------------------------
     ToolSpec(
@@ -278,7 +305,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             ),
         ),
         required=("query",),
-        modes=frozenset({_P, _C, _V, _D}),
+        modes=_READERS,
         provider=Provider.GOPLS,
         instead="use search_repo for a textual search",
         unavailable=(
@@ -295,7 +322,7 @@ _SPECS: tuple[ToolSpec, ...] = (
         parameters=_obj(
             path=_str("Narrow to one file. Omit for the whole workspace."),
         ),
-        modes=frozenset({_C, _V, _D}),
+        modes=_ACTS,
         provider=Provider.GOPLS,
         instead="use go_build, which is authoritative but slower",
         unavailable=(
@@ -313,7 +340,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             paths=_str("Comma-separated paths to lint. Omit for the whole workspace."),
             only=_str("Comma-separated rule ids, e.g. 'layer-sql-boundary,handler-signature'."),
         ),
-        modes=frozenset({_P, _C, _V, _D}),
+        modes=_READERS,
         provider=Provider.GOTOOLS,
     ),
     ToolSpec(
@@ -326,7 +353,7 @@ _SPECS: tuple[ToolSpec, ...] = (
         parameters=_obj(
             paths=_str("Comma-separated paths to audit. Omit for the whole workspace."),
         ),
-        modes=frozenset({_P, _V}),
+        modes=_SURVEY,
         provider=Provider.GOTOOLS,
     ),
     # ── the four review audits ──────────────────────────────────────────────
@@ -363,7 +390,7 @@ _SPECS: tuple[ToolSpec, ...] = (
         # `rules_lint` plus `playbook` already serve that. If a slow endpoint is
         # the failure, the Planner turn that scoped the work is where this
         # belongs.
-        modes=frozenset({_P, _V}),
+        modes=_SURVEY,
         provider=Provider.GOTOOLS,
     ),
     ToolSpec(
@@ -376,7 +403,7 @@ _SPECS: tuple[ToolSpec, ...] = (
         parameters=_obj(),
         # Coder earns its place here: writing a request DTO is exactly when the
         # missing bound is cheap to add and invisible to add later.
-        modes=frozenset({_P, _C, _V}),
+        modes=_SURVEY,
         provider=Provider.GOTOOLS,
     ),
     ToolSpec(
@@ -390,7 +417,7 @@ _SPECS: tuple[ToolSpec, ...] = (
         # Planner alone. The output is a survey with no advice attached, and the
         # decision it feeds — what should happen when that work fails halfway —
         # is not one a Coder or Verifier turn is positioned to take.
-        modes=frozenset({_P}),
+        modes=_SURVEY,
         provider=Provider.GOTOOLS,
     ),
     ToolSpec(
@@ -403,7 +430,7 @@ _SPECS: tuple[ToolSpec, ...] = (
         # Planner alone, and for a reason beyond cost: offering this to Coder or
         # Verifier invites a library bump in the middle of unrelated work, which
         # turns a review into a regression hunt.
-        modes=frozenset({_P}),
+        modes=_SURVEY,
         provider=Provider.GOTOOLS,
     ),
     ToolSpec(
@@ -415,7 +442,81 @@ _SPECS: tuple[ToolSpec, ...] = (
         parameters=_obj(
             rule=_str("Rule id or failure class, e.g. 'fx-registration' or 'pgx-no-rows'."),
         ),
-        modes=frozenset({_C, _V, _D}),
+        modes=_READERS,
+    ),
+    # -- ending the planning phase ------------------------------------------
+    #
+    # The two tools that replace ~500 lines of regex over prose.
+    #
+    # A plan used to be whatever text came back from a mode called "Planner",
+    # recognised by counting lines that started with a number and pinned into
+    # the un-evictable task layer. That could not distinguish a plan from a
+    # numbered explanation -- and it did not: "explain the bootstrapper and how
+    # it deviates from the template" was answered in numbered paragraphs, pinned
+    # as a plan, handed to a Coder that had nothing to execute, and the run went
+    # off to migrate a hundred routes nobody had asked it to touch. The module's
+    # own comment concedes that "no regex over prose can separate them".
+    #
+    # A tool call is not prose. It arrives typed, validated against a schema the
+    # model was shown, with a `tool_call_id` and an unambiguous meaning, and the
+    # loop transitions on the *event* rather than on a guess about the text. The
+    # regexes are gone -- `_STEP`, `_count_steps`, `_PLAN_EDITS`, `_ACCEPTS`,
+    # `_asks_the_developer`, `_refuses_to_plan`, `_restated_the_plan` -- and so
+    # is every failure that belonged to them.
+    ToolSpec(
+        name="submit_plan",
+        description=(
+            "Submit the plan and start the work. Each step names one file, what "
+            "changes in it, and how you will know it worked."
+        ),
+        parameters=_obj(
+            steps=_array(
+                "The steps, in order. At most eight.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "description": (
+                                "Workspace-relative path this step changes, "
+                                "e.g. 'handler/pension.go'."
+                            ),
+                        },
+                        "action": {
+                            "type": "string",
+                            "description": "What changes in it, in one sentence.",
+                        },
+                        "accepts": {
+                            "type": "string",
+                            "description": "How this step is checked once done.",
+                        },
+                    },
+                    "required": ["file", "action", "accepts"],
+                    "additionalProperties": False,
+                },
+                maxItems=8,
+            ),
+            summary=_str("One sentence on what the whole plan achieves."),
+        ),
+        required=("steps",),
+        modes=frozenset({_PLAN}),
+    ),
+    ToolSpec(
+        name="ask_developer",
+        description=(
+            "Stop and ask, when something cannot be inferred. Use only for what "
+            "you genuinely cannot decide: field types, a table name, a route base."
+        ),
+        parameters=_obj(
+            questions=_array(
+                "The questions, at most four. One decision each.",
+                {"type": "string"},
+                maxItems=4,
+            ),
+            assumed=_str("What you inferred rather than asking about."),
+        ),
+        required=("questions",),
+        modes=frozenset({_PLAN}),
     ),
     # -- editing ------------------------------------------------------------
     ToolSpec(
@@ -429,7 +530,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             content=_str("Full file content."),
         ),
         required=("path", "content"),
-        modes=frozenset({_C, _S, _D}),
+        modes=_ACTS,
         mutates=True,
         approval=Approval.CONDITIONAL,
         instead="use patch_file to change a file that already exists",
@@ -446,7 +547,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             new=_str("Replacement text."),
         ),
         required=("path", "old", "new"),
-        modes=frozenset({_C, _D}),
+        modes=_ACTS,
         mutates=True,
         approval=Approval.CONDITIONAL,
         instead="use write_file to create a file that does not exist yet",
@@ -459,7 +560,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             reason=_str("One sentence on why it should go."),
         ),
         required=("path", "reason"),
-        modes=frozenset({_C, _D}),
+        modes=_ACTS,
         mutates=True,
         approval=Approval.ALWAYS,
     ),
@@ -487,7 +588,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             spec=_str('Resource as JSON: {"name","table","route_base","fields","operations"}.'),
         ),
         required=("spec",),
-        modes=frozenset({_S}),
+        modes=_ACTS,
         mutates=True,
         approval=Approval.ALWAYS,
         provider=Provider.GOTOOLS,
@@ -503,7 +604,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             resource=_str("One resource to seed the service with, same shape as resource_scaffold."),
         ),
         required=("project", "resource"),
-        modes=frozenset({_S}),
+        modes=_ACTS,
         mutates=True,
         approval=Approval.ALWAYS,
         provider=Provider.GOTOOLS,
@@ -519,7 +620,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             ctor=_str("The constructor's bare name, e.g. 'NewPensionHandler'."),
         ),
         required=("kind", "ctor"),
-        modes=frozenset({_C, _S, _D}),
+        modes=_ACTS,
         mutates=True,
         provider=Provider.GOTOOLS,
     ),
@@ -530,7 +631,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             "whenever a validate tag changes; never hand-edit the generated files."
         ),
         parameters=_obj(),
-        modes=frozenset({_C, _S, _D}),
+        modes=_ACTS,
         mutates=True,
     ),
     # -- the gate -----------------------------------------------------------
@@ -541,16 +642,18 @@ _SPECS: tuple[ToolSpec, ...] = (
             "it is clean, whatever the other tools say."
         ),
         parameters=_obj(),
-        modes=frozenset({_C, _V, _D}),
+        modes=_ACTS,
     ),
     ToolSpec(
         name="go_vet",
         description=(
-            "Run go vet over the workspace. Gate only — it takes about thirty seconds, so "
-            "never run it in the edit loop."
+            "Run go vet. Pass pattern to scope it to one package; unscoped it takes "
+            "about thirty seconds, so never run that in the edit loop."
         ),
-        parameters=_obj(),
-        modes=frozenset({_D}),
+        parameters=_obj(
+            pattern=_str("Package pattern, e.g. './handler/...'. Omit for './...'."),
+        ),
+        modes=_ACTS,
     ),
     ToolSpec(
         name="go_test",
@@ -559,7 +662,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             pattern=_str("Package pattern, e.g. './handler/...'. Omit for './...'."),
             run=_str("Regular expression for -run, e.g. 'TestCreatePension'."),
         ),
-        modes=frozenset({_D}),
+        modes=_ACTS,
     ),
     ToolSpec(
         name="golangci_lint",
@@ -610,7 +713,12 @@ _SPECS: tuple[ToolSpec, ...] = (
             version=_str("Version for get, e.g. 'v1.4.0'. Omit for latest."),
         ),
         required=("op",),
-        modes=frozenset({_C, _D}),
+        modes=_ACTS,
+        # `check` is the gate's, not the model's. With it, tidy reports the drift
+        # and puts go.mod back; without it, tidy tidies. Offering the model the
+        # parameter would let it decide whether its own dependency change was
+        # real, which is exactly the assertion the gate exists to make instead.
+        gate_params=frozenset({"check"}),
         mutates=True,
         approval=Approval.CONDITIONAL,
     ),
@@ -619,16 +727,21 @@ _SPECS: tuple[ToolSpec, ...] = (
         name="git_status",
         description="List changed, staged and untracked files. Cheap; use it to confirm what you changed.",
         parameters=_obj(),
-        modes=_ALL,
+        modes=_READERS,
     ),
     ToolSpec(
         name="git_diff",
         description="Show the diff of the working tree, or of one path. Read this before claiming a change is done.",
         parameters=_obj(
             path=_str("Limit the diff to one path."),
-            staged=_str("Pass 'true' to diff the index instead of the working tree."),
+            # A boolean, typed as one. It was declared a *string* whose
+            # description asked for the text "true", so a model sending the
+            # obvious `staged: true` was refused on type — for the commonest
+            # form of the commonest call. The coercion accepts both spellings;
+            # the schema now asks for the right one.
+            staged=_bool("True to diff the index instead of the working tree."),
         ),
-        modes=_ALL,
+        modes=_READERS,
     ),
     ToolSpec(
         name="git_blame",
@@ -639,7 +752,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             end=_int("Last line.", minimum=1),
         ),
         required=("path",),
-        modes=frozenset({_P, _D}),
+        modes=_READERS,
     ),
     ToolSpec(
         name="git_ops",
@@ -656,7 +769,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             message=_str("Commit message, for commit."),
         ),
         required=("op",),
-        modes=frozenset({_C, _S}),
+        modes=_ACTS,
         mutates=True,
         approval=Approval.CONDITIONAL,
     ),
@@ -672,7 +785,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             timeout=_int("Seconds before it is killed. Defaults to 60.", minimum=1, maximum=600),
         ),
         required=("argv",),
-        modes=frozenset({_D}),
+        modes=_ACTS,
         approval=Approval.CONDITIONAL,
     ),
 )

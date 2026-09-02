@@ -31,8 +31,8 @@ import pytest
 
 from dakcoder_agent.context import ContextManager
 from dakcoder_agent.loop import AgentLoop, Outcome
-from dakcoder_agent.modes import Mode
-from dakcoder_agent.tools import commands, fs, knowledge
+from dakcoder_agent.modes import Intent, Mode
+from dakcoder_agent.tools import commands, control, fs, knowledge
 from dakcoder_agent.tools.gotools import GoTools, _find_binary, handlers_for
 from dakcoder_agent.tools.router import Router
 from dakcoder_shared.envelope import EventType
@@ -134,16 +134,38 @@ def run(tmp_path_factory):
     with GoTools(work) as sidecar:
         router = Router(
             workspace,
-            {**fs.HANDLERS, **knowledge.HANDLERS, **commands.HANDLERS, **handlers_for(sidecar)},
+            {
+                **fs.HANDLERS,
+                **knowledge.HANDLERS,
+                **commands.HANDLERS,
+                **control.HANDLERS,
+                **handlers_for(sidecar),
+            },
         )
         agent = AgentLoop(
             ContextManager(mode=Mode.PLANNER, system_prompt="You are dakcoder."),
             Scripted([
-                say(
-                    "1. Call resource_scaffold with the Pension spec.\n"
-                    "   Accepts: go build ./... clean\n"
-                    "2. Confirm the repository and handler are wired with fx_wire.\n"
-                    "   Accepts: FxRepo and FxHandler updated"
+                # The plan is a tool call, not a numbered paragraph. This used
+                # to be prose that `_count_steps` recognised by counting lines
+                # beginning with a digit -- which is also how a numbered
+                # *explanation* came to be pinned as a plan and executed.
+                call(
+                    "submit_plan",
+                    {
+                        "summary": "Scaffold the Pension resource and wire it into FX.",
+                        "steps": [
+                            {
+                                "file": "core/domain/pension.go",
+                                "action": "resource_scaffold with the Pension spec",
+                                "accepts": "go build ./... clean",
+                            },
+                            {
+                                "file": "bootstrap/bootstrapper.go",
+                                "action": "fx_wire the repository and the handler",
+                                "accepts": "FxRepo and FxHandler updated",
+                            },
+                        ],
+                    },
                 ),
                 call("resource_scaffold", {"spec": json.dumps(SPEC)}),
                 call("fx_wire", {"kind": "repo", "ctor": "NewPensionRepository"}),
@@ -154,7 +176,14 @@ def run(tmp_path_factory):
             approve=lambda _r: True,
         )
         events = list(
-            agent.run("Add a Pension resource", acceptance=["go build ./... clean"])
+            agent.run(
+                "Add a Pension resource",
+                acceptance=["go build ./... clean"],
+                # Stated rather than classified: the scripted client holds no
+                # classifier reply, and what this test is about is what happens
+                # *after* the intent is known.
+                intent=Intent.AGENT,
+            )
         )
     return agent, events, workspace
 
@@ -223,28 +252,39 @@ def test_the_scaffolder_wires_fx_itself_and_fx_wire_says_so(run) -> None:
     assert all("already registered" in e.data["content"] for e in wired)
 
 
-def test_the_first_gate_catches_the_templates_own_go_mod_drift(run) -> None:
-    """A finding about the reference template, reproduced every run.
+def test_the_gate_reports_the_templates_go_mod_drift_without_writing_it(run) -> None:
+    """The reference template's own drift, reproduced every run -- and no longer
+    charged to the run that met it.
 
-    Its go.mod requires api-db while its code imports n-api-db, so the first
-    `go mod tidy` at the gate is never a no-op — on a service the agent has not
-    otherwise changed the dependencies of. The gate blocks, tidy has already
-    applied the fix, and the next gate passes. That is the sequence working:
-    drift detected, corrected, confirmed.
+    Its go.mod carries requirements its code does not import, so `go mod tidy`
+    is never a no-op on it. The gate used to run the real thing to find out:
+    tidy rewrote go.mod, that counted as a mutation, and a run that had been
+    asked a question finished "32 turns - 1 file: go.mod". The gate's own
+    diagnostic was editing the repository, and the drift it "fixed" was one the
+    run had not caused.
+
+    Now tidy runs in check mode -- the verdict is identical, the bytes are put
+    back -- and the run-start baseline recognises the drift as pre-existing, so
+    it is reported and does not block.
     """
     _agent, events, workspace = run
-    assert len(gates(events)) >= 2, "expected the first gate to fail and a second to pass"
+    stages = {s["name"]: s for s in gates(events)[-1].data["stages"]}
+    tidy = stages["go_mod tidy"]
 
-    first = {s["name"]: s for s in gates(events)[0].data["stages"]}
-    assert not first["go_mod tidy"]["ok"]
-    assert "n-api-db" in (workspace.root / "go.mod").read_text(encoding="utf-8")
+    assert not tidy["ok"], "the drift is still detected and still reported"
+    assert not tidy["blocking"], "but it predates this run, so it is not this run's"
+    assert "already present before this run" in tidy["content"]
 
 
-def test_go_mod_appears_in_the_change_list(run) -> None:
-    """Because tidy really did rewrite it. A file the run changed and did not
-    report is a file the developer merges without reading."""
-    agent, _events, _ws = run
-    assert "go.mod" in agent.result.mutations
+def test_the_gate_never_writes_go_mod(run) -> None:
+    """A gate that edits the repository to find out whether the repository needs
+    editing is not a gate. `go.mod` must not appear in the change list of a run
+    that never asked for a dependency change."""
+    agent, _events, workspace = run
+    assert "go.mod" not in agent.result.mutations
+    # And the drift is genuinely still there, which is what makes the point:
+    # the gate reported it rather than quietly applying it.
+    assert "api-db" in (workspace.root / "go.mod").read_text(encoding="utf-8")
 
 
 def test_the_ddl_is_written_but_never_applied(run) -> None:

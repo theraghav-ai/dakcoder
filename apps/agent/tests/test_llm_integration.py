@@ -21,7 +21,7 @@ def client_for(endpoint) -> LLMClient:
     )
 
 
-def context(mode: Mode = Mode.CODER) -> ContextManager:
+def context(mode: Mode = Mode.AGENT) -> ContextManager:
     cm = ContextManager(mode=mode, system_prompt=SYSTEM, tool_schema_tokens=1200)
     cm.set_task("Add a Pension resource", acceptance=["go build ./... clean"])
     cm.begin_turn()

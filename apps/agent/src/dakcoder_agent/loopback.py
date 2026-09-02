@@ -37,6 +37,7 @@ proceed on a mismatch rather than failing later in a way nobody can attribute.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import secrets
 import threading
 import uuid
@@ -51,8 +52,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from dakcoder_shared.envelope import Event, EventType
 
-from .loop import AgentLoop
-from .modes import Mode
+from .loop import AgentLoop, Outcome, RunResult
+from .modes import Intent
 from .session import Session, SessionStore, Status
 from .tools.router import ApprovalRequest
 
@@ -139,38 +140,51 @@ class Loopback:
         self.approvals: dict[str, PendingApproval] = {}
         self.contexts: dict[str, Any] = {}
         self.ready: dict[str, Any] = {"prewarmed": False}
+        #: The developer's gateway JWT, as the extension last refreshed it.
+        #: Read per request by the LLM client rather than captured at spawn —
+        #: see ``POST /v1/credential``. Empty means "whatever the process
+        #: started with", which is what ``serve`` falls back to.
+        self._credential: str = ""
+
+    def set_credential(self, jwt: str) -> None:
+        self._credential = jwt.strip()
+
+    def credential(self) -> str:
+        return self._credential
 
     # -- running a task -----------------------------------------------------
 
-    def start(self, task: str, *, mode: Mode = Mode.PLANNER, acceptance=()) -> Session:
+    def start(self, task: str, *, intent: Intent = Intent.AUTO, acceptance=()) -> Session:
         session = self.sessions.create(task)
         # Recorded before the loop is spawned, so the developer's own words are
         # the first row of the transcript rather than something only the panel
         # that happened to be open at the time remembers.
         session.record(Event(EventType.USER, {"text": task, "turn": 0}))
-        self._spawn(session, task, mode, tuple(acceptance))
+        self._spawn(session, task, intent, tuple(acceptance))
         return session
 
-    def _resume_mode(self, session: Session) -> Mode:
-        """Where a follow-up picks up.
+    def _resume_intent(self, session: Session) -> Intent:
+        """What a follow-up on this conversation is asking for.
 
-        The mode the conversation is actually in, not the Planner.
+        ``AUTO``, always, and that is the change. The old version returned the
+        *mode the previous run ended in* -- so a conversation that had finished
+        in the Debugger answered its next message with the Debugger's overlay,
+        its budget and its tool set, whatever the message said. It was written to
+        fix the opposite bug (a session that had just produced a plan re-planned
+        it on "go") and it fixed that one by hard-coding the other.
 
-        ``follow_up`` preserves the context with some care — the docstring below
-        explains why an amnesiac second question is unacceptable — and then
-        threw away the other half of where the run had got to. A session that
-        had just produced a plan and stopped for approval answered "go" by
-        entering the Planner and planning it again, because the default said so.
-        That is the same amnesia one level up: the working set remembered the
-        plan and the loop did not.
-
-        Falls back to the Planner when there is no context yet, which is a new
-        conversation and exactly where the Planner belongs.
+        Neither is a decision about what was asked. A follow-up is a new
+        request, and the classifier sees the conversation as well as the message
+        -- which is exactly what it needs to tell "go" after a plan from "go" as
+        a topic. Where the run resumes follows from that, not from where it
+        stopped.
         """
-        context = self.contexts.get(session.id)
-        return context.mode if context is not None else Mode.PLANNER
+        del session
+        return Intent.AUTO
 
-    def follow_up(self, session: Session, text: str, *, mode: Mode | None = None) -> Session:
+    def follow_up(
+        self, session: Session, text: str, *, intent: Intent | None = None
+    ) -> Session:
         """Another message in the same conversation.
 
         This is what a chat panel does when a run has finished and the developer
@@ -194,14 +208,16 @@ class Loopback:
         session.cancel = threading.Event()
         session.winding_down = threading.Event()
         session.record(Event(EventType.USER, {"text": text, "turn": session.turns}))
-        self._spawn(session, text, mode or self._resume_mode(session), (), continued=True)
+        self._spawn(
+            session, text, intent or self._resume_intent(session), (), continued=True
+        )
         return session
 
     def _spawn(
         self,
         session: Session,
         task: str,
-        mode: Mode,
+        intent: Intent,
         acceptance: tuple[str, ...],
         *,
         continued: bool = False,
@@ -269,14 +285,33 @@ class Loopback:
         def run() -> None:
             try:
                 for event in agent.run(
-                    task, acceptance=acceptance, start=mode, continued=continued
+                    task, acceptance=acceptance, intent=intent, continued=continued
                 ):
                     emit(event)
             except Exception as exc:  # noqa: BLE001 - a crashed run must still close
-                emit(Event(EventType.ERROR, {"message": f"the run failed: {exc}"}))
-                emit(Event(EventType.END, {"outcome": "error"}))
+                # A `finish` as well as an `end`, and in that order.
+                #
+                # This emitted `error` then `end` and nothing else, and every
+                # client derives "the run is over" from `finish`. So a crashed
+                # run left the panel on "Working..." forever, swallowed the next
+                # message as a mid-run correction, and gave the developer no
+                # sign that anything had gone wrong. The extension now treats
+                # `end` as terminal too, but a run that failed should say so in
+                # the same shape a run that succeeded does -- a client should
+                # not have to reconstruct the outcome from the absence of an
+                # event.
+                summary = f"the run failed: {exc}"
+                emit(Event(EventType.ERROR, {"message": summary}))
+                failed = RunResult(
+                    Outcome.ERROR,
+                    summary,
+                    getattr(agent.context, "turn", 0),
+                    tuple(agent.router.touched),
+                )
+                emit(Event(EventType.FINISH, failed.as_dict()))
+                emit(Event(EventType.END, failed.as_dict()))
                 session.status = Status.ERROR
-                session.summary = str(exc)
+                session.summary = summary
                 session.finished_at = datetime.now(tz=timezone.utc)
             else:
                 if agent.result is not None:
@@ -312,7 +347,10 @@ class Loopback:
         session.finished_at = None
         session.cancel = threading.Event()
         session.winding_down = threading.Event()
-        self._spawn(session, task, Mode.PLANNER, ())
+        # A resume is another go at work that did not land, so it is a change
+        # request by construction -- there is nothing for the classifier to
+        # decide.
+        self._spawn(session, task, Intent.AGENT, ())
         return session
 
     def _await_decision(self, session: Session, request: ApprovalRequest) -> bool:
@@ -402,6 +440,31 @@ def create_app(runtime: Loopback) -> FastAPI:
         authorise(authorization)
         return runtime.tool_catalog
 
+    # -- the developer's credential -----------------------------------------
+
+    @app.post("/v1/credential")
+    async def credential(
+        body: dict[str, Any], authorization: str | None = Header(default=None)
+    ) -> dict[str, Any]:
+        """Replace the JWT the runtime authenticates to the gateway with.
+
+        The daemon outlives the token it was spawned with. It used to be baked
+        into the HTTP client's default headers at construction, so from the
+        moment it expired every model call was a 401 — non-retryable, so every
+        task ended ERROR — and restarting the runtime was the only cure. The
+        extension is the only party that can mint a fresh one, so it pushes it
+        here; the client asks for the current value on every request.
+
+        Nothing is echoed back but a fingerprint. A token in a response body is
+        a token in a log.
+        """
+        authorise(authorization)
+        jwt = str(body.get("jwt", "")).strip()
+        if not jwt:
+            raise HTTPException(status_code=400, detail="jwt is required")
+        runtime.set_credential(jwt)
+        return {"ok": True, "fingerprint": hashlib.sha256(jwt.encode()).hexdigest()[:12]}
+
     # -- tasks --------------------------------------------------------------
 
     @app.post("/v1/tasks")
@@ -413,9 +476,16 @@ def create_app(runtime: Loopback) -> FastAPI:
         if not task:
             raise HTTPException(status_code=400, detail="task is required")
 
+        # `intent`, with `mode` still accepted for a client that has not been
+        # rebuilt. They are the same field on the wire and always were: the old
+        # `mode` default was "planner", which is also the backend default, so
+        # the server could not tell "let the agent choose" from "the developer
+        # asked for the Planner" -- and the answer it picked, for every message,
+        # was the phase that plans. `Intent.coerce` maps every retired name onto
+        # what it actually asked for.
         session = runtime.start(
             task,
-            mode=Mode(str(body.get("mode", "planner"))),
+            intent=Intent.coerce(body.get("intent") or body.get("mode")),
             acceptance=tuple(body.get("acceptance") or ()),
         )
         return session.as_dict()
@@ -622,13 +692,12 @@ def create_app(runtime: Loopback) -> FastAPI:
         else:
             # No default here. This read `body.get("mode", "planner")`, which
             # made every follow-up an explicit request for the Planner and left
-            # `follow_up`'s own default unreachable — so a session that had
-            # produced a plan and stopped for approval answered "go" by planning
-            # it again. Absent means "carry on where the conversation is"; a
-            # client that genuinely wants a mode still says so and is obeyed.
-            requested = body.get("mode")
+            # `follow_up`'s own default unreachable. Absent means "decide from
+            # the conversation", which is what the classifier is for; a client
+            # with an Ask/Agent toggle says which and is obeyed.
+            requested = body.get("intent") or body.get("mode")
             runtime.follow_up(
-                session, text, mode=Mode(str(requested)) if requested else None
+                session, text, intent=Intent.coerce(requested) if requested else None
             )
         return session.as_dict()
 

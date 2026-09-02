@@ -1309,6 +1309,16 @@
 
       case 'tool_pending': {
         const id = String(d.id || '');
+        /*
+         * `historical` is set by the host when this row is replayed from a run
+         * that has already ended. The card is drawn, because the approval is
+         * part of what happened; the buttons are not, because there is nothing
+         * left to answer. Without it, opening a finished session filled the
+         * panel with live Accept/Reject pairs that did nothing, and the
+         * approval poller then toasted "released by the runtime... recorded as
+         * a rejection" for every one of them five seconds later.
+         */
+        const historical = d.historical === true;
         put({
           key: 'ap:' + id,
           kind: 'approval',
@@ -1318,7 +1328,9 @@
           paths: Array.isArray(d.paths) ? d.paths : [],
           protectedPaths: Array.isArray(d.protected) ? d.protected : [],
           unconditional: d.unconditional === true,
+          decision: historical ? 'released' : undefined,
         });
+        if (historical) return;
         pendingApprovals.add(id);
         updateSkip();
         // Urgent, and the sentence names the skip link: the card is not focused,

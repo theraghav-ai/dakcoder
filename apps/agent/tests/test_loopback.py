@@ -24,12 +24,31 @@ from dakcoder_agent.loopback import API_VERSION, Loopback, create_app
 from dakcoder_agent.modes import Mode
 from dakcoder_agent.prompts import system_prompt
 from dakcoder_agent.session import Status
+from dakcoder_agent.tools import control
 from dakcoder_agent.tools.router import Router
 from dakcoder_shared.llm import ChatResult, ToolCall, Usage
 
 from test_loop import ScriptedClient, calls, say
 
 TOKEN = "loopback-token-for-tests"
+
+
+def plan_for(path: str, action: str = "edit it") -> ChatResult:
+    """The turn that ends the planning phase.
+
+    A plan is a `submit_plan` call now, not a numbered paragraph -- so a test
+    that scripts a run has to script the call. That is the point of the change:
+    the loop transitions on a typed event, and there is no prose for a test (or
+    a model) to phrase in a way the loop misreads.
+    """
+    return calls(
+        (
+            "submit_plan",
+            json.dumps(
+                {"steps": [{"file": path, "action": action, "accepts": "go build clean"}]}
+            ),
+        )
+    )
 
 
 @pytest.fixture
@@ -44,26 +63,52 @@ def scripted(router: Router, workspace):
     from dakcoder_agent.gate import GATE
     from dakcoder_shared.envelope import ToolResult
 
-    for stage in GATE:
-        router.handlers[stage.tool] = (
-            lambda _inv, _n=stage.tool: ToolResult.success(f"{_n}: clean")
-        )
-    for name in ("gofmt", "rules_lint", "go_diagnostics"):
-        router.handlers[name] = lambda _inv, _n=name: ToolResult.success(f"{_n}: clean")
+    # `rules_lint` carries `meta`, because the real one does: `gotools._report`
+    # copies the sidecar's counts there beside the rendered prose, and
+    # `_stage_passed` reads them. A stub returning bare text stands for a tool
+    # that does not exist -- and it is what let the blocking contract-lint stage
+    # look like it worked while being unable to fail on a finding (defect T1).
+    def clean(name: str):
+        meta = {"violations": 0, "files_scanned": 1} if name == "rules_lint" else {}
+        return lambda _inv, _n=name, _m=meta: ToolResult.success(f"{_n}: clean", meta=dict(_m))
 
-    # The coder edits, because the plan says to. A run whose plan names a file
-    # and never writes it is an unstarted run, and the loop says so rather than
-    # reporting the untouched repository's clean gate as success.
+    for stage in GATE:
+        router.handlers[stage.tool] = clean(stage.tool)
+    for name in ("gofmt", "rules_lint", "go_diagnostics"):
+        router.handlers[name] = clean(name)
+
+    router.handlers.update(control.HANDLERS)
+
+    # The plan arrives as a tool call, and the acting phase then writes the file
+    # it named. A run whose plan names a file and never writes it says so rather
+    # than reporting the untouched repository's clean gate as success.
     plan = {
         "turns": [
-            say("1. Add handler/pension.go"),
-            calls(("write_file", '{"path": "handler/pension.go", "content": "package handler"}')),
+            calls(
+                (
+                    "submit_plan",
+                    json.dumps(
+                        {
+                            "steps": [
+                                {
+                                    "file": "handler/pension.go",
+                                    "action": "add the Pension handler",
+                                    "accepts": "go build ./... clean",
+                                }
+                            ]
+                        }
+                    ),
+                )
+            ),
+            calls(
+                ("write_file", '{"path": "handler/pension.go", "content": "package handler"}')
+            ),
             say("done"),
         ]
     }
 
     def build(session, approve):
-        context = ContextManager(mode=Mode.PLANNER, system_prompt=system_prompt())
+        context = ContextManager(mode=Mode.ASK, system_prompt=system_prompt())
         return AgentLoop(context, ScriptedClient(plan["turns"]), router, approve=approve)
 
     runtime = Loopback(
@@ -279,7 +324,7 @@ async def test_events_for_an_unknown_session_are_a_404(client: httpx.AsyncClient
 def approving(scripted: Loopback):
     """A script that tries to patch go.mod, which needs approval."""
     scripted._plan["turns"] = [
-        say("1. Edit go.mod"),
+        plan_for("go.mod", "change the module line"),
         calls(("patch_file", json.dumps(
             {"path": "go.mod", "old": "module pisapi", "new": "module x"}))),
         say("done"),
@@ -463,7 +508,7 @@ async def test_a_revert_plan_lists_the_exact_paths(
     """§12 asks for the confirmation to list them, because "revert my last task"
     is easy to fire by accident."""
     scripted._plan["turns"] = [
-        say("1. Write"),
+        plan_for("handler/pension.go", "add the handler"),
         calls(("write_file", json.dumps(
             {"path": "handler/pension.go", "content": "package handler"}))),
         say("done"),
@@ -480,7 +525,7 @@ async def test_revert_deletes_what_the_session_created(
     client: httpx.AsyncClient, scripted: Loopback, git_workspace
 ) -> None:
     scripted._plan["turns"] = [
-        say("1. Write"),
+        plan_for("handler/pension.go", "add the handler"),
         calls(("write_file", json.dumps(
             {"path": "handler/pension.go", "content": "package handler"}))),
         say("done"),
@@ -498,7 +543,7 @@ async def test_revert_restores_what_the_session_changed(
 ) -> None:
     original = (git_workspace.root / "handler/user.go").read_bytes()
     scripted._plan["turns"] = [
-        say("1. Patch"),
+        plan_for("handler/pension.go", "patch the handler"),
         calls(("patch_file", json.dumps(
             {"path": "handler/user.go", "old": "func New()", "new": "func Renamed()"}))),
         say("done"),
@@ -532,7 +577,7 @@ async def test_revert_outside_a_git_repository_is_blocked_not_attempted(
     """Blocked with a reason rather than silently doing nothing: a revert that
     reports success and changes nothing is the worst of both."""
     scripted._plan["turns"] = [
-        say("1. Write"),
+        plan_for("handler/pension.go", "add the handler"),
         calls(("write_file", json.dumps({"path": "a/b.go", "content": "package b"}))),
         say("done"),
     ]

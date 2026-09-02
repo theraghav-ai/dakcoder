@@ -46,9 +46,9 @@ def test_prefix_is_byte_identical_across_turns_and_modes():
         cm.append_assistant(f"working on step {turn}")
         cm.append_tool_result("rules_lint", "OK — 0 violations")
         if turn == 4:
-            cm.switch_mode(Mode.VERIFIER, "Run the verification gate.")
+            cm.switch_mode(Mode.ASK, "Run the verification gate.")
         if turn == 7:
-            cm.switch_mode(Mode.DEBUGGER, "Reproduce, then localise.")
+            cm.switch_mode(Mode.AGENT, "Reproduce, then localise.")
 
         assert cm.build()[0] is head, "the system message was replaced"
         assert cm.build()[0].content == SYSTEM
@@ -74,7 +74,7 @@ def test_mode_switch_appends_and_never_rewrites_history():
     cm.append_assistant("planned")
     before = cm.build()
 
-    cm.switch_mode(Mode.CODER, "Execute plan step 1.")
+    cm.switch_mode(Mode.AGENT, "Execute plan step 1.")
     after = cm.build()
 
     assert len(after) == len(before) + 1
@@ -82,7 +82,7 @@ def test_mode_switch_appends_and_never_rewrites_history():
     # inserted instruction goes into the pinned head region, above the working
     # set, so the assistant turn keeps its relative position at the end.
     assert after[-1] == before[-1]
-    assert cm.mode is Mode.CODER
+    assert cm.mode is Mode.AGENT
 
 
 def test_task_and_acceptance_are_pinned_above_the_working_set():
@@ -177,6 +177,15 @@ def test_small_results_pass_through_untouched():
 
 
 # ── the file-slice ledger ───────────────────────────────────────────────────
+#
+# `ContextManager.SUPERSEDE_SLICES` says why this is still on at a 245,760-token
+# budget, against the failure report's advice: measured, turning it off puts
+# `test_budget_regression`'s P95 at 166,801 tokens against a 128,000 target.
+# What the report is right about is the bug, and the containment rule below is
+# what fixes that -- a read is replaced only when every line of it is inside a
+# newer read further down.
+
+
 
 
 def test_only_the_newest_read_of_a_path_survives():
@@ -288,7 +297,7 @@ def test_stale_stubs_are_not_re_superseded():
 def test_usage_accounts_for_every_layer_and_the_tool_schemas():
     cm = manager(tool_schema_tokens=1200)
     cm.set_task("Add Pension", acceptance=["clean"])
-    cm.switch_mode(Mode.CODER, "Execute the plan.")
+    cm.switch_mode(Mode.AGENT, "Execute the plan.")
     cm.begin_turn()
     cm.append_assistant("thinking")
     cm.append_tool_result("rules_lint", "OK")
@@ -307,7 +316,7 @@ def test_usage_accounts_for_every_layer_and_the_tool_schemas():
     "mode,budget",
     # Read off the constant rather than restated, so raising the budget is one
     # edit rather than a hunt for every place that pinned the old number.
-    [(Mode.PLANNER, PROMPT_BUDGET), (Mode.CODER, PROMPT_BUDGET), (Mode.DEBUGGER, PROMPT_BUDGET)],
+    [(Mode.PLANNER, PROMPT_BUDGET), (Mode.AGENT, PROMPT_BUDGET), (Mode.AGENT, PROMPT_BUDGET)],
 )
 def test_budget_follows_the_mode(mode: Mode, budget: int):
     assert manager(mode=mode).budget == budget
@@ -411,7 +420,7 @@ def test_compaction_keeps_the_most_recent_turns_verbatim():
 def test_compaction_never_evicts_the_pinned_layers():
     cm = manager()
     cm.set_task("Add Pension", acceptance=["go build clean"])
-    cm.switch_mode(Mode.CODER, "Execute.")
+    cm.switch_mode(Mode.AGENT, "Execute.")
     for i in range(12):
         cm.begin_turn()
         cm.append_assistant(f"step {i}")
@@ -453,7 +462,17 @@ def test_compacting_an_empty_working_set_is_a_no_op():
 
 def test_estimate_is_recalibrated_from_real_usage():
     """§16.4: the frontend agent reserves a flat 4,096 tokens and never
-    reconciles, which is why its quota is fiction."""
+    reconciles, which is why its quota is fiction.
+
+    The `prompt_tokens` here is derived from the *whole* prompt -- message
+    content plus the tool schemas -- because that is what the endpoint reports.
+    Deriving it from content alone is defect T11: the numerator counted less
+    than the denominator, every observed ratio came out low, the calibrated
+    ratio was dragged toward its floor, and every estimate built on it ran high.
+    That estimate is what compaction fires on and what `X-Estimated-Tokens`
+    reserves against a 600k/hour quota, so a long run over-reserved its way into
+    429s it had not earned.
+    """
     cal = Calibration()
     assert not cal.calibrated
 
@@ -462,10 +481,33 @@ def test_estimate_is_recalibrated_from_real_usage():
     cm.begin_turn()
     cm.append_assistant("some content of a realistic length " * 20)
 
-    chars = sum(len(m.content) for m in cm.build())
-    cm.observe_usage(prompt_tokens=chars // 3)  # a denser tokenizer than assumed
+    content_chars = sum(len(m.content) for m in cm.build())
+    # 1,200 schema tokens is what `manager` declares; at the default 4.0 ratio
+    # that is 4,800 characters on the wire the endpoint will also charge for.
+    whole_prompt = content_chars + 1_200 * 4
+    cm.observe_usage(prompt_tokens=whole_prompt // 3)  # a denser tokenizer than assumed
     assert cal.calibrated
     assert cal.ratio < 4.0
+
+
+def test_calibration_counts_the_tool_schemas_and_not_just_the_messages():
+    """Defect T11, as a regression.
+
+    Two managers, identical messages, identical reported `prompt_tokens`. The
+    one carrying tool schemas is describing a *bigger* prompt for the same
+    token count, so its characters-per-token must come out higher. When the
+    numerator ignored the schemas the two were indistinguishable.
+    """
+    bare, with_tools = Calibration(), Calibration()
+
+    for cal, schema_tokens in ((bare, 0), (with_tools, 4_000)):
+        cm = manager(calibration=cal, tool_schema_tokens=schema_tokens)
+        cm.set_task("t")
+        cm.begin_turn()
+        cm.append_assistant("some content of a realistic length " * 20)
+        cm.observe_usage(prompt_tokens=2_000)
+
+    assert with_tools.ratio > bare.ratio
 
 
 def test_calibration_is_bounded_against_a_malformed_usage_payload():
@@ -500,9 +542,9 @@ def test_a_thinking_mode_must_budget_for_a_runaway_reasoning_block():
     1,247 then 9,948 then 4,828 characters for the same prompt — so a tight
     budget does not produce a worse answer, it produces content: null."""
     with pytest.raises(ValueError, match="content: null"):
-        ModeConfig(Mode.DEBUGGER, 32_768, 4096, enable_thinking=True, temperature=0.1)
+        ModeConfig(Mode.AGENT, 32_768, 4096, enable_thinking=True, temperature=0.1)
 
-    ok = ModeConfig(Mode.DEBUGGER, 32_768, 6144, enable_thinking=True, temperature=0.1)
+    ok = ModeConfig(Mode.AGENT, 32_768, 6144, enable_thinking=True, temperature=0.1)
     assert ok.enable_thinking
 
 
@@ -526,7 +568,7 @@ def test_inspect_reports_what_the_context_inspector_renders():
     snap = cm.inspect()
     for key in ("mode", "turn", "total_tokens", "budget", "used_pct", "by_layer", "compactions"):
         assert key in snap
-    assert snap["mode"] == "coder"
+    assert snap["mode"] == "ask"
     assert snap["by_layer"]["working_set"] > 0
 
 
@@ -542,39 +584,38 @@ def test_over_budget_error_exists_for_the_overflow_path():
 def test_the_mode_layer_does_not_grow_without_limit():
     """MODE is pinned, so compaction can never reclaim it.
 
-    A run that walks the escalation ladder switches mode on nearly every turn.
-    One session reached thirteen instructions stacked in the head — five Coder,
-    four Verifier — each contradicting the one above it, in the one layer that
-    is exempt from eviction.
+    A run that switched mode on nearly every turn reached thirteen instructions
+    stacked in the head -- five Coder, four Verifier -- each contradicting the
+    one above it, in the one layer that is exempt from eviction. Bounding it at
+    six stopped it growing and did nothing about six sets of live instructions:
+    the Verifier read the Coder's and announced it was about to make an edit.
+
+    The bound is one now. The head carries the instruction in force and nothing
+    else, so there is no "which of these is current" for the model to get wrong
+    and no preamble needed to tell it.
     """
     cm = manager()
     cm.set_task("t")
     for _ in range(20):
         cm.begin_turn()
-        cm.switch_mode(Mode.CODER, "Execute one plan step.")
-        cm.switch_mode(Mode.VERIFIER, "Report; do not fix.")
+        cm.switch_mode(Mode.AGENT, "Execute one plan step.")
+        cm.switch_mode(Mode.ASK, "Report; do not fix.")
 
     modes = [m for m in cm.build() if m.layer is Layer.MODE]
     assert len(modes) <= MAX_MODE_MESSAGES
-    # `endswith` rather than `==`: every overlay after the first is prefixed with
-    # a line saying it replaces the ones above it. Bounding the stack kept the
-    # head from growing; it did nothing about six sets of live instructions, and
-    # the Verifier read the Coder's and announced it was about to make an edit.
-    assert modes[-1].content.endswith("Report; do not fix."), (
-        "the current mode must be the last word"
+    assert modes[-1].content == "Report; do not fix.", (
+        "the current mode must be the only word"
     )
-    assert "replaces the mode instructions above it" in modes[-1].content
-
 
 def test_re_entering_the_mode_you_are_in_restates_nothing():
     """Cheaper than the guard in the loop and, unlike it, keeps the head
     byte-identical — so a re-entry costs no prefill either."""
     cm = manager()
     cm.set_task("t")
-    cm.switch_mode(Mode.CODER, "Execute one plan step.")
+    cm.switch_mode(Mode.AGENT, "Execute one plan step.")
     before = cm.build()
 
-    cm.switch_mode(Mode.CODER, "Execute one plan step.")
+    cm.switch_mode(Mode.AGENT, "Execute one plan step.")
 
     assert cm.build() == before
 
@@ -656,7 +697,7 @@ def test_the_tools_array_is_counted_against_the_budget():
     compaction threshold, the retention floor and `complete`'s budget check
     were all decided against a prompt smaller than the one actually sent.
     """
-    cm = ContextManager(mode=Mode.CODER, system_prompt=SYSTEM)
+    cm = ContextManager(mode=Mode.AGENT, system_prompt=SYSTEM)
     cm.set_task("t")
     assert cm.usage().tools == 0
 
@@ -666,21 +707,22 @@ def test_the_tools_array_is_counted_against_the_budget():
     assert cm.usage().total > sum(cm.usage().by_layer.values()) - 1
 
 
-def test_each_overlay_says_it_replaces_the_ones_above_it():
-    """The Verifier is handed no write tool and its overlay opens "Report; do
+def test_only_the_overlay_in_force_is_in_the_head():
+    """The Verifier was handed no write tool and its overlay opened "Report; do
     not fix anything here". It announced "My job is to make the edit" on four
     separate turns, because the Coder's instruction was still sitting two
     messages above its own in the pinned head.
 
-    Bounding the stack at six stopped it growing; it did not stop six sets of
-    instructions all reading as current.
+    The earlier fix prefixed each overlay with "this replaces the ones above
+    it", which is one more sentence in a pile of contradictory sentences for a
+    27B model at temperature 0.1 to weigh. Removing the pile is the fix.
     """
     cm = manager()
     cm.set_task("t")
-    cm.switch_mode(Mode.CODER, "Execute one plan step.")
-    cm.switch_mode(Mode.VERIFIER, "Report; do not fix anything here.")
+    cm.switch_mode(Mode.AGENT, "Execute one plan step.")
+    cm.switch_mode(Mode.ASK, "Report; do not fix anything here.")
 
     overlays = [m for m in cm.build() if m.layer is Layer.MODE]
-    assert "replaces" not in overlays[0].content, "the first overlay replaces nothing"
-    assert "replaces the mode instructions above it" in overlays[-1].content
-    assert "verifier" in overlays[-1].content
+    assert len(overlays) == 1, "a superseded overlay must not stay in the head"
+    assert overlays[0].content == "Report; do not fix anything here."
+    assert "Execute one plan step." not in overlays[0].content

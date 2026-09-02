@@ -15,7 +15,7 @@ from dakcoder_shared.paths import Workspace
 
 
 def run(router: Router, tool: str, **args):
-    return router.dispatch(tool, args, mode=Mode.CODER)
+    return router.dispatch(tool, args, mode=Mode.AGENT)
 
 
 # ── line endings ────────────────────────────────────────────────────────────

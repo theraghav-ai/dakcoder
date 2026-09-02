@@ -57,6 +57,16 @@ const BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000, 15_000];
 /** Reconnecting is normal; say "offline" only once it has stopped looking like a blip. */
 const OFFLINE_AFTER_ATTEMPTS = 3;
 
+/**
+ * How many reconnect attempts before the run is reported as unreachable.
+ *
+ * There was no such limit: `isPermanent` only recognises an `HttpError`, and a
+ * runtime that has exited answers with a `TypeError` from `fetch`, so the loop
+ * retried a dead socket indefinitely. Twelve attempts across the backoff table
+ * is a little over two minutes.
+ */
+const MAX_RECONNECT_ATTEMPTS = 12;
+
 // ── the derived view types ──────────────────────────────────────────────────
 //
 // These are *derivations*, not wire shapes. Where a wire object is carried
@@ -216,6 +226,8 @@ export class RunState implements vscode.Disposable {
   private _lastError?: string;
   private _connection: Connection = 'idle';
   private _attached = false;
+  /** True only while `hydrate` is replaying a stored transcript. */
+  private replaying = false;
   private _active = false;
 
   private readonly entries: TranscriptEntry[] = [];
@@ -257,16 +269,20 @@ export class RunState implements vscode.Disposable {
    */
   get modeLabel(): string {
     switch (this._mode) {
+      case 'ask':
+        return vscode.l10n.t('reading');
       case 'planner':
         return vscode.l10n.t('planning');
+      case 'agent':
+        return vscode.l10n.t('working');
+      // The retired five. Kept so a stored session recorded under them still
+      // reads as English rather than as a raw wire value.
       case 'scaffolder':
-        return vscode.l10n.t('scaffolding');
       case 'coder':
-        return vscode.l10n.t('coding');
+      case 'debugger':
+        return vscode.l10n.t('working');
       case 'verifier':
         return vscode.l10n.t('verifying');
-      case 'debugger':
-        return vscode.l10n.t('debugging');
       default:
         // C2: an unknown mode is displayed, not swallowed. Better a word the
         // developer can search for than a state the UI pretends is idle.
@@ -484,7 +500,29 @@ export class RunState implements vscode.Disposable {
       ? Date.parse(summary.finished_at) || Date.now()
       : undefined;
 
-    for (const event of summary.transcript ?? []) this.ingest(event);
+    /*
+     * A stored transcript is history, and the difference matters for exactly
+     * one row: `tool_pending`.
+     *
+     * Opening a finished session replayed every approval it had ever raised as
+     * a live card with Accept and Reject on it, and five seconds later the
+     * approval poller noticed the runtime was not holding them and toasted
+     * "released by the runtime... recorded as a rejection" for each one.
+     * Buttons that did nothing, followed by a warning about a decision nobody
+     * made.
+     *
+     * Replay is the right discriminator rather than "is the run finished",
+     * because a `tool_pending` in a *transcript* is history whatever the
+     * session's status: an approval that is genuinely still open comes back
+     * separately below, in `summary.pending_approvals`, which is the server's
+     * live set and the only authority on the question.
+     */
+    this.replaying = true;
+    try {
+      for (const event of summary.transcript ?? []) this.ingest(event);
+    } finally {
+      this.replaying = false;
+    }
     for (const path of summary.mutations) this.notePath(path);
     for (const approval of summary.pending_approvals ?? []) {
       this.approvals.set(approval.id, approval);
@@ -640,6 +678,35 @@ export class RunState implements vscode.Disposable {
 
       const wait = this.retryDelay(failures);
       failures += 1;
+      // Give up eventually.
+      //
+      // Only an `HttpError` counted as permanent, and a dead daemon does not
+      // produce one - `fetch failed` is a `TypeError`. So a runtime that had
+      // exited was reconnected to forever, at fifteen-second intervals, behind
+      // a "Working..." spinner nothing could ever resolve. The developer's only
+      // signal was that nothing happened, which is the same signal every other
+      // failure gave them.
+      //
+      // The backoff table tops out at 15s, so this is roughly two minutes of
+      // trying before the run is reported as unreachable. Long enough for a VPN
+      // blink or a runtime restart; short enough that a real death is visible
+      // while the developer is still looking at it.
+      if (failures >= MAX_RECONNECT_ATTEMPTS) {
+        this._lastError = vscode.l10n.t(
+          'Lost contact with the runtime after {0} attempts. It may have exited; try again to restart it.',
+          failures,
+        );
+        this._status = 'error';
+        this._summary = this._lastError;
+        this._finishedAt = Date.now();
+        this._attached = false;
+        this.approvals.clear();
+        this.inFlight.clear();
+        this.setConnection('closed');
+        this.settleActivity();
+        this.scheduleChange();
+        return;
+      }
       this.setConnection(failures >= OFFLINE_AFTER_ATTEMPTS ? 'offline' : 'reconnecting');
       await sleep(wait, signal);
     }
@@ -662,6 +729,25 @@ export class RunState implements vscode.Disposable {
   // ── ingestion ─────────────────────────────────────────────────────────────
 
   private ingest(event: WireEvent): void {
+    /*
+     * A stored `tool_pending` from a run that has ended is history, not a
+     * question, and is marked as such before anything renders it.
+     *
+     * Opening a finished session replays its transcript through this same path,
+     * so every approval it ever raised came back to the panel as a live card
+     * with Accept and Reject on it - and five seconds later the approval poller
+     * noticed the runtime was not holding them and toasted "released by the
+     * runtime... recorded as a rejection" for each one. Buttons that do
+     * nothing, followed by a warning about a decision nobody made.
+     *
+     * `replaying` is the whole test: an approval that is genuinely still open
+     * arrives through `summary.pending_approvals`, which is the server's live
+     * set, not through a row in the transcript.
+     */
+    if (event.type === 'tool_pending' && this.replaying) {
+      event = { ...event, data: { ...(event.data ?? {}), historical: true } };
+    }
+
     // Re-emitted first, so a consumer that renders raw events sees them in
     // exactly the order the server sent them, before any derived state moves.
     this.receiveEmitter.fire(event);
@@ -758,6 +844,9 @@ export class RunState implements vscode.Disposable {
       case 'tool_pending': {
         this.release();
         const approval = readApproval(d);
+        // Replayed from a stored transcript: recorded, never presented. See
+        // the note in `hydrate`.
+        if (this.replaying) break;
         this.approvals.set(approval.id, approval);
         this.approvalEmitter.fire(approval);
         break;
@@ -890,8 +979,42 @@ export class RunState implements vscode.Disposable {
         break;
       }
 
-      case 'end':
+      case 'end': {
+        /*
+         * `end` is terminal, whether or not `finish` came first.
+         *
+         * The panel's `running` flag cleared only on `finish`, and a crashed run
+         * never sends one: the runtime emits `error` then `end` and the thread
+         * dies. So any backend exception - a gateway 401 on an expired token, a
+         * timeout inside the loop - froze the panel on "Working..." forever, and
+         * the developer's next message was then treated as a mid-run correction,
+         * queued against a session that had stopped, and never seen again. From
+         * the panel, every backend failure looked like "your message, then
+         * nothing".
+         *
+         * `end.outcome` carries the answer and was ignored outright. It is read
+         * here, and a run that reached `finish` first keeps the status it set:
+         * `finish` is the richer event and must not be overwritten by the
+         * envelope that follows it.
+         */
+        if (this._status === 'running') {
+          this._status = str(d.outcome, 'error');
+          this._summary = str(d.summary) || this._summary;
+          this._finishedAt = at;
+          this.setStreaming('');
+          for (const path of strings(d.mutations)) this.notePath(path);
+        }
+        // Nothing can still be waiting on a run that has ended, however it
+        // ended. Without this a crashed run leaves approval cards on screen
+        // that nothing will ever answer.
+        this.approvals.clear();
+        this.inFlight.clear();
+        this.release();
+        this._attached = false;
+        this.settleActivity();
+        this.scheduleChange();
         return;
+      }
 
       default:
         // C2: an unknown type is a row we skip, not an error we show.

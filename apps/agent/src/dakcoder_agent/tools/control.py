@@ -1,0 +1,159 @@
+"""The two tools that end the planning phase.
+
+They are the whole of Track A item 3, and the reason they exist is worth stating
+plainly, because "make the plan a tool call" sounds like a refactor and is not.
+
+A plan used to be *whatever prose the Planner returned*. The loop decided
+whether it was a plan by counting lines that began with a number
+(``_count_steps``), whether it was a question by counting question marks
+(``_asks_the_developer``), whether it was a refusal by matching "I cannot"
+(``_refuses_to_plan``), and whether it was really an explanation by matching
+twenty verbs against the task (``_is_explanation``). Every one of those was
+wrong in the field, and the module's own comment concedes why: *"A description
+of a deviation is indistinguishable from a proposal to remove it, and no regex
+over prose can separate them."*
+
+So the model says which it is, by calling one of these. The reply is typed,
+validated against a schema it was shown, and carries a ``tool_call_id``; the
+loop transitions on that event and never reads the prose to find out what
+happened. What is deleted along with the guessing: ``_STEP``, ``_count_steps``,
+``_PLAN_EDITS``, ``_PLAN_PATH``, ``_ACCEPTS``, ``_STEP_START``, ``_REFUSES``,
+``_asks_the_developer``, ``_refuses_to_plan``, ``_restated_the_plan``,
+``_plan_targets``, ``_is_scaffold_plan``.
+
+Neither tool touches the workspace. They are handlers rather than something the
+loop intercepts before dispatch so that argument validation, coercion, the
+malformed-arguments message and the tool-result envelope are the same ones every
+other tool gets -- an intercept would be a second, quietly different code path
+for the one call a run cannot afford to get wrong.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from dakcoder_shared.envelope import ToolResult
+
+from .router import Invocation
+
+__all__ = ["HANDLERS", "PlanStep", "steps_from_meta"]
+
+
+@dataclass(frozen=True, slots=True)
+class PlanStep:
+    """One step, as the model submitted it.
+
+    ``file`` is what makes the plan checkable: at the end of a run the loop can
+    say which steps were never written, and it can say it from a field the model
+    filled in rather than from a regex over its prose. ``_plan_targets`` used to
+    guess this by finding the first path-shaped token in each numbered paragraph,
+    which reported a neighbour named as an example as an unwritten target.
+    """
+
+    file: str
+    action: str
+    accepts: str
+
+    def rendered(self, index: int) -> str:
+        return f"{index}. {self.file} — {self.action}\n   Accepts: {self.accepts}"
+
+
+def steps_from_meta(meta: dict[str, Any]) -> tuple[PlanStep, ...]:
+    """Rebuild the typed steps from a tool result's ``meta``."""
+    out: list[PlanStep] = []
+    for raw in meta.get("steps") or ():
+        if not isinstance(raw, dict):
+            continue
+        out.append(
+            PlanStep(
+                file=str(raw.get("file", "")).strip(),
+                action=str(raw.get("action", "")).strip(),
+                accepts=str(raw.get("accepts", "")).strip(),
+            )
+        )
+    return tuple(out)
+
+
+def submit_plan(inv: Invocation) -> ToolResult:
+    """Accept the plan and hand the run on to the acting mode.
+
+    The router has already checked that every step carries a file, an action and
+    an acceptance criterion, so there is nothing left to validate here beyond
+    the one thing a schema cannot express: a plan with no steps in it.
+
+    The rendered text is what the developer and the next turns read; the typed
+    steps travel in ``meta`` for the loop.
+    """
+    raw = inv.arg("steps") or []
+    steps = tuple(
+        PlanStep(
+            file=str(s.get("file", "")).strip(),
+            action=str(s.get("action", "")).strip(),
+            accepts=str(s.get("accepts", "")).strip(),
+        )
+        for s in raw
+        if isinstance(s, dict)
+    )
+    if not steps:
+        return ToolResult.failure(
+            "submit_plan was called with no steps.",
+            fix="Send at least one step, each naming the file it changes, what "
+            "changes in it, and how it is checked. If the task genuinely needs "
+            "no change, say so in one sentence instead of calling this.",
+        )
+
+    summary = str(inv.arg("summary") or "").strip()
+    body = "\n".join(step.rendered(i) for i, step in enumerate(steps, 1))
+    if summary:
+        body = f"{summary}\n\n{body}"
+
+    return ToolResult.success(
+        f"Plan accepted, {len(steps)} step(s). Work starts now — you hold the "
+        f"write tools from this turn on.\n\n{body}",
+        meta={
+            "control": "plan",
+            "summary": summary,
+            "steps": [
+                {"file": s.file, "action": s.action, "accepts": s.accepts} for s in steps
+            ],
+        },
+    )
+
+
+def ask_developer(inv: Invocation) -> ToolResult:
+    """Stop and put the questions to the developer.
+
+    The run ends here, deliberately and cleanly. The questions are the last thing
+    on screen, and the developer's answer arrives as a follow-up on this same
+    transcript — which is what a continued session is for, and what the Planner
+    was waiting on all along.
+
+    The old path reached the same place by accident and much later: a numbered
+    list of questions counted as a numbered list of steps, so it was pinned as
+    the plan, the Coder found nothing to execute, the gate ran on an untouched
+    workspace, and the ladder cycled until the escalation budget ran out — with
+    four unanswered questions still on screen and the run reported ``unverified``.
+    """
+    questions = [str(q).strip() for q in (inv.arg("questions") or []) if str(q).strip()]
+    if not questions:
+        return ToolResult.failure(
+            "ask_developer was called with no questions.",
+            fix="Ask at least one, or submit the plan with what you inferred.",
+        )
+    assumed = str(inv.arg("assumed") or "").strip()
+
+    body = "\n".join(f"{i}. {q}" for i, q in enumerate(questions[:4], 1))
+    if assumed:
+        body += f"\n\nInferred without asking: {assumed}"
+
+    return ToolResult.success(
+        body,
+        meta={"control": "ask", "questions": questions[:4], "assumed": assumed},
+    )
+
+
+HANDLERS: dict[str, Any] = {
+    "submit_plan": submit_plan,
+    "ask_developer": ask_developer,
+}
