@@ -1501,6 +1501,25 @@ class AgentLoop:
             "reasoning_tokens": result.chat.usage.reasoning_tokens,
             "estimate_error": result.estimate_error,
         }
+        # One line per call, which is the thing an in-progress run makes
+        # visible and the end-of-run summary cannot: a run that is climbing
+        # towards the ceiling looks identical to one that is not until it
+        # arrives. `estimate_error` is here because the prompt budget is
+        # enforced against the estimate, so a drift is a budget being enforced
+        # against a number that means less than it says.
+        log.info(
+            "turn %d %s: prompt %d/%d tokens (%.0f%%), completion %d, cached %d, "
+            "estimate x%.3f",
+            self.context.turn,
+            self.state.mode,
+            result.actual_prompt_tokens,
+            usage.budget,
+            usage.used_pct,
+            result.chat.usage.completion_tokens,
+            result.chat.usage.cached_tokens or 0,
+            result.estimate_error,
+        )
+
         if reasoning_leaked(result):
             # Non-zero reasoning in a thinking-off mode means
             # chat_template_kwargs is not reaching the model: ~15x the latency

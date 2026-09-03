@@ -208,6 +208,24 @@ Tests: seven in `test_regression_audit.py`, including one that runs the report
 as a subprocess against a journal with the truncated last line a hard kill
 leaves.
 
+**Amended after a redeploy showed nothing.** The first cut logged only at the
+*end* of a run, so a restarted runtime that had not completed one looked exactly
+like a runtime where the change had not landed — and the runtime's whole log,
+across every restart, had been one `{"port": ...}` line. Two additions, both
+about being able to tell those apart:
+
+* a **startup line** naming the level and the budget arithmetic, so a redeploy
+  proves the plumbing on its own and records what configuration a run was made
+  under;
+* a **per-call line** — prompt tokens against the budget, completion, cached,
+  and the estimate ratio — which is what the original request asked for first
+  and what makes a run visible while it is climbing rather than only once it
+  has arrived.
+
+Verified against the live endpoint rather than a stub: a second runtime on a
+spare port, a real task, `Qwen3.6-35B` answering, and the three kinds of line in
+`runtime.log`.
+
 ### 4.5 — the output budgets, and the arithmetic nobody was checking · done
 
 Asked for directly: raise the output limits, since a 245,760 prompt budget

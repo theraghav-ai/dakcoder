@@ -214,6 +214,31 @@ def _configure_logging() -> None:
         logger.handlers[:] = [handler]
         logger.propagate = False
 
+    # Said out loud, on every start.
+    #
+    # Without it there is no way to tell "logging is configured and this run was
+    # quiet" from "logging is not reaching the file at all" — and those need
+    # completely different things done about them. The runtime used to write
+    # exactly one line ever, the `{"port": ...}` announcement on stdout, so an
+    # operator tailing runtime.log after a redeploy saw the same thing whether
+    # the change had landed or not.
+    #
+    # It also records what configuration a run was made under, which is the
+    # first question asked of any number that comes out of it.
+    from .modes import CONTEXT_WINDOW, Mode, config_for
+
+    agent = config_for(Mode.AGENT)
+    logging.getLogger("dakcoder_agent").info(
+        "logging at %s; model window %d tokens = prompt budget %d + output %d "
+        "(agent) + %d reserved. Per-call and per-run lines follow; "
+        "DAKCODER_LOG_LEVEL=debug for more.",
+        logging.getLevelName(resolved),
+        CONTEXT_WINDOW,
+        agent.prompt_budget,
+        agent.max_tokens,
+        CONTEXT_WINDOW - agent.prompt_budget - agent.max_tokens,
+    )
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dakcoderd", description="the dakcoder runtime")
