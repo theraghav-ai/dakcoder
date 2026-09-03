@@ -147,6 +147,78 @@ before spawning the runtime (matched by shape, not from a list that would go
 out of date the first time a role was added), the extension does the same at
 spawn, and `local_config` refuses to build a configuration that has one (§4.7).
 
+## Measuring whether the context window is big enough
+
+Three records, in increasing order of detail. All of them are already being
+written; none of them costs a model call to read.
+
+**1. One line per run, in `deploy/logs/runtime.log`.** Enough to notice that a
+run was shaped by the window rather than by the task:
+
+```
+2026-09-03T10:00:51 INFO dakcoder_agent.loop  run 9f2c unverified in 180 turn(s):
+  peak prompt 233000/235520 tokens (89% of the window), 5 compaction(s) discarding
+  755000 tokens, 1 truncation(s), 40 file(s) evicted then re-read,
+  3 read(s) refused as already held, 2600000 bytes of source read
+```
+
+`DAKCODER_LOG_LEVEL=debug` in `deploy/dakcoder.env` turns on per-turn detail.
+The default is `info`, which is this line and the warnings around it.
+
+**2. The report, across every run a workspace has journalled.**
+
+```bash
+.venv/bin/python scripts/context-report.py --workspace /path/to/the/repo
+.venv/bin/python scripts/context-report.py --workspace /path/to/the/repo --json
+```
+
+Reads `.dakcoder/sessions/*/events.jsonl` — written by the runtime as it goes,
+so this works on runs that have already happened, including ones recorded before
+the accounting existed. It separates two things a claim has to keep apart:
+
+* **pressure** — a compaction fired, or a reply was cut off. Real, but a
+  threshold can be moved and a budget can be retuned, so on its own it argues
+  about tuning rather than about the window.
+* **loss** — a file was evicted and then read again, or a read was refused
+  because the content was already held. That is the evidence: a window large
+  enough for the task produces none of it at any threshold.
+
+The last section is the one that settles it. It totals the *unique source* each
+run had to read and puts it against the prompt budget, so a task whose files
+alone exceed the window is visible as arithmetic rather than as an argument.
+It counts only `read_file` bytes — not the system prompt, the tool schemas, the
+plan, the assistant messages or any other tool result — so it is a floor on what
+the task needed.
+
+**3. The gateway ledger, in Postgres, which is the billing-grade record.**
+Every metered turn, with the endpoint's own token counts rather than the agent's
+estimate:
+
+```sql
+-- per session: how big the prompts got, and how much was cache
+SELECT session_id, mode, count(*) AS turns,
+       max(prompt_tokens) AS peak_prompt, sum(prompt_tokens) AS total_prompt,
+       sum(completion_tokens) AS completion, sum(reasoning_tokens) AS reasoning,
+       round(100.0 * sum(cached_tokens) / nullif(sum(prompt_tokens), 0), 1) AS cache_pct
+FROM usage_events GROUP BY session_id, mode ORDER BY peak_prompt DESC LIMIT 20;
+
+-- how close the prompts get to the 262,144-token window
+SELECT width_bucket(prompt_tokens, 0, 262144, 10) * 26214 AS bucket_ceiling,
+       count(*) AS turns
+FROM usage_events GROUP BY 1 ORDER BY 1;
+
+-- the agent's estimate against the endpoint's truth, which is what the
+-- prompt budget is enforced with
+SELECT round(avg(estimated_tokens::numeric / nullif(prompt_tokens, 0)), 3) AS mean_ratio,
+       min(estimated_tokens::numeric / nullif(prompt_tokens, 0)) AS worst_under,
+       max(estimated_tokens::numeric / nullif(prompt_tokens, 0)) AS worst_over
+FROM usage_events WHERE prompt_tokens > 0;
+```
+
+That last query is also how to decide whether `OUTPUT_RESERVE` in
+`apps/agent/src/dakcoder_agent/modes.py` is bigger than it needs to be: it is
+sized for estimator error, and this measures the error.
+
 ## Verifying it works
 
 ```bash

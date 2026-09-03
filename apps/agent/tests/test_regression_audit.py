@@ -939,7 +939,8 @@ def test_repeated_result_replay_marks_truncation(planning_router: Router, worksp
     again = ToolCall(id="c2", name="read_file", arguments='{"path":"core/long.go"}')
     intercepted = loop._intercept(again, _fingerprint_of(again))
     assert intercepted is not None
-    body, _said = intercepted
+    body, _said, kind = intercepted
+    assert kind == "cached", "the reason is on the record, not only the prose"
     assert f"the first {CACHED_RESULT_CHARS:,} characters" in body, (
         f"a truncated replay must say so: {body[:200]!r}"
     )
@@ -2132,3 +2133,194 @@ def test_the_probe_and_the_agent_agree_on_the_window() -> None:
         pytest.skip("the gateway package is not installed")
 
     assert CONTEXT_WINDOW == EXPECTED_MAX_MODEL_LEN
+
+
+# ── run accounting: the evidence for a claim about the window ──────────────
+
+
+def test_a_run_ends_with_its_own_accounting(planning_router: Router, gated, written) -> None:
+    """Every fact was already emitted turn by turn — a `usage` per turn, a
+    `gate` per compaction, a failed `tool_result` per truncated reply — and
+    nothing added them up. Answering "is this window big enough for this
+    codebase" meant reading a transcript and counting by eye, one run at a
+    time."""
+    from dakcoder_shared.envelope import EventType
+
+    loop, _client = build(planning_router, [plan_call(), patch(), say("done")])
+    events = list(loop.run("add Routes", intent=Intent.AGENT))
+
+    records = [e for e in events if e.type == EventType.METRICS]
+    assert len(records) == 1, "one record per run, at the end of it"
+    data = records[0].data
+
+    assert data["turns"] > 0
+    assert data["outcome"]
+    assert data["context_window"] == 262_144, "the window the claim is about"
+    assert data["budget"] > 0 and data["output_limit"] > 0
+    assert isinstance(data["prompt_tokens"], list)
+    assert data["peak_prompt_tokens"] == max(data["prompt_tokens"], default=0)
+    # This run is small, so it should say plainly that nothing was squeezed.
+    assert data["pressed_the_ceiling"] is False
+    assert data["lost_work"] is False
+
+
+def test_the_metrics_event_lands_before_end(planning_router: Router, gated, written) -> None:
+    """`end` is terminal for the panel and for the journal reader. A record
+    emitted after it is a record nothing reads."""
+    from dakcoder_shared.envelope import EventType
+
+    loop, _client = build(planning_router, [plan_call(), patch(), say("done")])
+    kinds = [e.type for e in loop.run("add Routes", intent=Intent.AGENT)]
+
+    assert kinds.index(EventType.METRICS) < kinds.index(EventType.END)
+    assert kinds.index(EventType.FINISH) < kinds.index(EventType.METRICS)
+
+
+def test_a_reread_after_eviction_is_what_the_claim_rests_on() -> None:
+    """Not "the context was full" — a threshold anyone can move — but "the run
+    deleted a file and then had to read it again". A window large enough for the
+    task produces none of these."""
+    from dakcoder_agent.metrics import Accumulator
+
+    acc = Accumulator("s1")
+    acc.feed({"type": "tool_call", "data": {"id": "c1", "name": "read_file",
+                                            "arguments": {"path": "handler/pension.go"}}})
+    acc.feed({"type": "tool_result", "data": {"id": "c1", "name": "read_file", "ok": True,
+                                              "turn": 3, "meta": {"bytes": 40_000}}})
+    acc.feed({"type": "gate", "data": {"kind": "compaction", "turn": 9, "before": 200_000,
+                                       "after": 80_000, "evicted_messages": 44,
+                                       "evicted_paths": ["handler/pension.go"]}})
+    acc.feed({"type": "tool_call", "data": {"id": "c2", "name": "read_file",
+                                            "arguments": {"path": "handler/pension.go"}}})
+    acc.feed({"type": "tool_result", "data": {"id": "c2", "name": "read_file", "ok": True,
+                                              "turn": 14, "meta": {"bytes": 40_000}}})
+    m = acc.finish()
+
+    assert m.evicted_paths_reread == ["handler/pension.go"]
+    assert m.lost_work is True
+    assert m.bytes_read == 80_000
+    assert m.bytes_reread == 40_000, "what the re-read cost"
+    assert m.compactions[0]["freed"] == 120_000
+
+
+def test_a_read_before_an_eviction_is_not_a_reread() -> None:
+    """Two reads of one file with no compaction between them is a model being
+    repetitive, not a window being small. Counting it as the latter would
+    inflate the very number the claim depends on."""
+    from dakcoder_agent.metrics import Accumulator
+
+    acc = Accumulator("s1")
+    for n, turn in ((1, 2), (2, 4)):
+        acc.feed({"type": "tool_call", "data": {"id": f"c{n}", "name": "read_file",
+                                                "arguments": {"path": "a.go"}}})
+        acc.feed({"type": "tool_result", "data": {"id": f"c{n}", "name": "read_file",
+                                                  "ok": True, "turn": turn,
+                                                  "meta": {"bytes": 100}}})
+    m = acc.finish()
+
+    assert m.evicted_paths_reread == []
+    assert m.lost_work is False, "repetition is not evidence about the window"
+    assert m.bytes_reread == 100, "but the repeat is still counted"
+
+
+def test_the_live_record_and_the_replayed_one_agree(
+    planning_router: Router, gated, written
+) -> None:
+    """One accumulator, two drivers: the loop feeds it live, a report feeds it a
+    journal. Two implementations of "add these up" is how the number in a run's
+    record and the number in a report come to disagree — and it is the one
+    number a claim about the window would rest on."""
+    from dakcoder_agent.metrics import from_events
+    from dakcoder_shared.envelope import EventType
+
+    loop, _client = build(planning_router, [plan_call(), patch(), say("done")])
+    events = list(loop.run("add Routes", intent=Intent.AGENT))
+    live = next(e for e in events if e.type == EventType.METRICS).data
+
+    replayed = from_events(
+        [{"type": str(e.type), "data": e.data} for e in events], session_id=live["session_id"]
+    ).as_dict()
+
+    for field in ("prompt_tokens", "compactions", "truncations", "files_read",
+                  "bytes_read", "evicted_paths_reread", "intercepted_re_read"):
+        assert replayed[field] == live[field], f"{field} disagrees between live and replay"
+
+
+def test_truncation_is_countable_without_reading_prose(
+    planning_router: Router, gated, written
+) -> None:
+    """It used to be a `tool_result` with `ok: false` and an English sentence.
+    Counting how often the output limit was hit meant string-matching the event
+    stream, which is not a thing a report should do about its own events."""
+    from dakcoder_agent.metrics import Accumulator
+
+    acc = Accumulator()
+    acc.feed({"type": "tool_result", "data": {
+        "id": "c1", "name": "write_file", "ok": False,
+        "content": "output limit reached mid-call; write_file was not dispatched",
+        "truncated_by_output_limit": True, "output_limit": 16_384}})
+    m = acc.finish()
+
+    assert m.truncations == 1
+    assert m.output_limit == 16_384
+    assert m.pressed_the_ceiling is True
+
+
+def test_the_report_reads_a_journal_and_separates_pressure_from_loss(tmp_path) -> None:
+    """The report is the deliverable, so it is tested on a journal rather than
+    on a record: a claim built on it has to survive the file format, the
+    truncated last line a hard kill leaves, and a session that predates the
+    accounting."""
+    import json
+    import subprocess
+    import sys
+
+    root = tmp_path / ".dakcoder" / "sessions"
+    (root / "quiet00000001").mkdir(parents=True)
+    (root / "pressed000002").mkdir(parents=True)
+
+    quiet = [
+        {"id": 1, "type": "user", "data": {"text": "add a handler"}},
+        {"id": 2, "type": "usage", "data": {"prompt_tokens": 20_000, "budget": 235_520}},
+        {"id": 3, "type": "finish", "data": {"outcome": "done", "turns": 3}},
+        {"id": 4, "type": "metrics", "data": {"context_window": 262_144}},
+    ]
+    pressed = [
+        {"id": 1, "type": "user", "data": {"text": "migrate the service"}},
+        {"id": 2, "type": "tool_call", "data": {"id": "c1", "name": "read_file",
+                                                "arguments": {"path": "a.go"}, "turn": 2}},
+        {"id": 3, "type": "tool_result", "data": {"id": "c1", "name": "read_file", "ok": True,
+                                                  "turn": 2, "meta": {"bytes": 90_000}}},
+        {"id": 4, "type": "gate", "data": {"kind": "compaction", "turn": 6, "before": 230_000,
+                                           "after": 80_000, "evicted_paths": ["a.go"]}},
+        {"id": 5, "type": "tool_call", "data": {"id": "c2", "name": "read_file",
+                                                "arguments": {"path": "a.go"}, "turn": 9}},
+        {"id": 6, "type": "tool_result", "data": {"id": "c2", "name": "read_file", "ok": True,
+                                                  "turn": 9, "meta": {"bytes": 90_000}}},
+        {"id": 7, "type": "usage", "data": {"prompt_tokens": 230_000, "budget": 235_520}},
+        {"id": 8, "type": "finish", "data": {"outcome": "unverified", "turns": 9}},
+        {"id": 9, "type": "metrics", "data": {"context_window": 262_144}},
+    ]
+    for name, rows in (("quiet00000001", quiet), ("pressed000002", pressed)):
+        with (root / name / "events.jsonl").open("w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+            # The shape a hard kill leaves. It must be skipped, not raised on.
+            fh.write('{"id": 99, "type": "usa')
+
+    script = pathlib.Path(__file__).resolve().parents[3] / "scripts" / "context-report.py"
+    out = subprocess.run(
+        [sys.executable, str(script), "--workspace", str(tmp_path), "--json"],
+        capture_output=True, text=True, check=True,
+    )
+    records = {r["session_id"]: r for r in json.loads(out.stdout)}
+
+    assert records["quiet00000001"]["pressed_the_ceiling"] is False
+    assert records["quiet00000001"]["lost_work"] is False
+
+    hard = records["pressed000002"]
+    assert hard["pressed_the_ceiling"] is True, "a compaction fired"
+    assert hard["lost_work"] is True, "and the run needed what it threw away"
+    assert hard["evicted_paths_reread"] == ["a.go"]
+    assert hard["bytes_read"] == 180_000, "the true size, not the 64k event cap"
+    assert hard["peak_prompt_tokens"] == 230_000

@@ -45,6 +45,7 @@ auto-approves is one where the approval layer is decoration.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
@@ -70,10 +71,13 @@ from .gate import (
     take_baseline,
 )
 from .llm import TurnResult, complete, reasoning_leaked
-from .modes import Intent, Mode, config_for
+from . import metrics
+from .modes import CONTEXT_WINDOW, Intent, Mode, config_for
 from .prompts import mode_instruction, system_prompt
 from .tools.control import PlanStep, steps_from_meta
 from .tools.router import ApprovalRequest, Router
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "AgentLoop",
@@ -661,10 +665,48 @@ class AgentLoop:
         self.result: RunResult | None = None
         #: The background baseline. See ``_take_baseline``.
         self._baseline_thread: threading.Thread | None = None
+        #: This run's accounting. Replaced at `run`; initialised here so a
+        #: caller driving `_run` directly still has one to finish.
+        self._metrics_acc = metrics.Accumulator()
 
     # -- the run ----------------------------------------------------------
 
     def run(
+        self,
+        task: str,
+        *,
+        acceptance: Sequence[str] = (),
+        intent: Intent | str = Intent.AUTO,
+        continued: bool = False,
+        start: Mode | str | None = None,
+    ) -> Iterator[Event]:
+        """Drive the run, teeing every event into the run's own accounting.
+
+        A thin wrapper on ``_run`` for one reason: events are yielded from a
+        dozen nested generators, and the accounting needs to see all of them.
+        Teeing here is the only funnel every event passes through, so a new
+        `yield Event(...)` anywhere inside cannot be missed by omission — which
+        is exactly how the tool-call invariant came to be a discipline that two
+        paths forgot (BUG L-1).
+
+        The accumulator holds counters and path sets, never content, so this
+        costs a run bounded memory and no retained transcript.
+        """
+        self._metrics_acc = metrics.Accumulator(self.session_id or "")
+        for event in self._run(
+            task,
+            acceptance=acceptance,
+            intent=intent,
+            continued=continued,
+            start=start,
+        ):
+            try:
+                self._metrics_acc.feed({"type": str(event.type), "data": event.data})
+            except Exception:  # noqa: BLE001 - accounting must never fail a run
+                log.warning("run metrics could not read an event", exc_info=True)
+            yield event
+
+    def _run(
         self,
         task: str,
         *,
@@ -745,7 +787,58 @@ class AgentLoop:
         # contract.
         yield Event(EventType.QUOTA, {"reason": "run finished"})
         yield Event(EventType.FINISH, self.result.as_dict())
+        yield from self._metrics()
         yield Event(EventType.END, self.result.as_dict())
+
+    def _metrics(self) -> Iterator[Event]:
+        """One record of what this run cost and where it ran out of room.
+
+        Emitted before ``end`` so it lands in the transcript rather than after
+        it, and built by ``metrics.from_events`` — the same function a report
+        uses to rebuild the record from a journal — so the live number and the
+        reconstructed one cannot disagree. The loop supplies only the two facts
+        the events do not carry: the ceilings this run was measured against.
+
+        Never fails a run. A run that finished is finished; an arithmetic error
+        in its accounting must not turn that into an error the developer sees.
+        """
+        try:
+            config = config_for(self.state.mode)
+            record = self._metrics_acc.finish()
+            record.session_id = record.session_id or (self.session_id or "")
+            record.outcome = str(self.result.outcome) if self.result else ""
+            record.turns = self.context.turn
+            record.output_limit = record.output_limit or config.max_tokens
+            record.context_window = CONTEXT_WINDOW
+            record.budget = record.budget or config.prompt_budget
+            payload = record.as_dict()
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            log.warning("run metrics could not be assembled: %s", exc, exc_info=True)
+            return
+
+        # One line in the server log as well as the event, because the event
+        # lands in a workspace the operator may never look at and the log is
+        # the thing they already tail. `scripts/context-report.py` is the
+        # detail; this is enough to notice that a run was shaped by the window.
+        log.info(
+            "run %s %s in %d turn(s): peak prompt %d/%d tokens (%.0f%% of the window), "
+            "%d compaction(s) discarding %d tokens, %d truncation(s), "
+            "%d file(s) evicted then re-read, %d read(s) refused as already held, "
+            "%d bytes of source read",
+            record.session_id or "?",
+            record.outcome or "?",
+            record.turns,
+            record.peak_prompt_tokens,
+            record.budget,
+            record.peak_pct_of_window,
+            len(record.compactions),
+            sum(c["freed"] for c in record.compactions),
+            record.truncations,
+            len(record.evicted_paths_reread),
+            record.intercepted_re_read,
+            record.bytes_read,
+        )
+        yield Event(EventType.METRICS, payload)
 
     # -- intent -----------------------------------------------------------
 
@@ -1325,6 +1418,13 @@ class AgentLoop:
                     "ok": False,
                     "content": said,
                     "turn": self.context.turn,
+                    # Structured, not only narrated. Counting how often the
+                    # output limit was hit used to mean string-matching the
+                    # prose above, which is not a thing a report should have to
+                    # do about its own event stream.
+                    "truncated_by_output_limit": True,
+                    "output_limit": config_for(self.state.mode).max_tokens,
+                    "dispatched": False,
                 },
             )
 
@@ -1473,7 +1573,7 @@ class AgentLoop:
             args = _safe_args(call)
 
             if intercepted := self._intercept(call, fingerprint):
-                body, said = intercepted
+                body, said, intercept_kind = intercepted
                 # The previous answer to this same question is stubbed out
                 # before the new one is appended.
                 #
@@ -1505,6 +1605,12 @@ class AgentLoop:
                         "ok": True,
                         "turn": self.context.turn,
                         "intercepted": True,
+                        # *Which* ledger answered, because they are different
+                        # findings. A cached repeat is the model being slow to
+                        # move on; a refused re-read is the context window
+                        # costing a turn, and only one of those is evidence
+                        # about the size of the window.
+                        "intercept": intercept_kind,
                         "arguments": args,
                         "content": said,
                     },
@@ -1770,8 +1876,16 @@ class AgentLoop:
             report,
         )
 
-    def _intercept(self, call: ToolCall, fingerprint: str) -> tuple[str, str] | None:
+    def _intercept(self, call: ToolCall, fingerprint: str) -> tuple[str, str, str] | None:
         """What to answer without dispatching, or None to dispatch.
+
+        Returns ``(body, said, kind)``. The ``kind`` names *which* ledger
+        answered — ``dead_end``, ``cached`` or ``re_read`` — because they are
+        different findings and the event stream reported all three as a single
+        ``intercepted: true``. Only one of them is evidence about the size of
+        the context window: a refused re-read is a turn spent because content
+        the model needed had to be kept out of the prompt. The other two are the
+        model being slow to move on, which is a different problem.
 
         Three ledgers, and none of them ends a run. A model being slow to take a
         hint costs a turn; it is not a reason to throw away twenty-five, which
@@ -1789,6 +1903,7 @@ class AgentLoop:
                 "This is the answer, not a failure. Act on what does exist -- the "
                 "alternatives named in the earlier result still stand.",
                 f"{call.name}: known dead end; answered without re-running",
+                "dead_end",
             )
 
         # An exact repeat while nothing has changed. An answer that stopped at
@@ -1835,6 +1950,7 @@ class AgentLoop:
                 body,
                 f"{call.name} asked again with the same arguments; answered from the "
                 "previous result",
+                "cached",
             )
 
         # A read that asks for lines already delivered. `_fingerprint` covers
@@ -1843,7 +1959,7 @@ class AgentLoop:
         # fingerprint cannot, and asks it about coverage rather than about how
         # many times the file has come up.
         if why := self._re_reading(call):
-            return why, "asks for lines already in context; not re-read"
+            return why, "asks for lines already in context; not re-read", "re_read"
         return None
 
     def _gate_wants_an_edit(self) -> bool:

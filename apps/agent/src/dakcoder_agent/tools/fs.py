@@ -243,8 +243,12 @@ def read_file(inv: Invocation) -> ToolResult:
     # slice ledger compares. Deriving it from the call arguments instead would
     # read `end=99999` on a 200-line file as a range no later whole-file read
     # contains, and keep both copies for the rest of the run.
+    # `bytes` is what this read actually carried, recorded because the event
+    # stream caps content at 64,000 characters and a report asking "how much
+    # source did this task need" would otherwise measure the cap.
     return ToolResult.success(
-        f"{header}\n{body}", meta={"lines": total, "span": [start, end]}
+        f"{header}\n{body}",
+        meta={"lines": total, "span": [start, end], "bytes": len(body)},
     )
 
 

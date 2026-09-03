@@ -58,6 +58,7 @@ Status key: `[ ]` pending · `[~]` in progress · `[x]` done
 - [x] 4.3 FS-3 the truncation bound resets, so alternating thrash is unbounded
 - [x] 4.4 FS-4 a shell redirection is answered with the tool that reads
 - [x] 4.5 output budgets raised; the window arithmetic made a checked invariant
+- [x] 4.6 run accounting: per-call tokens, truncations, and the evidence report
 - [x] 3.6 documentation truth pass (DOC-1) — done early: the four false claims
 - [x] 3.7 residual loop rows (L-16, L-22, L-23, L-30, TL-10, GT-1)
 
@@ -91,7 +92,7 @@ Status key: `[ ]` pending · `[~]` in progress · `[x]` done
 
 ## Where this stands
 
-**Suite: 847 tests, green** (it was 704 with 6 failing). Extension `npm run
+**Suite: 854 tests, green** (it was 704 with 6 failing). Extension `npm run
 verify` green end to end: typecheck, 69 tests, bundle, credential scan, 59/59
 commands in both directions, l10n, gotools manifest.
 
@@ -127,6 +128,85 @@ Two things worth knowing before the next run against a real repository:
 ---
 
 ## Log — audit remediation
+
+### 4.6 — the accounting a claim about the window can rest on · done
+
+Asked for: log prompt tokens per call, count truncations, and enough detail on
+this server to support the claim that a 262k window is not enough for large
+codebase tasks.
+
+Most of the facts were already being emitted — a `usage` event per turn, a
+`gate` event per compaction, a failed `tool_result` per truncated reply. Three
+things were missing, and the third is the one that matters.
+
+**Nothing added them up.** Answering "is this window big enough" meant reading a
+transcript and counting by eye, one run at a time. `metrics.py` is the record:
+one `RunMetrics` per run, emitted as a `metrics` event before `end` so it lands
+in `events.jsonl`, and summarised as one line in `runtime.log`.
+
+**Two facts were prose rather than data.** A truncated reply was a
+`tool_result` with `ok: false` and an English sentence, so counting output-limit
+hits meant string-matching the event stream — which is not a thing a report
+should have to do about its own events. And all three intercept ledgers reported
+as a single `intercepted: true`, though only one of them says anything about the
+window: a refused re-read is a turn spent because content had to be kept out of
+the prompt, while a cached repeat is the model being slow to move on. Both are
+structured now (`truncated_by_output_limit`, `intercept: cached|dead_end|re_read`).
+
+**The runtime configured no logging at all.** Every `log.info` and `log.warning`
+in the package went to the root logger's default handler and was discarded;
+uvicorn had its own level and that was the only thing anybody saw. So the line
+this step adds would have gone nowhere. `serve._configure_logging` sends
+dakcoder's loggers to stderr — which `start.sh` already redirects to
+`deploy/logs/runtime.log` — with `DAKCODER_LOG_LEVEL` for per-turn detail.
+
+**Pressure and loss are kept apart, because a claim depends on it.** *Pressure*
+is a compaction firing or a reply being cut off: real, but a threshold can be
+moved and a budget retuned, so on its own it argues about tuning. *Loss* is a
+file evicted and then read again, or a read refused because the content was
+already held — a window large enough for the task produces none of it at any
+threshold. `lost_work` is the second, and it is the number the argument rests on.
+
+One deliberate piece of care: a second read of a file is only counted as a
+re-read *after an eviction of that file*. Two reads with no compaction between
+them is a model being repetitive, and counting that as evidence would inflate
+exactly the number the claim depends on.
+
+**What the task actually needed.** `read_file` now records the true byte count in
+`meta`, because the event stream caps content at 64,000 characters and a report
+asking "how much source did this task need" would otherwise be measuring the
+cap. `scripts/context-report.py` totals the unique source a run had to read and
+puts it against the prompt budget, so a task whose *files alone* exceed the
+window is arithmetic rather than an argument. It counts only `read_file` bytes —
+not the system prompt, the schemas, the plan, the assistant messages or any
+other tool result — so it is a floor on what the task required.
+
+On a simulated whole-service migration the report reads: 180 turns, peak prompt
+233,000 (89% of the window), 5 compactions discarding 755k tokens, 40 files
+evicted and then read again, 2.6 MB of source read = ~816k tokens of files
+alone against a 235.5k budget — *does not fit*.
+
+**One accumulator, two drivers.** The loop feeds it live through a single funnel
+in `run()` — a thin wrapper over `_run`, because events come from a dozen nested
+generators and a tee anywhere else could be missed by omission, which is exactly
+how the tool-call invariant became a discipline two paths forgot (L-1). A report
+feeds it a stored journal. Two implementations of "add these up" is how the live
+number and the reported one come to disagree, and a test asserts they do not.
+
+The accumulator holds counters and path sets, never content, so a run pays
+bounded memory and retains no transcript. The event is `metrics`, which both the
+extension and the webview ignore by contract C2 — verified, since an unknown
+type reaching a renderer is how this kind of addition breaks a panel.
+
+`deploy/README.md` documents all three levels, including the SQL against the
+gateway's Postgres ledger — the billing-grade record, with the endpoint's own
+token counts rather than the agent's estimate. One of those queries measures the
+estimator error directly, which is also how to decide whether `OUTPUT_RESERVE`
+(step 4.5) is larger than it needs to be.
+
+Tests: seven in `test_regression_audit.py`, including one that runs the report
+as a subprocess against a journal with the truncated last line a hard kill
+leaves.
 
 ### 4.5 — the output budgets, and the arithmetic nobody was checking · done
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import threading
@@ -183,6 +184,37 @@ def prewarm(runtime: Loopback, config) -> None:
     threading.Thread(target=probe, name="dakcoder-prewarm", daemon=True).start()
 
 
+#: What the runtime logs, and where.
+#:
+#: Nothing configured logging at all, so every `log.info` and `log.warning` in
+#: the package went to the root logger's default handler and was discarded --
+#: including the per-run accounting that says whether a run was shaped by the
+#: context window (see `AgentLoop._metrics`). uvicorn had its own level and that
+#: was the only thing anybody saw.
+#:
+#: stderr, because `deploy/start.sh` redirects it to `deploy/logs/runtime.log`,
+#: which is the file an operator already tails. `DAKCODER_LOG_LEVEL=debug` turns
+#: on the per-turn detail; the default says enough to notice a problem without
+#: making the log unreadable.
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s  %(message)s"
+
+
+def _configure_logging() -> None:
+    level = os.environ.get("DAKCODER_LOG_LEVEL", "info").strip().lower()
+    resolved = getattr(logging, level.upper(), None)
+    if not isinstance(resolved, int):
+        resolved = logging.INFO
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%dT%H:%M:%S"))
+    for name in ("dakcoder_agent", "dakcoder_shared"):
+        logger = logging.getLogger(name)
+        logger.setLevel(resolved)
+        # Replaced rather than added to, so a restarted runtime in the same
+        # process -- which the tests do -- does not double every line.
+        logger.handlers[:] = [handler]
+        logger.propagate = False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dakcoderd", description="the dakcoder runtime")
     parser.add_argument("--workspace", default=".", help="the repository to work in")
@@ -237,6 +269,8 @@ def main(argv: list[str] | None = None) -> int:
     # can be printed. The extension is parsing stdout with a sixty-second timeout;
     # a port it learns about only after the server is up is a race it loses on a
     # slow machine.
+    _configure_logging()
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((args.host, args.port))
@@ -259,6 +293,9 @@ def main(argv: list[str] | None = None) -> int:
     # handles are not file descriptors. The primary platform here is Windows 11,
     # so the portable form is the only one worth having.
     server = uvicorn.Server(
+        # uvicorn stays at warning: its access log is one line per SSE poll and
+        # would bury the run's own record. `_configure_logging` sets the level
+        # for dakcoder's loggers, which is the interesting half.
         uvicorn.Config(app, log_level="warning", access_log=False, lifespan="on")
     )
     try:

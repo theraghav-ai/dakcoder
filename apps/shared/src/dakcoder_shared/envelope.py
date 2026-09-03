@@ -206,6 +206,12 @@ class EventType(StrEnum):
     USAGE = "usage"
     QUOTA = "quota"
     FINISH = "finish"
+    #: One record of what the whole run cost and where it ran out of room, at
+    #: the end of it. Everything in it was already emitted turn by turn; nothing
+    #: added them up, so "is this window big enough for this codebase" could
+    #: only be answered by reading a transcript and counting by eye. See
+    #: ``dakcoder_agent.metrics``.
+    METRICS = "metrics"
     ERROR = "error"
     STEER = "steer"
     HEARTBEAT = "heartbeat"
