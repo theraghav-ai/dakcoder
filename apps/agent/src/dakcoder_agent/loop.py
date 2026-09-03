@@ -2311,8 +2311,10 @@ class AgentLoop:
             self.context.append_user(
                 "The gate ran on your change and it is not clean yet. This is its "
                 f"report:\n\n{report.summary()}\n\n"
-                "Fix what it found. Anything it marks advisory is either pre-existing "
-                "or not about this change, and is not yours to fix."
+                "Fix what it found. Anything it marks advisory, and anything it lists "
+                "under \"Already failing before this run\", was broken before you "
+                "touched the workspace: it is not about this change and not yours to "
+                "fix, so do not edit those files to clear it."
             )
         else:
             blocker = report.blocked_by.name if report.blocked_by else "the gate"

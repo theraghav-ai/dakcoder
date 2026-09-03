@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dakcoder-gateway"
-version = "0.3.1"
+version = "0.3.2"
 description = "The dakcoder gateway: identity, quota, ledger and the model proxy"
 requires-python = ">=3.11"
 # SERVER ONLY. Never packaged into the .vsix — this is the process that holds

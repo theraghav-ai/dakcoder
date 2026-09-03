@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.2 — 2026-09-03
+
+Extension `0.3.2`, `dakcoder-agent` `0.3.2`, `dakcoder-shared` `0.3.2`,
+`dakcoder-gateway` `0.3.2`. Runtime API unchanged at **1.1**.
+
+**No deploy order.** Nothing on the wire changed and the gateway is untouched;
+this is the verification gate's accounting and the sentence the loop wraps it
+in. A 0.3.1 gateway serves a 0.3.2 runtime and the reverse.
+
+### Fixed
+
+- **One new compile error no longer re-charges the run with every old one.**
+  The baseline excused a stage all-or-nothing, so a single genuine error in the
+  file this run wrote made the whole of `go build ./...` this run's failure
+  again — forty errors on a legacy service, none of them marked, under `go
+  build`'s own advice to "fix the first error listed". That first error is
+  whichever package sorts first, which is somebody else's redeclaration from
+  two years ago. A field run followed the instruction exactly as written: it
+  spent its turns reading a file it was not allowed to touch, edited nothing,
+  and was stopped by the stall guard for standing still in front of a gate it
+  had been told to clear. `Baseline.charge` now answers with the *set* of
+  findings this run is answerable for, the report prints those under the fix
+  hint and the rest under **"Already failing before this run changed anything"**,
+  and the loop's covering sentence names that heading as explicitly not the
+  model's to fix. The stage still blocks — the build really is broken — but it
+  blocks on one error in `handler/laptop.go` instead of on the module's history.
+- **A baseline that failed for a reason it could not name no longer poisons the
+  gate.** `take_baseline` runs `go build` under `-mod=readonly` so measuring
+  cannot rewrite `go.sum`; the gate stage runs without it. On a module with an
+  incomplete `go.sum` the two therefore fail *differently* — module resolution
+  against compiler errors — so the subtraction cancelled nothing and the run was
+  charged for every pre-existing error. Such a failure is now recorded as
+  `unkeyable` and excuses the stage whole, which is the honest reading of a
+  stage that was already red on arrival. The same path covers a baseline that
+  timed out or found no toolchain.
+- **The "failing before, with nothing keyable" branch could not be reached.**
+  It tested `findings.get(tool) is None`, and `_take_baseline` writes
+  `findings[tool]` exactly when `passed[tool]` is False — so the case it was
+  written for arrived as an *empty* key set and fell through to blocking
+  everything. It now tests the set itself, and `charge` distinguishes "measured,
+  nothing charged" (excused) from "never measured" (`None`, charged whole),
+  which a plain falsiness test read as the same answer.
+
 ## 0.3.1 — 2026-09-03
 
 Extension `0.3.1`, `dakcoder-agent` `0.3.1`, `dakcoder-shared` `0.3.1`,

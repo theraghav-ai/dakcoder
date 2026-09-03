@@ -710,3 +710,137 @@ def test_a_swagger_failure_does_not_stop_the_stages_it_has_nothing_to_do_with(
     assert "go_vet" in gate.order
     assert "go_mod" in gate.order
 
+
+
+# -- what the run is answerable for, finding by finding -----------------------
+
+
+#: A legacy service's `go build ./...`: two errors that predate the run, one the
+#: run's own new file. The shape the field report arrived in.
+_MIXED_BUILD = """# gitlab.cept.gov.in/it-2.0/pao/handler
+handler/request_product.go:45:6: convertProductRequestToDomain redeclared in this block
+\thandler/request_product.go:12:6: other declaration of convertProductRequestToDomain
+handler/laptop.go:88:2: undefined: laptopRepo"""
+
+_PRE_EXISTING_BUILD = """# gitlab.cept.gov.in/it-2.0/pao/handler
+handler/request_product.go:45:6: convertProductRequestToDomain redeclared in this block
+\thandler/request_product.go:12:6: other declaration of convertProductRequestToDomain"""
+
+
+def _build_baseline() -> Baseline:
+    return Baseline(
+        findings={"go_build": _finding_keys(_PRE_EXISTING_BUILD)},
+        passed={"go_build": False},
+        taken=True,
+    )
+
+
+def test_a_new_error_does_not_recharge_the_run_with_the_old_ones(
+    gate: Recorder, router: Router
+) -> None:
+    """The defect this file's baseline was supposed to prevent and did not.
+
+    Excusing was stage-at-a-time, so one new compile error in the run's own file
+    made every pre-existing error in the module this run's failure again -- and
+    the report then said "fix the first error listed", which `go build ./...`
+    orders by package, so the first error listed was somebody else's
+    redeclaration from two years ago. The field run went to fix it, edited
+    nothing it was allowed to edit, and was stopped for standing still.
+    """
+    gate.fails("go_build", _MIXED_BUILD)
+
+    report = full_gate(router, ["handler/laptop.go"], baseline=_build_baseline())
+
+    build = next(r for r in report.results if r.name == "go_build")
+    assert build.blocked, "the run did break the build and must be told so"
+
+    mine, _, already = build.content.partition("Already failing before this run")
+    assert "handler/laptop.go:88:2: undefined: laptopRepo" in mine
+    assert "redeclared in this block" not in mine, (
+        "a pre-existing error was handed over as this change's work"
+    )
+    assert "redeclared in this block" in already, "and it is still reported"
+    assert "other declaration of" in already
+    assert "# gitlab.cept.gov.in/it-2.0/pao/handler" in mine, (
+        "an error with no package header above it is one the model cannot place"
+    )
+
+
+def test_the_fix_hint_sits_with_the_findings_it_points_at(
+    gate: Recorder, router: Router
+) -> None:
+    """"Fix the first error listed" is only sound advice under a list that is
+    this run's. Under the whole build log it points at the wrong file."""
+    gate.answer(
+        "go_build",
+        ToolResult.failure(
+            _MIXED_BUILD,
+            fix="Fix the first error listed; later ones are often consequences of it.",
+        ),
+    )
+
+    report = full_gate(router, ["handler/laptop.go"], baseline=_build_baseline())
+
+    content = next(r for r in report.results if r.name == "go_build").content
+    assert content.index("Fix the first error listed") < content.index(
+        "Already failing before this run"
+    )
+
+
+def test_only_pre_existing_errors_still_excuse_the_whole_stage(
+    gate: Recorder, router: Router
+) -> None:
+    """Splitting the report must not cost the excuse that was already working."""
+    gate.fails("go_build", _PRE_EXISTING_BUILD)
+
+    report = full_gate(router, ["handler/laptop.go"], baseline=_build_baseline())
+
+    build = next(r for r in report.results if r.name == "go_build")
+    assert not build.ok and not build.blocking
+    assert report.ok, "a run whose only failure predates it has passed"
+    assert report.not_run == (), "an excused stage must not halt the sequence"
+
+
+def test_a_baseline_failure_that_named_no_file_excuses_the_stage(
+    router: Router
+) -> None:
+    """The baseline poisoning the gate instead of excusing it.
+
+    `take_baseline` runs `go build` under `-mod=readonly` so it cannot rewrite
+    `go.sum` while measuring; the gate stage runs without it. On a module with an
+    incomplete `go.sum` the two therefore fail differently -- module resolution
+    against compiler errors -- and subtracting one from the other cancels
+    nothing. Every compile error was then charged to a run that caused none of
+    them.
+    """
+    readonly = "go: updates to go.mod needed; to update it:\n\tgo mod tidy"
+    baseline = take_baseline(
+        _scripted(router, {"go_build": ToolResult.failure(readonly)}), include_tests=False
+    )
+
+    assert "go_build" in baseline.unkeyable
+    assert baseline.charge("go_build", _finding_keys(_MIXED_BUILD)) == frozenset()
+
+
+def test_a_baseline_that_failed_on_findings_still_charges_the_new_ones(
+    router: Router
+) -> None:
+    """The other half of it: an unkeyable failure excuses the stage whole, and a
+    keyable one must go on excusing exactly what it named."""
+    baseline = take_baseline(
+        _scripted(router, {"go_build": ToolResult.failure(_PRE_EXISTING_BUILD)}),
+        include_tests=False,
+    )
+
+    assert "go_build" not in baseline.unkeyable
+    assert baseline.charge("go_build", _finding_keys(_MIXED_BUILD)) == frozenset(
+        {"handler/laptop.go|undefined: laptopRepo"}
+    )
+
+
+def _scripted(router: Router, answers: dict[str, ToolResult]) -> Router:
+    """A router whose gate tools answer from ``answers``, defaulting to clean."""
+    recorder = Recorder(router)
+    for name, result in answers.items():
+        recorder.answer(name, result)
+    return router

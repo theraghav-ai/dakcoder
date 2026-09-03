@@ -144,12 +144,35 @@ class Baseline:
     #: Passed *into* `swagger_check` rather than compared after it, because that
     #: stage does the discounting itself.
     compliance: frozenset[str] = frozenset()
+    #: Stages whose pre-run failure could not be keyed to individual findings.
+    #:
+    #: A failing stage is *not* always a list of findings. `go build` under
+    #: ``-mod=readonly`` answers a missing checksum with ``go: updates to go.mod
+    #: needed``; a cold module cache answers with a timeout line; a toolchain
+    #: that is not installed answers with neither. None of those key to
+    #: ``path|message``, so comparing them against a gate run that *did* produce
+    #: compiler errors subtracts nothing and charges the run for every one of
+    #: them -- the baseline poisoning the gate instead of excusing it.
+    #:
+    #: Recorded rather than inferred from an empty key set, because "the stage
+    #: was failing for a reason we cannot enumerate" is a different fact from
+    #: "the stage was failing on nothing", and only the first excuses a stage
+    #: whole.
+    unkeyable: frozenset[str] = frozenset()
     #: True once the baseline has actually been taken. A gate that runs before
     #: it is ready must not read an empty baseline as "nothing was broken".
     taken: bool = False
 
-    def excuses(self, tool: str, current: frozenset[str]) -> bool:
-        """Whether every finding in ``current`` is one this run is not answerable for.
+    def charge(self, tool: str, current: frozenset[str]) -> frozenset[str] | None:
+        """The findings in ``current`` this run is answerable for.
+
+        ``None`` where the question cannot be asked -- no baseline was taken, or
+        the stage was passing before this run and every finding in it is
+        therefore new. An empty set is the opposite answer and must not read the
+        same: it means the comparison was made and nothing came back charged.
+        A stage failing on findings this cannot enumerate (`go mod tidy` reports
+        drift, not lines) yields an empty *current* and would otherwise be
+        excused by a baseline that never looked at it.
 
         Two tests, and the second is what makes this usable on a legacy service.
 
@@ -167,29 +190,63 @@ class Baseline:
         What still blocks is a rule *nothing* in the service was violating and
         this change now does. That is a regression, and it is the only thing here
         that is.
+
+        **Per finding, not per stage.** This used to answer a yes/no about the
+        whole stage, and on `go_build` that made the excuse worthless in exactly
+        the case it exists for: one genuinely new compile error in the run's own
+        new file re-charged the run with every pre-existing error in the module.
+        The report then carried forty errors headed "fix the first error listed"
+        -- and the first error listed is whichever package sorts first, which on
+        a legacy service is somebody else's redeclaration from two years ago. A
+        field run read that instruction exactly as written, spent its turns
+        reading a file it must not touch, edited nothing, and was stopped by the
+        stall guard for standing still.
+
+        So the answer is the *set* the run is answerable for. The caller blocks
+        on those and reports the rest as what they are.
         """
         if not self.taken:
-            return False
+            return None
         if self.passed.get(tool, True):
-            return False
+            return None
+        if tool in self.unkeyable:
+            # Failing before, for a reason that does not enumerate. Excused
+            # whole: the alternative is charging this run for a stage that was
+            # red when it arrived.
+            return frozenset()
         known = self.findings.get(tool)
-        if known is None:
-            # Failing before, with nothing keyable. Excused whole.
-            return True
+        if not known:
+            # Same case, reached the other way -- a failure whose output keyed
+            # to nothing at all. Tested with `not`, not `is None`: `_take_baseline`
+            # writes `findings[tool]` whenever `passed[tool]` is False, so the
+            # `is None` this replaced could not be reached from here and the
+            # empty set it was meant to catch fell through to blocking.
+            return frozenset()
         if not current:
             # Failing before, and we cannot key what it is failing on now.
-            # Treated as the same failure: the alternative is charging this run
-            # for a stage that was red when it arrived.
-            return True
+            return frozenset()
 
         introduced = current - known
         if not introduced:
-            return True
+            return frozenset()
 
         classes = self.rule_classes.get(tool)
         if not classes:
-            return False
-        return all(key.split("|", 1)[0] in classes for key in introduced)
+            return introduced
+        return frozenset(k for k in introduced if k.split("|", 1)[0] not in classes)
+
+    def excuses(self, tool: str, current: frozenset[str]) -> bool:
+        """Whether *every* finding in ``current`` is one this run did not cause.
+
+        The stage-level reading of `charge`, kept because two callers only need
+        the yes/no: a stage excused whole stops blocking, and the inner loop's
+        lint has nothing to say about a finding the service was already making.
+
+        Compared against an empty set rather than written ``not charge(...)``:
+        ``None`` is "there was nothing to compare against", which excuses
+        nothing, and falsiness would read it as excusing everything.
+        """
+        return self.charge(tool, current) == frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,17 +544,77 @@ def _finding_keys(content: str) -> frozenset[str]:
     keys: set[str] = set()
     for line in content.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith(("#", "go: ")):
+        if _is_context(stripped):
             continue
-        parts = stripped.split(":")
-        if len(parts) >= 3 and parts[1].strip().isdigit():
-            path = parts[0].strip()
-            # Drop the line, and the column when there is one.
-            rest = parts[3:] if len(parts) >= 4 and parts[2].strip().isdigit() else parts[2:]
-            keys.add(f"{path}|{':'.join(rest).strip()}")
-        else:
-            keys.add(stripped)
+        keys.add(_line_key(stripped))
     return frozenset(keys)
+
+
+def _line_key(stripped: str) -> str:
+    """The key for one already-stripped line of output.
+
+    Split out of `_finding_keys` so the two directions agree by construction:
+    the baseline turns lines into keys, and `_split_by_charge` turns keys back
+    into lines. Two implementations of that mapping would drift, and the failure
+    mode of drift here is a report that files an error under the wrong heading.
+    """
+    parts = stripped.split(":")
+    if len(parts) >= 3 and parts[1].strip().isdigit():
+        path = parts[0].strip()
+        # Drop the line, and the column when there is one.
+        rest = parts[3:] if len(parts) >= 4 and parts[2].strip().isdigit() else parts[2:]
+        return f"{path}|{':'.join(rest).strip()}"
+    return stripped
+
+
+def _is_context(stripped: str) -> bool:
+    """Whether a line is surrounding context rather than a finding.
+
+    ``# package/path`` headers and ``go: `` module notes are neither findings
+    nor noise: they say which package the lines under them belong to, so they
+    are keyed as nothing and reprinted wherever those lines end up.
+    """
+    return not stripped or stripped.startswith(("#", "go: "))
+
+
+def _split_by_charge(content: str, charged: frozenset[str]) -> tuple[str, str]:
+    """Output split into (what this run caused, what was already failing).
+
+    The package header is carried into *both* halves when a package has some of
+    each, because ``undefined: laptopRepo`` with no ``# service/handler`` above
+    it is an error the model cannot place.
+    """
+    mine: list[str] = []
+    theirs: list[str] = []
+    notes: list[str] = []
+    header = ""
+    shown_mine = shown_theirs = ""
+
+    for raw in content.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            header = raw
+            continue
+        if stripped.startswith("go: "):
+            # Module-level notes. They belong with the actionable half: a
+            # checksum or a download line is context for what to do next, and
+            # duplicating it under both headings reads as two problems.
+            notes.append(raw)
+            continue
+        if _line_key(stripped) in charged:
+            if header and shown_mine != header:
+                mine.append(header)
+                shown_mine = header
+            mine.append(raw)
+        else:
+            if header and shown_theirs != header:
+                theirs.append(header)
+                shown_theirs = header
+            theirs.append(raw)
+
+    return "\n".join(notes + mine), "\n".join(theirs)
 
 
 #: Why every Go stage sits out a workspace that is not itself a module, stated
@@ -803,6 +920,7 @@ def _take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
     findings: dict[str, frozenset[str]] = {}
     passed: dict[str, bool] = {}
     rule_classes: dict[str, frozenset[str]] = {}
+    unkeyable: set[str] = set()
     compliance: frozenset[str] = frozenset()
 
     root_is_module = (router.workspace.root / "go.mod").is_file()
@@ -841,7 +959,18 @@ def _take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
 
         passed[tool] = outcome.ok
         if not outcome.ok:
-            findings[tool] = _finding_keys(outcome.for_model())
+            keys = _finding_keys(outcome.for_model())
+            findings[tool] = keys
+            # A failure that named no file and no line is a failure about the
+            # module or the machine, not a list of findings: `-mod=readonly`
+            # refusing to add a checksum, a cold cache timing out, a toolchain
+            # that is not installed. The gate stage runs *without* readonly and
+            # with a warm cache, so it fails differently -- and subtracting one
+            # from the other cancels nothing and charges the run for everything.
+            # `_line_key` only puts a `|` in a key it built from `path:line:`,
+            # so this is the same judgement the keys were made with.
+            if not any("|" in key for key in keys):
+                unkeyable.add(tool)
 
     try:
         outcome = router.run_gate_tool("swagger_check", {})
@@ -860,6 +989,7 @@ def _take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
         passed=passed,
         rule_classes=rule_classes,
         compliance=compliance,
+        unkeyable=frozenset(unkeyable),
         taken=True,
     )
 
@@ -890,6 +1020,7 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
         ok = _stage_passed(stage, result)
         blocking = stage.blocking
         content = result.for_model()
+        found = frozenset() if ok else _stage_findings(stage, result)
 
         if not ok and blocking:
             # Two reasons a blocking stage stops blocking, both of them about
@@ -897,21 +1028,29 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
             if reason := stage.advisory_when(ctx):
                 blocking = False
                 content = f"{content}\n\nAdvisory, not blocking: {reason}."
-            elif stage.baseline_key and ctx.baseline.excuses(
-                stage.baseline_key, _stage_findings(stage, result)
-            ):
-                blocking = False
-                content = (
-                    f"{content}\n\nAdvisory, not blocking: every finding here was "
-                    "already present before this run changed anything, so it is not "
-                    "this change's failure. Fix it only if it bears on the work."
-                )
+            elif stage.baseline_key:
+                charged = ctx.baseline.charge(stage.baseline_key, found)
+                if charged is not None and not charged:
+                    blocking = False
+                    content = (
+                        f"{content}\n\nAdvisory, not blocking: every finding here was "
+                        "already present before this run changed anything, so it is not "
+                        "this change's failure. Fix it only if it bears on the work."
+                    )
+                elif charged:
+                    # Some of it is this run's, so the stage still blocks -- but
+                    # the report says which part, instead of handing over the
+                    # whole pile under one verdict. `go build ./...` orders its
+                    # output by package, so without this the "first error listed"
+                    # a model is told to start with is whichever package sorts
+                    # first, which on a legacy service is somebody else's.
+                    content = _charged_content(stage, result, charged, found)
+                # `charged is None` is the third case and does nothing: no
+                # baseline was taken, or the stage was green before this run, so
+                # there is nothing to subtract and the report stands as it is.
 
         results.append(
-            StageResult(
-                stage.name, ok, blocking, content, elapsed,
-                findings=frozenset() if ok else _stage_findings(stage, result),
-            )
+            StageResult(stage.name, ok, blocking, content, elapsed, findings=found)
         )
 
         if blocking and not ok and stage.halts:
@@ -938,6 +1077,60 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
         # `unverified` without ever asking them.
 
     return GateReport(tuple(results), (), time.monotonic() - started)
+
+
+#: Stages whose findings are keyed out of ``meta`` rather than off their text.
+#: Their output cannot be split line by line, because the keys were never lines.
+_META_KEYED = ("go_mod", "rules_lint")
+
+
+def _charged_content(
+    stage: Stage, result: ToolResult, charged: frozenset[str], found: frozenset[str]
+) -> str:
+    """A failing stage's output with what this run caused separated from what it did not.
+
+    The half of the baseline that was missing. Excusing worked stage-at-a-time,
+    so a single new compile error in the run's own file re-charged it with every
+    error the module arrived with -- and the model, reading a report that marked
+    none of them, did exactly what the report said and went to fix them.
+
+    The excused half is still printed. Dropping it would be a different lie: the
+    build genuinely does not compile, and a model told to fix three errors in a
+    file whose package has forty needs to know why its own three are not the
+    whole story.
+    """
+    excused = found - charged
+    if not excused:
+        return result.for_model()
+
+    if stage.tool in _META_KEYED:
+        # Nothing to split, so say the count. It is still the difference between
+        # "98 violations, fix them" and "3 of these 98 are yours".
+        return (
+            f"{result.for_model()}\n\n{len(excused)} of these findings were already "
+            f"present before this run changed anything and are not this change's to "
+            f"fix; {len(charged)} of them are new."
+        )
+
+    mine, already = _split_by_charge(result.content, charged)
+    if not mine:
+        # Keys that no line maps back to -- a renderer this does not know about.
+        # The unsplit output is worse but it is still the truth.
+        return result.for_model()
+
+    out = mine
+    if result.fix:
+        # Now that it sits under the charged half only, "fix the first error
+        # listed" points at an error this run is answerable for.
+        out += f"\n\n{result.fix}"
+    if already:
+        out += (
+            "\n\nAlready failing before this run changed anything. Not this change's, "
+            "and not yours to fix -- do not edit these files to clear them, and do not "
+            "count them against your own work:\n"
+            f"{already}"
+        )
+    return out
 
 
 def _stage_findings(stage: Stage, result: ToolResult) -> frozenset[str]:
