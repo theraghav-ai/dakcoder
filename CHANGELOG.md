@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — 2026-09-03
+
+The residuals of the 2 September audit's re-check, closed. Runtime API
+unchanged at **1.1**; nothing on the wire changed.
+
+### Fixed
+
+- **The summariser is handed pieces, never the whole eviction.** The evicted
+  set went to the recap call whole, whatever its size: three capped reads were
+  one ~577,000-character request, and on the emergency 15% path the eviction
+  could exceed the summariser's own window, fail, and fall back in silence.
+  Every message is now bounded first (a tool result keeps its head and tail,
+  prose its head), the transcript is split at message boundaries into pieces of
+  at most `_TRANSCRIPT_CHARS`, and each piece's recap is folded into the next
+  through `Recap.merge` — Aider's recursive summary and langmem's running
+  summary, applied to a structured recap. At most `_MAX_RECAP_CALLS` calls per
+  compaction; older pieces beyond that are digested deterministically (which
+  tools were called on which files) and the recap says so. Every failed piece
+  is now an `error` event, not only the ones that were programming mistakes.
+  See D-95.
+- **The Planner's research fence asks only for what it forces.** It said
+  "submit the plan now, or ask the developer what you cannot infer" on a turn
+  whose `tool_choice` named `submit_plan` alone. The text now matches the
+  constraint, and tells the model to carry an open question as a stated
+  assumption in the step, where the developer sees it in the plan card.
+- **An empty read range is refused, not clamped.** `read_file(start=100,
+  end=50)` returned line 100 as a success. It is now a refusal with a
+  `dead_end` mark, so a repeat is answered from the ledger.
+- **A second `UnsupportedParameterError` ends the run instead of escaping it.**
+  The fallback dispatch ran inside the `except` handler, so a refusal of the
+  degraded choice skipped every handler below and left `_complete` as a crash
+  the runtime dressed up after the fact. The fallback is a loop now, and a
+  refusal with nothing left to fall back to takes the ordinary error path.
+- **A steer restarts the gate-stall clock.** A run standing in front of a
+  failing gate ended on the very turn the developer's correction arrived, with
+  the message appended to a context nothing would read again. A drained steer
+  resets `idle_since_gate`; the bound is unchanged.
+- **A session's status flips after its last event lands.** `session.finish`
+  ran on the worker thread while `finish` and `end` were still queued for the
+  event loop, so a client connecting in that window replayed a transcript with
+  no `end`, saw "not running", and closed. The status update is now queued
+  behind the events on the same loop.
+- Test hygiene: `test_zz_debug_gate` (printed, asserted nothing) is gone, and
+  `test_write_preserves_the_executable_bit` skips on Windows, where NTFS has no
+  executable bit and the suite was red on the project's primary platform.
+
 ## 0.3.2 — 2026-09-03
 
 Extension `0.3.2`, `dakcoder-agent` `0.3.2`, `dakcoder-shared` `0.3.2`,

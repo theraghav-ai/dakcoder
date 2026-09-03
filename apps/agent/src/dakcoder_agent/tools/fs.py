@@ -227,11 +227,25 @@ def read_file(inv: Invocation) -> ToolResult:
     total = len(lines)
 
     start = inv.arg("start") or 1
-    end = inv.arg("end") or total
+    asked_end = inv.arg("end")
+    end = asked_end or total
     if start > total:
         return ToolResult.failure(
             f"{inv.path()} has {total} lines; start={start} is past the end.",
             fix=f"Read from line 1, or up to {total}.",
+        )
+    if asked_end is not None and asked_end < start:
+        # Refused, not clamped. `max(start, end)` used to turn `start=100,
+        # end=50` into a one-line read of line 100, reported as a success -- a
+        # model that swapped its arguments was handed an answer to a question
+        # it did not ask and had no way to notice. The same arguments will be
+        # wrong the same way every time, so the loop may answer a repeat from
+        # its ledger.
+        return ToolResult.failure(
+            f"{inv.path()}: end={asked_end} is before start={start}, so the range is "
+            "empty.",
+            fix=f"Pass start <= end, for example start={asked_end} end={start}.",
+            meta={"dead_end": f"end={asked_end} is before start={start}"},
         )
     start = max(1, start)
     end = min(total, max(start, end))

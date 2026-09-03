@@ -816,18 +816,3 @@ def test_stopping_mid_batch_answers_the_calls_it_abandoned(
     answered = {m.tool_call_id for m in loop.context.build() if str(m.role) == "tool"}
     assert declared <= answered, "every declared call must have an answer"
     assert loop.result.outcome == Outcome.ABORTED
-
-
-def test_zz_debug_gate(planning_router, gated, written):
-    gated["fail"] = "go_build"
-    loop, _c = build(planning_router, [plan_call(), patch()] + [say("nope.")] * 8, max_turns=20)
-    for e in loop.run("add Routes", intent=Intent.AGENT):
-        if e.type is EventType.GATE and e.data.get("kind") == "full":
-            print("\nGATE ok=", e.data["ok"], "blocked=", e.data.get("blocked_by"))
-            for st in e.data["stages"]:
-                print("   ", st["name"], "ok=", st["ok"], "blk=", st["blocking"],
-                      "skip=", repr(st.get("skipped"))[:40])
-    print("baseline taken:", loop.state.baseline.taken)
-    print("baseline passed:", loop.state.baseline.passed)
-    print("mutations:", loop.router.mutations, "touched:", loop.router.touched)
-    print("OUTCOME:", loop.result.outcome)

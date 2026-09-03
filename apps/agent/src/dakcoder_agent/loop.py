@@ -61,7 +61,15 @@ from dakcoder_shared.llm import (
 from dakcoder_shared.paths import PathEscape
 from dakcoder_shared.tokens import estimate_tokens
 
-from .context import ContextManager, Eviction, Message, OverBudgetError, Recap
+from .context import (
+    MAX_RECAP_ITEMS,
+    ContextManager,
+    Eviction,
+    Message,
+    OverBudgetError,
+    Recap,
+    Role,
+)
 from .gate import (
     Baseline,
     GateReport,
@@ -966,6 +974,7 @@ class AgentLoop:
     # -- one turn ---------------------------------------------------------
 
     def _turn(self) -> Iterator[Event]:
+        steered = False
         for correction in self.steer():
             # Appended as a user message so it lands in the working set the same
             # way the original task did, and the model treats it as instruction
@@ -973,6 +982,16 @@ class AgentLoop:
             self.context.append_user(correction)
             self.context.pin_directive(correction)
             yield Event(EventType.STEER, {"text": correction, "turn": self.context.turn})
+            steered = True
+
+        if steered:
+            # A correction is new input, and the developer typed it expecting a
+            # turn. The gate-stall clock counts turns in which nothing changed
+            # *and nothing new was said*; a run standing in front of a failing
+            # gate used to end on the very turn the developer's "try X instead"
+            # arrived, with the message appended to a context nothing would
+            # read again. The clock restarts; the bound is unchanged.
+            self.state.idle_since_gate = 0
 
         if reason := self._gate_stalled():
             self.result = RunResult(
@@ -1091,12 +1110,7 @@ class AgentLoop:
                     f"You have spent {self.state.research_turns} turns calling tools "
                     "in this phase without finishing it. That is enough to act on -- "
                     "reading more will not make the decision easier.\n\n"
-                    + (
-                        "Submit the plan now, or ask the developer what you cannot "
-                        "infer."
-                        if self.state.mode is Mode.PLANNER
-                        else "Say what you have done and what you found."
-                    )
+                    + self._fence_ask()
                 )
 
         if self.context.should_compact():
@@ -1257,47 +1271,57 @@ class AgentLoop:
 
         ticker = threading.Thread(target=tick, name="dakcoder-deltas", daemon=True)
 
-        def dispatch() -> TurnResult:
+        def dispatch(choice: str | dict[str, Any] | None) -> TurnResult:
             return complete(
                 self.context,
                 self.client,
                 tools=tools,
-                tool_choice=tool_choice,
+                tool_choice=choice,
                 session_id=self.session_id,
                 on_delta=lambda fragment: self._relay(deltas.feed(fragment)),
             )
 
         ticker.start()
         try:
-            return dispatch()
-        except UnsupportedParameterError:
-            # The endpoint does not take this `tool_choice`. Both uses of it here
-            # are recoveries from a run that is otherwise going to loop, so
-            # falling back is worth a prefill: "required" degrades to asking
-            # again plainly, and a named choice degrades to `required`, which at
-            # least keeps a tool call on the table.
-            #
-            # Deliberately *not* falling back to `tools=[]`. Measured on the live
-            # endpoint: with no tools the model emits markup for `Grep` with an
-            # `output_mode` parameter -- a tool from another harness, remembered
-            # from training -- and the loop would serve that to a developer as an
-            # answer. An unconstrained retry is a worse turn; that is a worse
-            # product.
-            if tool_choice is None:
-                raise
-            yield Event(
-                EventType.GATE,
-                {"kind": "tool_choice_unsupported", "value": str(tool_choice)},
-            )
-            tool_choice = "required" if isinstance(tool_choice, dict) else None
-            return dispatch()
+            while True:
+                try:
+                    return dispatch(tool_choice)
+                except UnsupportedParameterError:
+                    # The endpoint does not take this `tool_choice`. Both uses of
+                    # it here are recoveries from a run that is otherwise going
+                    # to loop, so falling back is worth a prefill: "required"
+                    # degrades to asking again plainly, and a named choice
+                    # degrades to `required`, which at least keeps a tool call
+                    # on the table.
+                    #
+                    # Deliberately *not* falling back to `tools=[]`. Measured on
+                    # the live endpoint: with no tools the model emits markup for
+                    # `Grep` with an `output_mode` parameter -- a tool from
+                    # another harness, remembered from training -- and the loop
+                    # would serve that to a developer as an answer. An
+                    # unconstrained retry is a worse turn; that is a worse
+                    # product.
+                    #
+                    # A loop rather than a retry inside the handler, because a
+                    # second refusal raised *inside* an `except` block skipped
+                    # every handler below and left `_complete` as an exception
+                    # the runtime had to dress up as a crash. Nothing left to
+                    # fall back to re-raises into the ordinary error path, which
+                    # ends the run ERROR with the endpoint's message on screen.
+                    if tool_choice is None:
+                        raise
+                    yield Event(
+                        EventType.GATE,
+                        {"kind": "tool_choice_unsupported", "value": str(tool_choice)},
+                    )
+                    tool_choice = "required" if isinstance(tool_choice, dict) else None
         except OverBudgetError as exc:
             # The context manager exists to prevent this, so reaching it means
             # compaction could not free enough. Compacting harder and retrying
             # once is worth a turn; failing the run outright is not.
             yield from self._compact(retain_pct=0.15, reason="over budget")
             try:
-                return dispatch()
+                return dispatch(tool_choice)
             except OverBudgetError:
                 self.result = RunResult(
                     Outcome.ERROR,
@@ -1980,6 +2004,33 @@ class AgentLoop:
         if why := self._re_reading(call):
             return why, "asks for lines already in context; not re-read", "re_read"
         return None
+
+    def _fence_ask(self) -> str:
+        """What the research fence asks for — and it names only what it allows.
+
+        The Planner used to be told "submit the plan now, or ask the developer
+        what you cannot infer" on a turn whose ``tool_choice`` named
+        ``submit_plan`` alone, so half the instruction was a move the request
+        forbade. The named choice is the lever measured to work; the text has to
+        agree with it, and the honest way to carry an open question through a
+        forced ``submit_plan`` is as a stated assumption in the step itself,
+        which the developer sees in the plan card and can correct before any
+        file changes.
+        """
+        if self.state.mode is not Mode.PLANNER:
+            return "Say what you have done and what you found."
+        forced = self._terminal_choice()["function"]["name"]
+        if forced == "submit_plan":
+            return (
+                "Submit the plan now, from what you already have. This turn accepts "
+                "only `submit_plan`: where something could not be inferred, state the "
+                "assumption you are making in that step's `action`, and the developer "
+                "will correct it in review."
+            )
+        return (
+            "Call `finish` now: say what you established about the task in `answer`, "
+            "and what you could not find out in `blocked`."
+        )
 
     def _gate_wants_an_edit(self) -> bool:
         """Whether a failing gate is currently asking for a change that has not come.
@@ -2866,19 +2917,58 @@ class AgentLoop:
             min((m.turn for m in messages), default=self.context.turn),
             max((m.turn for m in messages), default=self.context.turn),
         )
-        transcript = "\n\n".join(_rendered(m) for m in messages)
-
         read = self._read_paths(messages)
         modified = tuple(self.router.touched)
-        fallback = Recap(
-            goal=self.state.plan_summary or (self.state.plan[0].action if self.state.plan else ""),
-            files_modified=modified,
+        goal = self.state.plan_summary or (
+            self.state.plan[0].action if self.state.plan else ""
+        )
+
+        # Bounded per message, then split at message boundaries into pieces one
+        # call can take, then summarised oldest-first with each recap folded
+        # into the next. The evicted set used to go to the summariser whole,
+        # and on a large eviction the call could not fit its own window.
+        pieces = _chunked([(m, _rendered(m)) for m in messages], _TRANSCRIPT_CHARS)
+        recap: Recap | None = None
+        if len(pieces) > _MAX_RECAP_CALLS:
+            recap = _digest(pieces[: -_MAX_RECAP_CALLS])
+            pieces = pieces[-_MAX_RECAP_CALLS:]
+
+        for piece in pieces:
+            transcript = "\n\n".join(text for _, text in piece)
+            fallback = Recap(
+                goal=goal,
+                files_modified=modified,
+                open_items=(
+                    "part of the recap could not be summarised; its tail is preserved "
+                    "below",
+                ),
+                decisions=(transcript[-2000:],) if transcript else (),
+                turns=turns,
+            )
+            summarised = self._recap_call(transcript) or fallback
+            recap = summarised.merge(recap)
+
+        if recap is None:
+            recap = Recap(turns=turns)
+        return replace(
+            recap,
+            goal=recap.goal or goal,
+            files_modified=recap.files_modified or modified,
+            # Not taken from the model. What was evicted is a fact about this
+            # compaction, and the loop is the only thing that knows it.
             files_read=read,
-            open_items=("the recap could not be summarised; the tail is preserved below",),
-            decisions=(transcript[-2000:],) if transcript else (),
             turns=turns,
         )
 
+    def _recap_call(self, transcript: str) -> Recap | None:
+        """One summariser call over one piece of the transcript, or ``None``.
+
+        ``None`` on any failure, and every failure is announced. The broad
+        ``except`` used to return the fallback in silence for anything that was
+        not a programming error, so a summariser that could not fit its window
+        — the exact case the chunking above exists for — degraded every
+        compaction of a long run without one line saying so.
+        """
         try:
             reply = self.client.chat(
                 [{"role": "user", "content": _RECAP_PROMPT + transcript}],
@@ -2909,37 +2999,39 @@ class AgentLoop:
             # a permanent failure that degrades every compaction for the life of
             # the process, and a broad `except` hid exactly that for this
             # method's entire history.
-            self.on_event(
-                Event(
-                    EventType.ERROR,
-                    {
-                        "where": "summariser",
-                        "message": f"the recap could not be requested: {exc}",
-                        "effect": "compaction degraded to a fallback recap; dead ends "
-                        "will not be carried across it",
-                    },
-                )
-            )
-            return fallback
-        except Exception:  # noqa: BLE001 - a degraded recap beats ending the run
-            return fallback
+            self._summariser_failed(f"the recap could not be requested: {exc}")
+            return None
+        except Exception as exc:  # noqa: BLE001 - a degraded recap beats ending the run
+            self._summariser_failed(f"the summariser call failed: {exc}")
+            return None
 
         parsed = _parse_json_object(reply.content or "")
         if parsed is None:
-            return fallback
+            self._summariser_failed("the summariser replied with something that is not a recap")
+            return None
         return Recap(
-            goal=parsed.get("goal", "") or fallback.goal,
-            plan_step=parsed.get("plan_step", ""),
+            goal=str(parsed.get("goal", "") or ""),
+            plan_step=str(parsed.get("plan_step", "") or ""),
             files_created=tuple(parsed.get("files_created") or ()),
-            files_modified=tuple(parsed.get("files_modified") or modified),
-            # Not taken from the model. What was evicted is a fact about this
-            # compaction, and the loop is the only thing that knows it.
-            files_read=read,
+            files_modified=tuple(parsed.get("files_modified") or ()),
             decisions=tuple(parsed.get("decisions") or ()),
             verified=tuple(parsed.get("verified") or ()),
             open_items=tuple(parsed.get("open_items") or ()),
             do_not_retry=tuple(parsed.get("do_not_retry") or ()),
-            turns=turns,
+        )
+
+    def _summariser_failed(self, message: str) -> None:
+        """Say that a compaction is degraded, in the transcript, every time."""
+        self._relay(
+            Event(
+                EventType.ERROR,
+                {
+                    "where": "summariser",
+                    "message": message,
+                    "effect": "compaction degraded to a fallback recap for part of the "
+                    "transcript; dead ends in that part will not be carried across it",
+                },
+            )
         )
 
     @staticmethod
@@ -2989,6 +3081,67 @@ class AgentLoop:
 #: enough for one 40KB write to be the whole recap prompt.
 _ARGS_IN_TRANSCRIPT = 200
 
+#: How much of a tool result the summariser is shown: this much of its head and
+#: ``_RESULT_TAIL_IN_TRANSCRIPT`` of its tail, with the cut stated between them.
+#:
+#: The recap is about *what happened* — which file was read, what the build
+#: said, which search came back empty — and the head of a result carries that:
+#: `read_file`'s header line, `go_build`'s first errors, `search_repo`'s match
+#: count. The body is the thing the compaction is throwing away; handing all of
+#: it to the summariser is paying to re-read what is being forgotten. This is
+#: the same move Claude Code's "microcompact" makes before any model call —
+#: stale tool results are cleared deterministically, and only the residue is
+#: summarised.
+_RESULT_HEAD_IN_TRANSCRIPT = 1_200
+_RESULT_TAIL_IN_TRANSCRIPT = 400
+
+#: How much of a prose message (the model's, or the developer's) is kept.
+_PROSE_IN_TRANSCRIPT = 1_500
+
+#: The most transcript one summariser call is handed, in characters.
+#:
+#: The evicted set used to go to the summariser whole. Three capped reads are
+#: ~577,000 characters; on the emergency 15% path the evicted set can be most of
+#: an over-budget prompt, which does not fit the summariser's own window, and
+#: the call failed into the fallback recap without a word. Forty thousand
+#: characters is ~12k tokens on the code ratio: comfortably inside any model the
+#: `summariser` role could be pointed at, and large enough that a compaction of
+#: an ordinary working set is still one call.
+_TRANSCRIPT_CHARS = 40_000
+
+#: How many summariser calls one compaction may make. A transcript that does
+#: not fit one call is split at message boundaries and summarised oldest-first,
+#: each recap folded into the next (``Recap.merge``) — Aider's recursive
+#: ``ChatSummary`` and langmem's running summary, applied to a structured recap.
+#: Beyond this many pieces the oldest are digested deterministically instead:
+#: a compaction is already a real cost against the developer's quota, and one
+#: that spent twenty model calls summarising would be its own budget problem.
+_MAX_RECAP_CALLS = 4
+
+
+def _clipped(message: Message) -> str:
+    """The message's content as the summariser sees it: bounded per message.
+
+    A tool result keeps its head and its tail. The head is where the tools here
+    put the facts (the path and span, the first compiler errors, the match
+    count); the tail is where a truncated build log ends and where a search
+    result says it stopped. Prose keeps its head: a reply that needed more than
+    this to say what it decided had not decided.
+    """
+    text = message.content or ""
+    if message.role is Role.TOOL:
+        limit = _RESULT_HEAD_IN_TRANSCRIPT + _RESULT_TAIL_IN_TRANSCRIPT
+        if len(text) <= limit:
+            return text
+        cut = len(text) - limit
+        return (
+            f"{text[:_RESULT_HEAD_IN_TRANSCRIPT]}\n[… {cut:,} chars of this result "
+            f"omitted from the handover …]\n{text[-_RESULT_TAIL_IN_TRANSCRIPT:]}"
+        )
+    if len(text) <= _PROSE_IN_TRANSCRIPT:
+        return text
+    return f"{text[:_PROSE_IN_TRANSCRIPT]}… ({len(text) - _PROSE_IN_TRANSCRIPT:,} more chars)"
+
 
 def _rendered(message: Message) -> str:
     """One message, as the summariser sees it.
@@ -3001,17 +3154,74 @@ def _rendered(message: Message) -> str:
     post-compaction run had no way to know it had already written the file.
 
     Arguments are truncated rather than omitted: which file was written is the
-    fact worth carrying, and the content of the write is in the workspace.
+    fact worth carrying, and the content of the write is in the workspace. The
+    content is bounded too, by ``_clipped``, so that no single message can make
+    the transcript larger than one summariser call takes.
     """
     where = "" if not message.path else " " + message.path
     head = f"[{message.role}{where}]"
-    parts = [f"{head} {message.content}".rstrip()]
+    parts = [f"{head} {_clipped(message)}".rstrip()]
     for call in message.tool_calls:
         args = (call.arguments or "").strip()
         if len(args) > _ARGS_IN_TRANSCRIPT:
             args = f"{args[:_ARGS_IN_TRANSCRIPT]}… ({len(call.arguments):,} chars)"
         parts.append(f"{head} called {call.name}({args})")
     return "\n".join(p for p in parts if p.strip() != head)
+
+
+def _chunked(
+    rendered: Sequence[tuple[Message, str]], budget: int
+) -> list[list[tuple[Message, str]]]:
+    """Split a rendered transcript at message boundaries into pieces under ``budget``.
+
+    A single rendered message is already bounded by ``_clipped`` and
+    ``_ARGS_IN_TRANSCRIPT``, so a piece holds at least one message and a message
+    is never split — the summariser is never shown half a tool result with no
+    idea which half.
+    """
+    pieces: list[list[tuple[Message, str]]] = []
+    current: list[tuple[Message, str]] = []
+    size = 0
+    for item in rendered:
+        cost = len(item[1]) + 2
+        if current and size + cost > budget:
+            pieces.append(current)
+            current, size = [], 0
+        current.append(item)
+        size += cost
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _digest(pieces: Sequence[Sequence[tuple[Message, str]]]) -> Recap:
+    """A recap of what the run *did* in pieces the summariser will not be shown.
+
+    Deterministic, and about actions rather than conclusions: which tools were
+    called on which files. It carries no ``do_not_retry`` — that is a judgement,
+    and this makes none — but it keeps the compaction honest about the shape of
+    what it dropped, which is more than the previous silent fallback did.
+    """
+    seen: dict[str, None] = {}
+    for piece in pieces:
+        for message, _ in piece:
+            for call in message.tool_calls:
+                args = _safe_args(call)
+                target = None
+                if isinstance(args, dict):
+                    target = args.get("path") or args.get("pattern") or args.get("query")
+                seen[f"{call.name}({target})" if target else call.name] = None
+    if not seen:
+        return Recap()
+    listed = ", ".join(list(seen)[:MAX_RECAP_ITEMS])
+    more = len(seen) - MAX_RECAP_ITEMS
+    return Recap(
+        decisions=(
+            "earlier in this run (not summarised by the model; the transcript was "
+            f"too long): calls made were {listed}"
+            + (f" and {more} more" if more > 0 else ""),
+        ),
+    )
 
 
 def _safe_args(call: ToolCall) -> Any:

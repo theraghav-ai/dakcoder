@@ -218,6 +218,7 @@ def test_a_failed_write_leaves_the_file_untouched(router: Router, workspace) -> 
     assert target.read_bytes() == before
 
 
+@pytest.mark.skipif(os.name == "nt", reason="NTFS has no executable bit to preserve")
 def test_write_preserves_the_executable_bit(router: Router, workspace) -> None:
     """A patched script that quietly loses +x is breakage nobody attributes here."""
     script = workspace.root / "scripts" / "build.sh"
@@ -1577,6 +1578,9 @@ def test_over_budget_fallback_recovers(planning_router: Router) -> None:
         # and silently reading something else teaches it nothing.
         ({"start": 0}, "must be at least 1"),
         ({"start": -5}, "must be at least 1"),
+        # An empty range is refused too. `max(start, end)` used to turn it into
+        # a one-line read of `start`, reported as a success.
+        ({"start": 3, "end": 1}, "before start"),
     ],
 )
 def test_invalid_line_ranges(router: Router, args: dict, expect) -> None:

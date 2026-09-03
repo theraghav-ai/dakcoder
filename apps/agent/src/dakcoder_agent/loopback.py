@@ -347,6 +347,24 @@ class Loopback:
         # use, from the same thread, which is what keeps them in order.
         agent.on_event = emit
 
+        def settle(update: Callable[[], None]) -> None:
+            """Apply the session's terminal status *after* its last event lands.
+
+            The events travel to the transcript by ``call_soon_threadsafe``; the
+            status used to be flipped right here on the worker thread. So for a
+            moment the session read as finished while its ``finish`` and ``end``
+            were still queued as callbacks, and a client that connected in that
+            window replayed a transcript with no ``end``, saw "not running", and
+            closed -- the run looked as though it had died mid-sentence. The
+            test suite had to work around the same gap (``settle`` in
+            ``test_loopback``). Queued behind the events on the same loop, the
+            status cannot be observed ahead of the record that justifies it.
+            """
+            try:
+                loop.call_soon_threadsafe(update)
+            except RuntimeError:
+                update()
+
         def run() -> None:
             try:
                 for event in agent.run(
@@ -375,12 +393,17 @@ class Loopback:
                 )
                 emit(Event(EventType.FINISH, failed.as_dict()))
                 emit(Event(EventType.END, failed.as_dict()))
-                session.status = Status.ERROR
-                session.summary = summary
-                session.finished_at = datetime.now(tz=timezone.utc)
+
+                def failed_status() -> None:
+                    session.status = Status.ERROR
+                    session.summary = summary
+                    session.finished_at = datetime.now(tz=timezone.utc)
+
+                settle(failed_status)
             else:
-                if agent.result is not None:
-                    session.finish(agent.result)
+                result = agent.result
+                if result is not None:
+                    settle(lambda: session.finish(result))
             finally:
                 # Every approval this run was waiting on is released, whichever
                 # way the run ended. A crashed run holding a pending approval

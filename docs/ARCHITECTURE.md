@@ -1704,6 +1704,52 @@ properly means the Planner marking its own output, which is a prompt-contract
 change with a budget cost, and is worth doing deliberately rather than as part of
 a bug fix.
 
+---
+**D-95 · The summariser is handed bounded pieces and folds a running recap**
+· *settled 3 Sep 2026*
+
+`AgentLoop._summarise` clips every message (`_clipped`: a tool result keeps
+`_RESULT_HEAD_IN_TRANSCRIPT` of its head and `_RESULT_TAIL_IN_TRANSCRIPT` of its
+tail, prose keeps `_PROSE_IN_TRANSCRIPT`), splits the rendered transcript at
+message boundaries into pieces of at most `_TRANSCRIPT_CHARS`, summarises them
+oldest-first, and folds each recap into the next with `Recap.merge`. At most
+`_MAX_RECAP_CALLS` model calls per compaction; pieces older than that are
+digested deterministically into a `decisions` line naming the calls made, and
+the recap says the model did not see them.
+
+**Why**: the evicted set went to the summariser whole. Three capped reads were
+one ~577,000-character request; on the emergency 15% path the eviction can be
+most of an over-budget prompt, which does not fit the summariser's own window,
+and the call failed into the fallback recap without an `error` event. The
+design's own argument for compaction — "summarise, do not truncate" — was being
+lost at exactly the size where it mattered.
+
+**Where the shape comes from.** Three harnesses solve the same problem the same
+way, and the combination is what is built here rather than any one of them:
+
+- Claude Code's compaction is three-tier, and its first tier ("microcompact")
+  clears stale tool results *without a model call* before the full summary
+  runs. `_clipped` is that tier: the body of a tool result is what the
+  compaction is throwing away, and paying the summariser to re-read it is the
+  cost this decision removes.
+- Aider's `ChatSummary.summarize()` recursively splits history that does not
+  fit the summariser's limit and summarises the pieces. `_chunked` is the
+  split; `Recap.merge` is the fold.
+- langmem's `SummarizationNode` carries a *running summary* into each new one
+  rather than replacing it. `ContextManager.compact` already did that across
+  compactions (D-72's successor, BUG L-4); this extends it within one.
+
+**Rejected**: raising the summariser's budget to the model window. It would
+have worked on this endpoint today and failed the day `summariser` is pointed
+at a smaller model, which D-94 exists to make cheap. Also rejected: dropping
+the oldest messages unsummarised once the transcript is too long. That is the
+truncation the design argues against, and it drops `do_not_retry` first.
+
+**Cost to reverse**: one function. `_summarise` is the only caller of
+`_chunked`, `_clipped` and `_digest`.
+
+---
+
 ## 4. Verification strategy
 
 The load-bearing assertions, and what each is guarding against:
