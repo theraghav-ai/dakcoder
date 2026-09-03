@@ -1,8 +1,12 @@
 # dakcoder
 
+python -m build --wheel --outdir extension/runtime apps/shared
+python -m build --wheel --outdir extension/runtime apps/agent
+cd extension && npm run package
+
 The IT 2.0 backend coding agent for Go services on `n-api-template`.
 
-Turns *"add a `Pension` resource with CRUD and a status filter"* into a
+Turns _"add a `Pension` resource with CRUD and a status filter"_ into a
 compiling, FX-wired, swagger-visible set of Go files — verified by the compiler
 and a static template linter before a human sees the diff.
 

@@ -304,7 +304,14 @@ describe('RunState — the conversation', () => {
       id: 's1',
       task: 't',
       workspace: 'w',
-      created_at: new Date().toISOString(),
+      // A minute ago, and the first run ended thirty seconds ago.
+      //
+      // Both timestamps used to be `now`, which made the frozen clock and the
+      // fresh one the same 0ms and turned the assertion into a question about
+      // which millisecond each `toISOString()` landed in — it failed roughly
+      // seven runs in eight. Spacing them is what makes the two readings
+      // distinguishable, which is the whole thing being tested.
+      created_at: new Date(Date.now() - 60_000).toISOString(),
       summary: '',
       mutations: [],
       events: 0,
@@ -312,13 +319,22 @@ describe('RunState — the conversation', () => {
       queued: 0,
       winding_down: false,
     };
-    state.hydrate({ ...base, status: 'done', finished_at: new Date().toISOString() } as never);
-    const stopped = state.elapsedMs;
+    state.hydrate({
+      ...base,
+      status: 'done',
+      finished_at: new Date(Date.now() - 30_000).toISOString(),
+    } as never);
+    // Frozen at what that run took, which is the right answer while it is over.
+    assert.ok(state.elapsedMs >= 30_000, `a finished run reads ${state.elapsedMs}ms`);
+
     state.hydrate({ ...base, status: 'running', finished_at: null } as never);
     assert.equal(state.status, 'running');
+    // Not `>= stopped`, which asked the new run's clock to be at least as long
+    // as the old one's — a follow-up to a two-hour run would have failed that
+    // on entirely correct behaviour.
     assert.ok(
-      state.elapsedMs >= stopped,
-      'a frozen elapsed clock reads as a run that has stalled',
+      state.elapsedMs < 1_000,
+      'a follow-up starts a new run, and its clock starts now rather than staying frozen at what the last one took',
     );
   });
 });

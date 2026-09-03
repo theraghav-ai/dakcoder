@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 — 2026-09-03
+
+Extension `0.3.1`, `dakcoder-agent` `0.3.1`, `dakcoder-shared` `0.3.1`,
+`dakcoder-gateway` `0.3.1`. Runtime API unchanged at **1.1**.
+
+**Deploy the gateway before the extension.** A 0.3.1 runtime dispatches Ask
+turns as the `ask` role, which a 0.3.0 gateway's table does not contain — every
+Ask turn against one would come back "'ask' is not a configured role". The
+reverse skew is safe: a 0.3.0 runtime only ever sends `coder`, `fast` and
+`embed`, all of which a 0.3.1 gateway routes.
 
 ### Added
 
@@ -19,6 +28,14 @@
 
 ### Fixed
 
+- **A flaky extension test** that failed roughly seven runs in eight, blocking
+  `npm run package`. `clears finished_at when a follow-up puts the session back
+  to running` built its fixture with `created_at` and `finished_at` both taken
+  `now`, so the frozen clock and the fresh one were the same 0ms and the
+  assertion turned on which millisecond each `toISOString()` landed in. It also
+  asserted the wrong thing — `elapsedMs >= stopped` asks a new run's clock to be
+  at least as long as the old run's, which a follow-up to a two-hour run would
+  fail on entirely correct behaviour.
 - **Every turn dispatched as `coder` whatever mode it was in**, so `planner`
   and `ask` were role-table entries nothing could reach — planning and
   answering were billed, logged and routed as coding. A mode now carries its
