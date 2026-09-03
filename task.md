@@ -50,6 +50,14 @@ Status key: `[ ]` pending · `[~]` in progress · `[x]` done
 - [x] 3.5 extension (EXT-6, EXT-16, EXT-18, then EXT-11/12/13/14/19-22)
 - [x] 3.8 rehydration — a restart restores the conversation, not only the record
 - [x] 3.9 SH-6 — the delta interval flush needs something to ask it the time
+
+## Phase 4 — reported from a live run (not in the audit)
+
+- [x] 4.1 FS-1 a file larger than one reply could not be written at all
+- [x] 4.2 FS-2 the truncation advice could not work for a single oversized call
+- [x] 4.3 FS-3 the truncation bound resets, so alternating thrash is unbounded
+- [x] 4.4 FS-4 a shell redirection is answered with the tool that reads
+- [x] 4.5 output budgets raised; the window arithmetic made a checked invariant
 - [x] 3.6 documentation truth pass (DOC-1) — done early: the four false claims
 - [x] 3.7 residual loop rows (L-16, L-22, L-23, L-30, TL-10, GT-1)
 
@@ -83,7 +91,7 @@ Status key: `[ ]` pending · `[~]` in progress · `[x]` done
 
 ## Where this stands
 
-**Suite: 833 tests, green** (it was 704 with 6 failing). Extension `npm run
+**Suite: 847 tests, green** (it was 704 with 6 failing). Extension `npm run
 verify` green end to end: typecheck, 69 tests, bundle, credential scan, 59/59
 commands in both directions, l10n, gotools manifest.
 
@@ -119,6 +127,155 @@ Two things worth knowing before the next run against a real repository:
 ---
 
 ## Log — audit remediation
+
+### 4.5 — the output budgets, and the arithmetic nobody was checking · done
+
+Asked for directly: raise the output limits, since a 245,760 prompt budget
+against a 262,144 window leaves 16,384 and only 6,144 was being used.
+
+The observation is right, and the reason it matters is FS-1 above. A reply has
+to hold the prose, the tool name and the whole of every argument, so
+``max_tokens`` is the real limit on what a single call can carry. At 6,144 the
+largest file ``write_file`` could create in one call was about 21 KB. ``append``
+removed the hard floor, but every chunk is a turn and every turn is a full
+prefill, so the ceiling still costs real money.
+
+**Where the room came from.** Not from the 16,384. That number is not spare: the
+design reserves ~10k of it for two things the budgets cannot see — the chat
+template's own wrapping, and the fact that ``prompt_budget`` is enforced against
+an *estimate*. The estimator is calibrated per session against the endpoint's
+real ``prompt_tokens``, so in steady state it tracks; the reserve is for when it
+does not, and its bounds alone permit 2.0 to 6.0 chars per token. Spending it is
+the change that passes every test and then fails on the *last* turn of a long
+run, where the prompt is largest and a context-length 400 is not retryable — the
+run dies having done the work.
+
+So the room came out of the prompt ceiling, which makes it a stated trade rather
+than a borrowed margin:
+
+    CONTEXT_WINDOW  262,144
+    - max_tokens     16,384   (agent, was 6,144)
+    - OUTPUT_RESERVE 10,240   (unchanged)
+    = PROMPT_BUDGET 235,520   (was 245,760, -4.2%)
+
+ask and planner go 4,096 -> 8,192. A plan is one ``submit_plan`` call whose
+arguments hold every step, so it has the same shape of limit as a write.
+
+**What the prompt cut costs: measured, not assumed.** The worry was that a lower
+ceiling compacts earlier and ``test_budget_regression.py`` goes red on its own
+terms. It does not, and the reason is the interesting part — the simulation
+peaks at ~115k against a ceiling of 235,520, so a run is nowhere near either the
+old number or the new one, and cutting 4.2% off a ceiling nothing reaches costs
+nothing:
+
+    P95 prompt   113,961 -> 114,811   (+0.7%)
+    novel total  846,221 -> 846,666   (+445 tokens)
+    compactions        0 ->       0   (unchanged)
+
+What it buys: the largest single ``write_file`` goes from about 21 KB to about
+56 KB.
+
+**The part worth keeping.** ``prompt_budget`` and ``max_tokens`` were
+independent numbers in separate paragraphs, and the only place their sum ever
+appeared was a sentence of prose. Nothing evaluated it. ``ModeConfig`` checks it
+now: prompt + output + reserve must fit the window, or the config refuses to
+load where it is written rather than 400-ing on the last turn of a long run. A
+property nothing evaluates is a comment, and this one was about to be edited by
+hand.
+
+Two related fixes fell out. ``CONTEXT_WINDOW`` and the gateway probe's
+``EXPECTED_MAX_MODEL_LEN`` are the same deployment fact in two packages, so a
+test pins them equal. And the probe's comment said "the agent caps its own
+prompts at 32k", which stopped being true when the budget was re-based on the
+model's window and was wrong by a factor of seven by the time anyone read it.
+
+Two tests also changed rather than broke: both asserted the literal ``4096``
+where they meant "the planner's own budget", so they failed on a retune that
+said nothing about them. They read the config now.
+
+Tests: four in `test_regression_audit.py` for the window invariant.
+
+### 4.1-4.4 — the write loop, reported from a live run · done
+
+Not from the audit. A transcript was handed over showing turns 29 to 33 of a run
+asked for a report over ten repository files: `write_file` cut off, `write_file`
+cut off, `run_terminal cat > report.md` refused, `write_file` cut off,
+`write_file` cut off. The model's own narration across those turns was "Let me
+write the report in chunks", "Let me write it in parts", "Let me split it into
+multiple files and combine" — the right idea, three times, and each attempt came
+back identically.
+
+It was right and the tools were wrong. Four defects, and the first is the cause.
+
+**FS-1 — a file larger than one reply was not writable.** A model's whole reply
+— prose, tool name and the entire `content` argument, JSON-escaped — has to fit
+one `max_tokens` budget, 6,144 for the acting mode. That caps a single
+`write_file` at roughly 24 KB of text. Measured on report-shaped markdown: 16 KB
+fits at 4,240 tokens, 32 KB does not at 8,472. And there was no second way in.
+`write_file` refuses to overwrite, which is a deliberate and correct safety
+property; `patch_file` needs a unique anchor *in a file that already has one*,
+which the first chunk of a new document does not have; `run_terminal` cannot
+write. The three tools compose to "documents up to 24 KB only", and nothing said
+so.
+
+`write_file` takes `append` now. Safe by construction — it adds at the end and
+can destroy nothing — and it makes chunked writing uniform: the same call for
+the first chunk and every one after it, with no anchor to guess. Two details
+that would have been bugs. An append adds **no** trailing newline, where a
+create does: a chunk boundary can fall mid-word and a newline inserted there
+splits it. And an append to an existing file records `MODIFY`, not `CREATE`,
+because `revert` reads that kind to decide between restoring bytes and deleting
+the file — a wrong kind there would have revert delete a file the run did not
+create.
+
+Verified end to end: the 64 KB report that could not be written at all now goes
+in twelve appends and comes back byte-identical.
+
+**FS-2 — the advice could not work.** A cut-off reply got one paragraph
+whatever its shape: "Make the next reply shorter: fewer tool calls in one turn,
+and less prose before them. One call is enough." That is correct when a batch of
+five was cut off in the fifth. It is useless when the reply held *one* call
+whose single argument is the thing that does not fit, because there is nothing
+left to remove — and the transcript is four turns of a model following it
+exactly and being cut off in the same place. The message branches now: a lone
+content-bearing write is told the content itself is too large and given the
+chunked call to make, and everything else still gets the shorter-reply advice,
+which for a batch is right.
+
+**FS-3 — the bound could be dodged.** `MAX_TRUNCATED_TURNS` is three, and the
+streak resets on any reply that arrives whole. Turn 30 — the refused
+`run_terminal` — was a whole reply, so the streak never got past one and the run
+was bounded by nothing but `max_turns`. That is not an unlucky shape; casting
+about for another way to send something too large is exactly what puts an
+ordinary call between two oversized ones. There is a run total now,
+`MAX_TRUNCATIONS = 6`, which never resets, and the run ends on either bound
+naming which one it hit.
+
+**FS-4 — the last exit was mislabelled.** `_TERMINAL_ALTERNATIVES` is keyed on
+the binary alone, so `cat > report.md` — a write — was answered "Use
+read_file.": advice for the opposite operation, handed to a run that had
+exhausted its ways to write a large file and was trying the shell as a last
+resort. Wrong advice at the end of a dead end is worse than none. A redirection
+token in argv is now recognised and answered with the tool that writes, plus the
+fact that `>` was passed to the process as a literal argument because argv never
+goes through a shell. A plain `cat go.mod` still says `read_file`.
+
+**What it cost.** The `append` parameter pushed the agent mode's stable prefix
+from 3,771 to 3,812 tokens, over the 3,800 ceiling `test_prompts.py` asserts —
+which is the tripwire working as its own comment says it should. The text was
+tightened twice, `write_file`'s description stopped repeating "use patch_file
+for that" (`ToolSpec.instead` and the runtime refusal both already say it, and
+neither is in the prefix), and what was left was a decision rather than a
+rounding error: the ceiling moved to 3,850 with the reasoning recorded beside
+it. The 41 tokens buy the model knowing *before* it tries that a large file can
+be chunked. The alternative is not free — without the hint it discovers the wall
+by hitting it, at a full 6,144-token reply plus a prefill per attempt, and the
+reported run spent four turns doing that and never got there. The schema text is
+in the stable prefix, so it is a cache hit after the first call of a run; the
+wasted turn is not.
+
+Tests: six in `test_fs_tools.py` for the append path, four in
+`test_regression_audit.py` for the advice, the bound and the refusal.
 
 ### 3.9 — SH-6, found by re-reading the register rather than the board · done
 

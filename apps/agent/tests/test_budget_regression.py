@@ -25,6 +25,18 @@ still a red build. Measured on this simulation at the new budget and caps:
                                budget shrank back, which is the very regression
                                this file exists to catch)
 
+**Re-measured 2026-09-03 for PROMPT_BUDGET = 235,520**, after 10,240 tokens moved
+from the prompt ceiling to ``agent``'s output budget so a single ``write_file``
+could carry more than ~21 KB (BUG FS-1). The worry was that a lower ceiling
+would compact earlier and this gate would go red on its own terms. It does not,
+and the reason is worth recording: the simulation peaks at ~115k against a
+ceiling of 235,520, so the run is nowhere near either the old ceiling or the new
+one, and a 4.2% cut to a number nothing reaches costs nothing.
+
+    P95 prompt   114,811   (+0.7%)
+    novel total  846,666   (+445 tokens)
+    compactions        0   (unchanged — the cut did not bring compaction back)
+
 The prefill target needs reading carefully. §5.3 writes it as
 "<= 180k (cap + compaction + **prefix reuse**)", and the row beneath it marks
 the >=80% cache-hit rate as *contingent on plan.md §9 Q1* — which is unresolved,

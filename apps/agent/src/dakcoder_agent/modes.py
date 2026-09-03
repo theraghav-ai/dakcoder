@@ -44,7 +44,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-__all__ = ["Intent", "Mode", "ModeConfig", "MODES", "config_for"]
+__all__ = [
+    "CONTEXT_WINDOW",
+    "Intent",
+    "MODES",
+    "Mode",
+    "ModeConfig",
+    "OUTPUT_RESERVE",
+    "PROMPT_BUDGET",
+    "config_for",
+]
 
 
 class Mode(StrEnum):
@@ -181,15 +190,64 @@ class ModeConfig:
                 "content: null, wasting the turn. Use at least 6144."
             )
 
+        # The two budgets share one window, and nothing used to say so.
+        #
+        # ``prompt_budget`` and ``max_tokens`` were independent numbers in
+        # separate paragraphs, and the only place their sum appeared was a
+        # sentence of prose. Raising either past their sum is a config that
+        # loads cleanly, passes every test, and then fails on the *last* turn
+        # of a long run -- the endpoint refuses `prompt + max_tokens` over
+        # `max_model_len` with a 400, which is not retryable, so the run dies
+        # having done the work and lost it. That is the worst possible turn to
+        # find out on, and it is the one this arithmetic guarantees.
+        if self.prompt_budget + self.max_tokens + OUTPUT_RESERVE > CONTEXT_WINDOW:
+            raise ValueError(
+                f"{self.mode}: prompt_budget {self.prompt_budget:,} + max_tokens "
+                f"{self.max_tokens:,} + the {OUTPUT_RESERVE:,}-token reserve exceeds "
+                f"the {CONTEXT_WINDOW:,}-token window. Prompt and completion share it; "
+                "raise one only by lowering the other."
+            )
+
+
+#: The model's context window. Prompt and completion share it.
+#:
+#: The endpoint serves Qwen3.8-27B at ``max_model_len`` 262,144, asserted by the
+#: gateway probe (``EXPECTED_MAX_MODEL_LEN``). Stated here as a constant rather
+#: than as prose, because ``ModeConfig.__post_init__`` now checks against it:
+#: the sum of the two budgets is a property of the deployment, and a property
+#: nothing evaluates is a comment.
+CONTEXT_WINDOW = 262_144
+
+#: Window left unclaimed by either budget.
+#:
+#: For two things the numbers below cannot see. The chat template wraps every
+#: message in role markers and serialises the tool schemas its own way, none of
+#: which the estimator is shown; and ``prompt_budget`` is enforced against an
+#: *estimate* (``tokens.py``), so a prompt at the ceiling is only approximately
+#: at the ceiling.
+#:
+#: The estimator is calibrated per session against the endpoint's own
+#: ``prompt_tokens`` (``Calibration``, EMA at 0.2), so in steady state it
+#: tracks. The reserve is for when it does not: the ratio lags by a few turns
+#: after the content shape changes -- a run that has been reading prose docs and
+#: turns to reading Go source -- and the ratio bounds alone permit 2.0 to 6.0.
+#: 10,240 is 3.9% of the window, which covers a materially wrong estimate at a
+#: full prompt without costing a turn's worth of either budget.
+#:
+#: It is deliberately not spent. Raising an output budget by eating this is the
+#: change that works in every test and fails on the last turn of a long run,
+#: where the prompt is largest and a 400 is not retryable.
+OUTPUT_RESERVE = 10_240
 
 #: The prompt budget every mode gets. One number, because five copies of it is
 #: how the Planner came to have a different one that nobody noticed.
 #:
-#: 245,760 -- the model's own window, minus room to answer. The endpoint serves
-#: Qwen3.8-27B at ``max_model_len`` 262,144 (asserted by the gateway probe),
-#: prompt and completion share it, and the largest completion budget below is
-#: 6,144; the remaining ~10k is headroom for template overhead and estimator
-#: error, so a full prompt cannot push the answer out of the window.
+#: ``CONTEXT_WINDOW - AGENT's max_tokens - OUTPUT_RESERVE``, exactly:
+#: 262,144 - 16,384 - 10,240 = 235,520. It was 245,760 when the largest
+#: completion budget was 6,144; raising that to 16,384 bought the output room
+#: out of here rather than out of the reserve, which is the trade the arithmetic
+#: above makes explicit. The cost is 4.2% of the prompt ceiling and a compaction
+#: threshold 7,168 tokens earlier, measured in ``test_budget_regression.py``.
 #:
 #: The history is worth keeping, because both of the old numbers were
 #: load-bearing. It was 24,000 for the Planner once, and that killed a
@@ -202,7 +260,7 @@ class ModeConfig:
 #:
 #: The budget is a ceiling, not an allocation: short runs are unchanged, and
 #: prefix caching absorbs most of what a long one accumulates.
-PROMPT_BUDGET = 245_760
+PROMPT_BUDGET = 235_520
 
 #: Output budgets.
 #:
@@ -212,15 +270,31 @@ PROMPT_BUDGET = 245_760
 #: ``write_file`` needs room to use it, and a mode that does not costs nothing
 #: by having room it never spends: ``max_tokens`` is a ceiling, and an unused
 #: ceiling is free.
+#:
+#: **Raised 2026-09-03**, because "an unused ceiling is free" cuts both ways and
+#: the old ceilings were not unused. A reply has to hold the prose, the tool
+#: name and the whole of every argument, so ``max_tokens`` is the real limit on
+#: how much a single call can carry: at 6,144 the largest file ``write_file``
+#: could create in one call was about 24 KB, and a run asked for a report longer
+#: than that could not write it at all (BUG FS-1). ``append`` removed the hard
+#: floor -- anything can now be written in chunks -- but each chunk is a turn,
+#: and a turn is a full prefill. 16,384 makes the common case one call instead
+#: of three.
+#:
+#: The room came from ``PROMPT_BUDGET``, not from ``OUTPUT_RESERVE``. See both.
 MODES: dict[Mode, ModeConfig] = {
-    # Answers a question. No write tools, so its ceiling is about prose.
-    Mode.ASK: ModeConfig(Mode.ASK, PROMPT_BUDGET, 4096, False, 0.1, role="ask"),
+    # Answers a question. No write tools, so its ceiling is about prose. 8,192
+    # is roughly 30 KB of answer, which is longer than any answer should be.
+    Mode.ASK: ModeConfig(Mode.ASK, PROMPT_BUDGET, 8192, False, 0.1, role="ask"),
     # Emits a plan through ``submit_plan``, which is structured output, and the
-    # spike found no quality gain from thinking on structured output.
-    Mode.PLANNER: ModeConfig(Mode.PLANNER, PROMPT_BUDGET, 4096, False, 0.1, role="planner"),
+    # spike found no quality gain from thinking on structured output. A plan is
+    # one call whose arguments hold every step, so it has the same shape of
+    # limit as a write and the same reason to have room.
+    Mode.PLANNER: ModeConfig(Mode.PLANNER, PROMPT_BUDGET, 8192, False, 0.1, role="planner"),
     # Every tool, including ``write_file``. The largest budget, because this is
-    # the only mode that ever has to emit a whole file.
-    Mode.AGENT: ModeConfig(Mode.AGENT, PROMPT_BUDGET, 6144, False, 0.1, role="coder"),
+    # the only mode that ever has to emit a whole file, and the one the window
+    # arithmetic above is sized against.
+    Mode.AGENT: ModeConfig(Mode.AGENT, PROMPT_BUDGET, 16384, False, 0.1, role="coder"),
 }
 
 

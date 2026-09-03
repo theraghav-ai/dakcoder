@@ -7,6 +7,7 @@ import pytest
 from dakcoder_agent import ContextManager, Mode
 from dakcoder_agent.context import OverBudgetError
 from dakcoder_agent.llm import complete, make_client, reasoning_leaked
+from dakcoder_agent.modes import config_for
 from dakcoder_shared.config import Deployment, LLMConfig, local_config
 from dakcoder_shared.llm import LLMClient
 
@@ -34,7 +35,10 @@ def test_a_turn_dispatches_with_the_modes_own_settings(endpoint):
         result = complete(cm, c)
 
     sent = endpoint.requests[0]
-    assert sent["max_tokens"] == 4096            # planner's output budget
+    # The mode's own budget, read from the config rather than repeated here:
+    # this test is about the dispatch carrying the mode's settings, and a
+    # literal makes it fail whenever the budget is retuned, which says nothing.
+    assert sent["max_tokens"] == config_for(Mode.PLANNER).max_tokens
     assert sent["chat_template_kwargs"] == {"enable_thinking": False}
     assert sent["temperature"] == 0.1
     assert result.mode is Mode.PLANNER

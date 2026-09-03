@@ -329,6 +329,11 @@ class _State:
     #: the entire turn budget doing it and ended EXHAUSTED without truncation
     #: ever being mentioned (BUG L-13).
     truncated_turns: int = 0
+    #: Truncated replies in the whole run, never reset. The streak above can be
+    #: dodged by one complete reply between two overruns, which is exactly what
+    #: a model does while it hunts for a way to send something too large
+    #: (BUG FS-3).
+    truncations: int = 0
 
 
 _RECAP_PROMPT = """Summarise this agent transcript for a handover to a fresh context.
@@ -498,6 +503,21 @@ MAX_FORCED_TERMINAL = 2
 #: one thing a developer can act on -- an EXHAUSTED at turn 40 with no mention
 #: of truncation is not.
 MAX_TRUNCATED_TURNS = 3
+
+#: The same ceiling, counted over the whole run rather than consecutively.
+#:
+#: A streak resets on any reply that arrives whole, so a run that alternates —
+#: cut off, one ordinary call, cut off again — never reaches three in a row and
+#: is bounded by nothing but `max_turns` (BUG FS-3). Six is generous for a run
+#: that is making progress and hitting the limit occasionally, and short enough
+#: that thrashing ends while a developer is still watching.
+MAX_TRUNCATIONS = 6
+
+#: Tools whose oversized argument is a document, and which therefore have a
+#: chunked answer: write the first part, then append the rest. Anything else
+#: that overruns is told to make a shorter reply, which for a batch of calls is
+#: the correct advice. See `AgentLoop._shorter_reply`.
+_CHUNKABLE_WRITES = frozenset({"write_file"})
 
 #: How long a gate waits for the baseline before running without it.
 #:
@@ -1273,8 +1293,12 @@ class AgentLoop:
         for the rest of the run *and the rest of the session*.
         """
         self.state.truncated_turns += 1
+        self.state.truncations += 1
         names = ", ".join(sorted({c.name for c in incomplete}))
         cut = {c.id for c in incomplete}
+        # One oversized call is a different failure from five ordinary ones, and
+        # the advice for it is different too (BUG FS-2). See `_shorter_reply`.
+        alone = len(result.chat.tool_calls) == 1
         for call in result.chat.tool_calls:
             if call.id in cut:
                 body = (
@@ -1282,9 +1306,7 @@ class AgentLoop:
                     "partway through, so the call was not made. Nothing is wrong with "
                     "your JSON; this is what running into the "
                     f"{config_for(self.state.mode).max_tokens:,}-token output limit "
-                    "looks like.\n\n"
-                    "Make the next reply shorter: fewer tool calls in one turn, and "
-                    "less prose before them. One call is enough."
+                    "looks like.\n\n" + self._shorter_reply(call.name, alone)
                 )
                 said = f"output limit reached mid-call; {names} was not dispatched"
             else:
@@ -1306,13 +1328,28 @@ class AgentLoop:
                 },
             )
 
-        if self.state.truncated_turns >= MAX_TRUNCATED_TURNS:
+        # Two bounds, because one of them could be dodged (BUG FS-3).
+        #
+        # The streak resets on any reply that arrives whole, and a run that
+        # alternates — cut off, one ordinary call, cut off again — never reaches
+        # three in a row. That is not a hypothetical shape: a refused
+        # `run_terminal` between two oversized writes is enough, and it is
+        # exactly what a model does when it is casting about for a way to write
+        # something too large. The reported transcript thrashed on turns 29 to
+        # 33 and the streak never got past one.
+        streak = self.state.truncated_turns >= MAX_TRUNCATED_TURNS
+        total = self.state.truncations >= MAX_TRUNCATIONS
+        if streak or total:
             limit = config_for(self.state.mode).max_tokens
+            how = (
+                f"{self.state.truncated_turns} replies in a row were"
+                if streak
+                else f"{self.state.truncations} replies in this run were"
+            )
             self.result = RunResult(
                 Outcome.UNVERIFIED if self.router.touched else Outcome.NO_PROGRESS,
-                f"{self.state.truncated_turns} replies in a row were cut off by the "
-                f"{limit:,}-token output limit for {self.state.mode}, so no tool call "
-                "was ever dispatched. The turn the model is trying to make does not "
+                f"{how} cut off by the {limit:,}-token output limit for "
+                f"{self.state.mode}. The turn the model is trying to make does not "
                 "fit; narrow the task, or raise the mode's output budget"
                 + self._unfinished(),
                 self.context.turn,
@@ -1320,6 +1357,36 @@ class AgentLoop:
                 self.state.last_gate,
             )
             yield Event(EventType.ERROR, {"message": self.result.summary})
+
+    def _shorter_reply(self, tool: str, alone: bool) -> str:
+        """What to actually do about a reply that did not fit.
+
+        BUG FS-2. The advice was one paragraph for every overrun: "fewer tool
+        calls in one turn, and less prose before them. One call is enough." That
+        is right when a batch of five calls was cut off in the fifth. It is
+        useless when the reply held *one* call whose single argument is the
+        thing that does not fit, because there is nothing left to remove — and
+        the reported transcript is four turns of a model following it exactly,
+        making one call with no prose, and being cut off in the same place each
+        time.
+
+        A content-bearing write is the case worth naming, because the answer is
+        a specific tool call rather than a general instruction to be briefer.
+        """
+        if alone and tool in _CHUNKABLE_WRITES:
+            return (
+                "One call with no prose is already as short as a reply gets, so "
+                "there is nothing left to trim: the content itself is larger than "
+                "one reply can carry. Write it in pieces instead. Call "
+                f"{tool} with the first part, then call write_file again with "
+                "append=true and the next part, and keep going until it is "
+                "complete. Aim for a third of the limit per chunk. A chunk may "
+                "end mid-line; nothing is inserted between them."
+            )
+        return (
+            "Make the next reply shorter: fewer tool calls in one turn, and "
+            "less prose before them. One call is enough."
+        )
 
     def _usage(self, result: TurnResult) -> Iterator[Event]:
         usage = self.context.usage()

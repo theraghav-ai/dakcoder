@@ -967,6 +967,28 @@ def run_terminal(inv: Invocation) -> ToolResult:
             return refusal
 
     if binary not in ALLOWED_BINARIES:
+        # The redirection check comes first, because the alternative depends on
+        # what the command was *for* and not on its name (BUG FS-4).
+        #
+        # `cat > report.md` is a write. The table is keyed on the binary alone,
+        # so it answered "Use read_file." — advice for the opposite operation,
+        # given to a run that was out of ways to write a large file and trying
+        # the shell as a last resort. Wrong advice at the end of a dead end is
+        # worse than none: it sends the model somewhere that cannot work.
+        redirect = next((a for a in argv[1:] if a in (">", ">>", "|", "<")), "")
+        if redirect:
+            return ToolResult.failure(
+                f"run_terminal will not run {argv[0]!r}, and {redirect!r} is an "
+                "argument here rather than a redirection: argv is passed to the "
+                "process directly, never through a shell.",
+                fix=(
+                    "To write a file, use write_file — with append=true for each "
+                    "part if it is too large for one reply."
+                    if redirect in (">", ">>")
+                    else "Run the one command you need and read its output from the "
+                    "result; there is no pipeline to build."
+                ),
+            )
         alternative = _TERMINAL_ALTERNATIVES.get(binary)
         fix = (
             f"Use {alternative}."

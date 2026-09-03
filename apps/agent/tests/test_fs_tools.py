@@ -298,3 +298,86 @@ def test_unparseable_go_is_not_reported_as_a_gofmt_failure(
     out = router.run_gate_tool("gofmt", {"paths": "handler/broken.go"})
     assert out.ok
     assert "go_build" in out.content
+
+
+# ── FS-1: a file too large for one reply ────────────────────────────────────
+
+
+def test_a_document_can_be_written_in_chunks(router: Router, workspace: Workspace) -> None:
+    """BUG FS-1. A model's whole reply — prose, tool name and the entire
+    `content` argument, JSON-escaped — has to fit one `max_tokens` budget, which
+    caps a single `write_file` at roughly 24 KB. There was no second way to get
+    bytes into a file: `write_file` refused to overwrite, and `patch_file` needs
+    a unique anchor in a file that already has one, which the first chunk of a
+    new document does not. So a document larger than one reply was not writable
+    at all, and a run asked for one looped until it ran out of turns.
+    """
+    assert run(router, "write_file", path="report.md", content="# Report\n\n## SQL\n").ok
+    assert run(router, "write_file", path="report.md", content="N+1 on line 40.\n", append=True).ok
+    assert run(router, "write_file", path="report.md", content="No index on sub.\n", append=True).ok
+
+    text = (workspace.root / "report.md").read_text(encoding="utf-8")
+    assert text == "# Report\n\n## SQL\nN+1 on line 40.\nNo index on sub.\n"
+
+
+def test_an_append_chunk_may_end_mid_line(router: Router, workspace: Workspace) -> None:
+    """A create adds a trailing newline — Go tooling and every diff viewer
+    expect one. An append must not: a chunk boundary can fall mid-word, and a
+    newline inserted there splits it."""
+    assert run(router, "write_file", path="notes.md", content="the quick ", append=True).ok
+    assert run(router, "write_file", path="notes.md", content="brown fox\n", append=True).ok
+
+    assert (workspace.root / "notes.md").read_text(encoding="utf-8") == "the quick brown fox\n"
+
+
+def test_append_creates_the_file_when_it_is_not_there(
+    router: Router, workspace: Workspace
+) -> None:
+    """The first chunk and every chunk after it are the same call. A first chunk
+    that had to be a different call is an edge the model gets wrong once per
+    document."""
+    assert run(router, "write_file", path="fresh.md", content="first", append=True).ok
+    assert (workspace.root / "fresh.md").read_text(encoding="utf-8") == "first"
+
+
+def test_write_file_still_refuses_to_overwrite(router: Router, workspace: Workspace) -> None:
+    """Append is safe by construction — it adds at the end and can destroy
+    nothing. The refusal that protects an existing file is unchanged, and the
+    fix line now names all three ways forward."""
+    assert run(router, "write_file", path="report.md", content="one").ok
+    out = run(router, "write_file", path="report.md", content="two")
+    assert not out.ok
+    assert "will not overwrite" in out.content
+    assert "append=true" in out.fix and "patch_file" in out.fix
+    assert (workspace.root / "report.md").read_text(encoding="utf-8") == "one\n"
+
+
+def test_an_append_mirrors_the_files_own_line_endings(
+    router: Router, workspace: Workspace
+) -> None:
+    """Same rule as `patch_file`: the file's endings, not a sibling's guess."""
+    target = workspace.root / "crlf.md"
+    target.write_bytes(b"first\r\nsecond\r\n")
+    assert run(router, "write_file", path="crlf.md", content="third\n", append=True).ok
+
+    raw = target.read_bytes()
+    assert raw == b"first\r\nsecond\r\nthird\r\n"
+    assert raw.count(b"\n") == raw.count(b"\r\n"), "a bare LF crept in"
+
+
+def test_an_append_records_a_modification_not_a_creation(
+    router: Router, workspace: Workspace
+) -> None:
+    """`revert` restores from the pre-run snapshot the router takes at first
+    mutation, and the kind is what tells it whether to restore bytes or delete
+    the file. An append to an existing file that reported CREATE would have
+    revert delete a file the run did not create."""
+    from dakcoder_shared.envelope import MutationKind
+
+    (workspace.root / "existing.md").write_text("before\n", encoding="utf-8")
+    out = run(router, "write_file", path="existing.md", content="after\n", append=True)
+    assert out.ok
+    assert [m.kind for m in out.mutations] == [MutationKind.MODIFY]
+
+    fresh = run(router, "write_file", path="created.md", content="new\n", append=True)
+    assert [m.kind for m in fresh.mutations] == [MutationKind.CREATE]

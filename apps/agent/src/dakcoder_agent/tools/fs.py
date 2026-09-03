@@ -252,24 +252,66 @@ def read_file(inv: Invocation) -> ToolResult:
 
 
 def write_file(inv: Invocation) -> ToolResult:
-    """Create a new file. Refuses to overwrite."""
+    """Create a new file, or add to the end of one with ``append``.
+
+    **Why append exists** (BUG FS-1). A model's whole reply — prose, tool name
+    and the entire ``content`` argument, JSON-escaped — has to fit one
+    ``max_tokens`` budget, which is 6,144 for the acting mode. That caps a
+    single ``write_file`` at roughly 24 KB of text, and there was no second way
+    to get bytes into a file: ``write_file`` refused to overwrite and
+    ``patch_file`` needs a unique anchor *in a file that already has one*, which
+    the first chunk of a new document does not have. So a document larger than
+    one reply was not writable at all.
+
+    That is not a hypothetical. A run asked for a report over ten files
+    produced, across five turns: "Let me write the report in chunks", "Let me
+    write it in parts", "Let me split it into multiple files and combine" — the
+    right idea three times — and every attempt came back cut off mid-call,
+    because the tool it was reaching for did not exist. It then tried
+    ``run_terminal cat > report.md`` and was told to use ``read_file``.
+
+    Append is the missing half, and it is safe by construction: it adds at the
+    end and can destroy nothing. Chunked writing is now uniform — the same call
+    for the first chunk and every one after it, with no anchor to guess.
+
+    **Append does not add a trailing newline.** A create does, because Go
+    tooling, POSIX convention and every diff viewer expect one and gofmt would
+    add it anyway on the next run, producing a spurious one-line diff attributed
+    to formatting. An append must not: a chunk boundary can fall mid-word, and a
+    newline inserted there splits it. The last chunk carries the final newline.
+    """
     rel = inv.path()
     path = inv.absolute()
+    append = bool(inv.arg("append", False))
+    content = inv.arg("content", "")
 
-    if path.exists():
+    if path.exists() and not append:
         return ToolResult.failure(
             f"{rel} already exists; write_file will not overwrite it.",
-            fix="Use patch_file to change it, or delete_file first if it should go.",
+            fix="Use patch_file to change it, append=true to add to the end, "
+            "or delete_file first if it should go.",
         )
 
-    content = inv.arg("content", "")
+    if path.exists():
+        existing = _read_text(path)
+        eol = _detect_eol(existing)
+        # Read-modify-write through the same atomic helper, so an append keeps
+        # the write-to-temp-then-replace property a partial write would break
+        # (BUG TL-2) and mirrors the file's own line endings rather than a
+        # sibling's guess.
+        body = _to_lf(existing) + _to_lf(content)
+        _write_text(path, _apply_eol(body, eol))
+        added = len(content.splitlines())
+        return ToolResult.success(
+            f"appended {added} line(s) to {rel} ({len(body.split(chr(10)))} lines total)",
+            mutations=[Mutation(rel, MutationKind.MODIFY)],
+            meta={"eol": "crlf" if eol == "\r\n" else "lf", "appended": added},
+        )
+
     path.parent.mkdir(parents=True, exist_ok=True)
     eol = _sibling_eol(path)
     body = _apply_eol(content, eol)
-    if body and not body.endswith(eol):
-        # Go tooling, POSIX convention and every diff viewer expect it, and
-        # gofmt would add it on the next run anyway — producing a spurious
-        # one-line diff attributed to formatting rather than to this write.
+    if body and not body.endswith(eol) and not append:
         body += eol
     _write_text(path, body)
 

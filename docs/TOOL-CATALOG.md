@@ -17,7 +17,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 |---|---|---|
 | **ask** | 15 | ~1,656 tokens |
 | **planner** | 17 | ~2,019 tokens |
-| **agent** | 23 | ~2,772 tokens |
+| **agent** | 23 | ~2,808 tokens |
 
 ## The catalogue
 
@@ -39,7 +39,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `submit_plan` | P |  |  | agent | Submit the plan and start the work. Each step names one file, what changes in it, and how you will know it worked. |
 | `ask_developer` | P |  |  | agent | Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base. |
 | `finish` | AAP |  |  | agent | End your turn and hand the developer your answer. Call this when the work is done, or when going further will not help. |
-| `write_file` | A | ✓ | if protected | agent | Create a new file. Refuses to overwrite an existing one — use patch_file for that. Write complete, compiling Go, not a sketch. |
+| `write_file` | A | ✓ | if protected | agent | Create a new file, or append=true to add to the end — the way to write a file too big for one reply. Refuses to overwrite. Write complete, compiling Go, not a sketch. |
 | `patch_file` | A | ✓ | if protected | agent | Replace an exact unique string in a file. Include enough surrounding lines to make old unique; the call fails rather than guessing. |
 | `delete_file` | A | ✓ | **always** | agent | Delete a file. Always needs the developer's approval; say why in reason. |
 | `gofmt` | gate | ✓ |  | agent | Format Go files and fix their imports. Runs automatically after edits; call it directly only to clean up a file you did not just touch. |
@@ -196,12 +196,13 @@ End your turn and hand the developer your answer. Call this when the work is don
 
 ### `write_file`
 
-Create a new file. Refuses to overwrite an existing one — use patch_file for that. Write complete, compiling Go, not a sketch.
+Create a new file, or append=true to add to the end — the way to write a file too big for one reply. Refuses to overwrite. Write complete, compiling Go, not a sketch.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `path` | string | yes | Workspace-relative path for the new file. |
-| `content` | string | yes | Full file content. |
+| `content` | string | yes | Full file content, or the next chunk. |
+| `append` | boolean |  | Add to the end instead of creating. |
 
 ### `patch_file`
 

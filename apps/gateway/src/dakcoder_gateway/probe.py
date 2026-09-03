@@ -47,7 +47,14 @@ from .routing import ModelRoute, RoleRouter
 __all__ = ["Status", "ProbeResult", "ProbeReport", "CapabilityProbe", "EndpointProbes"]
 
 #: Documented in plan.md §4.2, surfaced verbatim in the 400 on an over-large
-#: max_tokens. A ceiling, not a target — the agent caps its own prompts at 32k.
+#: max_tokens.
+#:
+#: A ceiling that both sides now budget against, and the same number as
+#: ``dakcoder_agent.modes.CONTEXT_WINDOW`` — pinned equal by a test, because two
+#: constants for one deployment fact in two packages drift silently. The comment
+#: here used to say "the agent caps its own prompts at 32k", which stopped being
+#: true when the prompt budget was re-based on the model's own window and was
+#: wrong by a factor of seven by the time anyone read it.
 EXPECTED_MAX_MODEL_LEN = 262_144
 
 #: LiteLLM shapes tool-call ids this way. Checked because a change here means

@@ -564,12 +564,14 @@ _SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="write_file",
         description=(
-            "Create a new file. Refuses to overwrite an existing one — use patch_file "
-            "for that. Write complete, compiling Go, not a sketch."
+            "Create a new file, or append=true to add to the end — the way to write a "
+            "file too big for one reply. Refuses to overwrite. Write complete, "
+            "compiling Go, not a sketch."
         ),
         parameters=_obj(
             path=_str("Workspace-relative path for the new file."),
-            content=_str("Full file content."),
+            content=_str("Full file content, or the next chunk."),
+            append=_bool("Add to the end instead of creating."),
         ),
         required=("path", "content"),
         modes=_ACTS,

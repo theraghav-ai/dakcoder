@@ -155,7 +155,22 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 #:
 #: Asserted per mode rather than as one number so that a mode growing is a test
 #: failure and not a rounding error absorbed by the loosest ceiling.
-PREFIX_CEILING = {Mode.ASK: 2_700, Mode.PLANNER: 3_100, Mode.AGENT: 3_800}
+#:
+#: `agent` moved from 3,800 to 3,850 for `write_file`'s `append` parameter, and
+#: the tripwire worked exactly as this comment says it should: the change failed
+#: the test, the text was tightened twice, and what remained was a decision
+#: rather than a rounding error. What the 41 tokens buy is the model knowing,
+#: before it tries, that a file too large for one reply can be written in
+#: chunks (BUG FS-1). The alternative is not free: without the hint a model
+#: discovers the wall by hitting it, which costs a full 6,144-token reply and a
+#: prefill to find out, and the reported transcript spent four turns doing that
+#: and never got there. This text is in the stable prefix, so it is a cache hit
+#: after the first call of a run; the wasted turn is not.
+#:
+#: Bought back on the way: `write_file`'s description no longer repeats "use
+#: patch_file for that", which `ToolSpec.instead` and the runtime refusal
+#: message both already say, and neither of those is in the prefix.
+PREFIX_CEILING = {Mode.ASK: 2_700, Mode.PLANNER: 3_100, Mode.AGENT: 3_850}
 
 
 @pytest.mark.parametrize("mode", list(Mode))

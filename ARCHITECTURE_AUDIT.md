@@ -520,6 +520,39 @@ The lesson is about the method rather than the defect: a change plan is a list
 of the work someone decided to do, and the register is the list of what is
 wrong. Reconciling the two at the end is a separate step, and it found something.
 
+### Reported from a live run, and not in the audit at all (FS-1..4)
+
+A transcript of turns 29-33 of a run asked for a report over ten files:
+`write_file` cut off, `write_file` cut off, `run_terminal cat > report.md`
+refused, `write_file` cut off, `write_file` cut off. The model narrated "in
+chunks", "in parts", "split it into multiple files and combine" — right three
+times — and every attempt failed identically.
+
+The cause is a composition the audit did not look for, because each tool is
+correct on its own. A reply carries prose, tool name and the whole `content`
+argument inside one `max_tokens` budget (6,144 for `agent`), which caps a single
+`write_file` at about 24 KB. `write_file` refuses to overwrite, which is a
+deliberate safety property. `patch_file` needs a unique anchor in a file that
+already has one, which a new document's first chunk does not. `run_terminal`
+cannot write. Three correct tools compose to "documents up to 24 KB only", and
+no tool description, refusal or error said so. That is the shape worth
+remembering: this audit read components and seams, and this defect is in neither
+— it is in what the set of tools can and cannot express.
+
+`write_file` takes `append` now, so chunked writing is uniform and there is no
+anchor to guess; an append adds no trailing newline (a chunk boundary can fall
+mid-word) and records `MODIFY` rather than `CREATE` (`revert` reads the kind to
+choose between restoring bytes and deleting the file). The truncation advice
+branches on the shape of the overrun instead of telling a lone oversized call to
+send fewer calls. The truncation bound gained a run total, because the streak
+resets on any whole reply and one refused call between two oversized ones was
+enough to dodge it. And a redirection in argv is answered with the tool that
+writes rather than the one that reads.
+
+The `append` parameter cost 41 tokens of stable prefix and broke the ceiling
+`test_prompts.py` asserts, which is the tripwire working; the text was tightened
+twice and the ceiling then moved deliberately, with the trade written beside it.
+
 The audit's own §12 ("what can safely wait") is where the deferred list came
 from. It is now empty apart from the multi-worker gateway store above and the
 two rows the audit itself marked BY-DESIGN (GT-2/3, PI-1).

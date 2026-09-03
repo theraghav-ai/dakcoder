@@ -2003,3 +2003,132 @@ def test_the_ticker_and_the_stream_cannot_lose_text() -> None:
 
     joined = "".join(seen)
     assert joined == "".join(f"{i:04d}" for i in range(2_000)), "text was lost or reordered"
+
+
+# ── FS-2/3/4: the loop that the reported transcript could not leave ────────
+
+
+def test_a_single_oversized_call_is_told_to_chunk_not_to_be_brief() -> None:
+    """BUG FS-2. The advice was one paragraph for every overrun: "fewer tool
+    calls in one turn, and less prose before them. One call is enough." That is
+    right when a batch of five was cut off in the fifth, and useless when the
+    reply held *one* call whose single argument is what does not fit — there is
+    nothing left to remove. The reported transcript is four turns of a model
+    following it exactly, making one call with no prose, cut off in the same
+    place each time."""
+    from dakcoder_agent.loop import AgentLoop
+
+    advice = AgentLoop._shorter_reply(None, "write_file", True)  # type: ignore[arg-type]
+    assert "append=true" in advice, "the answer is a specific call, not 'be briefer'"
+    assert "shorter" not in advice, "one call with no prose cannot be made shorter"
+
+    batch = AgentLoop._shorter_reply(None, "read_file", False)  # type: ignore[arg-type]
+    assert "shorter" in batch, "a batch of calls is still told to send fewer"
+    assert "append" not in batch
+
+
+def test_alternating_truncation_is_bounded(planning_router: Router, gated, written) -> None:
+    """BUG FS-3. `truncated_turns` resets on any reply that arrives whole, so a
+    run that alternates — cut off, one ordinary call, cut off again — never
+    reaches three in a row. A refused `run_terminal` between two oversized
+    writes is enough, and it is exactly what a model does while hunting for a
+    way to send something too large. The reported transcript thrashed across
+    turns 29 to 33 and the streak never got past one."""
+    from dakcoder_agent.loop import MAX_TRUNCATED_TURNS, MAX_TRUNCATIONS, _State
+
+    state = _State()
+    for _ in range(MAX_TRUNCATIONS):
+        state.truncations += 1
+        state.truncated_turns += 1
+        state.truncated_turns = 0  # the complete reply in between
+
+    assert state.truncated_turns < MAX_TRUNCATED_TURNS, "the streak really does reset"
+    assert state.truncations >= MAX_TRUNCATIONS, "and the run total is what catches it"
+
+
+def _terminal(router: Router, argv: list[str]):
+    """Call `run_terminal`'s own guard.
+
+    Not through `router.dispatch`: `run_terminal` is approval-gated, so dispatch
+    returns an ApprovalRequest and never reaches the allow-list. The refusal
+    under test is the tool's, and this is where it lives.
+    """
+    from dakcoder_agent.tools import registry
+    from dakcoder_agent.tools.commands import run_terminal
+    from dakcoder_agent.tools.router import Invocation
+
+    spec = registry.get("run_terminal")
+    return run_terminal(Invocation(spec, {"argv": argv}, router.workspace))
+
+
+def test_a_shell_redirection_is_answered_with_the_tool_that_writes(
+    router: Router,
+) -> None:
+    """BUG FS-4. `_TERMINAL_ALTERNATIVES` is keyed on the binary alone, so
+    `cat > report.md` — a write — was answered "Use read_file.": advice for the
+    opposite operation, handed to a run that had exhausted its ways to write a
+    large file and was trying the shell as a last resort."""
+    out = _terminal(router, ["cat", ">", "report.md"])
+    assert not out.ok
+    assert "write_file" in out.fix, f"the fix must name the tool that writes: {out.fix}"
+    assert "read_file" not in out.fix
+    assert "never through a shell" in out.content, "and say why the > did nothing"
+
+
+def test_a_plain_cat_is_still_sent_to_read_file(router: Router) -> None:
+    """The table is right when the command really is a read; only the
+    redirection case was wrong."""
+    out = _terminal(router, ["cat", "go.mod"])
+    assert not out.ok
+    assert out.fix == "Use read_file."
+
+
+# ── the two budgets share one window ───────────────────────────────────────
+
+
+def test_the_two_budgets_fit_the_window_with_the_reserve_intact() -> None:
+    """Prompt and completion come out of the same `max_model_len`, and until the
+    check in `ModeConfig.__post_init__` the only place their sum appeared was a
+    sentence of prose. A config that overruns loads cleanly, passes every test,
+    and fails on the *last* turn of a long run — the prompt is largest there, the
+    400 is not retryable, and the run dies having done the work."""
+    from dakcoder_agent.modes import CONTEXT_WINDOW, OUTPUT_RESERVE, Mode, config_for
+
+    for mode in Mode:
+        cfg = config_for(mode)
+        total = cfg.prompt_budget + cfg.max_tokens + OUTPUT_RESERVE
+        assert total <= CONTEXT_WINDOW, f"{mode} claims {total:,} of {CONTEXT_WINDOW:,}"
+
+
+def test_the_window_arithmetic_is_checked_not_documented() -> None:
+    """The point of the constructor check: a bad pair is refused where it is
+    written, not discovered in production."""
+    from dakcoder_agent.modes import CONTEXT_WINDOW, Mode, ModeConfig
+
+    with pytest.raises(ValueError, match="share it"):
+        ModeConfig(Mode.AGENT, CONTEXT_WINDOW - 1_000, 16_384, False, 0.1)
+
+
+def test_the_agent_window_is_sized_against_the_largest_output_budget() -> None:
+    """`prompt_budget` is one number for every mode, so the mode with the
+    largest `max_tokens` is the one the arithmetic has to hold for. If a mode
+    ever exceeds `agent`'s output budget, the prompt budget was sized against
+    the wrong one."""
+    from dakcoder_agent.modes import Mode, config_for
+
+    largest = max(config_for(m).max_tokens for m in Mode)
+    assert config_for(Mode.AGENT).max_tokens == largest
+
+
+def test_the_probe_and_the_agent_agree_on_the_window() -> None:
+    """Two constants for one deployment fact. The gateway asserts the endpoint
+    serves this window; the agent budgets against it. They are in different
+    packages and would drift silently."""
+    from dakcoder_agent.modes import CONTEXT_WINDOW
+
+    try:
+        from dakcoder_gateway.probe import EXPECTED_MAX_MODEL_LEN
+    except ImportError:  # pragma: no cover - the agent ships without the gateway
+        pytest.skip("the gateway package is not installed")
+
+    assert CONTEXT_WINDOW == EXPECTED_MAX_MODEL_LEN
