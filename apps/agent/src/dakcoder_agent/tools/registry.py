@@ -550,7 +550,11 @@ _SPECS: tuple[ToolSpec, ...] = (
             "work is done, or when going further will not help."
         ),
         parameters=_obj(
-            answer=_str("What you found or did, in full. This is what they read."),
+            answer=_str(
+                "What you found or did. This is what they read; keep it under about "
+                "900 words.",
+                maxLength=6000,
+            ),
             blocked=_str("What stopped you, if anything did. Omit when nothing did."),
         ),
         required=("answer",),
@@ -559,6 +563,45 @@ _SPECS: tuple[ToolSpec, ...] = (
         # needs to say so, and used to do it by falling silent -- which is the
         # non-action this model cannot reliably produce either.
         modes=_READERS,
+    ),
+    # -- changing course ----------------------------------------------------
+    #
+    # The acting phase's only way to say "that approach failed; here is a
+    # different one". Every other exit it has is a stop: a forced `finish`, a
+    # turn cap, a gate bound. Steps already done are kept by the loop; what is
+    # sent here replaces the rest, and the reason is shown on every later turn
+    # under "what has been tried".
+    ToolSpec(
+        name="revise_plan",
+        description=(
+            "Replace the remaining plan steps after an approach failed. Say what was "
+            "tried and why it did not work; steps already done are kept."
+        ),
+        parameters=_obj(
+            steps=_array(
+                "The remaining steps, in order. At most eight.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string", "description": "Path this step changes."},
+                        "action": {"type": "string", "description": "What changes in it."},
+                        "accepts": {"type": "string", "description": "How it is checked."},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "skipped"],
+                            "description": "skipped drops the step; say why in note.",
+                        },
+                        "note": {"type": "string", "description": "Why it is skipped."},
+                    },
+                    "required": ["file", "action", "accepts"],
+                    "additionalProperties": False,
+                },
+                maxItems=8,
+            ),
+            reason=_str("What was tried and why it did not work."),
+        ),
+        required=("steps", "reason"),
+        modes=_ACTS,
     ),
     # -- editing ------------------------------------------------------------
     ToolSpec(

@@ -18,6 +18,8 @@ import pytest
 
 from dakcoder_agent.context import Layer, Message, Role
 from dakcoder_agent.loop import (
+    MAX_CALLS_PER_BATCH,
+    STALLS_BEFORE_ANSWER,
     _MAX_RECAP_CALLS,
     _RECAP_PROMPT,
     _RESULT_HEAD_IN_TRANSCRIPT,
@@ -170,9 +172,17 @@ def test_the_planner_fence_asks_only_for_what_it_forces(
 ) -> None:
     """The Planner was told "submit the plan now, or ask the developer" on a
     turn whose `tool_choice` named `submit_plan` alone."""
+    # Each search finds a different place, so every turn genuinely informs the
+    # run and the fence -- not the stall guard -- is what ends the phase.
+    found = [
+        "package domain", "package postgres", "package handler", "package request",
+        "package bootstrap", "package main", "GetAll", "GetByID", "Routes",
+        "CreateUserRequest", "FxRepo", "FirstName",
+    ]
+    assert len(found) >= MAX_RESEARCH_TURNS
     reads = [
-        calls(("search_repo", json.dumps({"pattern": f"needle{i}"})))
-        for i in range(MAX_RESEARCH_TURNS)
+        calls(("search_repo", json.dumps({"pattern": pattern})))
+        for pattern in found[:MAX_RESEARCH_TURNS]
     ]
     loop, client = build(planning_router, reads, max_turns=MAX_RESEARCH_TURNS + 3)
     list(loop.run("add a status filter to the user list", intent=Intent.AGENT))
@@ -279,3 +289,325 @@ def test_a_steer_restarts_the_gate_stall_clock(planning_router: Router, gated, w
     assert any(
         m.source == "user" and "unused import" in m.content for m in loop.context.build()
     )
+
+
+# ── the task state machine, and the block that shows it ─────────────────────
+#
+# The third review's root cause: "a correct control state machine and no task
+# state machine, and the task state it does hold -- router.touched, state.plan,
+# state.last_gate -- is never shown to the model." One test per fix, in the
+# order the review ranked them.
+
+
+def _state_blocks(loop) -> list[str]:
+    return [m.content for m in loop.context.build() if m.source == "directive"]
+
+
+def test_the_state_block_shows_the_change_set_the_plan_and_the_gate(
+    planning_router: Router, gated, written
+) -> None:
+    """Fix 1. The model's only evidence about its own progress was the
+    transcript, including its own statements of intent."""
+    gated["fail"] = "go_build"
+    loop, _client = build(planning_router, [plan_call(), patch(), say("Done.")])
+    list(loop.run("add Routes", intent=Intent.AGENT))
+
+    block = _state_blocks(loop)[-1]
+    assert "# Current state" in block
+    assert "Written this run: handler/user.go" in block
+    assert "[done] handler/user.go" in block, "the step is done because the file was written"
+    assert "Last gate: FAIL at go_build" in block
+    assert "gate failed at go_build" in block, "the failure is listed under what was tried"
+
+
+def test_the_state_block_is_silent_on_a_question(planning_router: Router) -> None:
+    """A read-only run with nothing to report gets no block: it is not noise."""
+    loop, _client = build(
+        planning_router,
+        [calls(("read_file", '{"path":"handler/user.go"}'))],
+        kind="question",
+    )
+    list(loop.run("what does the handler do", intent=Intent.ASK))
+    assert not any("# Current state" in b for b in _state_blocks(loop))
+
+
+def test_the_state_block_is_rebuilt_from_ground_truth_not_from_prose(
+    planning_router: Router, gated, written
+) -> None:
+    """The model claiming it wrote a file changes nothing in the block."""
+    loop, _client = build(
+        planning_router,
+        [plan_call(), say("I have written handler/user.go and it builds.")],
+    )
+    list(loop.run("add Routes", intent=Intent.AGENT))
+    block = _state_blocks(loop)[-1]
+    assert "Written this run: nothing yet" in block
+    assert "[pending] handler/user.go" in block
+
+
+# ── Fix 2: plan steps carry a status ────────────────────────────────────────
+
+
+def test_a_plan_step_moves_from_pending_to_done_when_its_file_is_written(
+    planning_router: Router, gated, written
+) -> None:
+    loop, _client = build(planning_router, [plan_call(), patch(), say("Done.")])
+    events = list(loop.run("add Routes", intent=Intent.AGENT))
+    assert loop.state.plan[0].status == "done"
+    assert not any(
+        e.type is EventType.GATE and e.data.get("kind") == "replan" for e in events
+    )
+
+
+def test_a_gate_failure_marks_the_step_it_names_failed(
+    planning_router: Router, gated, written
+) -> None:
+    """`failed` is a status the set difference could not represent."""
+    from dakcoder_shared.envelope import ToolResult
+
+    # Fails only once the run has changed something, like the `gated` fixture:
+    # a stage that fails during the baseline too is excused as pre-existing.
+    planning_router.handlers["go_build"] = lambda inv: (
+        ToolResult.failure("handler/user.go:3:1: undefined: Routes")
+        if planning_router.mutations > 0
+        else ToolResult.success("go build: clean")
+    )
+    loop, _client = build(planning_router, [plan_call(), patch(), say("Done.")])
+    list(loop.run("add Routes", intent=Intent.AGENT))
+    step = loop.state.plan[0]
+    assert step.status == "failed", step
+    assert "go_build" in step.note
+    assert loop._unwritten_targets() == [], "a written-then-failed step is not never written"
+
+
+# ── Fix 3: informed is not dispatched ───────────────────────────────────────
+
+
+def test_an_empty_search_does_not_count_as_progress(planning_router: Router) -> None:
+    """A search that finds nothing is a finding, not progress -- and rephrasing
+    it forever used to reset the stall counter every time."""
+    empties = [
+        calls(("search_repo", json.dumps({"pattern": f"NoSuchSymbol{i}"})))
+        for i in range(STALLS_BEFORE_ANSWER + 1)
+    ]
+    loop, client = build(planning_router, empties, kind="question", max_turns=8)
+    list(loop.run("where is NoSuchSymbol used", intent=Intent.ASK))
+    assert any(isinstance(c, dict) for c in client.tool_choices), (
+        "the empty searches were counted as progress, so the run was never made to answer"
+    )
+
+
+def test_the_same_result_under_different_arguments_is_not_progress(
+    planning_router: Router,
+) -> None:
+    """`Handler` and `handler` are two fingerprints and one set of places."""
+    same_places = [
+        calls(("search_repo", json.dumps({"pattern": "func New"}))),
+        calls(("search_repo", json.dumps({"pattern": "func New\\("}))),
+        calls(("search_repo", json.dumps({"pattern": "func N[e]w"}))),
+    ]
+    loop, _client = build(planning_router, same_places, kind="question", max_turns=8)
+    list(loop.run("where is New defined", intent=Intent.ASK))
+    told = [
+        m.content for m in loop.context.build()
+        if m.source == "user" and "same lines under different words" in m.content
+    ]
+    assert told, "the run was never told its searches returned the same places"
+
+
+# ── Fix 4: a replan path ────────────────────────────────────────────────────
+
+
+def test_a_second_gate_failure_after_an_edit_sends_the_run_back_to_plan(
+    planning_router: Router, gated, written
+) -> None:
+    """Every exit used to be a stop. The second failure after an edit is the
+    strongest evidence a run produces that its approach is wrong."""
+    gated["fail"] = "go_build"
+    second = calls(
+        (
+            "submit_plan",
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "file": "repo/postgres/user.go",
+                            "action": "move the Routes wiring here",
+                            "accepts": "go build",
+                        }
+                    ]
+                }
+            ),
+        )
+    )
+    loop, client = build(
+        planning_router,
+        [plan_call(), patch(), say("Done."), patch(), say("Done again."), second],
+        max_turns=16,
+    )
+    events = list(loop.run("add Routes", intent=Intent.AGENT))
+
+    replans = [e for e in events if e.type is EventType.GATE and e.data.get("kind") == "replan"]
+    assert len(replans) == 1, "exactly one loop-initiated replan"
+    assert replans[0].data["tried"], "the replan carries what was tried"
+    asked = [m.content for m in loop.context.build() if "# What has been tried" in m.content]
+    assert asked and "gate failed at go_build" in asked[0]
+    plans = [e for e in events if e.type is EventType.PLAN]
+    assert len(plans) == 2, "the revised plan was adopted"
+    assert loop.state.replans == 1
+    statuses = [(s.file, s.status) for s in loop.state.plan]
+    assert statuses == [("handler/user.go", "done"), ("repo/postgres/user.go", "pending")], (
+        "a done step survives the replan; the new step starts pending"
+    )
+
+
+def test_a_planner_that_declines_after_a_replan_does_not_report_done(
+    planning_router: Router, gated, written
+) -> None:
+    gated["fail"] = "go_build"
+    loop, _client = build(planning_router, [], max_turns=16)
+
+    class Declining(ScriptedClient):
+        """Refuses the forced submit_plan by answering in prose again."""
+
+        def chat(self, messages, *, tool_choice=None, **kwargs):
+            if tool_choice is not None and loop.state.replans:
+                return say("There is nothing sensible left to plan.")
+            return super().chat(messages, tool_choice=tool_choice, **kwargs)
+
+    loop.client = Declining([plan_call(), patch(), say("Done."), patch()])
+    list(loop.run("add Routes", intent=Intent.AGENT))
+    assert loop.result.outcome == Outcome.UNVERIFIED
+    assert "revised plan was asked for" in loop.result.summary
+
+
+def test_the_model_can_revise_the_plan_and_the_reason_is_remembered(
+    planning_router: Router, gated, written
+) -> None:
+    revision = calls(
+        (
+            "revise_plan",
+            json.dumps(
+                {
+                    "reason": "the Routes method belongs on the handler, not the repo",
+                    "steps": [
+                        {"file": "handler/user.go", "action": "add Routes", "accepts": "go build"},
+                        {
+                            "file": "repo/postgres/user.go",
+                            "action": "no change",
+                            "accepts": "n/a",
+                            "status": "skipped",
+                            "note": "the repo has no routes",
+                        },
+                    ],
+                }
+            ),
+        )
+    )
+    loop, _client = build(planning_router, [plan_call(), revision, patch(), say("Done.")])
+    events = list(loop.run("add Routes", intent=Intent.AGENT))
+
+    plans = [e for e in events if e.type is EventType.PLAN]
+    assert len(plans) == 2, "the revision is a plan event too"
+    statuses = {s.file: s.status for s in loop.state.plan}
+    assert statuses["repo/postgres/user.go"] == "skipped"
+    assert statuses["handler/user.go"] == "done"
+    assert any("plan revised" in t for t in loop.state.tried)
+    assert loop.result.outcome == Outcome.DONE, loop.result.summary
+
+
+# ── Fix 5: batches are bounded ──────────────────────────────────────────────
+
+
+def test_a_reply_that_repeats_a_call_in_the_same_batch_runs_it_once(
+    planning_router: Router,
+) -> None:
+    from scripted import assert_wire_is_coherent
+
+    read = ("read_file", '{"path":"handler/user.go"}')
+    loop, _client = build(planning_router, [calls(read, read, read)], kind="question")
+    events = list(loop.run("show me the handler", intent=Intent.ASK))
+    results = [e for e in events if e.type is EventType.TOOL_RESULT]
+    assert sum(1 for r in results if r.data.get("dispatched") is False) == 2
+    assert_wire_is_coherent(loop.context.wire())
+
+
+def test_a_reply_past_the_batch_cap_is_answered_not_dispatched(
+    planning_router: Router,
+) -> None:
+    from scripted import assert_wire_is_coherent
+
+    many = [
+        ("search_repo", json.dumps({"pattern": f"p{i}"}))
+        for i in range(MAX_CALLS_PER_BATCH + 2)
+    ]
+    loop, _client = build(planning_router, [calls(*many)], kind="question")
+    events = list(loop.run("find things", intent=Intent.ASK))
+    not_run = [
+        e for e in events
+        if e.type is EventType.TOOL_RESULT and e.data.get("dispatched") is False
+    ]
+    assert len(not_run) == 2
+    assert_wire_is_coherent(loop.context.wire())
+
+
+# ── Fix 6: finish is bounded and never batched ──────────────────────────────
+
+
+def test_finish_sent_with_other_calls_is_refused_and_the_others_run(
+    planning_router: Router,
+) -> None:
+    loop, _client = build(
+        planning_router,
+        [
+            calls(("read_file", '{"path":"handler/user.go"}'), ("finish", '{"answer":"x"}')),
+            calls(("finish", '{"answer":"the handler has one method"}')),
+        ],
+        kind="question",
+    )
+    events = list(loop.run("what is in the handler", intent=Intent.ASK))
+    refused = [
+        e for e in events
+        if e.type is EventType.TOOL_RESULT
+        and e.data["name"] == "finish"
+        and e.data.get("dispatched") is False
+    ]
+    assert refused and "on its own" in refused[0].data["content"]
+    assert loop.result.outcome == Outcome.DONE
+    assert loop.state.forced_terminal == 0, "a batched finish is not a schema refusal"
+
+
+def test_a_finish_answer_is_capped_and_says_so(planning_router: Router) -> None:
+    from dakcoder_agent.tools.control import MAX_ANSWER_CHARS
+
+    out = planning_router.dispatch(
+        "finish", {"answer": "y" * (MAX_ANSWER_CHARS + 500)}, mode=Mode.ASK
+    )
+    assert out.ok
+    assert "answer cut at" in out.content
+    assert out.meta["answer_cut"] == 500
+
+
+def test_a_cut_off_write_names_the_file_and_what_has_landed(
+    planning_router: Router, gated, written
+) -> None:
+    cut = ChatResult(
+        tool_calls=[
+            ToolCall(
+                id="w1",
+                name="write_file",
+                arguments='{"path":"handler/new.go","content":"package ha',
+            )
+        ],
+        finish_reason="length",
+        usage=Usage(prompt_tokens=100),
+    )
+    loop, _client = build(planning_router, [plan_call(), patch(), cut, say("Done.")])
+    list(loop.run("add Routes", intent=Intent.AGENT))
+    told = [
+        m.content for m in loop.context.build()
+        if m.source == "tool:write_file" and "cut off" in m.content
+    ]
+    assert told, "the truncated call was not answered"
+    assert "handler/new.go" in told[0]
+    assert "Written this run so far: handler/user.go" in told[0]

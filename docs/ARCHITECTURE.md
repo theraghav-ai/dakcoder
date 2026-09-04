@@ -1749,6 +1749,64 @@ truncation the design argues against, and it drops `do_not_retry` first.
 `_chunked`, `_clipped` and `_digest`.
 
 ---
+**D-96 · The task has a state machine, and the model is shown it every turn**
+· *settled 3 Sep 2026*
+
+`PlanStep.status` (`pending | done | failed | skipped`), set from ground truth;
+`AgentLoop._state_block`, rendered every turn through
+`ContextManager.set_state` into the end of the volatile layer; `_replan`, the
+one loop-initiated return to the Planner; `revise_plan`, the model's own pivot;
+and `informed` redefined as "the run learned something".
+
+**Why**: the third review's root cause, and it survives every earlier fix. The
+control state machine — three modes, typed transitions — was correct, and the
+task state it drove was a tuple written once at `submit_plan` and a set
+difference against `router.touched` computed on demand. Neither could say
+*attempted and failed*, *deliberately skipped* or *done then reverted*, and
+none of it reached the model. Its only evidence about its own progress was the
+transcript, including its own statements of intent, which is the mechanism
+behind "I wrote the first two test files but my last reply got cut off".
+
+**What is borrowed, and what is not.** Claude Code's `TodoWrite` and Cline's
+Focus Chain are the same idea — task state as a first-class artifact with
+explicit statuses, re-injected on a timer. Both are model-written, and can
+therefore lie. This block is derived from the change set and the gate report,
+which the model cannot edit, and it is rebuilt every turn rather than nagged
+back in. It sits where `build` already places the volatile layer (D-95's
+predecessor, BUG L-18), so a ~150-token block costs ~150 tokens of prefill and
+nothing above it.
+
+`informed` is the other half. It meant "dispatched and not mode-refused", so a
+search that found nothing, a search that found the same lines under different
+words, and a build log already read all reset the stall counter — and the
+forced `finish`, the one safety valve measured at 5/5 on the live endpoint,
+was wired to that counter. It now requires a result body the run has not seen,
+a non-empty finding, and no overlap with earlier places. The overlap test is
+the citation-set comparison `search_docs` had all along, applied to
+`search_repo` as well; the review's summary was that the codebase "independently
+invented the semantic half and scoped it to one tool".
+
+**The replan trigger is narrower than the review asked for**, deliberately.
+It fires on the second gate failure *after an edit* — the model changed
+something and the gate still failed — not on any second failure. A cached
+failure with nothing edited is a run not acting, and `_gate_stalled` already
+ends those; sending it to plan again would relitigate a decision it has not
+tried to carry out. Once per run, because a replan against the same facts is a
+re-roll, and the state block is what makes the facts different the second
+time.
+
+**Rejected**: collapsing the five survey audits into one `audit(kind=…)` tool.
+The review is right that they read as near-synonyms to a 27B model; the
+catalogue is a generated, freshness-checked contract (D-23) that the sidecar
+and the extension both bind against, and a rename there is a release rather
+than a fix. Batches are bounded in the loop instead (`MAX_CALLS_PER_BATCH`),
+because `parallel_tool_calls` is a parameter this endpoint refuses.
+
+**Cost to reverse**: moderate. `PlanStep.status` is read by `_unwritten_targets`,
+the state block, `revise_plan` and the replan path; removing it means going
+back to the set difference in all four.
+
+---
 
 ## 4. Verification strategy
 

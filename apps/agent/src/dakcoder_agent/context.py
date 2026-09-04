@@ -539,6 +539,9 @@ class ContextManager:
         self._acceptance: tuple[str, ...] = ()
         #: Follow-ups and corrections, pinned. See ``pin_directive``.
         self._directives: list[str] = []
+        #: The loop's turn-scoped statement of where the task stands, rendered
+        #: last in the volatile block. See ``set_state``.
+        self._state_text = ""
         self._recap: Message | None = None
         #: The structured recap behind ``_recap``'s rendered text, so the next
         #: compaction can fold this one in rather than replace it (BUG L-4).
@@ -793,6 +796,28 @@ class ContextManager:
         self._plan_text = plan.strip()
         self._rebuild_task()
 
+    def set_state(self, text: str) -> None:
+        """Pin the loop's statement of the task state for this turn.
+
+        The loop knows exactly what has been written, what the plan asked for
+        and what the gate said, and the model was told none of it: its only
+        evidence about its own progress was the transcript, including its own
+        statements of intent, which is how "I'll write migration.md" came to be
+        read as a report of completion. This block is rebuilt from ground truth
+        every turn and rendered at the end of the volatile layer, which
+        ``build`` already places after the working set -- so it costs the tokens
+        it contains, not a re-prefill of the conversation.
+
+        Derived, not model-written: a TodoWrite the model maintains can lie; a
+        block rendered from ``router.touched`` cannot. Identical text is a no-op
+        so the volatile block stays byte-stable across turns where nothing moved.
+        """
+        text = text.strip()
+        if text == self._state_text:
+            return
+        self._state_text = text
+        self._rebuild_task()
+
     def pin_directive(self, text: str) -> None:
         """Keep something the developer said where compaction cannot reach it.
 
@@ -856,6 +881,11 @@ class ContextManager:
         if self._directives:
             since = "\n".join(f"- {d}" for d in self._directives)
             volatile.append(f"# Since then, the developer has said\n{since}")
+        if self._state_text:
+            # Last, so the ground truth about the work is the closest thing to
+            # the model's next token, and so that rebuilding it every turn
+            # costs its own ~150 tokens and nothing above it.
+            volatile.append(self._state_text)
         self._directive_message = (
             Message(Role.USER, "\n\n".join(volatile), Layer.DIRECTIVE, source="directive")
             if volatile

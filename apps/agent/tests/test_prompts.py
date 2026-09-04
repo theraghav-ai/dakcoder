@@ -170,7 +170,15 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 #: Bought back on the way: `write_file`'s description no longer repeats "use
 #: patch_file for that", which `ToolSpec.instead` and the runtime refusal
 #: message both already say, and neither of those is in the prefix.
-PREFIX_CEILING = {Mode.ASK: 2_700, Mode.PLANNER: 3_100, Mode.AGENT: 3_850}
+#:
+#: `agent` moved again, from 3,850 to 4,100, for `revise_plan` (D-96). The
+#: tripwire fired, the schema was trimmed to the shortest descriptions that
+#: still say what the fields are, and what remains is the price of the acting
+#: phase having a way to change course that is not a stop. Every other exit it
+#: had -- a forced `finish`, a turn cap, a gate bound -- ended the run; the
+#: reported transcripts ended `unverified` with the fix one different approach
+#: away. About 250 tokens in the stable prefix, paid once per run.
+PREFIX_CEILING = {Mode.ASK: 2_700, Mode.PLANNER: 3_100, Mode.AGENT: 4_100}
 
 
 @pytest.mark.parametrize("mode", list(Mode))

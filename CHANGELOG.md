@@ -5,6 +5,55 @@
 The residuals of the 2 September audit's re-check, closed. Runtime API
 unchanged at **1.1**; nothing on the wire changed.
 
+### Added — a task state machine, and the block that shows it
+
+The third review's root cause, in its words: *a correct control state machine
+and no task state machine, and the task state it does hold is never shown to
+the model.* Six changes, in the order that review ranked them.
+
+- **A turn-scoped state block.** `ContextManager.set_state` pins a block the
+  loop rebuilds every turn from ground truth — the plan with each step's
+  status, the files written this run (`router.touched`), the last gate verdict
+  and the turn it ran on, and what has been ruled out — rendered last in the
+  volatile layer, so it costs its own ~150 tokens and never a re-prefill.
+  Derived, never model-written: a checklist the model maintains can lie; a
+  block rendered from the change set cannot. Empty on a question with nothing
+  to report.
+- **Plan steps carry a status.** `PlanStep.status` is `pending`, `done`,
+  `failed` or `skipped`, with a `note`. `done` when a mutation lands on the
+  step's file; `failed` when a gate failure after an edit names it; `skipped`
+  only by the model, through `revise_plan`. "What is left" is no longer a set
+  difference that could not say *attempted and failed*.
+- **Informed is not dispatched.** A call counts as progress only when its
+  result body is one the run has not seen (the same search under other words
+  returns the same body), it is not an empty finding (`search_repo` now
+  reports `hits: 0`), and the overlap test did not say it repeats. That test
+  — the citation-set comparison `search_docs` has had all along — now runs on
+  `search_repo`'s `path:line` keys too. The stall counter, and the forced
+  `finish` wired to it, now measure what their docstrings claim.
+- **A replan path.** On the second gate failure *after an edit*, the loop
+  sends the run back to the Planner once with a `# What has been tried` block
+  instead of the same instruction a third time; a plan that comes back keeps
+  the steps already done and gets the full gate bound. A Planner that declines
+  after being sent back ends `unverified`, not `done`. `revise_plan` is the
+  model's own pivot in the acting phase: the remaining steps replaced, the
+  reason recorded, at most twice a run.
+- **Batches are bounded.** `parallel_tool_calls` cannot be sent to an endpoint
+  with `drop_params` off, so the bound lives in the loop: a call repeated in
+  one reply runs once, calls past `MAX_CALLS_PER_BATCH` are answered "not run",
+  and `finish` sent alongside other calls is refused with the instruction to
+  send it alone after the results arrive. The wire stays coherent throughout.
+- **`finish` is bounded, and a cut-off write names its file.** `finish.answer`
+  carries `maxLength` and the handler caps it, saying so where the developer
+  reads it. The truncation message names the file the cut-off write was for,
+  says it is unchanged, and restates what has landed on disk.
+- **A live task suite.** `test_live_tasks.py` drives the loop over six real
+  tasks on a fixture service against the live endpoint (`DAKCODER_LIVE=1`,
+  like `test_live_endpoint.py`) and asserts on the run's metrics record and
+  change set, never on prose. A scripted model cannot rephrase a search, claim
+  work it did not do, or spin; those are the three failure modes the changes
+  above are for, and this is what makes them falsifiable.
+
 ### Fixed
 
 - **The summariser is handed pieces, never the whole eviction.** The evicted

@@ -295,11 +295,20 @@ def test_a_failing_gate_comes_back_to_the_same_mode(
     the failure -- which is how every mature agent does it, and how a human
     does it."""
     gated["fail"] = "go_build"
-    loop, _client = build(
-        planning_router, [plan_call(), patch(), say("Done."), patch("handler/user.go")]
-    )
-    list(loop.run("add Routes", intent=Intent.AGENT))
+    # One failure, one message, same mode. (A *second* failure after an edit is
+    # the replan trigger -- see test_audit_followups -- which is a different
+    # decision from handing the failure to another persona.)
+    loop, _client = build(planning_router, [plan_call(), patch(), say("Done.")])
+    events = list(loop.run("add Routes", intent=Intent.AGENT))
 
+    first_failure = next(
+        i for i, e in enumerate(events)
+        if e.type is EventType.GATE and e.data.get("kind") == "full" and not e.data["ok"]
+    )
+    assert not any(
+        e.type is EventType.GATE and e.data.get("kind") == "replan"
+        for e in events[: first_failure + 2]
+    ), "the first failure comes back to the same mode"
     assert loop.state.mode is Mode.AGENT, "the mode never changes on a failing gate"
     report = [m for m in loop.context.build() if "gate ran on your change" in m.content]
     assert report, "the failure comes back as an ordinary message"

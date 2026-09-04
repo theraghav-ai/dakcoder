@@ -51,6 +51,7 @@
       "rules_lint",
       "playbook",
       "finish",
+      "revise_plan",
       "write_file",
       "patch_file",
       "delete_file",
@@ -483,7 +484,8 @@
         "properties": {
           "answer": {
             "type": "string",
-            "description": "What you found or did, in full. This is what they read."
+            "description": "What you found or did. This is what they read; keep it under about 900 words.",
+            "maxLength": 6000
           },
           "blocked": {
             "type": "string",
@@ -499,6 +501,70 @@
         "agent",
         "ask",
         "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "revise_plan",
+      "description": "Replace the remaining plan steps after an approach failed. Say what was tried and why it did not work; steps already done are kept.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "steps": {
+            "type": "array",
+            "description": "The remaining steps, in order. At most eight.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": {
+                  "type": "string",
+                  "description": "Path this step changes."
+                },
+                "action": {
+                  "type": "string",
+                  "description": "What changes in it."
+                },
+                "accepts": {
+                  "type": "string",
+                  "description": "How it is checked."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "pending",
+                    "skipped"
+                  ],
+                  "description": "skipped drops the step; say why in note."
+                },
+                "note": {
+                  "type": "string",
+                  "description": "Why it is skipped."
+                }
+              },
+              "required": [
+                "file",
+                "action",
+                "accepts"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 8
+          },
+          "reason": {
+            "type": "string",
+            "description": "What was tried and why it did not work."
+          }
+        },
+        "required": [
+          "steps",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "agent"
       ],
       "mutates": false,
       "approval": "none",

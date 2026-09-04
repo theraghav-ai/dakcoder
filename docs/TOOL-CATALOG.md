@@ -15,9 +15,9 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 
 | Mode | Tools | Schema cost |
 |---|---|---|
-| **ask** | 15 | ~1,656 tokens |
-| **planner** | 17 | ~2,019 tokens |
-| **agent** | 23 | ~2,808 tokens |
+| **ask** | 15 | ~1,667 tokens |
+| **planner** | 17 | ~2,030 tokens |
+| **agent** | 24 | ~3,076 tokens |
 
 ## The catalogue
 
@@ -39,6 +39,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `submit_plan` | P |  |  | agent | Submit the plan and start the work. Each step names one file, what changes in it, and how you will know it worked. |
 | `ask_developer` | P |  |  | agent | Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base. |
 | `finish` | AAP |  |  | agent | End your turn and hand the developer your answer. Call this when the work is done, or when going further will not help. |
+| `revise_plan` | A |  |  | agent | Replace the remaining plan steps after an approach failed. Say what was tried and why it did not work; steps already done are kept. |
 | `write_file` | A | ✓ | if protected | agent | Create a new file, or append=true to add to the end — the way to write a file too big for one reply. Refuses to overwrite. Write complete, compiling Go, not a sketch. |
 | `patch_file` | A | ✓ | if protected | agent | Replace an exact unique string in a file. Include enough surrounding lines to make old unique; the call fails rather than guessing. |
 | `delete_file` | A | ✓ | **always** | agent | Delete a file. Always needs the developer's approval; say why in reason. |
@@ -191,8 +192,17 @@ End your turn and hand the developer your answer. Call this when the work is don
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `answer` | string | yes | What you found or did, in full. This is what they read. |
+| `answer` | string | yes | What you found or did. This is what they read; keep it under about 900 words. |
 | `blocked` | string |  | What stopped you, if anything did. Omit when nothing did. |
+
+### `revise_plan`
+
+Replace the remaining plan steps after an approach failed. Say what was tried and why it did not work; steps already done are kept.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `steps` | array | yes | The remaining steps, in order. At most eight. |
+| `reason` | string | yes | What was tried and why it did not work. |
 
 ### `write_file`
 

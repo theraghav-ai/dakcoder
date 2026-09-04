@@ -44,8 +44,10 @@ auto-approves is one where the approval layer is decoration.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
@@ -346,6 +348,29 @@ class _State:
     #: a model does while it hunts for a way to send something too large
     #: (BUG FS-3).
     truncations: int = 0
+    #: What has been tried and did not work, one line each, oldest first:
+    #: a gate failure and the stage it blocked at, a `revise_plan` and its
+    #: reason, a search the corpus could not answer. Rendered into the state
+    #: block every turn, so the model reads its own dead ends rather than
+    #: reconstructing them from a transcript that contains its statements of
+    #: intent. Bounded by ``STATE_ITEMS`` at render time.
+    tried: list[str] = field(default_factory=list)
+    #: Digests of tool-result bodies already shown this run. A dispatched call
+    #: whose result the model has seen before -- the same search under other
+    #: words, the same build log -- did not inform the run, whatever its
+    #: arguments looked like. Cleared with the cached-result ledgers on
+    #: eviction, because a body the context no longer holds is news again.
+    seen_bodies: set[str] = field(default_factory=set)
+    #: What each ``search_repo`` returned, as ``path:line`` keys, for the same
+    #: overlap test ``search_docs`` has had all along.
+    search_hits: list[tuple[str, frozenset[str]]] = field(default_factory=list)
+    search_repeats: int = 0
+    #: The turn the last full gate ran on, for the state block.
+    gate_turn: int = 0
+    #: Loop-initiated returns to the Planner this run. See ``_replan``.
+    replans: int = 0
+    #: Model-initiated ``revise_plan`` calls this run.
+    revisions: int = 0
 
 
 _RECAP_PROMPT = """Summarise this agent transcript for a handover to a fresh context.
@@ -546,6 +571,30 @@ BASELINE_JOIN_SECONDS = 180
 #: roughly a large file's worth of head, and a replay that hits the cut says so
 #: rather than presenting an extract as the whole answer.
 CACHED_RESULT_CHARS = 6_000
+
+#: How many times the loop itself sends a run back to the Planner.
+#:
+#: One. The trigger is the second gate failure *after an edit* -- the model
+#: changed something, the gate ran again, and it still did not clear. That is
+#: the strongest evidence a run produces that its approach is wrong, and the
+#: old answer to it was the same instruction a third time and then UNVERIFIED.
+#: A cached failure (nothing edited since) is not that evidence; it is a run
+#: not acting, and ``_gate_stalled`` already ends those. Once, because a replan
+#: against the same facts is a re-roll, and the state block is what makes the
+#: facts different the second time.
+MAX_REPLANS = 1
+
+#: How many times the model may replace the remaining plan with `revise_plan`.
+MAX_REVISIONS = 2
+
+#: How many calls one reply may dispatch. `parallel_tool_calls` is not sent --
+#: an endpoint with `drop_params` off would 400 on it -- so the bound is here:
+#: identical calls in one batch are answered once, and calls past the cap are
+#: answered "not run" with a reason, which keeps the wire coherent.
+MAX_CALLS_PER_BATCH = 6
+
+#: How many entries each list in the state block carries.
+STATE_ITEMS = 8
 
 #: How many times a `finish` that abandons the plan is sent back.
 #:
@@ -1005,6 +1054,9 @@ class AgentLoop:
             return
 
         turn = self.context.begin_turn()
+        # The task state, from ground truth, at the end of the prompt. The one
+        # thing the loop knew and the model was never told.
+        self.context.set_state(self._state_block())
         yield Event(
             EventType.TURN_START,
             {
@@ -1418,12 +1470,26 @@ class AgentLoop:
         alone = len(result.chat.tool_calls) == 1
         for call in result.chat.tool_calls:
             if call.id in cut:
+                # The file is named when the prefix carries it, and so is what
+                # has actually landed on disk: a model that lost a write to the
+                # limit has no other way to tell "I wrote it" from "I meant to".
+                target = _partial_path(call.arguments)
+                landed = (
+                    "Written this run so far: " + ", ".join(self.router.touched)
+                    if self.router.touched
+                    else "Nothing has been written this run yet"
+                )
                 body = (
-                    f"Your call to {call.name} arrived cut off -- the arguments stop "
-                    "partway through, so the call was not made. Nothing is wrong with "
-                    "your JSON; this is what running into the "
-                    f"{config_for(self.state.mode).max_tokens:,}-token output limit "
-                    "looks like.\n\n" + self._shorter_reply(call.name, alone)
+                    f"Your call to {call.name}"
+                    + (f" for {target}" if target else "")
+                    + " arrived cut off -- the arguments stop partway through, so "
+                    "the call was not made"
+                    + (f" and {target} is unchanged" if target else "")
+                    + ". Nothing is wrong with your JSON; this is what running into "
+                    f"the {config_for(self.state.mode).max_tokens:,}-token output "
+                    "limit looks like.\n\n"
+                    + self._shorter_reply(call.name, alone)
+                    + f"\n\n{landed}."
                 )
                 said = f"output limit reached mid-call; {names} was not dispatched"
             else:
@@ -1597,7 +1663,57 @@ class AgentLoop:
         #: Dispatched calls that told the run something it did not already have.
         informed = 0
 
+        # What in this batch will not be dispatched, and why. Three rules, all
+        # about the batch rather than any one call: a call repeated verbatim in
+        # the same reply is answered once; calls past MAX_CALLS_PER_BATCH are
+        # not run; and `finish` sent alongside other calls is refused, because
+        # an answer written before the results it asked for arrived is an
+        # answer to nothing -- and the model that batches them is the one the
+        # output limit cuts off mid-answer.
+        skipped: dict[str, str] = {}
+        seen_in_batch: set[str] = set()
+        others = [c for c in calls if c.name != "finish"]
+        for position, call in enumerate(calls):
+            fingerprint = _fingerprint(call)
+            if fingerprint in seen_in_batch:
+                skipped[call.id] = (
+                    "it repeats a call made earlier in this same reply; the answer "
+                    "above is the answer."
+                )
+                continue
+            seen_in_batch.add(fingerprint)
+            if call.name == "finish" and others:
+                skipped[call.id] = (
+                    "it was sent in the same reply as other calls. Read their "
+                    "results first, then call `finish` on its own, in a reply with "
+                    "nothing else in it."
+                )
+                continue
+            if position >= MAX_CALLS_PER_BATCH:
+                skipped[call.id] = (
+                    f"more than {MAX_CALLS_PER_BATCH} calls were sent in one reply; "
+                    "ask for it again in a later turn."
+                )
+
         for index, call in enumerate(calls):
+            if call.id in skipped:
+                self.context.append_tool_result(
+                    call.name,
+                    f"{call.name} was not run: {skipped[call.id]}",
+                    tool_call_id=call.id,
+                )
+                yield Event(
+                    EventType.TOOL_RESULT,
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "ok": False,
+                        "turn": self.context.turn,
+                        "dispatched": False,
+                        "content": f"not run: {skipped[call.id]}",
+                    },
+                )
+                continue
             if self.cancelled():
                 # Before the call, not after. A batch can hold five writes, and
                 # "it stopped but three more files changed" is the report this
@@ -1709,7 +1825,20 @@ class AgentLoop:
             # earned in one mode would answer the identical call made in the
             # mode that *can* run it.
             refused_by_mode = bool(outcome.meta.get("refused_by_mode"))
-            informed += 0 if refused_by_mode else 1
+            # "Informed" means the run learned something, not that a tool ran.
+            # It used to be the second: any dispatched, non-mode-refused call
+            # counted, so a search that found nothing, a search that found the
+            # same lines under different words, and a build log the model had
+            # already read all reset the stall counter -- and the stall counter
+            # is what the forced `finish` is wired to. Three tests now: the
+            # result body is one the run has not seen (the same search under
+            # other words returns the same body), it is not an empty finding,
+            # and the overlap test below did not say it repeats.
+            digest = _body_digest(call.name, outcome.for_model())
+            novel = digest not in self.state.seen_bodies
+            self.state.seen_bodies.add(digest)
+            if not refused_by_mode and novel and not _empty_finding(outcome):
+                informed += 1
             mutated = mutated or bool(outcome.mutations)
             if call.name == "go_mod":
                 self.state.dependencies_changed = True
@@ -1737,6 +1866,10 @@ class AgentLoop:
             # A file that was just written is worth reading again.
             for mutation in outcome.mutations:
                 self.state.reads.pop(mutation.path, None)
+                # A mutation on a plan step's file is that step done -- from the
+                # change set, which cannot lie, rather than from the model
+                # saying so.
+                self._mark_steps(mutation.path, "done")
 
             slice_path, slice_range = _slice_path(call, outcome)
             appended = self.context.append_tool_result(
@@ -1762,15 +1895,15 @@ class AgentLoop:
                     delivered=appended.line_range is not None or slice_range is None,
                 )
 
-            if note := self._retrieval_overlap(call, outcome):
+            if note := self._overlap(call, outcome):
                 # As a user message. It carries no `tool_call_id` because no
                 # tool produced it, and a `role: tool` message without one is
                 # malformed on the wire and a lie in the transcript -- the old
                 # loop had 17 such call sites, teaching the model that
                 # `go_build` returns paragraphs of instructions.
                 self.context.append_user(note)
-                # A retrieval that returned only sections the run already had
-                # did not inform this turn, so it must not count as progress.
+                # A search that returned only places the run already had did
+                # not inform this turn, so it must not count as progress.
                 informed -= 1
 
             yield Event(
@@ -1782,6 +1915,9 @@ class AgentLoop:
                     **outcome.as_dict(),
                 },
             )
+
+            if call.name == "revise_plan" and outcome.ok:
+                yield from self._revised(outcome)
 
             # A phase ends on its own tool call, not on its prose.
             if call.name in _TERMINAL:
@@ -2150,13 +2286,12 @@ class AgentLoop:
         # (prior-audit TC-4).
         self.state.forced = False
         steps = self._normalise_plan(steps_from_meta(dict(outcome.meta)))
-        self.state.plan = steps
-        self.state.plan_summary = str(outcome.meta.get("summary") or "")
-        rendered = "\n".join(step.rendered(i) for i, step in enumerate(steps, 1))
-        if self.state.plan_summary:
-            rendered = f"{self.state.plan_summary}\n\n{rendered}"
-        self.context.set_plan(rendered)
-        yield Event(EventType.PLAN, {"text": rendered, "steps": len(steps)})
+        replanned = bool(self.state.plan) and self.state.replans > 0
+        yield from self._adopt_plan(steps, str(outcome.meta.get("summary") or ""))
+        if replanned:
+            # A new approach gets the full gate bound. MAX_REPLANS is what keeps
+            # this finite: the second failed approach ends the run as before.
+            self.state.gate_failures = 0
         self._switch(Mode.AGENT)
 
     def _inner_loop(self) -> Iterator[Event]:
@@ -2236,6 +2371,27 @@ class AgentLoop:
             # with nothing to plan, which is a legitimate answer to a request
             # that turned out not to need a change -- and the honest thing is to
             # say so rather than manufacture a plan and run a gate on it.
+            #
+            # Unless this Planner was *sent back*. A replan that produces no
+            # plan is not "nothing needed changing": files were written and a
+            # gate failed on them, and DONE would say otherwise.
+            if self.state.replans > 0 or self.router.touched:
+                report = self.state.last_gate
+                self.result = RunResult(
+                    Outcome.UNVERIFIED,
+                    "a revised plan was asked for after the gate failed, and none "
+                    "was submitted. The edits are in the workspace"
+                    + (
+                        f"; the gate was last blocked at {report.blocked_by.name}"
+                        if report is not None and report.blocked_by
+                        else ""
+                    )
+                    + self._unfinished(),
+                    self.context.turn,
+                    tuple(self.router.touched),
+                    report,
+                )
+                return
             self.result = RunResult(
                 Outcome.DONE,
                 "no plan was submitted; the reply describes the code rather than "
@@ -2309,6 +2465,7 @@ class AgentLoop:
         )
         self.state.last_gate = report
         self.state.gate_key = key
+        self.state.gate_turn = self.context.turn
         yield Event(EventType.GATE, {"kind": "full", **report.as_dict()})
 
         if report.ok:
@@ -2345,6 +2502,11 @@ class AgentLoop:
         # bounded, by MAX_GATE_FAILURES and by `_gate_stalled`, both of which
         # count turns that changed nothing.
         self.state.research_turns = 0
+        if rerun:
+            # A failure after an edit is an attempt that did not work. Recorded
+            # where the state block will show it, and the steps it names are
+            # marked failed rather than left looking pending.
+            self._note_tried(report)
         if self.state.gate_failures > MAX_GATE_FAILURES:
             self.result = RunResult(
                 Outcome.UNVERIFIED,
@@ -2375,6 +2537,13 @@ class AgentLoop:
                 f"{blocker}, and the report above is still the whole of it.\n\n"
                 "Nothing will move until a file does. Make the edit, or say plainly "
                 "what is stopping you from making it."
+            )
+
+        if rerun and self.state.gate_failures >= 2 and self._can_replan():
+            blocker = report.blocked_by.name if report.blocked_by else "the gate"
+            yield from self._replan(
+                f"the gate has failed {self.state.gate_failures} times at {blocker}, "
+                "the last time after an edit meant to fix it"
             )
 
     def _gate_stalled(self) -> str:
@@ -2455,6 +2624,10 @@ class AgentLoop:
         self.state.reads = dict(previous.state.reads)
         self.state.retrievals = list(previous.state.retrievals)
         self.state.retrieval_repeats = previous.state.retrieval_repeats
+        # What did not work is still true on the next message; what the results
+        # looked like may not be, so the body and search-place ledgers start
+        # empty like `last_results` does.
+        self.state.tried = list(previous.state.tried)
         self.state.baseline = previous.state.baseline
         self.state.plan = previous.state.plan
         self.state.plan_summary = previous.state.plan_summary
@@ -2583,7 +2756,11 @@ class AgentLoop:
         if not self.state.plan:
             return []
         touched = set(self.router.touched)
-        return [s.file for s in self.state.plan if s.file and s.file not in touched]
+        return [
+            s.file
+            for s in self.state.plan
+            if s.file and s.open and s.file not in touched
+        ]
 
     def _retrieval_overlap(self, call: ToolCall, outcome: ToolResult) -> str:
         """What to tell a run that keeps asking the corpus the same thing.
@@ -2639,6 +2816,207 @@ class AgentLoop:
             "Stop rephrasing it. Follow the pattern in the nearest existing code "
             "instead, and if the step genuinely cannot be done without knowing this, "
             "say which step and what you need, in one line."
+        )
+
+    # -- the task state -----------------------------------------------------
+
+    def _state_block(self) -> str:
+        """Where the task stands, from ground truth, for the end of the prompt.
+
+        The loop had a correct control state machine and no task state machine,
+        and the task state it did hold -- the change set, the plan, the last
+        gate -- was never shown to the model. So the model's only evidence about
+        its own progress was the transcript, including its own statements of
+        intent, and "I'll write migration.md" three turns ago read exactly like
+        a report that it had. This is that state, rendered every turn.
+
+        Derived, never model-written: the lists come from ``router.touched``,
+        the gate report and the loop's own ledgers, none of which the model can
+        edit. Empty when there is nothing to say (an ASK run that has read two
+        files), so the block is not noise on a question.
+        """
+        lines = [f"# Current state — turn {self.context.turn}, {self.state.mode} phase"]
+
+        if self.state.plan:
+            lines.append("Plan:")
+            for i, step in enumerate(self.state.plan, 1):
+                note = f" ({step.note})" if step.note else ""
+                lines.append(f"  {i}. [{step.status}] {step.file} — {step.action}{note}")
+
+        touched = self.router.touched
+        if touched or self.state.mode is Mode.AGENT:
+            shown = ", ".join(touched[:STATE_ITEMS])
+            more = len(touched) - STATE_ITEMS
+            lines.append(
+                "Written this run: "
+                + (shown + (f" and {more} more" if more > 0 else "") if touched else "nothing yet")
+            )
+
+        report = self.state.last_gate
+        if report is not None:
+            verdict = (
+                "PASS"
+                if report.ok
+                else f"FAIL at {report.blocked_by.name if report.blocked_by else 'the gate'}"
+            )
+            lines.append(f"Last gate: {verdict} (turn {self.state.gate_turn})")
+        elif self.state.mode is Mode.AGENT and touched:
+            lines.append("Last gate: not run yet on these files")
+
+        ruled = self._ruled_out()
+        if ruled:
+            lines.append("Ruled out:")
+            lines.extend(f"  - {item}" for item in ruled[-STATE_ITEMS:])
+
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    def _ruled_out(self) -> list[str]:
+        """What this run has established does not work, one line each."""
+        out = list(self.state.tried)
+        for fingerprint, reason in list(self.state.dead_ends.items())[-STATE_ITEMS:]:
+            out.append(f"{fingerprint.split(':', 1)[0]}: {reason}")
+        if self.state.retrieval_repeats >= MAX_RETRIEVAL_REPEATS:
+            out.append("search_docs: the knowledge base does not cover the last question asked")
+        if self.state.search_repeats >= MAX_RETRIEVAL_REPEATS:
+            out.append(
+                "search_repo: the last searches returned only places already found; "
+                "the pattern is not in the workspace"
+            )
+        return out
+
+    def _mark_steps(self, path: str, status: str, note: str = "") -> None:
+        """Set the status of every plan step that names ``path``."""
+        if not self.state.plan:
+            return
+        self.state.plan = tuple(
+            replace(step, status=status, note=note) if step.file == path else step
+            for step in self.state.plan
+        )
+
+    def _note_tried(self, report: GateReport) -> None:
+        """Record a gate failure after an edit as an attempt that did not work."""
+        blocker = report.blocked_by
+        if blocker is None:
+            return
+        first = next((ln.strip() for ln in blocker.content.splitlines() if ln.strip()), "")
+        self.state.tried.append(
+            f"turn {self.context.turn}: gate failed at {blocker.name}"
+            + (f": {first[:120]}" if first else "")
+        )
+        del self.state.tried[:-STATE_ITEMS * 2]
+        for step in self.state.plan:
+            if step.file and step.file in blocker.content and step.status != "skipped":
+                self._mark_steps(step.file, "failed", f"{blocker.name}, turn {self.context.turn}")
+
+    def _can_replan(self) -> bool:
+        return (
+            self.state.mode is Mode.AGENT
+            and bool(self.state.plan)
+            and self.state.replans < MAX_REPLANS
+        )
+
+    def _replan(self, reason: str) -> Iterator[Event]:
+        """Send the run back to the Planner with what has been tried.
+
+        The one strategy change the loop makes on its own. Every other exit is a
+        stop. It arrives with the record -- the failures, the stages they blocked
+        at, the revisions already made -- because a replan against the same
+        empty state that produced the first plan is a re-roll, not a replan.
+        """
+        self.state.replans += 1
+        self.state.stalled_turns = 0
+        self.state.research_turns = 0
+        tried = "\n".join(f"- {t}" for t in self.state.tried[-STATE_ITEMS:]) or "- (nothing recorded)"
+        self.context.append_user(
+            f"That approach has not worked: {reason}.\n\n"
+            f"# What has been tried\n{tried}\n\n"
+            "Plan again from what is now known. Steps already done stay done; "
+            "replace the rest with a different approach, not the same one restated. "
+            "Submit it with `submit_plan`, or `ask_developer` if the decision is "
+            "theirs to make."
+        )
+        yield Event(
+            EventType.GATE,
+            {"kind": "replan", "reason": reason, "tried": list(self.state.tried)},
+        )
+        self._switch(Mode.PLANNER)
+
+    def _adopt_plan(self, steps: Sequence[PlanStep], summary: str) -> Iterator[Event]:
+        """Install a plan, keeping the steps an earlier plan already finished."""
+        incoming = {s.file for s in steps if s.file}
+        kept = tuple(
+            s for s in self.state.plan if s.status == "done" and s.file not in incoming
+        )
+        self.state.plan = kept + tuple(steps)
+        if summary:
+            self.state.plan_summary = summary
+        rendered = "\n".join(step.rendered(i) for i, step in enumerate(self.state.plan, 1))
+        if self.state.plan_summary:
+            rendered = f"{self.state.plan_summary}\n\n{rendered}"
+        self.context.set_plan(rendered)
+        yield Event(EventType.PLAN, {"text": rendered, "steps": len(self.state.plan)})
+
+    def _revised(self, outcome: ToolResult) -> Iterator[Event]:
+        """Act on a `revise_plan` the router accepted."""
+        reason = str(outcome.meta.get("reason") or "").strip()
+        self.state.revisions += 1
+        if self.state.revisions > MAX_REVISIONS:
+            self.context.append_user(
+                f"The plan has already been revised {MAX_REVISIONS} times this run and "
+                "this revision was not adopted. Carry out the plan as it stands, or "
+                "call `finish` and say in `blocked` what cannot be done."
+            )
+            return
+        self.state.tried.append(f"turn {self.context.turn}: plan revised: {reason}")
+        del self.state.tried[:-STATE_ITEMS * 2]
+        steps = self._normalise_plan(steps_from_meta(dict(outcome.meta)))
+        yield from self._adopt_plan(steps, "")
+
+    def _overlap(self, call: ToolCall, outcome: ToolResult) -> str:
+        """What to tell a run whose search returned only places it already had."""
+        if call.name == "search_docs":
+            return self._retrieval_overlap(call, outcome)
+        if call.name == "search_repo":
+            return self._search_overlap(call, outcome)
+        return ""
+
+    def _search_overlap(self, call: ToolCall, outcome: ToolResult) -> str:
+        """``_retrieval_overlap`` for the workspace search.
+
+        The same algorithm, on ``path:line`` keys instead of section citations.
+        It was applied to one of twenty-three tools, and the one that loops in
+        the field is this one: ``Handler``, ``handler`` and ``Handler\\(`` are
+        three fingerprints and one set of places.
+        """
+        if not outcome.ok:
+            return ""
+        keys = outcome.meta.get("match_keys")
+        if not keys:
+            return ""
+        hits = frozenset(str(k) for k in keys)
+        try:
+            pattern = str((call.parsed() or {}).get("pattern", ""))
+        except ValueError:
+            pattern = ""
+
+        seen: set[str] = set()
+        source = ""
+        for earlier_pattern, earlier in self.state.search_hits:
+            if len(hits & earlier) / len(hits) >= RETRIEVAL_OVERLAP and not source:
+                source = earlier_pattern
+            seen |= earlier
+        self.state.search_hits.append((pattern, hits))
+        del self.state.search_hits[:-40]
+
+        if hits - seen:
+            self.state.search_repeats = 0
+            return ""
+        self.state.search_repeats += 1
+        return (
+            f"That search found only places {source or 'an earlier search'!r} already "
+            "returned -- the same lines under different words. Rewording the pattern "
+            "will not reach different code. Read one of those places, search for "
+            "something else, or work from what is already above."
         )
 
     def _re_reading(self, call: ToolCall) -> str:
@@ -2900,6 +3278,11 @@ class AgentLoop:
         self.state.partial_results.clear()
         self.state.truncated_at.clear()
         self.state.echoes.clear()
+        # A result the context no longer holds is news again when it comes
+        # back, and a search's places are worth re-seeing once.
+        self.state.seen_bodies.clear()
+        self.state.search_hits.clear()
+        self.state.search_repeats = 0
 
     def _summarise(self, messages: Sequence[Message]) -> Recap:
         """Summarise the evicted working set into a structured recap.
@@ -3222,6 +3605,30 @@ def _digest(pieces: Sequence[Sequence[tuple[Message, str]]]) -> Recap:
             + (f" and {more} more" if more > 0 else ""),
         ),
     )
+
+
+_PARTIAL_PATH = re.compile(r'"path"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _partial_path(arguments: str) -> str:
+    """The ``path`` in a cut-off call's arguments, when the prefix reached it."""
+    match = _PARTIAL_PATH.search(arguments or "")
+    return match.group(1) if match else ""
+
+
+def _body_digest(name: str, body: str) -> str:
+    """A key for "the model has seen this result before".
+
+    Whitespace-normalised so a reflowed build log is the same log, and keyed by
+    tool so two tools that happen to say "clean" are not the same finding.
+    """
+    normalised = re.sub(r"\s+", " ", body).strip()
+    return hashlib.sha1(f"{name}\n{normalised}".encode("utf-8", "replace")).hexdigest()
+
+
+def _empty_finding(outcome: ToolResult) -> bool:
+    """A successful search that found nothing. A finding, but not progress twice."""
+    return outcome.ok and "hits" in outcome.meta and not outcome.meta.get("hits")
 
 
 def _safe_args(call: ToolCall) -> Any:

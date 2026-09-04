@@ -464,6 +464,9 @@ def search_repo(inv: Invocation) -> ToolResult:
     root = inv.workspace.root
 
     hits: list[str] = []
+    #: ``path:line`` for every hit, so the loop can tell a search that returned
+    #: the same places under different words from one that found something new.
+    keys: list[str] = []
     scanned = 0
     truncated = False
 
@@ -479,6 +482,7 @@ def search_repo(inv: Invocation) -> ToolResult:
         for number, line in enumerate(_to_lf(text).split("\n"), start=1):
             if rx.search(line):
                 hits.append(f"{rel}:{number}: {line.strip()[:200]}")
+                keys.append(f"{rel}:{number}")
                 if len(hits) >= limit:
                     truncated = True
                     break
@@ -509,7 +513,7 @@ def search_repo(inv: Invocation) -> ToolResult:
                 f"says nothing about whether {pattern!r} exists.\n\n"
                 + "Drop the glob to search the whole workspace, or check it -- globs "
                 "are matched against workspace-relative paths.",
-                meta={"scanned": 0, "empty_glob": glob},
+                meta={"scanned": 0, "empty_glob": glob, "hits": 0},
             )
 
         where = (
@@ -530,7 +534,11 @@ def search_repo(inv: Invocation) -> ToolResult:
                     "\n\nThe workspace's top level, for orientation:\n"
                     + "\n".join(f"  {entry}" for entry in top)
                 )
-        return ToolResult.success(body, meta={"scanned": scanned})
+        # `hits: 0` is what the loop reads. A search that found nothing is a
+        # finding, and it is reported as one -- but it is not *progress* the
+        # second time, and a run that rephrases the same empty search forever
+        # used to count every rephrasing as having informed it.
+        return ToolResult.success(body, meta={"scanned": scanned, "hits": 0})
 
     header = f"{len(hits)} match(es) in {scanned} files"
     if truncated:
@@ -538,7 +546,7 @@ def search_repo(inv: Invocation) -> ToolResult:
     return ToolResult.success(
         header + "\n" + "\n".join(hits),
         truncated=truncated,
-        meta={"scanned": scanned, "hits": len(hits)},
+        meta={"scanned": scanned, "hits": len(hits), "match_keys": keys},
     )
 
 
