@@ -247,7 +247,7 @@
   "Paths": "Paths",
   "Pension": "Pension",
   "Per-file detail is not available": "Per-file detail is not available",
-  "Per-step status is shown as a dash because no field on the wire carries it. The runtime reports the plan text and a step count; inferring progress from anything else would be a guess presented as a fact.": "Per-step status is shown as a dash because no field on the wire carries it. The runtime reports the plan text and a step count; inferring progress from anything else would be a guess presented as a fact.",
+  "Per-step status is shown as a dash for steps this runtime did not report one for. Progress is never inferred from gate results.": "Per-step status is shown as a dash for steps this runtime did not report one for. Progress is never inferred from gate results.",
   "Personal access token over HTTPS": "Personal access token over HTTPS",
   "Pick none to show every status": "Pick none to show every status",
   "Plan received.": "Plan received.",
@@ -763,10 +763,14 @@
   "{0}m": "{0}m",
   "{0}s": "{0}s",
   "·": "·",
+  "–": "–",
   "—": "—",
   "— not run": "— not run",
   "— skipped: {0}": "— skipped: {0}",
   "↑↓ to choose · ⏎ to run": "↑↓ to choose · ⏎ to run",
+  "○": "○",
+  "✓": "✓",
   "✓ passed": "✓ passed",
+  "✗": "✗",
   "✗ failed": "✗ failed"
 }

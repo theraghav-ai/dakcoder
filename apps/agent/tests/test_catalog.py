@@ -179,12 +179,21 @@ def test_every_audit_declares_a_context_cap() -> None:
 
     That is wrong for a ranked report in a way that is easy to miss: tail
     truncation keeps the least important findings and drops the N+1 the report
-    exists to surface. The four audits were shipped without caps and did exactly
-    that.
+    exists to surface. The audits were shipped without caps and did exactly that.
+
+    The five survey tools are one ``audit(kind=...)`` now, so this is one
+    assertion where it was four -- but it is the same assertion, and it still has
+    to hold for every ranked report the model can ask for.
     """
     from dakcoder_agent.context import TOOL_CAPS
 
-    for name in ("db_roundtrip_audit", "validation_audit", "temporal_audit", "lib_version_check"):
+    ranked = [
+        name
+        for name, spec in registry.REGISTRY.items()
+        if spec.provider is registry.Provider.GOTOOLS and name in ("audit", "rules_lint")
+    ]
+    assert "audit" in ranked, "the survey tool must still be reachable by this test"
+    for name in ranked:
         assert name in TOOL_CAPS, f"{name} has no cap; it would be tail-truncated"
         assert TOOL_CAPS[name].strategy == "head", (
             f"{name} is ranked worst-first, so the head is what must be kept"

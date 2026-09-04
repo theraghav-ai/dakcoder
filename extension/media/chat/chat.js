@@ -788,12 +788,17 @@
     }
 
     const list = el('ol');
+    let anyUnknown = false;
     parsed.steps.forEach(function (step) {
       const item = el('li');
-      // A dash, always. See the footnote — no field carries per-step status and
-      // deriving one from gate results would be a fabrication.
-      const status = el('span', 'status', S.planStatusUnknown);
-      status.setAttribute('aria-label', S.planStatusUnknown);
+      // Read from the plan, not inferred. The runtime maintains this from the
+      // workspace and the gate; what is rendered here is that fact, and a dash
+      // still means "not carried" rather than "not started".
+      const known = step.status && step.status !== 'unknown';
+      if (!known) anyUnknown = true;
+      const glyph = known ? S['planStatus_' + step.status] : S.planStatusUnknown;
+      const status = el('span', 'status status-' + (step.status || 'unknown'), glyph);
+      status.setAttribute('aria-label', glyph);
       item.appendChild(status);
       const text = el('span');
       text.appendChild(document.createTextNode(step.text));
@@ -810,12 +815,30 @@
       wrap.appendChild(el('p', 'footnote', S.planScope));
       wrap.appendChild(pathList(parsed.scope, []));
     }
-    wrap.appendChild(el('p', 'footnote', S.planFootnote));
+    // Only when something actually is unknown. Printing "status is shown as a
+    // dash because nothing carries it" under a list of real statuses is worse
+    // than printing nothing: it tells the reader not to trust what they can see.
+    if (anyUnknown) wrap.appendChild(el('p', 'footnote', S.planFootnote));
     return wrap;
   }
 
   /** The server's own step regex, kept identical so the count agrees. */
   const STEP = /^\s*\d+[.)]\s/;
+
+  /**
+   * The status mark the runtime writes at the head of each step.
+   *
+   * Stripped from the text rather than shown in it: this list has a status
+   * column of its own, and `[ done   ]` inside the step body would state the
+   * same fact twice, in the wrong place, unaligned.
+   */
+  const MARK = /^\[\s*(todo|done|failed|skipped)\s*\]\s*/i;
+  const MARK_STATUS = {
+    todo: 'pending',
+    done: 'passed',
+    failed: 'failed',
+    skipped: 'skipped',
+  };
 
   function parsePlan(text) {
     const lines = String(text || '').split(/\r?\n/);
@@ -832,7 +855,16 @@
         });
       }
       if (STEP.test(line)) {
-        current = { text: line.replace(STEP, '').trim(), accepts: '' };
+        const body = line.replace(STEP, '').trim();
+        const mark = MARK.exec(body);
+        current = {
+          text: body.replace(MARK, '').trim(),
+          accepts: '',
+          // 'unknown' when there is no mark, which is what a plan from a
+          // runtime predating per-step status looks like. The dash and its
+          // footnote are still the honest rendering for that case.
+          status: mark ? MARK_STATUS[mark[1].toLowerCase()] : 'unknown',
+        };
         steps.push(current);
         return;
       }

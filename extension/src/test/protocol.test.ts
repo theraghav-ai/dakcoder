@@ -169,12 +169,50 @@ describe('parsePlan', () => {
     assert.equal(plan.steps[2].accepts, 'rules_lint reports no layer-sql-boundary violation');
   });
 
-  it('leaves every step status unknown, because no field carries it', () => {
-    // The honest rendering. Tying "the gate passed" to "the step advanced" would
-    // be a fabrication, and a fabricated status is worse than a visible dash.
+  it('leaves a step unknown when the runtime did not mark it', () => {
+    // Still the honest rendering for a plan from a runtime that predates
+    // per-step status. Tying "the gate passed" to "the step advanced" would be
+    // a fabrication, and a fabricated status is worse than a visible dash.
     for (const step of parsePlan(PLAN).steps) {
       assert.equal(step.status, 'unknown');
     }
+  });
+
+  const MARKED = [
+    'Add a pension resource with list filters.',
+    '',
+    '1. [ done   ] handler/pension.go - scaffold the resource.',
+    '2. [ FAILED ] bootstrap/bootstrapper.go - wire the handler.',
+    '      go_build rejected this file',
+    '3. [ skipped] repo/postgres/pension.go - add the list filters.',
+    '      the repository already filters by status',
+    '4. [ todo   ] handler/request.go - add the filter DTO.',
+    '      Accepts: go build passes',
+  ].join('\n');
+
+  it('reads the status the runtime marked on each step', () => {
+    // The runtime maintains this from the workspace and the gate, so the panel
+    // and the model cannot disagree about what has been done. Before it existed
+    // the panel showed a dash for every step and a footnote explaining why.
+    const steps = parsePlan(MARKED).steps;
+    assert.deepEqual(
+      steps.map((s) => s.status),
+      ['passed', 'failed', 'skipped', 'pending'],
+    );
+  });
+
+  it('strips the status mark out of the step text', () => {
+    // The list has a status column of its own. Leaving `[ done   ]` in the body
+    // would state the same fact twice, in the wrong place.
+    const steps = parsePlan(MARKED).steps;
+    assert.equal(steps[0].text, 'handler/pension.go - scaffold the resource.');
+    assert.ok(!steps[1].text.includes('['), steps[1].text);
+  });
+
+  it('still finds the paths and the acceptance criteria around the marks', () => {
+    const plan = parsePlan(MARKED);
+    assert.ok(plan.scope.includes('bootstrap/bootstrapper.go'));
+    assert.equal(plan.steps[3].accepts, 'go build passes');
   });
 
   it('collects the file paths it can see, for the scope line', () => {

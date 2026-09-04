@@ -15,9 +15,9 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 
 | Mode | Tools | Schema cost |
 |---|---|---|
-| **ask** | 15 | ~1,656 tokens |
-| **planner** | 17 | ~2,019 tokens |
-| **agent** | 23 | ~2,808 tokens |
+| **ask** | 11 | ~1,365 tokens |
+| **planner** | 13 | ~1,721 tokens |
+| **agent** | 22 | ~2,837 tokens |
 
 ## The catalogue
 
@@ -29,14 +29,11 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `search_docs` | AAP |  |  | agent | Search the n-api-template knowledge base for the contract rule behind a pattern. Use it before inventing an approach, not after. |
 | `go_symbols` | AAP |  |  | gopls | Find a symbol's definition, references or package API through gopls. Use this rather than searching for a name textually. _(not yet available: gopls is not yet wired (Part A section 8.3). Use search_repo, or go_build for type errors.)_ |
 | `go_diagnostics` | A |  |  | gopls | Type-check the workspace incrementally and report errors. This is the fast inner-loop signal; run it after every edit batch. _(not yet available: gopls is not yet wired (Part A section 8.3). Use go_build, which is authoritative but takes about four seconds.)_ |
-| `rules_lint` | AAP |  |  | gotools | Check Go against the n-api-template contract: layer boundaries, handler signatures, repository idiom, FX registration. Pass paths to scope it. |
-| `legacy_audit` | AP |  |  | gotools | Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating; then search_docs 'legacy migration' and follow that SOP. |
-| `db_roundtrip_audit` | AP |  |  | gotools | Profile every repository method: database calls, any inside a loop, batched, in a transaction, with a verdict. Worst first. Use before optimising by eye. |
-| `validation_audit` | AP |  |  | gotools | List every request field, its validate tag, and what the tag leaves unbounded. `required` alone means only 'not empty', so a 10MB string passes. |
-| `temporal_audit` | AP |  |  | gotools | List inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only — it makes no recommendation. |
-| `lib_version_check` | AP |  |  | gotools | Report CEPT library drift: which are behind, which are superseded by n-api-*. Reports only — never edit go.mod on it, tell the user. |
+| `rules_lint` | AP |  |  | gotools | Check Go against the n-api-template contract: layer boundaries, handler signatures, repository idiom, FX registration. Pass paths to scope it. |
+| `audit` | AP |  |  | gotools | Survey the whole service on one axis: legacy (pre-template patterns), db (repository round trips), validation (request field bounds), temporal (off-request-path work), libs (CEPT drift). Reports only. |
 | `playbook` | AAP |  |  | agent | Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before. |
 | `submit_plan` | P |  |  | agent | Submit the plan and start the work. Each step names one file, what changes in it, and how you will know it worked. |
+| `revise_plan` | A |  |  | agent | Replace the rest of the plan when it cannot work. Say what you ruled out. You keep the write tools and carry on. |
 | `ask_developer` | P |  |  | agent | Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base. |
 | `finish` | AAP |  |  | agent | End your turn and hand the developer your answer. Call this when the work is done, or when going further will not help. |
 | `write_file` | A | ✓ | if protected | agent | Create a new file, or append=true to add to the end — the way to write a file too big for one reply. Refuses to overwrite. Write complete, compiling Go, not a sketch. |
@@ -56,7 +53,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `go_mod` | A | ✓ | if protected | agent | Run tidy, or add a dependency. Tidy is free and must be a no-op at the gate; adding a direct dependency needs approval. |
 | `git_status` | AAP |  |  | agent | List changed, staged and untracked files. Cheap; use it to confirm what you changed. |
 | `git_diff` | AAP |  |  | agent | Show the diff of the working tree, or of one path. Read this before claiming a change is done. |
-| `git_blame` | AAP |  |  | agent | Show who last changed each line of a file, and when. Use it to date a legacy pattern. |
+| `git_blame` | AP |  |  | agent | Show who last changed each line of a file, and when. Use it to date a legacy pattern. |
 | `git_ops` | A | ✓ | if protected | agent | Stage, commit, or switch to the session branch. Never pushes and never rewrites history, so nothing here can lose committed work. |
 | `run_terminal` | A |  | if protected | agent | Run one allow-listed binary with explicit arguments. There is no shell, so no pipes, globs or redirection. Prefer a purpose-built tool. |
 
@@ -127,37 +124,14 @@ Check Go against the n-api-template contract: layer boundaries, handler signatur
 | `paths` | string |  | Comma-separated paths to lint. Omit for the whole workspace. |
 | `only` | string |  | Comma-separated rule ids, e.g. 'layer-sql-boundary,handler-signature'. |
 
-### `legacy_audit`
+### `audit`
 
-Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating; then search_docs 'legacy migration' and follow that SOP.
+Survey the whole service on one axis: legacy (pre-template patterns), db (repository round trips), validation (request field bounds), temporal (off-request-path work), libs (CEPT drift). Reports only.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `paths` | string |  | Comma-separated paths to audit. Omit for the whole workspace. |
-
-### `db_roundtrip_audit`
-
-Profile every repository method: database calls, any inside a loop, batched, in a transaction, with a verdict. Worst first. Use before optimising by eye.
-
-_No parameters._
-
-### `validation_audit`
-
-List every request field, its validate tag, and what the tag leaves unbounded. `required` alone means only 'not empty', so a 10MB string passes.
-
-_No parameters._
-
-### `temporal_audit`
-
-List inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only — it makes no recommendation.
-
-_No parameters._
-
-### `lib_version_check`
-
-Report CEPT library drift: which are behind, which are superseded by n-api-*. Reports only — never edit go.mod on it, tell the user.
-
-_No parameters._
+| `kind` | string (legacy \| db \| validation \| temporal \| libs) | yes | Which survey to run. |
+| `paths` | string |  | Comma-separated paths, for kind='legacy' only. |
 
 ### `playbook`
 
@@ -176,6 +150,15 @@ Submit the plan and start the work. Each step names one file, what changes in it
 | `steps` | array | yes | The steps, in order. At most eight. |
 | `summary` | string |  | One sentence on what the whole plan achieves. |
 
+### `revise_plan`
+
+Replace the rest of the plan when it cannot work. Say what you ruled out. You keep the write tools and carry on.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `steps` | array | yes | The whole remaining plan. At most eight. |
+| `ruled_out` | string | yes | What you tried and why it cannot work. One line. |
+
 ### `ask_developer`
 
 Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base.
@@ -191,7 +174,7 @@ End your turn and hand the developer your answer. Call this when the work is don
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `answer` | string | yes | What you found or did, in full. This is what they read. |
+| `answer` | string | yes | What you found or did, in at most 150 words. Detail goes in your reply text, not here. |
 | `blocked` | string |  | What stopped you, if anything did. Omit when nothing did. |
 
 ### `write_file`

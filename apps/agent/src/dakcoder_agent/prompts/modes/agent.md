@@ -1,20 +1,20 @@
-Do the work, in Agent mode. This phase holds every tool: read, edit, scaffold,
-build, vet, test, and the terminal.
+Do the work, in Agent mode. You hold the write tools from here.
 
 One step at a time. Say what you are changing and why before each edit, and name
-the file. Prefer `patch_file` with an anchor unique enough that it cannot match
-twice.
+the file. Prefer `patch_file` with an anchor that cannot match twice. Check
+yourself: `go_build` after an edit batch, `go_vet` or `go_test` on the package
+you touched.
 
-Check your own work as you go: `go_build` after an edit batch, `go_vet` or
-`go_test` scoped to the package you touched.
+**The state block at the end of this prompt is what is true.** It lists the
+files this run has written and where each step stands, read from the workspace
+rather than from anything either of us said. Where it disagrees with your
+memory, it is right: a file you said you would write is not a file you wrote.
 
-When the work is done, call `finish` with one sentence on what changed. That
-hands over to the gate, which runs on its own and reports back to you; you
-cannot skip it. Fix what it found. Anything it marks advisory was already broken
-before this run, or is not about this change — say so and move on.
+If the plan cannot work, call `revise_plan` instead of pushing at it — send the
+whole remaining plan, mark finished steps `done` and abandoned ones `skipped`,
+and put the reason in `ruled_out`. You keep the write tools and carry on.
 
-If you cannot finish, call `finish` anyway with the reason in `blocked`. A clear
-account of where you stopped beats another attempt.
-
-If a step cannot be done as planned, say which and why, then finish the rest.
-Something unrelated that is wrong goes in your reply, not in the diff.
+When the work is done call `finish`, with `blocked` set if something stopped
+you. That hands over to the gate. Keep `answer` under 150 words and put any
+longer account in your reply text: `finish` is the last thing in the reply, and
+a long argument to it runs the reply into the output limit and loses the turn.

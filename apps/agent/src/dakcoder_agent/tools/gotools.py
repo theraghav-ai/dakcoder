@@ -521,18 +521,39 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
 
         return _report(sidecar.call("lib_version_check", {}), render)
 
+    #: The five surveys behind the one `audit` tool. The renderers above are
+    #: unchanged and each still answers its own question; what changed is that
+    #: the model chooses the axis with a parameter instead of choosing between
+    #: five near-synonymous tool names. See the `audit` spec in `registry.py`.
+    surveys = {
+        "legacy": legacy_audit,
+        "db": db_roundtrip_audit,
+        "validation": validation_audit,
+        "temporal": temporal_audit,
+        "libs": lib_version_check,
+    }
+
+    def audit(inv: Invocation) -> ToolResult:
+        # The enum is enforced by `_coerce`, so an unknown kind cannot arrive
+        # here from the model. The guard is for the gate and for tests, which
+        # dispatch without coercion.
+        kind = str(inv.arg("kind") or "").strip()
+        survey = surveys.get(kind)
+        if survey is None:
+            return ToolResult.failure(
+                f"audit: {kind!r} is not a survey.",
+                fix="Pass kind as one of: " + ", ".join(surveys) + ".",
+            )
+        return survey(inv)
+
     return {
         "repo_map": repo_map,
         "rules_lint": rules_lint,
-        "legacy_audit": legacy_audit,
+        "audit": audit,
         "fx_wire": fx_wire,
         "resource_scaffold": resource_scaffold,
         "project_scaffold": project_scaffold,
         "swagger_check": swagger_check,
-        "db_roundtrip_audit": db_roundtrip_audit,
-        "validation_audit": validation_audit,
-        "temporal_audit": temporal_audit,
-        "lib_version_check": lib_version_check,
     }
 
 

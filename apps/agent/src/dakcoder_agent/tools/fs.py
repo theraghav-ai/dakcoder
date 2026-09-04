@@ -516,7 +516,16 @@ def search_repo(inv: Invocation) -> ToolResult:
                     "\n\nThe workspace's top level, for orientation:\n"
                     + "\n".join(f"  {entry}" for entry in top)
                 )
-        return ToolResult.success(body, meta={"scanned": scanned})
+        # `informed: False` is the tool telling the loop this answer moved the
+        # run nowhere. The call succeeded -- a zero-match search is a real
+        # finding and must not be reported as a failure, or the model retries it
+        # -- but it added no locations, no file contents and no decision, and
+        # counting it as progress is what made the stall detector unreachable:
+        # `informed` was "dispatched and not mode-refused", so a model rephrasing
+        # a fruitless search reset `stalled_turns` on every turn forever.
+        return ToolResult.success(
+            body, meta={"scanned": scanned, "locations": [], "informed": False}
+        )
 
     header = f"{len(hits)} match(es) in {scanned} files"
     if truncated:
@@ -524,7 +533,21 @@ def search_repo(inv: Invocation) -> ToolResult:
     return ToolResult.success(
         header + "\n" + "\n".join(hits),
         truncated=truncated,
-        meta={"scanned": scanned, "hits": len(hits)},
+        meta={
+            "scanned": scanned,
+            "hits": len(hits),
+            # *Where* the matches are, not just how many. The loop compares this
+            # set against what earlier searches returned, which is the only way
+            # to tell "found the same thing again, spelled differently" from
+            # "found something new" -- `_fingerprint` is byte-exact over the
+            # arguments, so `"Handler"`, `"handler"` and `"Handler\\("` are three
+            # different questions to it and one question to everybody else.
+            #
+            # Locations rather than the matched lines: a line's text moves when
+            # the file is edited and its address does not, and the question being
+            # asked is "have I already been shown this place".
+            "locations": [h.split(":", 2)[0] + ":" + h.split(":", 2)[1] for h in hits],
+        },
     )
 
 

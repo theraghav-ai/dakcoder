@@ -270,10 +270,9 @@ class ToolCap:
 #: they are sized so an ordinary artefact — a whole Go file, a whole build log,
 #: a whole search — lands intact.
 #:
-#: The four review audits and ``lib_version_check`` are deliberately NOT
-#: raised: their caps sit above what their renderers emit by design, and the
-#: comment on them below still holds — if one ever exceeds its cap, the
-#: renderer needs tightening rather than the cap raising.
+#: ``audit`` is deliberately NOT raised: its cap sits above what its renderers
+#: emit by design, and the comment on it below still holds — if one ever exceeds
+#: the cap, the renderer needs tightening rather than the cap raising.
 #:
 #: `go_build` and friends get the special strategy for a reason worth stating:
 #: their error lines are the single most useful thing in the whole context, and
@@ -288,21 +287,20 @@ TOOL_CAPS: dict[str, ToolCap] = {
     "go_vet": ToolCap(12_000, "errors", "fix the reported findings and re-run"),
     "go_test": ToolCap(12_000, "errors", "re-run with a package pattern to narrow the output"),
     "rules_lint": ToolCap(8_000, "head", "pass `paths` to scope the lint to what you changed"),
-    "legacy_audit": ToolCap(8_000, "head", "pass `paths` to scope the audit"),
     "go_diagnostics": ToolCap(8_000, "head", "narrow to one file with `path`"),
-    # The review audits. `head` rather than the default `tail` for all four:
-    # they are rendered worst-first, so the head is the part worth keeping —
-    # and the default of tail-truncating a ranked report keeps the least
-    # important findings and drops the N+1.
+    # The whole-service surveys, now one tool with a `kind`. `head` rather than
+    # the default `tail`: every one of them is rendered worst-first, so the head
+    # is the part worth keeping — and the default of tail-truncating a ranked
+    # report keeps the least important findings and drops the N+1.
     #
-    # The caps are above what the renderers emit, deliberately. A report whose
+    # One cap where there were five (8,000 / 2,500 / 2,500 / 2,000 / 1,500),
+    # sized to the largest of them. The four small ones were set above what
+    # their renderers emit, deliberately, so raising them to the legacy survey's
+    # ceiling changes nothing about what is elided in practice: a report whose
     # whole purpose is to survive elision must not be the thing that gets
-    # elided; if one ever exceeds its cap, the renderer needs tightening rather
+    # elided, and if one ever exceeds this the renderer needs tightening rather
     # than the cap raising.
-    "db_roundtrip_audit": ToolCap(2_500, "head", "the worst methods are listed first"),
-    "validation_audit": ToolCap(2_500, "head", "fields are grouped by struct"),
-    "temporal_audit": ToolCap(2_000, "head", "candidates only; no action is implied"),
-    "lib_version_check": ToolCap(1_500, "head", "report only — do not edit go.mod"),
+    "audit": ToolCap(8_000, "head", "pass `paths` to scope it, or ask for one `kind`"),
 }
 
 #: Everything not named above. §6.2's "everything else".
@@ -536,6 +534,9 @@ class ContextManager:
         self._directive_message: Message | None = None
         self._task_text = ""
         self._plan_text = ""
+        #: What the loop asserts is true this turn. Rebuilt every turn from
+        #: ground truth; see ``set_state``.
+        self._state_text = ""
         self._acceptance: tuple[str, ...] = ()
         #: Follow-ups and corrections, pinned. See ``pin_directive``.
         self._directives: list[str] = []
@@ -793,6 +794,40 @@ class ContextManager:
         self._plan_text = plan.strip()
         self._rebuild_task()
 
+    def set_state(self, text: str) -> None:
+        """Assert what is true right now, at the bottom of the prompt.
+
+        The loop rebuilds this every turn from ground truth it already holds --
+        ``router.touched``, the plan's per-step statuses, the last gate verdict,
+        what has been ruled out -- and nothing here interprets it. See
+        ``AgentLoop._state_block``, which is the only caller.
+
+        **Why this layer exists at all.** Before it, the model's entire account
+        of its own progress was the transcript, *including its own prose*. A
+        planner turn saying "I will write migration.md" is an assistant message
+        in the working set, and nothing distinguishes it from a report that the
+        file was written -- so a run that had written two files of three said it
+        had written three, and a run whose reply was cut off mid-`write_file`
+        reconstructed what it had done from memory and got it wrong. The loop
+        knew the answer the whole time and was never asked.
+
+        **Why it is affordable.** ``build`` assembles this layer *last*,
+        measured: the same words appended at the end of a 100-turn context cost
+        11 tokens of prefill against 75,764 for the same edit made in the pinned
+        task block. A ~150-token state block rebuilt on every turn therefore
+        costs ~150 tokens of prefill per turn, not a re-read of the
+        conversation. That measurement was made for steering; this is the second
+        thing it pays for.
+
+        Idempotent, so a turn that changes nothing about the state does not
+        invalidate even that much: the byte-identical rebuild is skipped.
+        """
+        state = text.strip()
+        if state == self._state_text:
+            return
+        self._state_text = state
+        self._rebuild_task()
+
     def pin_directive(self, text: str) -> None:
         """Keep something the developer said where compaction cannot reach it.
 
@@ -851,7 +886,14 @@ class ContextManager:
         self._task = Message(Role.USER, "\n".join(parts), Layer.TASK, source="task")
 
         volatile: list[str] = []
-        if self._plan_text:
+        if self._state_text:
+            volatile.append(self._state_text)
+        elif self._plan_text:
+            # Only until the loop has asserted a state block, which happens on
+            # the first turn after `submit_plan`. The state block renders the
+            # plan itself -- with each step's status against it -- so showing
+            # both would put two copies of the plan in the prompt, and the stale
+            # one would be the copy that says nothing is done.
             volatile.append(f"# Plan\n{self._plan_text}")
         if self._directives:
             since = "\n".join(f"- {d}" for d in self._directives)

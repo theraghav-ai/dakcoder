@@ -134,8 +134,12 @@ def test_a_comma_separated_path_list_becomes_an_array(live_router: Router) -> No
     """The model-facing schema takes a string because C1 caps parameters at six.
     The sidecar takes an array because Go generated it from a []string. This is
     the only place the two shapes have to agree."""
+    # PLANNER, not AGENT: `rules_lint` left the acting mode once the inner
+    # loop was already running it after every edit batch. The bridge this
+    # test is about is unchanged, and the gate still reaches the tool through
+    # `run_gate_tool`, which bypasses mode filtering by design.
     out = live_router.dispatch(
-        "rules_lint", {"paths": "handler/user.go"}, mode=Mode.AGENT
+        "rules_lint", {"paths": "handler/user.go"}, mode=Mode.PLANNER
     )
     assert out.ok
     # Read off `meta`, not by parsing the content. `rules_lint` returns a
@@ -162,7 +166,7 @@ def test_repo_map_reads_the_generation_from_imports(live_router: Router) -> None
 def test_a_lint_finding_is_a_success_not_a_tool_failure(live_router: Router) -> None:
     """Marking a finding as ok=False would make the loop treat a lint report as
     a broken tool and retry it — a wasted turn, and noise in the transcript."""
-    out = live_router.dispatch("rules_lint", {}, mode=Mode.AGENT)
+    out = live_router.dispatch("rules_lint", {}, mode=Mode.PLANNER)
     assert out.ok
 
 

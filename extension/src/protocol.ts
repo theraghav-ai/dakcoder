@@ -433,16 +433,43 @@ export interface PlanStep {
   text: string;
   accepts: string;
   /**
-   * Always `unknown` today. No field on the wire carries per-step status, and
-   * no client-side heuristic can honestly infer it — tying "gate passed" to
-   * "step advanced" would be a fabrication. Rendered as a dash with a sentence
-   * saying why, which is the true thing.
+   * Read from the plan, not inferred.
+   *
+   * This was `unknown` for every step, with a footnote conceding that no field
+   * on the wire carried it and that guessing from gate events "would be a
+   * fabrication". That was true and is no longer: the runtime maintains a
+   * status per step from the workspace and the gate — `done` when a mutation
+   * landed on the step's file, `failed` when the blocking stage names it,
+   * `skipped` when the agent said so and why — and renders it into the plan
+   * text as a leading mark. It also ships the typed steps on the `plan` event,
+   * which is the better source when it is present.
+   *
+   * `running` remains client-side and unused here; it is kept because the tree
+   * view's rendering switches on it.
    */
-  status: 'unknown' | 'pending' | 'running' | 'passed' | 'failed';
+  status: 'unknown' | 'pending' | 'running' | 'passed' | 'failed' | 'skipped';
+  /** Why, for a `skipped` or `failed` step. Empty otherwise. */
+  note?: string;
 }
 
 /** The server's own step regex, so client and server agree on the count. */
 const STEP = /^\s*\d+[.)]\s/;
+
+/**
+ * The status mark the runtime renders at the head of each step.
+ *
+ * Stripped rather than displayed: the panel has a `status` field of its own and
+ * a column to render it in, so leaving `[ done   ]` inside the step *text*
+ * would show the same fact twice and in the wrong place.
+ */
+const MARK = /^\[\s*(todo|done|failed|skipped)\s*\]\s*/i;
+
+const MARK_STATUS: Record<string, PlanStep['status']> = {
+  todo: 'pending',
+  done: 'passed',
+  failed: 'failed',
+  skipped: 'skipped',
+};
 
 export function parsePlan(text: string): { goal: string; steps: PlanStep[]; scope: string[] } {
   const lines = text.split(/\r?\n/);
@@ -456,11 +483,17 @@ export function parsePlan(text: string): { goal: string; steps: PlanStep[]; scop
     if (path) scope.push(...path);
 
     if (STEP.test(line)) {
+      const body = line.replace(STEP, '').trim();
+      const mark = body.match(MARK);
       current = {
         index: steps.length + 1,
-        text: line.replace(STEP, '').trim(),
+        text: body.replace(MARK, '').trim(),
         accepts: '',
-        status: 'unknown',
+        // `unknown` when there is no mark, which is what an older runtime's
+        // plan text looks like. The dash and its footnote are still correct
+        // for that case, so nothing regresses against a server that predates
+        // per-step status.
+        status: mark ? MARK_STATUS[mark[1].toLowerCase()] : 'unknown',
       };
       steps.push(current);
       continue;

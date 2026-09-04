@@ -40,6 +40,7 @@ for the one call a run cannot afford to get wrong.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,7 +48,41 @@ from dakcoder_shared.envelope import ToolResult
 
 from .router import Invocation
 
-__all__ = ["HANDLERS", "PlanStep", "steps_from_meta"]
+__all__ = [
+    "DONE",
+    "FAILED",
+    "HANDLERS",
+    "PENDING",
+    "SKIPPED",
+    "PlanStep",
+    "as_meta",
+    "steps_from_meta",
+]
+
+#: A plan step's status. Four values, and the distinction that earns them is
+#: that the first three are facts the *loop* establishes and the fourth is a
+#: judgement only the model can make.
+#:
+#: `_unwritten_targets` used to be the whole of plan state: a set difference
+#: between the plan's paths and `router.touched`, computed on demand and stored
+#: nowhere. It cannot say "written, and the gate rejected it", it cannot say
+#: "decided against, here is why", and because it was never rendered anywhere
+#: the model could read, the model's only account of its own progress was its
+#: own earlier prose -- which is how a run that had written two files of three
+#: reported having written all three.
+PENDING = "pending"
+DONE = "done"
+FAILED = "failed"
+SKIPPED = "skipped"
+
+#: How each status is rendered into the state block. Words rather than symbols:
+#: this is read by a model, and `[x]` versus `[!]` is a legend it has to hold.
+_MARKS = {
+    PENDING: "[ todo   ]",
+    DONE: "[ done   ]",
+    FAILED: "[ FAILED ]",
+    SKIPPED: "[ skipped]",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,25 +99,72 @@ class PlanStep:
     file: str
     action: str
     accepts: str
+    #: Where this step has got to. Maintained by the loop from the workspace and
+    #: the gate, except ``SKIPPED``, which only the model may set and which
+    #: therefore survives every resync. See ``AgentLoop._sync_plan``.
+    status: str = PENDING
+    #: Why, for the two statuses where "why" is the whole content: the gate stage
+    #: that rejected the file, or the model's reason for skipping the step.
+    note: str = ""
+
+    @property
+    def open(self) -> bool:
+        """Whether this step is still work the run owes the developer."""
+        return self.status in (PENDING, FAILED)
 
     def rendered(self, index: int) -> str:
-        return f"{index}. {self.file} — {self.action}\n   Accepts: {self.accepts}"
+        """One line for the state block, plus what is still outstanding on it.
+
+        The acceptance criterion is dropped once a step is done or skipped: it
+        is an instruction for work that is no longer to be done, and every token
+        in this block is re-sent on every turn.
+        """
+        mark = _MARKS.get(self.status, _MARKS[PENDING])
+        line = f"{index}. {mark} {self.file} - {self.action}"
+        if self.open:
+            line += f"\n      Accepts: {self.accepts}"
+        if self.note:
+            line += f"\n      {self.note}"
+        return line
 
 
 def steps_from_meta(meta: dict[str, Any]) -> tuple[PlanStep, ...]:
-    """Rebuild the typed steps from a tool result's ``meta``."""
+    """Rebuild the typed steps from a tool result's ``meta``.
+
+    ``status`` and ``note`` round-trip so a revised plan can carry forward what
+    was already established about the steps it keeps. A revision that reset every
+    step to pending would tell the model to rewrite files it has already written,
+    which is the failure the status field exists to prevent.
+    """
     out: list[PlanStep] = []
     for raw in meta.get("steps") or ():
         if not isinstance(raw, dict):
             continue
+        status = str(raw.get("status", PENDING)).strip() or PENDING
         out.append(
             PlanStep(
                 file=str(raw.get("file", "")).strip(),
                 action=str(raw.get("action", "")).strip(),
                 accepts=str(raw.get("accepts", "")).strip(),
+                status=status if status in _MARKS else PENDING,
+                note=str(raw.get("note", "")).strip(),
             )
         )
     return tuple(out)
+
+
+def as_meta(steps: Sequence[PlanStep]) -> list[dict[str, str]]:
+    """The inverse of ``steps_from_meta``, for a result that carries a plan."""
+    return [
+        {
+            "file": s.file,
+            "action": s.action,
+            "accepts": s.accepts,
+            "status": s.status,
+            "note": s.note,
+        }
+        for s in steps
+    ]
 
 
 def submit_plan(inv: Invocation) -> ToolResult:
@@ -121,12 +203,78 @@ def submit_plan(inv: Invocation) -> ToolResult:
     return ToolResult.success(
         f"Plan accepted, {len(steps)} step(s). Work starts now — you hold the "
         f"write tools from this turn on.\n\n{body}",
+        meta={"control": "plan", "summary": summary, "steps": as_meta(steps)},
+    )
+
+
+def revise_plan(inv: Invocation) -> ToolResult:
+    """Replace the remaining plan, on the record, without ending the phase.
+
+    The gap this closes is the one the loop had no move for at all. Every escape
+    hatch in the loop was a *stop* -- forced ``finish``, the stall ceiling, the
+    gate-failure budget -- so a model whose plan was wrong could abandon the run
+    or keep pushing the plan that was wrong, and nothing in between. The gate
+    said "fix what it found" up to three times and the answer to "this approach
+    cannot work" was never available.
+
+    ``ruled_out`` is required, and that is the whole design. A revision with no
+    stated reason is a re-roll: the same model, the same context, a fresh guess,
+    and nothing stopping it landing on the approach it just abandoned. Requiring
+    the reason puts it into ``_State.ruled_out``, which the state block re-sends
+    on every turn -- so the next plan is made against an explicit record of what
+    has already failed rather than against the same blank slate that produced
+    the first one.
+
+    This is *not* a terminal tool. It does not end the phase, does not switch
+    modes and does not hand anything to the gate: the acting mode revises and
+    carries straight on with the next step. The loop's own replan path -- back
+    to the Planner after a second failing gate -- is the involuntary version of
+    this, for a model that has not noticed it needs one.
+    """
+    raw = inv.arg("steps") or []
+    steps = tuple(
+        PlanStep(
+            file=str(s.get("file", "")).strip(),
+            action=str(s.get("action", "")).strip(),
+            accepts=str(s.get("accepts", "")).strip(),
+            status=(
+                str(s.get("status", PENDING)).strip()
+                if str(s.get("status", PENDING)).strip() in _MARKS
+                else PENDING
+            ),
+            note=str(s.get("note", "")).strip(),
+        )
+        for s in raw
+        if isinstance(s, dict)
+    )
+    if not steps:
+        return ToolResult.failure(
+            "revise_plan was called with no steps.",
+            fix="Send the whole remaining plan, not just the part that changed -- "
+            "this replaces it. Mark work you have already finished `status: done` "
+            "and work you have decided against `status: skipped` so it is not "
+            "asked for again.",
+        )
+
+    ruled_out = str(inv.arg("ruled_out") or "").strip()
+    if not ruled_out:
+        return ToolResult.failure(
+            "revise_plan needs `ruled_out`.",
+            fix="Say in one line what you tried and why it cannot work. Without it "
+            "this is a fresh guess rather than a revision, and nothing stops the "
+            "new plan repeating the approach you are abandoning.",
+        )
+
+    body = "\n".join(step.rendered(i) for i, step in enumerate(steps, 1))
+    return ToolResult.success(
+        f"Plan revised, {len(steps)} step(s). Ruled out: {ruled_out}\n\n{body}\n\n"
+        "Carry on from the first step still open. You are still in the acting "
+        "phase and still hold the write tools.",
         meta={
-            "control": "plan",
-            "summary": summary,
-            "steps": [
-                {"file": s.file, "action": s.action, "accepts": s.accepts} for s in steps
-            ],
+            "control": "revise",
+            "summary": str(inv.arg("summary") or "").strip(),
+            "steps": as_meta(steps),
+            "ruled_out": ruled_out,
         },
     )
 
@@ -189,6 +337,7 @@ def finish(inv: Invocation) -> ToolResult:
 
 HANDLERS: dict[str, Any] = {
     "submit_plan": submit_plan,
+    "revise_plan": revise_plan,
     "ask_developer": ask_developer,
     "finish": finish,
 }

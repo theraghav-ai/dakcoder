@@ -596,13 +596,49 @@ function wheelHash(dir: string): string {
   return hash.digest('hex').slice(0, 16);
 }
 
+/**
+ * The wheel to install for `prefix`, newest version first.
+ *
+ * It used to be `readdirSync(...).find(...)` — the first entry in directory
+ * order, which on every filesystem this ships to means the *lowest* version
+ * number. A `runtime/` holding both `dakcoder_agent-0.3.1` and
+ * `dakcoder_agent-0.3.2` therefore installed 0.3.1, and the extension ran the
+ * previous release's agent with no error anywhere: the wheel existed, pip
+ * succeeded, and every version string the panel shows comes from package.json
+ * rather than from the installed package.
+ *
+ * Stale wheels should not be in the directory at all, and the build no longer
+ * leaves them there. This is the second lock, because the first one is a
+ * cleanup step someone has to remember.
+ */
 function firstWheel(dir: string, prefix: string): string | undefined {
   try {
-    const name = fs.readdirSync(dir).find((n) => n.startsWith(prefix) && n.endsWith('.whl'));
-    return name ? path.join(dir, name) : undefined;
+    const matches = fs
+      .readdirSync(dir)
+      .filter((n) => n.startsWith(`${prefix}-`) && n.endsWith('.whl'))
+      .sort(byWheelVersionDesc);
+    return matches.length ? path.join(dir, matches[0]) : undefined;
   } catch {
     return undefined;
   }
+}
+
+/** Compare two wheel filenames by their version segment, newest first. */
+function byWheelVersionDesc(a: string, b: string): number {
+  const parse = (name: string): number[] =>
+    (name.split('-')[1] ?? '')
+      .split('.')
+      .map((part) => Number.parseInt(part, 10))
+      .map((n) => (Number.isFinite(n) ? n : 0));
+  const left = parse(a);
+  const right = parse(b);
+  for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
+    const diff = (right[i] ?? 0) - (left[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  // Identical versions cannot happen for one prefix; ordering by name keeps
+  // the result deterministic if it somehow does.
+  return a.localeCompare(b);
 }
 
 function extensionVersion(extensionPath: string): string {

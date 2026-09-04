@@ -786,7 +786,17 @@ function strings(): Record<string, string> {
     planScope: vscode.l10n.t('Files in scope'),
     planAccepts: vscode.l10n.t('Accepts: {0}'),
     planStatusUnknown: vscode.l10n.t('—'),
-    planFootnote: vscode.l10n.t('Per-step status is shown as a dash because no field on the wire carries it. The runtime reports the plan text and a step count; inferring progress from anything else would be a guess presented as a fact.'),
+    // Read from the plan the runtime maintains, not inferred from gate events.
+    // `skipped` is the agent's own decision, recorded with a reason; the others
+    // are read off the workspace and the blocking gate stage.
+    planStatus_pending: vscode.l10n.t('○'),
+    planStatus_passed: vscode.l10n.t('✓'),
+    planStatus_failed: vscode.l10n.t('✗'),
+    planStatus_skipped: vscode.l10n.t('–'),
+    // Shown only when a step's status really is unknown, which now means a plan
+    // from a runtime older than per-step status. Printing it under a list of
+    // real statuses would tell the reader not to trust what they can see.
+    planFootnote: vscode.l10n.t('Per-step status is shown as a dash for steps this runtime did not report one for. Progress is never inferred from gate results.'),
 
     // gate
     gateInner: vscode.l10n.t('Inner gate'),

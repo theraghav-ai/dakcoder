@@ -234,6 +234,45 @@ def _array(desc: str, items: dict[str, Any], **extra: Any) -> dict[str, Any]:
 # the gate commands, then git. The order is what the model sees, and the first
 # few schemas are the ones it reaches for.
 
+#: One plan step, as ``submit_plan`` and ``revise_plan`` both take it.
+#:
+#: Defined once because it is sent twice: the acting mode carries
+#: ``revise_plan``'s copy in its prefix on every turn, and two hand-written
+#: copies of the same object drift as well as costing double. The descriptions
+#: are terse for the same reason -- this schema is prompt, not documentation,
+#: and `file`/`action`/`accepts` are close to self-describing next to a tool
+#: description that has already said what a plan step is.
+_PLAN_STEP: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "file": {
+            "type": "string",
+            "description": "Workspace-relative path, e.g. 'handler/pension.go'.",
+        },
+        "action": {"type": "string", "description": "What changes in it, in one sentence."},
+        "accepts": {"type": "string", "description": "How this step is checked."},
+    },
+    "required": ["file", "action", "accepts"],
+    "additionalProperties": False,
+}
+
+#: The same, plus the two fields only a revision needs: what is already finished
+#: and what has been decided against. A first plan has neither by construction,
+#: so ``submit_plan`` does not pay for them.
+_REVISED_STEP: dict[str, Any] = {
+    **_PLAN_STEP,
+    "properties": {
+        **_PLAN_STEP["properties"],
+        "status": {
+            "type": "string",
+            "enum": ["pending", "done", "failed", "skipped"],
+            "description": "'done' if already written, 'skipped' if dropped.",
+        },
+        "note": {"type": "string", "description": "Why, for a skipped step."},
+    },
+}
+
+
 _SPECS: tuple[ToolSpec, ...] = (
     # -- orientation --------------------------------------------------------
     ToolSpec(
@@ -340,96 +379,50 @@ _SPECS: tuple[ToolSpec, ...] = (
             paths=_str("Comma-separated paths to lint. Omit for the whole workspace."),
             only=_str("Comma-separated rule ids, e.g. 'layer-sql-boundary,handler-signature'."),
         ),
-        modes=_READERS,
+        # Not the acting mode, and this is a removal rather than a restriction.
+        # The acting mode already gets this lint twice without asking: `INNER`
+        # runs it scoped to the touched files after *every* edit batch and puts
+        # the findings in the transcript while the edit is still what the model
+        # is thinking about, and `GATE` runs it again before the run can finish.
+        # Offering it a third time as a tool bought nothing and cost 134 tokens
+        # of the one prefix with no room left in it -- which is what pays for
+        # `revise_plan`, a capability that mode did not otherwise have.
+        modes=_SURVEY,
         provider=Provider.GOTOOLS,
     ),
+    # -- the whole-service surveys ------------------------------------------
+    #
+    # One tool with a `kind`, where there were five: `legacy_audit`,
+    # `db_roundtrip_audit`, `validation_audit`, `temporal_audit` and
+    # `lib_version_check`. Each was a separate spec with its own description in
+    # the prompt, and from the model's side they were five names that all read
+    # "audit the repo".
+    #
+    # That is the shape that produces low-diversity thrash. A model looking for
+    # a problem it cannot name picks one, gets a wall of findings that does not
+    # answer its question, and picks the next -- five turns, five walls, and no
+    # decision, because nothing in the five names told it which question each
+    # one answers. Naming the axis in a required enum makes the choice a
+    # parameter rather than a guess, and takes the planner's tool list from
+    # seventeen names to thirteen.
+    #
+    # The renderers, the caps and the sidecar calls are unchanged: this is a
+    # change to how the capability is *offered*, not to what it does.
     ToolSpec(
-        name="legacy_audit",
+        name="audit",
         description=(
-            "Detect pre-template patterns in an existing service: routes.go, gin, "
-            "hand-rolled SQL builders, manual validation. Run before migrating; "
-            "then search_docs 'legacy migration' and follow that SOP."
+            "Survey the whole service on one axis: legacy (pre-template patterns), "
+            "db (repository round trips), validation (request field bounds), "
+            "temporal (off-request-path work), libs (CEPT drift). Reports only."
         ),
         parameters=_obj(
-            paths=_str("Comma-separated paths to audit. Omit for the whole workspace."),
+            kind=_str(
+                "Which survey to run.",
+                enum=["legacy", "db", "validation", "temporal", "libs"],
+            ),
+            paths=_str("Comma-separated paths, for kind='legacy' only."),
         ),
-        modes=_SURVEY,
-        provider=Provider.GOTOOLS,
-    ),
-    # ── the four review audits ──────────────────────────────────────────────
-    #
-    # Reports rather than checks: `rules_lint` says "this edit is wrong", these
-    # say "here is the shape of the problem across the service". They come from
-    # the manual review of 41 production services, where the three sheets a
-    # human filled in by hand were database round trips, request validation and
-    # what belongs off the request path.
-    #
-    # None takes a parameter. Each answers one question about the whole
-    # workspace, and every parameter is a chance for the model to get a call
-    # wrong for no gain.
-    #
-    # The mode sets are deliberately narrow. A tool's description sits in the
-    # prompt for every mode it is offered in, so the question is not "could this
-    # ever help here" but "does it earn its tokens on every turn in this mode".
-    ToolSpec(
-        name="db_roundtrip_audit",
-        description=(
-            "Profile every repository method: database calls, any inside a loop, "
-            "batched, in a transaction, with a verdict. Worst first. Use before "
-            "optimising by eye."
-        ),
-        parameters=_obj(),
-        # Not Coder or Scaffolder: they are writing one method, and rules_lint
-        # already tells them about that one. This answers a question about the
-        # service, which is what Planner and Verifier ask.
-        #
-        # Not Debugger either, and that one was measured rather than reasoned:
-        # the debugger prefix was already 3,087 tokens against a 3,100 cap, so
-        # this tool alone put it over. The cap is the constraint working, not an
-        # obstacle to route around — a debugger turn is chasing one failure, and
-        # `rules_lint` plus `playbook` already serve that. If a slow endpoint is
-        # the failure, the Planner turn that scoped the work is where this
-        # belongs.
-        modes=_SURVEY,
-        provider=Provider.GOTOOLS,
-    ),
-    ToolSpec(
-        name="validation_audit",
-        description=(
-            "List every request field, its validate tag, and what the tag leaves "
-            "unbounded. `required` alone means only 'not empty', so a 10MB string "
-            "passes."
-        ),
-        parameters=_obj(),
-        # Coder earns its place here: writing a request DTO is exactly when the
-        # missing bound is cheap to add and invisible to add later.
-        modes=_SURVEY,
-        provider=Provider.GOTOOLS,
-    ),
-    ToolSpec(
-        name="temporal_audit",
-        description=(
-            "List inline work that may belong off the request path: uploads, SMS, "
-            "email, reports, outbound calls. Candidates only — it makes no "
-            "recommendation."
-        ),
-        parameters=_obj(),
-        # Planner alone. The output is a survey with no advice attached, and the
-        # decision it feeds — what should happen when that work fails halfway —
-        # is not one a Coder or Verifier turn is positioned to take.
-        modes=_SURVEY,
-        provider=Provider.GOTOOLS,
-    ),
-    ToolSpec(
-        name="lib_version_check",
-        description=(
-            "Report CEPT library drift: which are behind, which are superseded by "
-            "n-api-*. Reports only — never edit go.mod on it, tell the user."
-        ),
-        parameters=_obj(),
-        # Planner alone, and for a reason beyond cost: offering this to Coder or
-        # Verifier invites a library bump in the middle of unrelated work, which
-        # turns a review into a regression hunt.
+        required=("kind",),
         modes=_SURVEY,
         provider=Provider.GOTOOLS,
     ),
@@ -470,36 +463,44 @@ _SPECS: tuple[ToolSpec, ...] = (
             "changes in it, and how you will know it worked."
         ),
         parameters=_obj(
-            steps=_array(
-                "The steps, in order. At most eight.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "file": {
-                            "type": "string",
-                            "description": (
-                                "Workspace-relative path this step changes, "
-                                "e.g. 'handler/pension.go'."
-                            ),
-                        },
-                        "action": {
-                            "type": "string",
-                            "description": "What changes in it, in one sentence.",
-                        },
-                        "accepts": {
-                            "type": "string",
-                            "description": "How this step is checked once done.",
-                        },
-                    },
-                    "required": ["file", "action", "accepts"],
-                    "additionalProperties": False,
-                },
-                maxItems=8,
-            ),
+            steps=_array("The steps, in order. At most eight.", _PLAN_STEP, maxItems=8),
             summary=_str("One sentence on what the whole plan achieves."),
         ),
         required=("steps",),
         modes=frozenset({_PLAN}),
+    ),
+    # -- changing strategy --------------------------------------------------
+    #
+    # The acting mode's counterpart to `submit_plan`, and the only tool in this
+    # registry whose purpose is to let the model *stop doing what it was told*.
+    #
+    # Every other escape from a wrong approach ended the run: a forced `finish`,
+    # the stall ceiling, the gate-failure budget. So a plan that turned out to be
+    # impossible had two outcomes -- abandon the run, or keep pushing -- and the
+    # loop sent the same "fix what it found" message up to three times against a
+    # gate that was never going to move. Nothing anywhere said "that will not
+    # work; here is a different route".
+    #
+    # `ruled_out` is required and that is the point of the tool. Without it a
+    # revision is a re-roll against the same context that produced the plan being
+    # abandoned, and the model lands back on it. With it, the reason goes into
+    # the state block and is re-sent every turn.
+    ToolSpec(
+        name="revise_plan",
+        description=(
+            "Replace the rest of the plan when it cannot work. Say what you ruled "
+            "out. You keep the write tools and carry on."
+        ),
+        # No `summary`. What the plan *achieves* has not changed -- only the route
+        # to it -- and the summary from `submit_plan` is still pinned. A second
+        # field for the same fact is a field the model has to decide about, in the
+        # one mode whose prefix has no room in it.
+        parameters=_obj(
+            steps=_array("The whole remaining plan. At most eight.", _REVISED_STEP, maxItems=8),
+            ruled_out=_str("What you tried and why it cannot work. One line."),
+        ),
+        required=("steps", "ruled_out"),
+        modes=_ACTS,
     ),
     ToolSpec(
         name="ask_developer",
@@ -549,8 +550,24 @@ _SPECS: tuple[ToolSpec, ...] = (
             "End your turn and hand the developer your answer. Call this when the "
             "work is done, or when going further will not help."
         ),
+        # `answer` is bounded, and the bound is not style advice.
+        #
+        # It said "in full", which is an invitation to put an unbounded document
+        # into the arguments of the one call that ends the run -- and arguments
+        # are serialised inside `max_tokens` along with every other call in the
+        # reply and all the prose before them. A run whose report was long was cut
+        # off *in the `finish` call*, so nothing was dispatched, the phase did not
+        # end, and the turn's work was discarded (BUG FS-1's shape, arriving
+        # through the terminal tool instead of through `write_file`).
+        #
+        # The long-form account still reaches the developer: it goes in the
+        # reply's own prose, which travels in the same message and cannot
+        # truncate a call. This field is the headline.
         parameters=_obj(
-            answer=_str("What you found or did, in full. This is what they read."),
+            answer=_str(
+                "What you found or did, in at most 150 words. Detail goes in your "
+                "reply text, not here."
+            ),
             blocked=_str("What stopped you, if anything did. Omit when nothing did."),
         ),
         required=("answer",),
@@ -796,7 +813,12 @@ _SPECS: tuple[ToolSpec, ...] = (
             end=_int("Last line.", minimum=1),
         ),
         required=("path",),
-        modes=_READERS,
+        # Not the acting mode. "Who wrote this line and when" is a question about
+        # the service's history, which is what the read-only phases are for; a
+        # mode part-way through an edit does not need it, and the acting prefix
+        # is the one with no room left in it. This pays for `revise_plan`, which
+        # that mode does need. Same reasoning as `_SURVEY`, one tool later.
+        modes=_SURVEY,
     ),
     ToolSpec(
         name="git_ops",

@@ -13,11 +13,7 @@
       "search_repo",
       "search_docs",
       "rules_lint",
-      "legacy_audit",
-      "db_roundtrip_audit",
-      "validation_audit",
-      "temporal_audit",
-      "lib_version_check",
+      "audit",
       "playbook",
       "finish",
       "git_status",
@@ -30,11 +26,7 @@
       "search_repo",
       "search_docs",
       "rules_lint",
-      "legacy_audit",
-      "db_roundtrip_audit",
-      "validation_audit",
-      "temporal_audit",
-      "lib_version_check",
+      "audit",
       "playbook",
       "submit_plan",
       "ask_developer",
@@ -48,8 +40,8 @@
       "read_file",
       "search_repo",
       "search_docs",
-      "rules_lint",
       "playbook",
+      "revise_plan",
       "finish",
       "write_file",
       "patch_file",
@@ -64,7 +56,6 @@
       "go_mod",
       "git_status",
       "git_diff",
-      "git_blame",
       "git_ops",
       "run_terminal"
     ]
@@ -272,7 +263,6 @@
         "additionalProperties": false
       },
       "modes": [
-        "agent",
         "ask",
         "planner"
       ],
@@ -281,85 +271,30 @@
       "provider": "gotools"
     },
     {
-      "name": "legacy_audit",
-      "description": "Detect pre-template patterns in an existing service: routes.go, gin, hand-rolled SQL builders, manual validation. Run before migrating; then search_docs 'legacy migration' and follow that SOP.",
+      "name": "audit",
+      "description": "Survey the whole service on one axis: legacy (pre-template patterns), db (repository round trips), validation (request field bounds), temporal (off-request-path work), libs (CEPT drift). Reports only.",
       "parameters": {
         "type": "object",
         "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Which survey to run.",
+            "enum": [
+              "legacy",
+              "db",
+              "validation",
+              "temporal",
+              "libs"
+            ]
+          },
           "paths": {
             "type": "string",
-            "description": "Comma-separated paths to audit. Omit for the whole workspace."
+            "description": "Comma-separated paths, for kind='legacy' only."
           }
         },
-        "required": [],
-        "additionalProperties": false
-      },
-      "modes": [
-        "ask",
-        "planner"
-      ],
-      "mutates": false,
-      "approval": "none",
-      "provider": "gotools"
-    },
-    {
-      "name": "db_roundtrip_audit",
-      "description": "Profile every repository method: database calls, any inside a loop, batched, in a transaction, with a verdict. Worst first. Use before optimising by eye.",
-      "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": [],
-        "additionalProperties": false
-      },
-      "modes": [
-        "ask",
-        "planner"
-      ],
-      "mutates": false,
-      "approval": "none",
-      "provider": "gotools"
-    },
-    {
-      "name": "validation_audit",
-      "description": "List every request field, its validate tag, and what the tag leaves unbounded. `required` alone means only 'not empty', so a 10MB string passes.",
-      "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": [],
-        "additionalProperties": false
-      },
-      "modes": [
-        "ask",
-        "planner"
-      ],
-      "mutates": false,
-      "approval": "none",
-      "provider": "gotools"
-    },
-    {
-      "name": "temporal_audit",
-      "description": "List inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only — it makes no recommendation.",
-      "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": [],
-        "additionalProperties": false
-      },
-      "modes": [
-        "ask",
-        "planner"
-      ],
-      "mutates": false,
-      "approval": "none",
-      "provider": "gotools"
-    },
-    {
-      "name": "lib_version_check",
-      "description": "Report CEPT library drift: which are behind, which are superseded by n-api-*. Reports only — never edit go.mod on it, tell the user.",
-      "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": [],
+        "required": [
+          "kind"
+        ],
         "additionalProperties": false
       },
       "modes": [
@@ -407,7 +342,7 @@
               "properties": {
                 "file": {
                   "type": "string",
-                  "description": "Workspace-relative path this step changes, e.g. 'handler/pension.go'."
+                  "description": "Workspace-relative path, e.g. 'handler/pension.go'."
                 },
                 "action": {
                   "type": "string",
@@ -415,7 +350,7 @@
                 },
                 "accepts": {
                   "type": "string",
-                  "description": "How this step is checked once done."
+                  "description": "How this step is checked."
                 }
               },
               "required": [
@@ -439,6 +374,72 @@
       },
       "modes": [
         "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "revise_plan",
+      "description": "Replace the rest of the plan when it cannot work. Say what you ruled out. You keep the write tools and carry on.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "steps": {
+            "type": "array",
+            "description": "The whole remaining plan. At most eight.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": {
+                  "type": "string",
+                  "description": "Workspace-relative path, e.g. 'handler/pension.go'."
+                },
+                "action": {
+                  "type": "string",
+                  "description": "What changes in it, in one sentence."
+                },
+                "accepts": {
+                  "type": "string",
+                  "description": "How this step is checked."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "pending",
+                    "done",
+                    "failed",
+                    "skipped"
+                  ],
+                  "description": "'done' if already written, 'skipped' if dropped."
+                },
+                "note": {
+                  "type": "string",
+                  "description": "Why, for a skipped step."
+                }
+              },
+              "required": [
+                "file",
+                "action",
+                "accepts"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 8
+          },
+          "ruled_out": {
+            "type": "string",
+            "description": "What you tried and why it cannot work. One line."
+          }
+        },
+        "required": [
+          "steps",
+          "ruled_out"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "agent"
       ],
       "mutates": false,
       "approval": "none",
@@ -483,7 +484,7 @@
         "properties": {
           "answer": {
             "type": "string",
-            "description": "What you found or did, in full. This is what they read."
+            "description": "What you found or did, in at most 150 words. Detail goes in your reply text, not here."
           },
           "blocked": {
             "type": "string",
@@ -938,7 +939,6 @@
         "additionalProperties": false
       },
       "modes": [
-        "agent",
         "ask",
         "planner"
       ],

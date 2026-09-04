@@ -14,7 +14,12 @@ import pytest
 
 from dakcoder_agent.context import ContextManager
 from dakcoder_agent.modes import Mode
-from dakcoder_agent.prompts import MODE_BUDGET, SYSTEM_BUDGET, mode_instruction, system_prompt
+from dakcoder_agent.prompts import (
+    MODE_BUDGETS,
+    SYSTEM_BUDGET,
+    mode_instruction,
+    system_prompt,
+)
 from dakcoder_agent.tools import registry
 from dakcoder_shared.tokens import estimate_tokens
 
@@ -34,7 +39,8 @@ def test_each_mode_overlay_stays_small(mode: Mode) -> None:
     """A mode overlay needing three hundred tokens to explain itself is usually
     a mode that has not been decided."""
     used = estimate_tokens(mode_instruction(mode))
-    assert used <= MODE_BUDGET, f"{mode} overlay is {used} tokens, budget {MODE_BUDGET}"
+    budget = MODE_BUDGETS[mode]
+    assert used <= budget, f"{mode} overlay is {used} tokens, budget {budget}"
 
 
 @pytest.mark.parametrize("mode", list(Mode))

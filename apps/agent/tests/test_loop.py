@@ -35,6 +35,7 @@ from dakcoder_agent.gate import GATE
 from dakcoder_agent.loop import (
     MAX_FINISH_REFUSALS,
     MAX_GATE_FAILURES,
+    MAX_REPLANS,
     MAX_RESEARCH_TURNS,
     STALLS_BEFORE_ANSWER,
     MAX_READS,
@@ -293,14 +294,26 @@ def test_a_failing_gate_comes_back_to_the_same_mode(
 ) -> None:
     """No Verifier, no Debugger, no ladder. The model that made the change reads
     the failure -- which is how every mature agent does it, and how a human
-    does it."""
+    does it.
+
+    Bounded to the turns the script actually supplies, because the invariant is
+    about *a* failing gate rather than about a run that never clears one. A
+    second failing gate with nothing new to try hands the run back to the
+    Planner (see the replan tests below), and that is a different mechanism from
+    the ladder this test exists to keep deleted: one bounded return to planning,
+    carrying the gate's own report, versus four personas taking turns.
+    """
     gated["fail"] = "go_build"
     loop, _client = build(
-        planning_router, [plan_call(), patch(), say("Done."), patch("handler/user.go")]
+        planning_router,
+        [plan_call(), patch(), say("Done."), patch("handler/user.go")],
+        max_turns=4,
     )
     list(loop.run("add Routes", intent=Intent.AGENT))
 
-    assert loop.state.mode is Mode.AGENT, "the mode never changes on a failing gate"
+    assert loop.state.gate_failures == 1, "exactly one gate verdict in this script"
+    assert loop.state.mode is Mode.AGENT, "the mode does not change on a failing gate"
+    assert loop.state.replans == 0, "one failure is not enough to abandon the plan"
     report = [m for m in loop.context.build() if "gate ran on your change" in m.content]
     assert report, "the failure comes back as an ordinary message"
     assert str(report[0].role) == "user"
@@ -321,8 +334,14 @@ def test_a_gate_that_will_not_come_clean_stops_after_a_bounded_number_of_tries(
     # The other way out -- a model that answers a blocked gate by calling tools,
     # and so never reaches `_verify` at all -- is `_gate_stalled`, covered
     # separately below.
+    # Still UNVERIFIED, and still bounded -- but the route there now includes
+    # one replan, so `gate_failures` is the count against the *current* plan
+    # rather than against the run. What must hold is that the run ends, that it
+    # ends honestly, and that the replan did not become a new way to loop.
     assert loop.result.outcome == Outcome.UNVERIFIED
-    assert loop.state.gate_failures > MAX_GATE_FAILURES
+    assert loop.state.replans == MAX_REPLANS, "one strategy change, not an escalation ladder"
+    assert loop.state.gate_failures <= MAX_GATE_FAILURES
+    assert "could not clear the gate" in loop.result.summary, loop.result.summary
 
 
 def test_a_failure_that_predates_the_run_does_not_block_it(
