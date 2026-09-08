@@ -63,10 +63,32 @@ def test_the_sop_rules_that_fail_at_runtime_are_retrievable(router: Router) -> N
     """The rules that motivated the integration: each fails silently or at
     runtime if unknown, so each must come back for its own question."""
     cases = {
-        "array slice request payload validator dive": "validate:\"dive\"",
+        "array slice request payload validator dive": "validate:\"required,dive\"",
         "query parameters not binding GET request": "form",
-        "protovalidate version pin": "v0.10.1",
+        "protovalidate version pin": "v0.9.2",
         "govalid Validate method conflict": "govalid",
+    }
+    for query, must_carry in cases.items():
+        content = _search(router, query)
+        assert must_carry in content, (
+            f"{query!r} came back without {must_carry!r}"
+        )
+
+
+def test_the_sop_rules_that_abort_startup_are_retrievable(router: Router) -> None:
+    """The 2026-09-08 SOP revision added rules that kill the process during
+    start-up rather than on a request: two swagger schema-registration traps,
+    the read replica alias, and the gRPC lifecycle. None of them is visible
+    from the service being converted -- each was diagnosed inside n-api-server
+    or n-api-bootstrapper -- so an agent that cannot retrieve them cannot
+    deduce them either."""
+    cases = {
+        "swagger map key not found converting to v3": "openapi2conv",
+        "pointer to slice response dto schema": "*[]Struct",
+        "json:\"-\" on query parameter struct": "uri",
+        "read replica read_db duplicate metric panic": "read_db",
+        "grpc connect handler registry bootstrap": "grpcserver",
+        "endpoint with no request parameters": "_ struct{}",
     }
     for query, must_carry in cases.items():
         content = _search(router, query)

@@ -18,6 +18,15 @@ package kb
 // Source: sop-for-old-to-new-template-conversion.md (the migration
 // program's SOP). When that document changes, this file is where the
 // change lands; regenerate with make knowledge and commit both.
+//
+// The 2026-09-08 revision of that SOP added four areas the first one had
+// nothing to say about, every one of them a start-up failure rather than a
+// compile error: the gRPC/Connect wiring that must be left to
+// bootstrapper.FxGrpc, the read_db alias that avoids a duplicate-metric
+// panic, and the two DTO shapes — *[]Struct in a response, json:"-" on a
+// uri/query request — that abort swagger's v2-to-v3 conversion. It also
+// repinned protovalidate-go from v0.10.1 to v0.9.2 and moved
+// apierrors.NewAppError to an error-constant-first signature.
 
 // migrationReferences are appended to References in references.go.
 var migrationReferences = []Reference{
@@ -26,8 +35,8 @@ var migrationReferences = []Reference{
 		Title:   "Converting a legacy service to the n-api template",
 		Purpose: "converting or migrating a whole legacy api-* service to the n-api template \u2014 the step-by-step SOP",
 		Intro: "The migration program's SOP, in execution order: branch, swap the " +
-			"dependencies, convert every handler, regenerate validation, modernise the " +
-			"tests, prove the swagger document exists.\n\n" +
+			"dependencies, convert every handler, wire the bootstrap graph, regenerate " +
+			"validation, modernise the tests, prove the swagger document exists.\n\n" +
 			// Points at the section rather than counting the rules. The
 			// previous wording promised "the CRITICAL rules" and "two mistakes
 			// that fail only at runtime", and the word CRITICAL then appeared
@@ -38,32 +47,42 @@ var migrationReferences = []Reference{
 			// mistakes, runtime, critical, rules), so BM25 returned it first
 			// every time and re-injected the promise that produced the search.
 			// A run died that way on 2026-09-01 after eight search_docs calls.
-			// A cross-reference cannot go stale the way a tally can.
-			"Every rule in here was paid for, and five of them are marked " +
-			"CRITICAL: each breaks a service in a way the compiler does not " +
-			"catch. They are collected in the first section below, and " +
-			"repeated in place at the step they belong to. Follow the order, " +
-			"and treat the CRITICAL rules as blocking.\n\n" +
+			// A cross-reference cannot go stale the way a tally can -- which is
+			// why the count that used to read "five of them" is gone rather
+			// than corrected: the 2026-09-08 SOP took the set to nine.
+			"Every rule in here was paid for, and the ones marked CRITICAL each " +
+			"break a service in a way the compiler does not catch. They are " +
+			"collected in the first section below, and repeated in place at the " +
+			"step they belong to. Follow the order, and treat the CRITICAL rules " +
+			"as blocking.\n\n" +
 			"Run `legacy_audit` before starting and after finishing \u2014 it should go " +
 			"from a page of findings to none.",
 		Body: `## The CRITICAL rules, in one place
 
-Five rules whose violation compiles. Four surface only when the service runs or
-a request arrives; one collides at build time. Each is repeated below at the
-step it belongs to — this section exists so that asking for "the CRITICAL rules"
-finds them, rather than finding the paragraph that mentions them.
+Every rule below survives the compiler. Most surface only when the service
+starts or the first request arrives; one collides at build time. Each is
+repeated in place at the step it belongs to — this section exists so that
+asking for "the CRITICAL rules" finds them, rather than finding the paragraph
+that mentions them.
 
-| # | Rule | Step | Fails |
+| # | Rule | Where | Fails |
 |---|---|---|---|
-| 1 | Use ` + "`" + `n-api-bootstrapper` + "`" + `, never the legacy ` + "`" + `api-bootstrapper` + "`" + `, and pin ` + "`" + `protovalidate-go@v0.10.1` + "`" + ` | 2 | FX graph, at start-up |
-| 2 | A handler parameter may not be a raw slice — wrap it in a struct tagged ` + "`" + `validate:"dive"` + "`" + ` | 3 | runtime, on first request |
-| 3 | Write route prefixes explicitly; ` + "`" + `n-api-server` + "`" + ` mounts paths exactly as ` + "`" + `Routes()` + "`" + ` declares them | 3 | runtime, as a 404 |
-| 4 | Never hand-write a ` + "`" + `Validate()` + "`" + ` method on a request DTO — ` + "`" + `govalid` + "`" + ` generates it | 4 | compile time |
-| 5 | Every request DTO carries at least one ` + "`" + `validate:` + "`" + ` tag, even ` + "`" + `validate:"omitempty"` + "`" + ` | 4 | bind time, as ` + "`" + `validator not implemented` + "`" + ` |
+| 1 | Use ` + "`" + `n-api-bootstrapper` + "`" + `, never the legacy ` + "`" + `api-bootstrapper` + "`" + `, and pin ` + "`" + `protovalidate-go@v0.9.2` + "`" + ` | dependencies | FX graph, at start-up |
+| 2 | A handler takes at most two parameters — context first, one request **struct** second. Never a raw slice, a bare primitive, or a third parameter | handlers | runtime, on first request |
+| 3 | ` + "`" + `SetPrefix` + "`" + ` carries the whole base path; ` + "`" + `Routes()` + "`" + ` declares sub-paths only, never repeating it | handlers | runtime, as a 404 |
+| 4 | Response DTOs hold ` + "`" + `[]Struct` + "`" + `, never ` + "`" + `*[]Struct` + "`" + ` | response DTOs | start-up, as a swagger v3 conversion crash |
+| 5 | URI and query request structs carry no ` + "`" + `json:` + "`" + ` tag at all — not even ` + "`" + `json:"-"` + "`" + ` | request DTOs | start-up, as a swagger v3 conversion crash |
+| 6 | Never hand-write a ` + "`" + `Validate()` + "`" + ` method on a request DTO — ` + "`" + `govalid` + "`" + ` generates it | validation | compile time |
+| 7 | Every request DTO carries at least one ` + "`" + `validate:` + "`" + ` tag, or a ` + "`" + `// +govalid:struct` + "`" + ` marker | validation | bind time, as ` + "`" + `validator not implemented` + "`" + ` |
+| 8 | ` + "`" + `read_db` + "`" + ` is an alias of ` + "`" + `write_db` + "`" + ` provided inside ` + "`" + `FxRepo` + "`" + `; ` + "`" + `bootstrapper.FxReadDB` + "`" + ` never goes into ` + "`" + `main.go` + "`" + ` | bootstrap | start-up, as a duplicate-metric panic |
+| 9 | Never declare your own ` + "`" + `FxGrpc` + "`" + `, listener or gRPC server — ` + "`" + `bootstrapper.FxGrpc` + "`" + ` owns that lifecycle | bootstrap | start-up, FX graph |
 
-Rules 2 and 3 are the two handler-conversion mistakes that fail only at runtime;
-rules 4 and 5 are the two validation mistakes. Rule 1 is the dependency swap's
-one wrong turn.
+Rules 2 and 3 are the handler-conversion mistakes that fail only at runtime.
+Rules 4 and 5 are the two that abort swagger generation during start-up, and
+they are the newest: both were diagnosed inside ` + "`" + `n-api-server` + "`" + `'s reflection
+code, and neither is visible from the service being converted. Rules 6 and 7
+are the validation mistakes, 8 and 9 belong to the FX composition root, and
+rule 1 is the dependency swap's one wrong turn.
 
 ## What the conversion changes, in one screen
 
@@ -74,6 +93,9 @@ one wrong turn.
 - ` + "`" + `ShouldBind` + "`" + ` and the hand-written validator service go; ` + "`" + `govalid` + "`" + ` generates compile-time validation from struct tags.
 - Errors unify on ` + "`" + `apierrors.NewAppError` + "`" + `; responses unify on the ` + "`" + `port` + "`" + ` envelopes.
 - Logging moves to ` + "`" + `n-api-log` + "`" + ` with levels configurable down to DEBUG.
+- gRPC and Connect-RPC standardise on ` + "`" + `bootstrapper.FxGrpc` + "`" + ` with a ` + "`" + `grpcserver.HandlerRegistry` + "`" + `; the service never builds its own server.
+- The read replica stops being a second pool: ` + "`" + `read_db` + "`" + ` becomes an FX alias of ` + "`" + `write_db` + "`" + `.
+- Swagger gains a ` + "`" + `nullableTypeMap` + "`" + ` for third-party nullable types, and two DTO shapes become prohibited because they break its schema registration.
 
 Run ` + "`" + `legacy_audit` + "`" + ` first: it names every file carrying a pre-template pattern, with a line for each. ` + "`" + `@skill:legacy-patterns` + "`" + ` maps each finding to its replacement, and ` + "`" + `@skill:data-access-library` + "`" + ` covers the one swap that is import-only.
 
@@ -81,11 +103,11 @@ Run ` + "`" + `legacy_audit` + "`" + ` first: it names every file carrying a pre
 
 Work on a ` + "`" + `template-conversion` + "`" + ` branch cut from ` + "`" + `development` + "`" + `, pushed with ` + "`" + `-u` + "`" + ` so the migration is reviewable and revertible as one unit:
 
-` + "`" + `` + "`" + `` + "`" + `
+` + "```" + `
 git checkout development && git pull origin development
 git checkout -b template-conversion
 git push -u origin template-conversion
-` + "`" + `` + "`" + `` + "`" + `
+` + "```" + `
 
 ## Step 2 — dependencies: the api-* to n-api-* swap
 
@@ -99,18 +121,27 @@ git push -u origin template-conversion
 | ` + "`" + `it-2.0-common/api-validation` + "`" + ` | ` + "`" + `n-api-validation@latest` + "`" + ` | compile-time validation (govalid) |
 | ` + "`" + `it-2.0-common/api-config` + "`" + ` | **unchanged** | configuration stays on ` + "`" + `api-config` + "`" + ` |
 
-` + "`" + `` + "`" + `` + "`" + `
+` + "```" + `
 go get gitlab.cept.gov.in/it-2.0-common/n-api-bootstrapper@latest
 go get gitlab.cept.gov.in/it-2.0-common/n-api-server@latest
 go get gitlab.cept.gov.in/it-2.0-common/n-api-log@latest
 go get gitlab.cept.gov.in/it-2.0-common/n-api-validation@latest
-go get github.com/bufbuild/protovalidate-go@v0.10.1
+go get github.com/bufbuild/protovalidate-go@v0.9.2
+go get gitlab.cept.gov.in/it-2.0-common/grpc-server@latest
 go get go.uber.org/fx@latest
 go get github.com/jackc/pgx/v5@latest
 go mod tidy
-` + "`" + `` + "`" + `` + "`" + `
+` + "```" + `
 
-**Critical dependency rules.** Use ` + "`" + `n-api-bootstrapper` + "`" + `, never the legacy ` + "`" + `api-bootstrapper` + "`" + `: the legacy one injects the old ` + "`" + `*api-db.DB` + "`" + ` type into Uber FX, which mismatches every repository expecting ` + "`" + `*n-api-db.DB` + "`" + `. And pin ` + "`" + `github.com/bufbuild/protovalidate-go` + "`" + ` to ` + "`" + `@v0.10.1` + "`" + ` — later versions break interface compatibility with the generated protobuf validators.
+` + "`" + `grpc-server` + "`" + ` is only needed by services that expose gRPC or Connect-RPC; the rest of the list is unconditional.
+
+**Critical dependency rules.** Use ` + "`" + `n-api-bootstrapper` + "`" + `, never the legacy ` + "`" + `api-bootstrapper` + "`" + `: the legacy one injects the old ` + "`" + `*api-db.DB` + "`" + ` type into Uber FX, which mismatches every repository expecting ` + "`" + `*n-api-db.DB` + "`" + `. And pin ` + "`" + `github.com/bufbuild/protovalidate-go` + "`" + ` to ` + "`" + `@v0.9.2` + "`" + ` — other versions break interface compatibility with the generated protobuf validators.
+
+**The protobuf replace directive.** A service with generated protobufs that fails to compile on ` + "`" + `undefined: File_buf_validate_expression_proto` + "`" + ` or ` + "`" + `undefined: File_buf_validate_validate_proto` + "`" + ` is seeing a breaking change in the upstream generated-protobuf module, not a mistake in its own code. Pin it at the bottom of ` + "`" + `go.mod` + "`" + ` and re-tidy:
+
+` + "```" + `
+replace buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go => buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.1-20241127180247-a33202765966.1
+` + "```" + `
 
 ## Step 3 — convert every handler file
 
@@ -118,20 +149,21 @@ Apply to **every** handler file in the service, not a sample of them.
 
 Imports:
 
-` + "`" + `` + "`" + `` + "`" + `go
+` + "```" + `go
 import (
     serverHandler "gitlab.cept.gov.in/it-2.0-common/n-api-server/handler"
     serverRoute "gitlab.cept.gov.in/it-2.0-common/n-api-server/route"
     request "<module>/handler/request"
+    response "<module>/handler/response"
 
     apierrors "gitlab.cept.gov.in/it-2.0-common/n-api-errors"
     log "gitlab.cept.gov.in/it-2.0-common/n-api-log"
 )
-` + "`" + `` + "`" + `` + "`" + `
+` + "```" + `
 
-Embed ` + "`" + `*serverHandler.Base` + "`" + ` in the struct, build it in the constructor with the prefix chain, and declare the routes on the handler itself:
+Embed ` + "`" + `*serverHandler.Base` + "`" + ` in the struct, build it in the constructor with the prefix, and declare the routes on the handler itself:
 
-` + "`" + `` + "`" + `` + "`" + `go
+` + "```" + `go
 type AwardHandler struct {
     *serverHandler.Base
     svc *repo.AwardRepository
@@ -144,39 +176,60 @@ func NewAwardsHandler(svc *repo.AwardRepository) *AwardHandler {
 
 func (c *AwardHandler) Routes() []serverRoute.Route {
     return []serverRoute.Route{
-        serverRoute.POST("/award-makers", c.CreateAwardsBulk).Name("Create Awards Bulk"),
-        serverRoute.GET("/awards", c.GetAwards).Name("Get Awards"),
+        serverRoute.POST("", c.CreateAwardsBulk).Name("Create Awards Bulk"),
+        serverRoute.GET("/:award-id", c.FetchAwardDetails).Name("Fetch Award Details"),
+        serverRoute.PUT("/:award-id", c.UpdateAwardDetails).Name("Update Award Details"),
+        serverRoute.DELETE("/:award-id", c.DeleteAwardDetails).Name("Delete Award Details"),
     }
 }
-` + "`" + `` + "`" + `` + "`" + `
+` + "```" + `
 
-**Route prefixing rule.** Legacy Gin groups (` + "`" + `r.Group("/pao-gen")` + "`" + `) attached prefixes implicitly; ` + "`" + `n-api-server` + "`" + ` mounts paths exactly as written in ` + "`" + `Routes()` + "`" + `. Either build the prefix with ` + "`" + `SetPrefix` + "`" + `/` + "`" + `AddPrefix` + "`" + ` in the constructor, or write the full path on every route — never assume a group.
+**Route prefixing rule.** Legacy Gin groups (` + "`" + `r.Group("/awards")` + "`" + `) attached prefixes implicitly. The prefix chain in the constructor now carries the whole base path, and ` + "`" + `Routes()` + "`" + ` declares only what comes after it — ` + "`" + `""` + "`" + ` for the collection, ` + "`" + `"/:award-id"` + "`" + ` for one member. Never write the prefix again inside ` + "`" + `Routes()` + "`" + `: ` + "`" + `n-api-server` + "`" + ` mounts prefix and path by concatenation, so a repeated prefix becomes ` + "`" + `/v1/awards/awards/...` + "`" + ` and every request 404s. The reference template writes this chain as ` + "`" + `serverHandler.New(name).SetPrefix("/v1").AddPrefix("/awards")` + "`" + `; a single ` + "`" + `SetPrefix("/v1/awards")` + "`" + ` is equivalent, and the rule is the same either way — the prefix is declared once, in the constructor.
 
 ## Handler signatures: sctx and a DTO, never gin
 
-` + "`" + `` + "`" + `` + "`" + `go
-func (ah *AwardHandler) CreateAwardsBulk(sctx *serverRoute.Context, req request.CreateAwardsReq) (*response.AwardsBulkCreateResponse, error) {
+` + "```" + `go
+func (ah *AwardHandler) CreateAwardsBulk(sctx *serverRoute.Context, req request.CreateAwardsRequest) (*response.CreateAwardsBulkAPIResponse, error) {
     // req arrives bound and validated; the raw context is sctx.Ctx
 }
-` + "`" + `` + "`" + `` + "`" + `
+` + "```" + `
 
 No ` + "`" + `*gin.Context` + "`" + ` in any handler or service signature, and no ` + "`" + `ShouldBind` + "`" + ` anywhere: binding and validation happen before the handler runs.
+
+**Critical handler signature rule.** A handler method takes **at most two** parameters: ` + "`" + `*serverRoute.Context` + "`" + ` (or ` + "`" + `context.Context` + "`" + `) first, and an optional request **struct** second. Not a raw slice, not a bare ` + "`" + `string` + "`" + ` or ` + "`" + `int64` + "`" + `, not a third parameter. Everything a route needs — path parameters, query values and body alike — is encapsulated in that one struct.
+
+**Endpoints with no input take ` + "`" + `_ struct{}` + "`" + `.** The route helpers are generic over ` + "`" + `route.HandlerFunc[Req, Res]` + "`" + `, so the request type parameter is not optional even when there is nothing to bind. Use an empty anonymous struct rather than dropping the parameter or reaching for ` + "`" + `any` + "`" + `:
+
+` + "```" + `go
+func (ah *AwardHandler) FetchAwardsSummary(sctx *serverRoute.Context, _ struct{}) (*response.AwardSummaryAPIResponse, error) {
+    summary, err := ah.svc.GetSummary(sctx.Ctx)
+    if err != nil {
+        return nil, apierrors.NewAppError(apierrors.HTTPErrorInternalServerError, "Failed to fetch summary", err)
+    }
+    return summary, nil
+}
+
+// registered exactly like any other route
+serverRoute.GET("/summary", ah.FetchAwardsSummary).Name("Fetch Awards Summary"),
+` + "```" + `
+
+` + "`" + `any` + "`" + ` or ` + "`" + `interface{}` + "`" + ` costs the compile-time type check and makes swagger emit a request body the endpoint does not have.
 
 ## Array payloads: the dive-wrapper rule
 
 Handler parameters **cannot** be raw slices (` + "`" + `req []request.SomeStruct` + "`" + ` is prohibited). ` + "`" + `n-api-server` + "`" + ` requires every request input to implement ` + "`" + `route.Validator` + "`" + ` — and Go cannot define methods on unnamed slice types, so ` + "`" + `govalid` + "`" + ` skips them and the server throws ` + "`" + `request must implement Validator.Validate()` + "`" + ` at runtime.
 
-Wrap the slice in a struct tagged ` + "`" + `validate:"dive"` + "`" + `:
+Wrap the slice in a struct and tag the field ` + "`" + `validate:"required,dive"` + "`" + ` — ` + "`" + `required` + "`" + ` rejects an absent or empty array, ` + "`" + `dive` + "`" + ` applies the element type's own rules to every entry:
 
-` + "`" + `` + "`" + `` + "`" + `go
+` + "```" + `go
 // handler/request/request.go
 type TransferEntryRequests struct {
-    TransferEntries []TransferEntryRequest ` + "`" + `json:"transfer_entries" validate:"dive"` + "`" + `
+    TransferEntries []TransferEntryRequest ` + "`" + `json:"transfer_entries" validate:"required,dive"` + "`" + `
 }
 
 // handler — iterate req.TransferEntries instead of req
-func (uh *TransferEntryHandler) CreateTransferEntryHandler(sctx *serverRoute.Context, req request.TransferEntryRequests) (*response.GetTransferentryCreationResponse, error)
-` + "`" + `` + "`" + `` + "`" + `
+func (h *TransferHandler) CreateTransferEntries(sctx *serverRoute.Context, req request.TransferEntryRequests) (*response.TransferEntryAPIResponse, error)
+` + "```" + `
 
 The client payload changes shape with it: an object holding the array field, not a bare JSON array.
 
@@ -184,7 +237,7 @@ The client payload changes shape with it: an object holding the array field, not
 
 GET query and pagination fields (` + "`" + `MetaDataRequest` + "`" + ` and friends) must carry ` + "`" + `form:` + "`" + ` tags. ` + "`" + `n-api-server` + "`" + ` extracts query parameters through form binding; a ` + "`" + `json:` + "`" + `-tagged field like ` + "`" + `order_by` + "`" + ` or ` + "`" + `total_records_required` + "`" + ` is silently ignored:
 
-` + "`" + `` + "`" + `` + "`" + `go
+` + "```" + `go
 type MetaDataRequest struct {
     Skip                 uint64 ` + "`" + `form:"skip,default=0" validate:"omitempty"` + "`" + `
     Limit                uint64 ` + "`" + `form:"limit,default=10" validate:"omitempty"` + "`" + `
@@ -192,37 +245,116 @@ type MetaDataRequest struct {
     SortType             string ` + "`" + `form:"sort_type,omitempty"` + "`" + `
     TotalRecordsRequired bool   ` + "`" + `form:"total_records_required,omitempty"` + "`" + `
 }
-` + "`" + `` + "`" + `` + "`" + `
+` + "```" + `
+
+**URI and query structs carry no ` + "`" + `json:` + "`" + ` tag at all.** Not even ` + "`" + `json:"-"` + "`" + `. The two halves of ` + "`" + `n-api-server` + "`" + `'s swagger generator disagree about what that tag means: ` + "`" + `swagger/paths.go` + "`" + ` decides an endpoint has a request body with ` + "`" + `if f.Tag.Get("json") != ""` + "`" + `, which ` + "`" + `"-"` + "`" + ` satisfies, while ` + "`" + `swagger/defs.go` + "`" + ` skips ` + "`" + `json:"-"` + "`" + ` fields when building the schema. A struct whose fields are all ` + "`" + `json:"-"` + "`" + ` therefore gets a ` + "`" + `$ref` + "`" + ` pointing at a definition that was never registered, and ` + "`" + `openapi2conv.ToV3` + "`" + ` aborts start-up on the dangling reference. Declare ` + "`" + `uri:` + "`" + ` and ` + "`" + `form:` + "`" + ` alone:
+
+` + "```" + `go
+// ✗ start-up crash: json:"-" asks for a request body, then refuses to describe it
+type AirDispatchHandoverReportRequest struct {
+    ScheduleID   string ` + "`" + `form:"schedule_id" json:"-" validate:"required"` + "`" + `
+    ScheduleDate string ` + "`" + `form:"schedule_date" json:"-" validate:"required"` + "`" + `
+}
+
+// ✓ no json tag at all
+type AirDispatchHandoverReportRequest struct {
+    ScheduleID   string ` + "`" + `form:"schedule_id" validate:"required"` + "`" + `
+    ScheduleDate string ` + "`" + `form:"schedule_date" validate:"required"` + "`" + `
+}
+` + "```" + `
+
+## Response DTOs: a slice, never a pointer to a slice
+
+A response field that holds a list is ` + "`" + `[]Struct` + "`" + `. ` + "`" + `*[]Struct` + "`" + ` compiles, and it breaks swagger the same way the tag above does: ` + "`" + `swagger/defs.go` + "`" + ` reflects into structs, pointers to structs and slices of structs, but not pointers to slices of structs — so the element type is never registered, and ` + "`" + `openapi2conv.ToV3` + "`" + ` aborts start-up on ` + "`" + `map key "..." not found` + "`" + `. A Go slice header is already a pointer, a length and a capacity, so the indirection buys nothing:
+
+` + "```" + `go
+// ✗ the inner type never reaches the swagger definitions
+type AirlinesReportResponse struct {
+    Data *[]GetCarrierTrackingReportResponse ` + "`" + `json:"data"` + "`" + `
+}
+
+// ✓
+type AirlinesReportResponse struct {
+    Data []GetCarrierTrackingReportResponse ` + "`" + `json:"data"` + "`" + `
+}
+` + "```" + `
 
 ## Errors: NewAppError, one return per branch
 
-` + "`" + `` + "`" + `` + "`" + `go
-if err != nil {
-    log.Error(sctx, "Database query failed: %s", err.Error())
-    appErr := apierrors.NewAppError("Failed to retrieve record", http.StatusInternalServerError, err)
-    return nil, &appErr
-}
-` + "`" + `` + "`" + `` + "`" + `
+` + "`" + `apierrors.NewAppError` + "`" + ` takes the HTTP error constant first, then the client-facing message, then the underlying error. Return it directly — it is already the error value:
 
-Structured errors with real HTTP status codes, and exactly one return statement per error branch — ` + "`" + `go vet` + "`" + ` checks it.
+` + "```" + `go
+if err != nil {
+    log.Error(sctx.Ctx, "Failed to process award: %s", err.Error())
+    return nil, apierrors.NewAppError(
+        apierrors.HTTPErrorBadRequest,
+        "Invalid award payload",
+        err,
+    )
+}
+return &apiResponse, nil
+` + "```" + `
+
+Use the ` + "`" + `apierrors.HTTPError*` + "`" + ` constants rather than raw ` + "`" + `http.Status*` + "`" + ` integers, never return a response and an error together, and keep exactly one return statement per error branch — ` + "`" + `go vet` + "`" + ` checks the last part.
 
 ## File upload and file responses
 
 Uploads are fields on the request DTO — ` + "`" + `form:` + "`" + ` tags with ` + "`" + `*multipart.FileHeader` + "`" + ` (or a slice of them) — opened directly via ` + "`" + `req.SingleFile.Open()` + "`" + `. Responses that carry files use ` + "`" + `port.FileResponse` + "`" + ` with either ` + "`" + `Data` + "`" + ` (byte array) or ` + "`" + `Reader` + "`" + ` (stream), plus ` + "`" + `ContentType` + "`" + ` and ` + "`" + `ContentDisposition` + "`" + `.
 
-## bootstrap: register handlers into FX
+## bootstrap: handlers, gRPC services, and the read_db alias
 
-Every handler goes into ` + "`" + `FxHandler` + "`" + ` wrapped for group discovery:
+HTTP handlers go into ` + "`" + `FxHandler` + "`" + ` wrapped for group discovery. gRPC and Connect-RPC handler constructors go into the same module **unannotated** — they are collected by ` + "`" + `AddHandlers` + "`" + `, not by the controller group:
 
-` + "`" + `` + "`" + `` + "`" + `go
+` + "```" + `go
 var FxHandler = fx.Module("Handlermodule", fx.Provide(
+    // HTTP: annotated into the controller group
     fx.Annotate(handler.NewTransferHandler,
         fx.As(new(serverHandler.Handler)),
         fx.ResultTags(serverHandler.ServerControllersGroupTag)),
-))
-` + "`" + `` + "`" + `` + "`" + `
 
-**gRPC rule.** If gRPC services are absent or commented out, comment out ` + "`" + `AddHandlers` + "`" + ` and ` + "`" + `bootstrapper.FxGrpc` + "`" + ` in ` + "`" + `main.go` + "`" + ` too, or FX fails on the missing ` + "`" + `*grpcserver.HandlerRegistry` + "`" + `.
+    // gRPC / Connect: provided plain
+    handler.NewAllocationGrpcHandler,
+    handler.NewBudgetGrpcHandler,
+))
+` + "```" + `
+
+Services exposing gRPC then register themselves against the registry, each constructor wrapped with ` + "`" + `grpcserver.Wrap` + "`" + `:
+
+` + "```" + `go
+func AddHandlers(
+    registry *grpcserver.HandlerRegistry,
+    allocationHandler *handler.AllocationGrpcHandler,
+    budgetHandler *handler.BudgetGrpcHandler,
+) {
+    registry.AddHandlers([]grpcserver.HandlerDefinition{
+        {Constructor: grpcserver.Wrap(v1.NewAllocationServiceHandler), Server: allocationHandler},
+        {Constructor: grpcserver.Wrap(v1.NewBudgetServiceHandler), Server: budgetHandler},
+    })
+}
+` + "```" + `
+
+**Critical gRPC architecture rule.** Do not declare a ` + "`" + `var FxGrpc` + "`" + ` of your own in ` + "`" + `bootstrap/bootstrapper.go` + "`" + `, and do not open a ` + "`" + `net.Listener` + "`" + ` or construct a server. ` + "`" + `bootstrapper.FxGrpc` + "`" + ` from ` + "`" + `n-api-bootstrapper` + "`" + ` owns the whole gRPC lifecycle; the service supplies handlers and nothing else. And if the service has no gRPC services — or they are commented out — comment out ` + "`" + `AddHandlers` + "`" + ` and ` + "`" + `bootstrapper.FxGrpc` + "`" + ` in ` + "`" + `main.go` + "`" + ` too, or FX fails on the missing ` + "`" + `*grpcserver.HandlerRegistry` + "`" + `.
+
+**Critical read_db rule.** Repositories that inject both ` + "`" + `write_db` + "`" + ` and ` + "`" + `read_db` + "`" + ` get the second as an FX alias of the first, declared inside ` + "`" + `FxRepo` + "`" + `:
+
+` + "```" + `go
+var FxRepo = fx.Module("Repomodule", fx.Provide(
+    repo.NewBankMasterRepository,
+    repo.NewScrollRepository,
+
+    fx.Annotated{
+        Name: "read_db",
+        Target: func(p struct {
+            fx.In
+            WriteDB *dblib.DB ` + "`" + `name:"write_db"` + "`" + `
+        }) *dblib.DB {
+            return p.WriteDB
+        },
+    },
+))
+` + "```" + `
+
+Never add ` + "`" + `bootstrapper.FxReadDB` + "`" + ` to ` + "`" + `main.go` + "`" + ` to satisfy that dependency. It builds a second pool, which registers the ` + "`" + `pgxpool_acquire_count` + "`" + ` metric a second time into the shared VictoriaMetrics set, and the duplicate registration panics the process during start-up.
 
 ## Validation: govalid replaces the runtime validator
 
@@ -242,26 +374,57 @@ Legacy custom tags map to built-ins:
 | ` + "`" + `employee_id` + "`" + ` / ` + "`" + `office_id` + "`" + ` | ` + "`" + `validate:"required,employee_id"` + "`" + ` |
 | ` + "`" + `head_of_account` + "`" + ` / ` + "`" + `account_no` + "`" + ` | ` + "`" + `validate:"required,head_of_account"` + "`" + ` |
 
-For custom formats use CEL — ` + "`" + `validate:"cel=value.matches('^([01]\\d|2[0-3]):([0-5]\\d)$')"` + "`" + ` — and for reusable domain checks define a ` + "`" + `// +govalid:rule=rule_name` + "`" + ` function in ` + "`" + `package request` + "`" + `: package-level, no generics, exactly one parameter matching the field type, returning exactly ` + "`" + `bool` + "`" + `. Complex business validation stays in the handler/service layer.
+For custom formats use CEL — ` + "`" + `validate:"cel=value.matches('^([01]\\d|2[0-3]):([0-5]\\d)$')"` + "`" + ` — and for reusable domain checks define a ` + "`" + `// +govalid:rule=rule_name` + "`" + ` function in ` + "`" + `package request` + "`" + `: package-level, no generics, exactly one parameter matching the field type, returning exactly ` + "`" + `bool` + "`" + `. ` + "`" + `// +govalid:message=` + "`" + ` supplies the failure text, where ` + "`" + `[@FIELD]` + "`" + ` interpolates the field name:
 
-**Critical govalid rules.** Never define a ` + "`" + `Validate()` + "`" + ` method on a request DTO — govalid generates it, and yours collides at compile time. And every DTO must carry at least one ` + "`" + `validate:` + "`" + ` tag (even ` + "`" + `validate:"omitempty"` + "`" + `): a tagless struct gets no generated ` + "`" + `Validate()` + "`" + `, and the server throws ` + "`" + `validator not implemented` + "`" + ` at bind time.
+` + "```" + `go
+type AllTags struct {
+    GrossAmount float64 ` + "`" + `json:"gross_amount" validate:"omitempty,is_positive"` + "`" + `
+}
+
+// +govalid:rule=is_positive
+// +govalid:message=field [@FIELD] must be a positive
+func validatePositive(val float64) bool {
+    return val > 0
+}
+` + "```" + `
+
+Complex business validation stays in the handler/service layer, and it returns an ` + "`" + `apierrors.NewAppError` + "`" + ` like any other handler failure — not a bare ` + "`" + `errors.New` + "`" + `.
+
+**Critical govalid rules.** Never define a ` + "`" + `Validate()` + "`" + ` method on a request DTO — govalid generates it, and yours collides at compile time. And every DTO must be registered for generation: at least one field carrying a ` + "`" + `validate:` + "`" + ` tag (even ` + "`" + `validate:"omitempty"` + "`" + `), or a ` + "`" + `// +govalid:struct` + "`" + ` marker on the struct. A struct that qualifies under neither gets no generated ` + "`" + `Validate()` + "`" + `, and the server throws ` + "`" + `validator not implemented` + "`" + ` at bind time.
 
 Generate after every DTO change:
 
-` + "`" + `` + "`" + `` + "`" + `
+` + "```" + `
 go install gitlab.cept.gov.in/it-2.0-common/n-api-validation/cmd/govalid@latest
-cd handler/request && govalid ./request.go
-` + "`" + `` + "`" + `` + "`" + `
+cd handler/request && govalid ./request.go && cd ../..
+` + "```" + `
 
 ## main.go and port/response.go
 
-Remove ` + "`" + `fx.Invoke(routes.Routes)` + "`" + ` and ` + "`" + `bootstrap.Fxvalidator` + "`" + ` from ` + "`" + `main.go` + "`" + `; routes register themselves through the handler module. The remaining shape is ` + "`" + `bootstrapper.New().Options(bootstrap.FxHandler, bootstrap.FxRepo, ...)` + "`" + ` run with a context.
+Remove ` + "`" + `fx.Invoke(routes.Routes)` + "`" + ` and ` + "`" + `bootstrap.Fxvalidator` + "`" + `; routes register themselves through the handler module and validation is generated at build time. What remains is the module list, with the gRPC pair present only if the service serves gRPC, and ` + "`" + `bootstrapper.FxReadDB` + "`" + ` absent in every case:
+
+` + "```" + `go
+func main() {
+    app := bootstrapper.New().Options(
+        bootstrapper.Fxclient,
+        bootstrap.FxHandler,
+        bootstrap.FxRepo,
+
+        // only when gRPC / Connect-RPC is implemented
+        bootstrapper.FxGrpc,
+        fx.Invoke(bootstrap.AddHandlers),
+
+        bootstrap.Fxtemporal,
+    )
+    app.WithContext(context.Background()).Run()
+}
+` + "```" + `
 
 ` + "`" + `core/port/response.go` + "`" + ` needs the five envelope methods on ` + "`" + `StatusCodeAndMessage` + "`" + ` — ` + "`" + `Status() int` + "`" + `, ` + "`" + `ResponseType() string` + "`" + ` (` + "`" + `"standard"` + "`" + `), ` + "`" + `GetContentType() string` + "`" + ` (` + "`" + `"application/json"` + "`" + `), ` + "`" + `GetContentDisposition() string` + "`" + ` (` + "`" + `""` + "`" + `), and ` + "`" + `Object() []byte` + "`" + ` (` + "`" + `nil` + "`" + `) — so the shared response types satisfy the server's response interface.
 
 ## Tests: the n-api harness
 
-Replace ` + "`" + `tests/testmain_test.go` + "`" + ` with the generic N-API harness (FX controller auto-discovery, testcontainers for PostgreSQL + MinIO, lazy Temporal client), updating only the bootstrap import path to the service's module. Then update assertions:
+Replace ` + "`" + `tests/testmain_test.go` + "`" + ` with the generic N-API harness (FX controller auto-discovery, testcontainers for PostgreSQL + MinIO, lazy Temporal client), updating only the bootstrap import path to the service's module. Bootstrap it through a small ` + "`" + `fxtest.TB` + "`" + ` adapter rather than a zero-value ` + "`" + `&testing.T{}` + "`" + `: ` + "`" + `fxtest` + "`" + ` calls ` + "`" + `FailNow` + "`" + ` on a graph error, ` + "`" + `testing.T.FailNow` + "`" + ` runs ` + "`" + `runtime.Goexit()` + "`" + ` on the main goroutine, and ` + "`" + `TestMain` + "`" + ` then hangs forever with the real error buffered and never printed. The adapter prints to stderr and calls ` + "`" + `os.Exit(1)` + "`" + ` instead. Then update assertions:
 
 - ` + "`" + `Router` + "`" + ` is now a ` + "`" + `*gin.Engine` + "`" + ` directly: ` + "`" + `Router.Engine.ServeHTTP(rec, req)` + "`" + ` becomes ` + "`" + `Router.ServeHTTP(rec, req)` + "`" + `.
 - Failed field validation returns **422 Unprocessable Entity** under govalid, where legacy Gin returned 400 — update every validation test.
@@ -273,15 +436,32 @@ Run with ` + "`" + `go test -v -timeout 2m ./tests` + "`" + `.
 
 ## Prove it: swagger
 
-Enable generation in ` + "`" + `config.yaml` + "`" + `:
+Enable generation in ` + "`" + `config.yaml` + "`" + `. A service using nullable types from a library other than ` + "`" + `volatiletech/null` + "`" + ` — ` + "`" + `guregu/null` + "`" + `, typically — also needs ` + "`" + `nullableTypeMap` + "`" + `, or those fields are described as nested objects instead of primitives. The ` + "`" + `|` + "`" + ` matters: ` + "`" + `n-api-server` + "`" + ` reads the block as a single multi-line string:
 
-` + "`" + `` + "`" + `` + "`" + `yaml
+` + "```" + `yaml
 swagger:
   generation:
     mode: "build"
-` + "`" + `` + "`" + `` + "`" + `
+  nullableTypeMap: |
+    {
+      "null.String": { "type": "string" },
+      "null.Int":    { "type": "integer", "format": "int64" },
+      "null.Float":  { "type": "number", "format": "double" },
+      "null.Bool":   { "type": "boolean" },
+      "null.Time":   { "type": "string", "format": "date-time" },
+      "null.UUID":   { "type": "string", "format": "uuid" }
+    }
+` + "```" + `
 
-Start the service and confirm the document exists at ` + "`" + `http://localhost:<PORT>/docs/v3Doc.json` + "`" + `. A route missing from it is almost always missing its ` + "`" + `.Name(...)` + "`" + `.`,
+Start the service and confirm the document exists at ` + "`" + `http://localhost:<PORT>/docs/v3Doc.json` + "`" + `. A route missing from it is almost always missing its ` + "`" + `.Name(...)` + "`" + `.
+
+**When start-up dies on ` + "`" + `map key "..." not found` + "`" + `.** ` + "`" + `n-api-server` + "`" + ` builds OpenAPI v2 definitions from the registered routes and converts them with ` + "`" + `openapi2conv.ToV3` + "`" + `; a ` + "`" + `$ref` + "`" + ` to a type that never made it into the definitions dictionary is fatal, and the message names the type. Work down this list:
+
+1. Read the struct name out of the error — it is the type that failed to register.
+2. If it is a response DTO, look for a ` + "`" + `*[]Struct` + "`" + ` field and make it ` + "`" + `[]Struct` + "`" + `.
+3. If it is a request DTO, look for ` + "`" + `json:"-"` + "`" + ` on ` + "`" + `uri:` + "`" + `/` + "`" + `form:` + "`" + ` fields and delete the ` + "`" + `json` + "`" + ` tag.
+4. If nullable types from a third-party library are in play, add ` + "`" + `swagger.nullableTypeMap` + "`" + `.
+5. If the route takes no input, check the handler declares ` + "`" + `_ struct{}` + "`" + ` rather than ` + "`" + `any` + "`" + `.`,
 	},
 }
 

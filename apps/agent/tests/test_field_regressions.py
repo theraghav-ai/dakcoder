@@ -410,6 +410,18 @@ def test_a_search_that_returns_nothing_new_says_so_and_is_eventually_withdrawn(r
     """
     from dakcoder_agent.tools import knowledge
 
+    # The tail is permutations rather than fresh rewordings, and deliberately so.
+    # Each genuinely new wording introduces a term the corpus has not scored yet
+    # ("definition", "member", "attribute"), and every one of those can pull in a
+    # section nothing had returned before -- which resets the repeat counter. That
+    # made the fixture a hostage to corpus size: it reached three consecutive
+    # repeats against a 92-section corpus and stopped reaching them on 2026-09-08,
+    # when the migration SOP grew nine sections, without anything in the loop
+    # changing. BM25 is a bag of words, so a permutation scores identically to the
+    # phrasing above it and cannot reach a section that one did not -- while still
+    # being a distinct string, so the duplicate-call guard lets it dispatch.
+    # The run therefore exhausts the ladder on the mechanism under test, at any
+    # corpus size.
     queries = [
         "api-server Router struct Engine field",
         "api-server Router struct Engine field definition",
@@ -417,6 +429,9 @@ def test_a_search_that_returns_nothing_new_says_so_and_is_eventually_withdrawn(r
         "api-server Router Engine struct field def",
         "api-server Router type Engine member",
         "api-server Router Engine attribute",
+        "Router Engine api-server attribute",
+        "Engine attribute Router api-server",
+        "attribute api-server Engine Router",
     ]
     handlers = {**router.handlers, **knowledge.handlers_for()}
     searching = Router(router.workspace, handlers)

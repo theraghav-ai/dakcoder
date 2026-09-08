@@ -39,7 +39,7 @@ __all__ = ["Corpus", "HANDLERS", "handlers_for", "load_playbooks"]
 #: ``step`` and steps 1, 2 and 3 were the same query: a Planner asking for
 #: "legacy migration step 3" was answered with Step 1, every time, and searched
 #: until the run was killed. Bare numbers are rare in these documents and
-#: discriminating when they appear -- the step numbers, ``v0.10.1``, ``422``.
+#: discriminating when they appear -- the step numbers, ``v0.9.2``, ``422``.
 _WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_]*")
 
 #: Words carrying no retrieval signal here. Deliberately short: an aggressive
