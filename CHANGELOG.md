@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased — 2026-09-03
+## 0.3.3 — 2026-09-04
 
-The residuals of the 2 September audit's re-check, closed. Runtime API
-unchanged at **1.1**; nothing on the wire changed.
+Extension `0.3.3`, `dakcoder-agent` `0.3.3`, `dakcoder-shared` `0.3.3`,
+`dakcoder-gateway` `0.3.3`. Runtime API unchanged at **1.1**.
+
+**No deploy order.** Nothing on the wire changed and the gateway is untouched;
+a 0.3.2 gateway serves a 0.3.3 runtime and the reverse.
+
+The residuals of the 2 September audit's re-check, closed.
 
 ### Added — a task state machine, and the block that shows it
 
