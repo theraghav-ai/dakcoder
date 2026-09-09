@@ -40,6 +40,7 @@ import {
   type GateStage,
   type Mode,
   type Mutation,
+  type PlanItem,
   type SessionStatus,
   type SessionSummary,
   type WireEvent,
@@ -868,7 +869,9 @@ export class RunState implements vscode.Disposable {
           this.release();
         }
         this.setStreaming('');
-        this._plan = parsePlan(text);
+        // The runtime's typed steps when it sends them; the prose parse is the
+        // fallback for an older one, and it cannot report a step's file.
+        this._plan = parsePlan(text, planItems(d.items));
         this._planSteps = num(d.steps, this._plan.steps.length);
         this.append({ id: event.id, turn: this._turn, at, kind: 'plan', text, plan: this._plan, steps: this._planSteps });
         break;
@@ -1178,6 +1181,22 @@ export class RunState implements vscode.Disposable {
 // `WireEvent.data` is `Record<string, unknown>`: the declared interfaces in
 // ./protocol are a lower bound on what arrives, not a guarantee. Nothing below
 // throws — a field that is missing renders as its absence.
+
+/** The `items` of a `plan` event, defensively: it is absent on older runtimes. */
+function planItems(value: unknown): PlanItem[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  return value.map((raw, i) => {
+    const item = (raw ?? {}) as Record<string, unknown>;
+    return {
+      index: num(item.index, i + 1),
+      file: str(item.file),
+      action: str(item.action),
+      accepts: str(item.accepts),
+      status: str(item.status),
+      note: str(item.note),
+    };
+  });
+}
 
 function str(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value : fallback;

@@ -394,3 +394,258 @@ def test_wording_is_not_something_the_loop_can_depend_on(client: LLMClient) -> N
         "forcing in `loop._terminal_choice` is worth re-examining"
     )
     assert forced == SAMPLES, f"forcing is no longer reliable: {forced}/{SAMPLES}"
+
+
+# ── the fence has to be able to tell a question from a job ──────────────────
+
+
+def _validating(task: str, reads, fence: str) -> list[dict]:
+    """A Planner mid-task, at the turn the research fence fires."""
+    from dakcoder_agent.modes import Mode
+    from dakcoder_agent.prompts import mode_instruction, system_prompt
+
+    out = [
+        {"role": "system", "content": system_prompt() + chr(10) * 2 + mode_instruction(Mode.PLANNER)},
+        {"role": "user", "content": task},
+    ]
+    for i, (name, args, result) in enumerate(reads):
+        cid = f"call_{i:03d}"
+        out.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": cid, "type": "function",
+             "function": {"name": name, "arguments": json.dumps(args)}}]})
+        out.append({"role": "tool", "tool_call_id": cid, "content": result})
+    out.append({"role": "user", "content":
+                "You have spent 12 turns calling tools in this phase without finishing "
+                "it. That is enough to act on -- reading more will not make the "
+                "decision easier." + chr(10) * 2 + fence})
+    return out
+
+
+NL = chr(10)
+TAB = chr(9)
+Q = chr(34)
+
+_VALIDATION = (
+    "read MIGRATION_PLAN.md and validate it against the codebase. every file",
+    [
+        ("read_file", {"path": "MIGRATION_PLAN.md"},
+         "# Migration plan" + NL * 2 + "1. Swap api-* for n-api-*" + NL
+         + "2. Delete routes/routes.go" + NL + "3. Rewrite handlers"),
+        ("repo_map", {}, '{"packages":["handler","repo/postgres","core/domain","routes"]}'),
+        ("read_file", {"path": "go.mod"},
+         "module gotemplate" + NL * 2 + "require github.com/gin-gonic/gin v1.10.1"),
+        ("read_file", {"path": "routes/routes.go"},
+         "package routes" + NL * 2 + "func Routes(r *gin.Engine) {}"),
+        ("read_file", {"path": "handler/objection.go"},
+         "package handler" + NL * 2
+         + "func (h *ObjectionHandler) Create(ctx *gin.Context) {}"),
+        ("search_repo", {"pattern": "gin.Context"},
+         "handler/objection.go:14" + NL + "handler/paogen.go:31"),
+    ],
+)
+
+_CHANGE = (
+    "add a status filter to the user list endpoint",
+    [
+        ("repo_map", {}, '{"packages":["handler","repo/postgres","core/domain"]}'),
+        ("read_file", {"path": "handler/user.go"},
+         "package handler" + NL * 2 + "func (h *UserHandler) List(sctx *route.Context, "
+         "req request.ListUsers) (*resp.R, error) { return nil, nil }"),
+        ("read_file", {"path": "handler/request/request.go"},
+         "package request" + NL * 2 + "type ListUsers struct {" + NL + TAB
+         + "Page int `json:" + Q + "page" + Q + "`" + NL + "}"),
+        ("read_file", {"path": "repo/postgres/user.go"},
+         "package postgres" + NL * 2 + "func (r *UserRepository) List(ctx context.Context) "
+         "([]domain.User, error) { return nil, nil }"),
+        ("read_file", {"path": "core/domain/user.go"},
+         "package domain" + NL * 2 + "type User struct {" + NL + TAB + "ID int" + NL
+         + TAB + "Status string" + NL + "}"),
+        ("search_repo", {"pattern": "status"}, "core/domain/user.go:5"),
+    ],
+)
+
+
+def _picks(client: LLMClient, case, samples: int) -> dict[str, int]:
+    from dakcoder_agent.loop import AgentLoop, _TERMINAL
+    from dakcoder_agent.modes import Mode
+    from dakcoder_agent.tools.registry import schemas_for
+
+    class _Planner:
+        class state:
+            mode = Mode.PLANNER
+            forced_terminal = 0
+
+    terminals = [s for s in schemas_for(Mode.PLANNER) if s["function"]["name"] in _TERMINAL]
+    task, reads = case
+    messages = _validating(task, reads, AgentLoop._fence_ask(_Planner()))
+    out: dict[str, int] = {}
+    for _ in range(samples):
+        result = client.chat(messages, role="planner", max_tokens=8192,
+                             enable_thinking=False, tools=terminals,
+                             tool_choice="required", temperature=0.1)
+        name = result.tool_calls[0].name if result.tool_calls else "NO-CALL"
+        out[name] = out.get(name, 0) + 1
+    return out
+
+
+def test_the_fence_lets_a_validation_end_in_an_answer(client: LLMClient) -> None:
+    """The 2026-09-09 field failure, at the turn where it was decided.
+
+    `_terminal_choice` named `submit_plan`, so a run twelve turns into
+    *validating* a migration document had one legal move and wrote an eight-step
+    migration nobody asked for. The turn now offers the three terminals with
+    `tool_choice: "required"`, and `_fence_ask` names all three.
+
+    Which text is used matters more than the widened choice. Measured here,
+    10 samples each: a text listing the three calls got `finish` 0/10 -- the
+    Planner overlay says "plan the work" and one closing paragraph does not
+    outweigh it. Telling the model to re-read what the developer actually asked
+    for got 9/10. That is the text `_fence_ask` ships.
+    """
+    picks = _picks(client, _VALIDATION, SAMPLES)
+    print("    validation at the fence:", picks)
+    finished = picks.get("finish", 0)
+    assert finished > SAMPLES // 2, (
+        f"a validation still does not reach `finish` at the fence: {picks}"
+    )
+
+
+def test_the_fence_still_plans_real_work(client: LLMClient) -> None:
+    """The control, and the reason the fence text is measured rather than argued.
+
+    A text that always answers `finish` has not fixed the fence, it has moved
+    the failure. Measured 10/10 `submit_plan` on the shipped text.
+    """
+    picks = _picks(client, _CHANGE, SAMPLES)
+    print("    change at the fence:", picks)
+    planned = picks.get("submit_plan", 0)
+    assert planned > SAMPLES // 2, (
+        f"a change task stopped producing a plan; the fence text over-corrected: {picks}"
+    )
+
+
+# ── the intent classifier, on labelled tasks ────────────────────────────────
+
+#: 60 labelled requests. The six tagged as field cases are verbatim from the two
+#: runs that made this necessary; the rest are the boundaries those runs exposed.
+#:
+#: ``(task, conversation, expected)``. ``conversation`` is what ``_classify``
+#: builds from ``context.directives``, because a follow-up cannot be classified
+#: without it: "go" is a question about nothing and an instruction about
+#: whatever was just described.
+_FIRST = "(this is the first message)"
+_PLAN_TALK = "- I have read the objection handler and it needs six changes; here is what I would do"
+
+INTENT_CASES: tuple[tuple[str, str, str], ...] = (
+    # the field failures, verbatim
+    ("read this migration file @MIGRATION_PLAN.md and tell me what do you understand from this", _FIRST, "question"),
+    ("read MIGRATION_PLAN.md and validate it against the codebase. every file", _FIRST, "question"),
+    ("validate the plan against the codebase", _FIRST, "question"),
+    ("where is the assessment", _FIRST, "question"),
+    ("show me the remaining answer", _FIRST, "question"),
+    ("update those minor additions in the migration doc file",
+     "- validate MIGRATION_PLAN.md against the codebase", "change"),
+    # questions whose subject is work-shaped -- where the old prompt failed
+    ("what would migrating this service to n-api-template involve?", _FIRST, "question"),
+    ("explain how the migration plan wants us to handle gRPC handlers", _FIRST, "question"),
+    ("compare our handler signatures against the n-api-template contract", _FIRST, "question"),
+    ("audit repo/postgres for raw squirrel usage", _FIRST, "question"),
+    ("review the objection handler for contract violations", _FIRST, "question"),
+    ("check whether the objection repository has an N+1 query", _FIRST, "question"),
+    ("what would we need to change to drop gin?", _FIRST, "question"),
+    ("which files would a migration touch?", _FIRST, "question"),
+    ("explain what deleting routes.go would break", _FIRST, "question"),
+    ("should we delete routes/routes.go?", _FIRST, "question"),
+    ("is it worth migrating paogen.go first?", _FIRST, "question"),
+    ("go through every handler and list the contract violations", _FIRST, "question"),
+    ("walk me through the migration plan", _FIRST, "question"),
+    ("verify the migration plan covers the gRPC handlers", _FIRST, "question"),
+    ("summarise what the repo layer does wrong", _FIRST, "question"),
+    # plain questions
+    ("which repository methods exist for users, and where are they defined?", _FIRST, "question"),
+    ("is the user handler registered in the bootstrapper?", _FIRST, "question"),
+    ("list every file that still imports gin", _FIRST, "question"),
+    ("does this service still use volatiletech/null anywhere?", _FIRST, "question"),
+    ("what fields does the User domain model have?", _FIRST, "question"),
+    ("how many handlers still take gin.Context?", _FIRST, "question"),
+    # plain changes
+    ("add a status filter to the user list endpoint", _FIRST, "change"),
+    ("migrate this service to the n-api-template", _FIRST, "change"),
+    ("fix the N+1 query in GetClosingBalanceRepo", _FIRST, "change"),
+    ("add a LastName string field to the User domain model", _FIRST, "change"),
+    ("delete routes/routes.go and move the routes onto the handlers", _FIRST, "change"),
+    ("replace squirrel with dblib.Psql in repo/postgres/objection.go", _FIRST, "change"),
+    ("scaffold a remittance resource", _FIRST, "change"),
+    ("make the handlers take sctx *route.Context", _FIRST, "change"),
+    ("I want the handlers to take sctx *route.Context", _FIRST, "change"),
+    ("can you drop gin from go.mod?", _FIRST, "change"),
+    # writing a document is a change, however analytical it sounds
+    ("rewrite MIGRATION_PLAN.md to include the gaps you found", _FIRST, "change"),
+    ("add the missing sections to the migration doc", _FIRST, "change"),
+    ("document the migration steps in MIGRATION_PLAN.md", _FIRST, "change"),
+    ("write up your findings in AUDIT.md", _FIRST, "change"),
+    # approvals and combinations
+    ("go", _PLAN_TALK, "change"),
+    ("yes please", _PLAN_TALK, "change"),
+    ("do it", _PLAN_TALK, "change"),
+    ("explain the handler, then migrate it", _FIRST, "change"),
+    ("review the repo and fix what you find", _FIRST, "change"),
+    ("tell me what is wrong with the repo layer and fix it", _FIRST, "change"),
+    ("run the linter and fix what it reports", _FIRST, "change"),
+    # verbs no candidate prompt named: the generalisation check
+    ("diagnose why the cashbook reversion is slow", _FIRST, "question"),
+    ("investigate whether paogen.go has dead code", _FIRST, "question"),
+    ("trace how a transfer entry flows through the repo layer", _FIRST, "question"),
+    ("critique the migration plan", _FIRST, "question"),
+    ("sanity-check the fx wiring", _FIRST, "question"),
+    ("evaluate whether dblib.Psql covers our query shapes", _FIRST, "question"),
+    ("map out the dependencies between handler and repo", _FIRST, "question"),
+    ("figure out why swagger_check is failing", _FIRST, "question"),
+    ("wire up the objection handler in the bootstrapper", _FIRST, "change"),
+    ("strip volatiletech/null out of core/domain", _FIRST, "change"),
+    ("port the objection repository to dblib.Psql", _FIRST, "change"),
+    ("harden the request validation on CreateUserRequest", _FIRST, "change"),
+)
+
+
+def test_the_intent_classifier_reads_the_verb_not_the_subject(client: LLMClient) -> None:
+    """The decision the whole run turns on, on 60 labelled requests.
+
+    A wrong "question" costs one word -- the answer is on screen and the next
+    message starts the work. A wrong "change" put a run into the Planner for a
+    request to *validate* a document, and twenty turns later the developer had
+    an unrequested eight-step migration and no answer. That asymmetry is why
+    `_classify` falls back to ASK, and it is why this is measured rather than
+    reasoned about.
+
+    The prompt this replaced scored 44/60. It enumerated the *subjects* of a
+    change -- "a feature, a fix, a migration, a refactor" -- so "validate the
+    migration plan" matched on the noun and the verb was never consulted. Three
+    rewrites all scored 60/60 at three samples each, including on eight verbs
+    none of them named (diagnose, critique, sanity-check, map out), so the
+    enumerating ones were not winning by their enumeration. The shipped one
+    states the test instead of a vocabulary.
+
+    One sample per case here, to keep the suite affordable. Every miss is
+    printed with the classifier's own `why`, so a regression names itself.
+    """
+    from dakcoder_agent.loop import _INTENT_PROMPT, _INTENT_SCHEMA, _parse_json_object
+
+    wrong = []
+    for task, conversation, expected in INTENT_CASES:
+        reply = client.chat(
+            [{"role": "user", "content": _INTENT_PROMPT.format(
+                conversation=conversation, task=task)}],
+            role="fast", max_tokens=64, enable_thinking=False,
+            response_format=_INTENT_SCHEMA,
+        )
+        parsed = _parse_json_object(reply.content or "") or {}
+        got = str(parsed.get("kind", "")).strip().lower()
+        if got != expected:
+            why = str(parsed.get("why", ""))[:60]
+            wrong.append(f"{task[:52]!r} want {expected} got {got or '?'} ({why})")
+
+    for row in wrong:
+        print("    MISS", row)
+    print(f"    intent: {len(INTENT_CASES) - len(wrong)}/{len(INTENT_CASES)}")
+    assert len(wrong) <= 2, f"{len(wrong)} of {len(INTENT_CASES)} misclassified"

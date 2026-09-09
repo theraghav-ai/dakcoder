@@ -15,9 +15,9 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 
 | Mode | Tools | Schema cost |
 |---|---|---|
-| **ask** | 15 | ~1,667 tokens |
-| **planner** | 17 | ~2,030 tokens |
-| **agent** | 24 | ~3,076 tokens |
+| **ask** | 15 | ~1,682 tokens |
+| **planner** | 17 | ~2,045 tokens |
+| **agent** | 24 | ~3,091 tokens |
 
 ## The catalogue
 
@@ -192,7 +192,7 @@ End your turn and hand the developer your answer. Call this when the work is don
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `answer` | string | yes | What you found or did. This is what they read; keep it under about 900 words. |
+| `answer` | string | yes | What you found or did, in full -- the developer reads this and nothing after it. A sentence for a finished edit, the findings for a review. |
 | `blocked` | string |  | What stopped you, if anything did. Omit when nothing did. |
 
 ### `revise_plan`

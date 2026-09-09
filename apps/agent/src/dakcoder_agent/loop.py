@@ -243,6 +243,17 @@ class _State:
     mode: Mode = Mode.ASK
     #: What the developer asked for. Fixed before the first turn.
     intent: Intent = Intent.AUTO
+    #: Where `intent` came from: "given" (the panel's Ask/Agent toggle, or an
+    #: explicit caller), "start" (a legacy mode name), or "classified".
+    #:
+    #: The decision the whole run turns on, and nothing on the wire distinguished
+    #: a developer who *said* this was work from a 64-token call that guessed it.
+    #: Twenty turns into an unrequested migration is a late moment to find out
+    #: which it was.
+    intent_source: str = "given"
+    #: The classifier's own one-line reason. The schema has asked for it since
+    #: the classifier was written and the reply was thrown away.
+    intent_why: str = ""
     #: The plan, as ``submit_plan`` typed it. Empty in ASK.
     plan: tuple[PlanStep, ...] = ()
     plan_summary: str = ""
@@ -332,10 +343,39 @@ class _State:
     #: paths out of the plan rather than out of the work, so it is not the
     #: arbiter of who is right.
     finish_refused: int = 0
+    #: How many times an answer that was only its own opening line was sent
+    #: back. Separate from `finish_refused` because they are different
+    #: mistakes -- one is work not done, the other is work done and not
+    #: delivered -- and a run may honestly make both.
+    preamble_refused: int = 0
     #: Terminal calls forced that did not land -- the model was made to call
     #: `submit_plan` and sent arguments the schema refused, say. Bounded,
     #: because forcing the same call again is the loop this exists to escape.
     forced_terminal: int = 0
+    #: Whether the turn just sent was one the loop forced to end the phase.
+    #: Read by `_phase_ended`, which is the only thing that can tell a plan the
+    #: model volunteered from one it was left no other move to produce.
+    terminal_forced: bool = False
+    #: Whether the current plan came out of a forced `submit_plan`.
+    #:
+    #: A plan is normally a commitment, and `_unwritten_targets` treats it as
+    #: one. A plan extracted at the research fence is not: the developer asked
+    #: a question, the fence fired, and the only call the turn accepted was
+    #: `submit_plan`, so the model wrote one. Enforcing it turns a question
+    #: into an unrequested migration and gives the run no exit (BUG L-28).
+    #:
+    #: Asking the model to reconsider before acting on a forced plan was tried
+    #: and reverted. It read as an invitation to stop: measured live at the
+    #: fence, genuine change tasks went from 4/4 writing the code to 2/4, to
+    #: buy one analysis run in four. The misroute is worth preventing at the
+    #: classifier, not worth talking every forced plan out of existence.
+    #:
+    #: Set by `_phase_ended`, cleared by any plan the model submits of its own
+    #: accord. It stops mattering the moment anything is written -- a forced
+    #: plan the run has started acting on is a plan, whatever produced it --
+    #: and that condition lives in `_open_targets`, which is the one place
+    #: every enforcement path reads.
+    plan_forced: bool = False
     #: Consecutive replies the output budget cut off. Reset by any reply that
     #: completes. The per-turn handling of a truncated reply is careful -- every
     #: declared call answered, the cause named accurately -- but nothing counted
@@ -381,12 +421,22 @@ Reply with JSON only, no prose around it, using exactly these keys:
   files_created   list of workspace-relative paths created
   files_modified  list of workspace-relative paths modified
   decisions       list of decisions taken AND the reason for each
+  findings        list of facts this run established about the code, each
+                  one usable on its own, e.g. "handler/objection.go: all 14
+                  handlers take *gin.Context" -- at most 12, best first
   verified        list of things confirmed working (gate stages that passed)
   open_items      list of what is still unresolved
   do_not_retry    list of approaches already tried that did NOT work
 
 `do_not_retry` matters most: without it the next turns repeat the dead end that
 made this compaction necessary. Keep every file path exactly as written.
+
+`findings` matters second, and mostly for a run that is answering rather
+than editing. Every other key describes what the run DID; on a review or a
+validation the reading IS the work, and a recap holding only the names of
+the files read throws it away -- so the turns after it re-read those files
+to recover it, which is what put the context over the threshold to begin
+with. Leave it empty for a run that is changing code.
 
 TRANSCRIPT:
 """
@@ -405,6 +455,7 @@ _RECAP_SCHEMA: dict[str, Any] = {
                 "files_created": {"type": "array", "items": {"type": "string"}},
                 "files_modified": {"type": "array", "items": {"type": "string"}},
                 "decisions": {"type": "array", "items": {"type": "string"}},
+                "findings": {"type": "array", "items": {"type": "string"}},
                 "verified": {"type": "array", "items": {"type": "string"}},
                 "open_items": {"type": "array", "items": {"type": "string"}},
                 "do_not_retry": {"type": "array", "items": {"type": "string"}},
@@ -424,15 +475,20 @@ _RECAP_SCHEMA: dict[str, Any] = {
 #: structured-output call; that is exactly this.
 _INTENT_PROMPT = """Decide what this developer wants from a Go backend agent.
 
-"question" -- they want to be told something about the code: an explanation, a
-review, a list, an opinion, a yes/no. Answering it changes no files.
+Apply one test: **after a perfect reply, is any file in the repository
+different?**
 
-"change" -- they want the code changed: a feature, a fix, a migration, a
-refactor, a scaffold. Also "change" when they are approving work that was just
-described to them ("go", "do it", "yes please"), or when they ask a question and
-then ask for the work as well ("explain the handler, then migrate it").
+No -- it is a "question". They wanted to be told something: an explanation, a
+review, a validation, an audit, a comparison, a list, an opinion, a yes/no.
+This holds however work-shaped the subject is; validating a migration plan
+changes no files, and neither does auditing a package.
 
-Answer with the JSON object only.
+Yes -- it is a "change". A feature, a fix, a migration, a refactor, a scaffold.
+Also "change" when they are approving work just described to them ("go", "do
+it", "yes please"), or when they ask a question and then ask for the work as
+well ("explain the handler, then migrate it").
+
+Answer with the JSON object only. Keep "why" to at most eight words.
 
 CONVERSATION SO FAR:
 {conversation}
@@ -441,6 +497,15 @@ LATEST MESSAGE FROM THE DEVELOPER:
 {task}
 """
 
+#: Measured 2026-09-09 against 60 labelled tasks, 3 samples each, after a field
+#: run turned "validate this migration plan" into an unrequested migration. The
+#: prompt this replaces scored 44/60: it listed the *subjects* of a change --
+#: "a feature, a fix, a migration, a refactor" -- and a request to validate a
+#: migration plan matched on the noun. Three candidate rewrites all scored
+#: 60/60, including on eight verbs none of them named (diagnose, critique,
+#: sanity-check, map out), so the enumerating ones were not winning by their
+#: enumeration. This one states the test rather than a vocabulary, which is the
+#: version that cannot rot as the words people use drift.
 _INTENT_SCHEMA: dict[str, Any] = {
     "type": "json_schema",
     "json_schema": {
@@ -448,10 +513,19 @@ _INTENT_SCHEMA: dict[str, Any] = {
         "schema": {
             "type": "object",
             "properties": {
+                # `kind` first, so guided decoding settles the answer before
+                # it spends any of a 64-token budget explaining it.
                 "kind": {"type": "string", "enum": ["question", "change"]},
-                "why": {"type": "string"},
+                "why": {
+                    "type": "string",
+                    "description": "At most eight words: the word that decided it.",
+                    "maxLength": 120,
+                },
             },
-            "required": ["kind"],
+            # Both of them. `why` was optional and the model simply left it
+            # out -- measured live, empty on every classification -- so the
+            # field the loop reads back to explain a misroute never arrived.
+            "required": ["kind", "why"],
         },
     },
 }
@@ -595,6 +669,46 @@ MAX_CALLS_PER_BATCH = 6
 
 #: How many entries each list in the state block carries.
 STATE_ITEMS = 8
+
+#: How many times an `answer` that reads as the opening of something longer is
+#: sent back. One, and it is cheap to reject: the message says that re-sending
+#: the same text unchanged will be taken as final, so a false positive costs a
+#: turn rather than an argument.
+MAX_PREAMBLE_REFUSALS = 1
+
+#: How long an answer can be and still be a preamble. Generous: what is being
+#: caught is an answer that *announces* findings and then stops, and the two
+#: field cases were 110 and 172 characters.
+PREAMBLE_CHARS = 400
+
+#: An answer that promises what it does not then deliver.
+#:
+#: Two field runs, three turns between them, all ending the same way: twenty
+#: turns of real work funnelled into one `finish`, and the `answer` holding
+#: only its own opening line. "I have validated the migration plan against the
+#: actual codebase. Here is my assessment of each step's accuracy:" -- and
+#: nothing after the colon. The developer typed "where is the assessment".
+#:
+#: The model is writing for a chat channel, where prose follows the sentence
+#: that introduces it. Here there is no after: `answer` is the whole delivery.
+_PROMISES_MORE = re.compile(
+    r"(here(?:'s| is| are)\s+(?:what|my|the)|as follows|step by step|"
+    r"the following|below\s*[:.]?$|my (?:assessment|findings|analysis|review))",
+    re.IGNORECASE,
+)
+
+
+def _is_preamble(answer: str) -> bool:
+    """Whether this answer reads as the opening of something longer.
+
+    Two signals, either alone enough, both bounded by length. An answer that
+    *ends* on a colon is incomplete by construction. An answer that says
+    findings follow -- and is short enough that they plainly did not -- is the
+    same failure with different punctuation.
+    """
+    if not answer or len(answer) > PREAMBLE_CHARS:
+        return False
+    return answer.rstrip().endswith((":", "：")) or bool(_PROMISES_MORE.search(answer))
 
 #: How many times a `finish` that abandons the plan is sent back.
 #:
@@ -793,11 +907,13 @@ class AgentLoop:
             self.context.set_task(task, acceptance=acceptance)
 
         decided = Intent.coerce(intent)
+        source = "given"
         if decided is Intent.AUTO and start is not None:
-            decided = Intent.coerce(start)
+            decided, source = Intent.coerce(start), "start"
         if decided is Intent.AUTO:
-            decided = self._classify(task, continued=continued)
+            decided, source = self._classify(task, continued=continued), "classified"
         self.state.intent = decided
+        self.state.intent_source = source
 
         self._switch(Mode.PLANNER if decided is Intent.AGENT else Mode.ASK)
         # Only a run that may write needs to know what was already broken.
@@ -932,7 +1048,16 @@ class AgentLoop:
                     }
                 ],
                 role="fast",
-                max_tokens=64,
+                # Room for the verdict *and* its reason. `why` is required
+                # now, and left to itself the model writes forty words of it:
+                # at 64 tokens the reply was cut mid-JSON, which parses as
+                # nothing and falls back to ASK -- the safe direction, but
+                # silently wrong on a change, and measured at 2 cases in 60.
+                #
+                # Two belts. The prompt asks for eight words, which is what the
+                # model actually reads and obeys (117 characters average down
+                # to 35, worst case 48); this budget is the brace.
+                max_tokens=160,
                 enable_thinking=False,
                 response_format=_INTENT_SCHEMA,
                 metering=Metering(
@@ -958,6 +1083,10 @@ class AgentLoop:
 
         parsed = _parse_json_object(reply.content or "")
         kind = str((parsed or {}).get("kind", "")).strip().lower()
+        # Kept, not discarded. `why` has been in `_INTENT_SCHEMA` since the
+        # classifier was written and the answer went straight in the bin, so the
+        # one artefact that could explain a misroute never existed.
+        self.state.intent_why = str((parsed or {}).get("why", "") or "").strip()[:300]
         return Intent.AGENT if kind == "change" else Intent.ASK
 
     # -- the baseline -----------------------------------------------------
@@ -1066,6 +1195,11 @@ class AgentLoop:
                 # mode it is in. This is the decision the whole run turns on and
                 # nothing on the wire used to name it.
                 "intent": str(self.state.intent),
+                # And whether a person said so or a 64-token call guessed. A
+                # panel that can render "treating this as work -- switch?" needs
+                # to know which, and so does anyone reading a transcript back.
+                "intent_source": self.state.intent_source,
+                "intent_why": self.state.intent_why,
                 # The attempt about to be made, not the number of failures
                 # behind it. `gate_failures` is 0 before any gate has failed, so
                 # the wire said "attempt 0" while the panel's own default said 1
@@ -1120,9 +1254,7 @@ class AgentLoop:
             # `finish` -- and finished, honestly and uselessly, with "nothing
             # was changed". The bound had fired correctly and pointed at the
             # exit instead of at the work.
-            outstanding = (
-                self._unwritten_targets() if self.state.mode is Mode.AGENT else []
-            )
+            outstanding = self._open_targets()
             answering = True
             if self._gate_wants_an_edit():
                 # A failing gate in the same context says "Make the edit, or say
@@ -1177,12 +1309,26 @@ class AgentLoop:
                 )
                 return
 
-        outcome = yield from self._complete(
-            tools,
-            tool_choice=(
-                (forced_choice or self._terminal_choice()) if answering else None
-            ),
-        )
+        # What this turn is allowed to call, and how hard.
+        #
+        # Three cases, and only the last one narrows the tool list. A branch
+        # that set `forced_choice` itself wants a *kind* of move -- an edit, or
+        # any tool at all -- and the right call there is `write_file` or
+        # `patch_file`, so it keeps everything. A turn that is ending the phase
+        # gets the terminals and nothing else: that is what makes `required`
+        # safe, and what stops a Planner being handed `submit_plan` as its only
+        # legal move when the task was a question (BUG L-28).
+        tool_choice: str | dict[str, Any] | None = None
+        offered = tools
+        if answering:
+            tool_choice = forced_choice or self._terminal_choice()
+            if forced_choice is None:
+                offered = self._terminal_tools()
+        # Recorded before the call, read after it by `_phase_ended`: a plan that
+        # arrives on a turn like this one was not volunteered.
+        self.state.terminal_forced = answering and forced_choice is None
+
+        outcome = yield from self._complete(offered, tool_choice=tool_choice)
         yield from self._report_wire_repairs()
         if outcome is None:
             return
@@ -2167,25 +2313,33 @@ class AgentLoop:
         The Planner used to be told "submit the plan now, or ask the developer
         what you cannot infer" on a turn whose ``tool_choice`` named
         ``submit_plan`` alone, so half the instruction was a move the request
-        forbade. The named choice is the lever measured to work; the text has to
-        agree with it, and the honest way to carry an open question through a
-        forced ``submit_plan`` is as a stated assumption in the step itself,
-        which the developer sees in the plan card and can correct before any
-        file changes.
+        forbade. The text has to agree with the request -- and now it can agree
+        with a wider one, because the turn offers all three terminals.
+
+        Naming the alternatives matters more than it looks. A model twelve turns
+        into validating a document, told only "submit the plan", writes a plan:
+        it is the one move on offer and the instruction confirms it. Told that
+        `finish` is what a review ends with, it can say what it found.
         """
         if self.state.mode is not Mode.PLANNER:
             return "Say what you have done and what you found."
-        forced = self._terminal_choice()["function"]["name"]
-        if forced == "submit_plan":
+        if self.state.forced_terminal:
+            # The second force. `finish` is named on the wire because a schema
+            # refused the first attempt; the text says the same thing.
             return (
-                "Submit the plan now, from what you already have. This turn accepts "
-                "only `submit_plan`: where something could not be inferred, state the "
-                "assumption you are making in that step's `action`, and the developer "
-                "will correct it in review."
+                "Call `finish` now: say what you established about the task in `answer`, "
+                "and what you could not find out in `blocked`."
             )
         return (
-            "Call `finish` now: say what you established about the task in `answer`, "
-            "and what you could not find out in `blocked`."
+            "End this phase now. Re-read what the developer actually asked for, at "
+            "the top of this conversation, and pick the call that answers it:\n\n"
+            "- Did they ask to be TOLD something -- to validate, review, audit, "
+            "check, compare, explain, list? Then call `finish`, with the whole of "
+            "what you found in `answer`. That call is the answer they read. A plan "
+            "is not what they asked for and they cannot use one.\n"
+            "- Did they ask for the code to CHANGE -- a feature, a fix, a migration, "
+            "a refactor? Then call `submit_plan`, naming the files you would change.\n"
+            "- `ask_developer` only if one unknown blocks everything else."
         )
 
     def _gate_wants_an_edit(self) -> bool:
@@ -2203,23 +2357,47 @@ class AgentLoop:
             and self.state.gate_failures <= MAX_GATE_FAILURES
         )
 
-    def _terminal_choice(self) -> dict[str, Any]:
-        """The tool this mode is forced to call when it must stop.
+    def _terminal_choice(self) -> str | dict[str, Any]:
+        """How this mode is made to stop, when it must.
 
-        Named rather than ``"required"``: required would let it pick a research
-        tool and carry on, which is the behaviour being escaped.
+        ``"required"``, paired with a tool list cut down to the terminals by
+        `_terminal_tools`. The old fear -- that ``required`` lets the model pick
+        a research tool and carry on -- is answered by removing the research
+        tools from the turn, which is a fact about the request rather than a
+        name the model may or may not honour.
 
-        The Planner is pointed at ``submit_plan`` first, because that is the
-        outcome the developer asked for and a plan submitted under protest is a
-        better thing to argue with than nineteen more turns of reading. **Once**:
-        if those arguments do not satisfy the schema, the second force is
-        ``finish``, whose schema is one required string and which therefore
-        cannot fail the same way. Forcing a call that keeps being refused is the
-        loop this whole mechanism exists to escape, arriving through the escape.
+        Naming ``submit_plan`` here was the more expensive mistake. A Planner at
+        the fence was given exactly one legal move, so a run that had spent
+        twelve turns *validating* a document wrote an eight-step migration
+        instead -- the outcome the developer had not asked for, produced under
+        duress and then enforced for the rest of the session (BUG L-28). The
+        three terminals are three different answers to "what was this task?",
+        and only the model knows which one it has been working on.
+
+        **Once**: if the arguments the model sends do not satisfy a schema, the
+        second force is ``finish``, whose schema is one required string and
+        which therefore cannot fail the same way. Forcing a call that keeps
+        being refused is the loop this whole mechanism exists to escape,
+        arriving through the escape.
         """
-        if self.state.mode is Mode.PLANNER and not self.state.forced_terminal:
-            return {"type": "function", "function": {"name": "submit_plan"}}
-        return _FORCE_FINISH
+        if self.state.forced_terminal:
+            return _FORCE_FINISH
+        return "required"
+
+    def _terminal_tools(self) -> list[dict[str, Any]]:
+        """Every way this mode can end its phase, and nothing else.
+
+        What makes ``tool_choice: "required"`` safe on a turn that has to stop.
+        In ASK and AGENT this is ``finish`` alone, so the turn is as constrained
+        as a named choice; in PLANNER it is the three, which is the point.
+
+        Falls back to the full list if a mode somehow holds no terminal: a turn
+        offered zero tools with ``required`` is a request no endpoint can
+        satisfy, and an unconstrained turn is a far better failure than one the
+        gateway rejects.
+        """
+        tools = [s for s in self._tools() if s["function"]["name"] in _TERMINAL]
+        return tools or self._tools()
 
     def _phase_ended(self, tool: str, outcome: ToolResult) -> Iterator[Event]:
         """Act on the tool call that ends a phase.
@@ -2259,9 +2437,7 @@ class AgentLoop:
             # plan rather than out of the work: the model may have decided a
             # step is unnecessary, and it is entitled to say so and be believed.
             # What it is not entitled to is silence.
-            missing = (
-                self._unwritten_targets() if self.state.mode is Mode.AGENT else []
-            )
+            missing = self._open_targets()
             if missing and self.state.finish_refused < MAX_FINISH_REFUSALS:
                 self.state.finish_refused += 1
                 self.context.append_user(
@@ -2273,6 +2449,36 @@ class AgentLoop:
                     + " now. Do that. If a file genuinely should not be written after "
                     "all, call `finish` again and say which and why in `blocked` -- "
                     "that will be taken at face value."
+                )
+                return
+
+            # An answer that is only its own opening line is sent back, once.
+            #
+            # The other way twenty turns of work reaches nobody. `answer` is
+            # the whole delivery -- there is no prose after it, the way there
+            # is in a chat -- and the model writes as if there were: "Here is
+            # my assessment of each step's accuracy:" and nothing after the
+            # colon. Two field runs ended exactly there, and in one of them the
+            # developer's next message was "where is the assessment".
+            #
+            # Cheap to reject on purpose. Re-sending the same text unchanged is
+            # accepted as final, so a wrong guess costs one turn rather than an
+            # argument with a model that is right.
+            if (
+                not blocked
+                and not self.router.touched
+                and _is_preamble(answer)
+                and self.state.preamble_refused < MAX_PREAMBLE_REFUSALS
+            ):
+                self.state.preamble_refused += 1
+                self.context.append_user(
+                    "Your `answer` reads as the opening of something longer: it says "
+                    "what is coming and then stops.\n\n"
+                    "The developer sees `answer` and nothing else -- there is no reply "
+                    "after it. Whatever you were about to write next has to be inside "
+                    "it. Call `finish` again with the whole thing.\n\n"
+                    "If that really was the whole answer, send it again unchanged and "
+                    "it will be taken as final."
                 )
                 return
 
@@ -2294,6 +2500,9 @@ class AgentLoop:
             )
             return
 
+        # Whether this plan was volunteered or extracted. The turn that
+        # produced it recorded which; `_open_targets` is what reads it.
+        self.state.plan_forced = self.state.terminal_forced
         self.state.research_turns = 0
         self.state.forced_terminal = 0
         # And the narration re-ask. It is once per *phase*, which is what the
@@ -2313,6 +2522,7 @@ class AgentLoop:
             # this finite: the second failed approach ends the run as before.
             self.state.gate_failures = 0
         self._switch(Mode.AGENT)
+
 
     def _inner_loop(self) -> Iterator[Event]:
         """Format and lint what was just written, sub-second.
@@ -2447,7 +2657,7 @@ class AgentLoop:
             # the developer acts on the second. A plan that named files and
             # wrote none of them is an *unstarted* run, and saying so is the
             # difference between a report and a shrug.
-            missing = self._unwritten_targets()
+            missing = self._open_targets()
             if missing:
                 self.result = RunResult(
                     Outcome.NO_PROGRESS,
@@ -2651,6 +2861,12 @@ class AgentLoop:
         self.state.baseline = previous.state.baseline
         self.state.plan = previous.state.plan
         self.state.plan_summary = previous.state.plan_summary
+        # Carried with the plan it is about. A forced plan that survived into a
+        # follow-up message is still a forced plan, and the follow-up is where
+        # it does the most damage: `finish_refused` starts at 0 in a fresh
+        # `_State`, so without this the "you planned to write these" refusal
+        # fires again on a plan the developer never asked for.
+        self.state.plan_forced = previous.state.plan_forced
         self.state.dependencies_changed = previous.state.dependencies_changed
         # Read off the Router that is now shared, so the two agree by
         # construction rather than by both being copied and hoping.
@@ -2799,6 +3015,44 @@ class AgentLoop:
         """
         return any(step.file == path for step in self.state.plan)
 
+    def _open_targets(self) -> list[str]:
+        """Plan targets this run is answerable for not having written.
+
+        `_unwritten_targets` answers "what does the plan still name?". This
+        answers the question the three enforcement paths actually ask, which is
+        "what is this run in the wrong for?" -- and they are not the same
+        question when the plan was never volunteered.
+
+        A plan produced by a forced `submit_plan`, on a run that has written
+        nothing since, is not a commitment. It is what came back when the fence
+        left the model no other move, and the developer may never have asked
+        for work at all.
+
+        All three enforcement paths read this, and the scope was measured
+        rather than argued. Restricting it to `_verify` alone -- on the
+        reasoning that the fence's "write them now" and `_phase_ended`'s "not
+        yet" are recoverable pushes, since each names `finish` as the way to
+        decline -- took the field scenario to **0 runs in 5**: every one was
+        pushed into writing files for a request to *validate* a document, and
+        once anything is written this guard correctly lapses, so all five then
+        committed to the migration and exhausted their budget.
+
+        What this cannot do is tell a question from a job. It only knows the
+        plan was not volunteered, so it stops the loop *insisting*. A model
+        that works a forced plan on its own initiative is not caught here and
+        is not meant to be: that is the misroute, and it belongs to the
+        classifier.
+
+        The moment anything *is* written, the guard lapses. A run that has
+        started acting on a plan is working to it, whatever produced it, and
+        half-finished work is what `_verify` exists to catch.
+        """
+        if self.state.mode is not Mode.AGENT:
+            return []
+        if self.state.plan_forced and not self.router.touched:
+            return []
+        return self._unwritten_targets()
+
     def _retrieval_overlap(self, call: ToolCall, outcome: ToolResult) -> str:
         """What to tell a run that keeps asking the corpus the same thing.
 
@@ -2879,6 +3133,12 @@ class AgentLoop:
             for i, step in enumerate(self.state.plan, 1):
                 note = f" ({step.note})" if step.note else ""
                 lines.append(f"  {i}. [{step.status}] {step.file} — {step.action}{note}")
+            if self.state.plan_forced and not self.router.touched:
+                lines.append(
+                    "  (this plan was written on a turn that accepted no other call. "
+                    "If the task was a question, `finish` with the answer is the right "
+                    "way to end -- the plan is not a commitment.)"
+                )
 
         touched = self.router.touched
         if touched or self.state.mode is Mode.AGENT:
@@ -2991,7 +3251,36 @@ class AgentLoop:
         if self.state.plan_summary:
             rendered = f"{self.state.plan_summary}\n\n{rendered}"
         self.context.set_plan(rendered)
-        yield Event(EventType.PLAN, {"text": rendered, "steps": len(self.state.plan)})
+        yield Event(
+            EventType.PLAN,
+            {
+                "text": rendered,
+                "steps": len(self.state.plan),
+                # The typed steps, not just a count and some prose.
+                #
+                # `submit_plan` has always had these; the event carried
+                # `{text, steps: N}` and left the panel to recover them with a
+                # regex over the rendered text. That regex matched path-shaped
+                # tokens, so a plan step whose *description* mentioned
+                # `handler/response.go` listed it under "Files in scope" and a
+                # step whose actual file was `MIGRATION_PLAN.md` did not appear
+                # at all -- the pattern only knew about Go, SQL and YAML. The
+                # panel showed two files the run would never touch and hid the
+                # one it would. `_unfinished` fixed exactly this bug on the
+                # server side; the UI kept the old version (BUG EXT-19).
+                "items": [
+                    {
+                        "index": i,
+                        "file": step.file,
+                        "action": step.action,
+                        "accepts": step.accepts,
+                        "status": step.status,
+                        "note": step.note,
+                    }
+                    for i, step in enumerate(self.state.plan, 1)
+                ],
+            },
+        )
 
     def _revised(self, outcome: ToolResult) -> Iterator[Event]:
         """Act on a `revise_plan` the router accepted."""
@@ -3007,6 +3296,9 @@ class AgentLoop:
         self.state.tried.append(f"turn {self.context.turn}: plan revised: {reason}")
         del self.state.tried[:-STATE_ITEMS * 2]
         steps = self._normalise_plan(steps_from_meta(dict(outcome.meta)))
+        # `revise_plan` is the model's own pivot, so whatever produced the plan
+        # it replaces, this one is volunteered.
+        self.state.plan_forced = False
         yield from self._adopt_plan(steps, "")
 
     def _overlap(self, call: ToolCall, outcome: ToolResult) -> str:
@@ -3450,6 +3742,7 @@ class AgentLoop:
             files_created=tuple(parsed.get("files_created") or ()),
             files_modified=tuple(parsed.get("files_modified") or ()),
             decisions=tuple(parsed.get("decisions") or ()),
+            findings=tuple(parsed.get("findings") or ()),
             verified=tuple(parsed.get("verified") or ()),
             open_items=tuple(parsed.get("open_items") or ()),
             do_not_retry=tuple(parsed.get("do_not_retry") or ()),

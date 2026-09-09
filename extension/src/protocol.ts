@@ -61,10 +61,26 @@ export interface AssistantText {
   text: string;
 }
 
+/** One step of a plan, exactly as `submit_plan` validated it. */
+export interface PlanItem {
+  index: number;
+  file: string;
+  action: string;
+  accepts: string;
+  status: string;
+  note: string;
+}
+
 export interface PlanEvent {
   text: string;
-  /** A count, not a list. The steps are parsed from `text`; see `parsePlan`. */
+  /** How many steps. Kept for older runtimes, which sent nothing else. */
   steps: number;
+  /**
+   * The steps themselves. Absent from a runtime older than this field, which
+   * is why `parsePlan` still carries a prose fallback — and why that fallback
+   * is documented as lossy rather than as an equivalent.
+   */
+  items?: PlanItem[];
 }
 
 export interface ToolCallEvent {
@@ -433,18 +449,65 @@ export interface PlanStep {
   text: string;
   accepts: string;
   /**
-   * Always `unknown` today. No field on the wire carries per-step status, and
-   * no client-side heuristic can honestly infer it — tying "gate passed" to
-   * "step advanced" would be a fabrication. Rendered as a dash with a sentence
-   * saying why, which is the true thing.
+   * From the wire when the runtime sends `items`, `'unknown'` when it does not.
+   *
+   * It was unconditionally `'unknown'` for the life of this file, on the true
+   * observation that no field carried it — but `submit_plan` had the status all
+   * along and the event simply did not forward it. Now it does, so a dash means
+   * "an older runtime", not "unknowable".
    */
-  status: 'unknown' | 'pending' | 'running' | 'passed' | 'failed';
+  status: 'unknown' | 'pending' | 'running' | 'passed' | 'failed' | 'skipped';
+  /** The file this step changes. Empty when recovered from prose. */
+  file: string;
+  /** Why a step was skipped or failed, when the runtime says. */
+  note: string;
 }
 
 /** The server's own step regex, so client and server agree on the count. */
 const STEP = /^\s*\d+[.)]\s/;
 
-export function parsePlan(text: string): { goal: string; steps: PlanStep[]; scope: string[] } {
+/** Runtime step status → the status this file renders. */
+const STATUS: Record<string, PlanStep['status']> = {
+  pending: 'pending',
+  done: 'passed',
+  failed: 'failed',
+  skipped: 'skipped',
+};
+
+/**
+ * The plan, from the runtime's typed steps when it sent them.
+ *
+ * `items` is the truth: `submit_plan` validates that every step names a file,
+ * an action and an acceptance criterion, and the loop normalises the paths to
+ * the same form the change set uses. The prose parse below is the fallback for
+ * a runtime older than that field, and it is a genuinely lossy one — it
+ * recovered "files in scope" by matching path-shaped tokens anywhere in the
+ * text, so a path merely *mentioned* in a step's description was reported as a
+ * file the run would touch, and a step whose real target was a `.md` file was
+ * not reported at all. The pattern only ever knew Go, SQL and YAML.
+ */
+export function parsePlan(
+  text: string,
+  items?: readonly PlanItem[],
+): { goal: string; steps: PlanStep[]; scope: string[] } {
+  if (items && items.length) {
+    const steps = items.map((item, i) => ({
+      index: typeof item.index === 'number' ? item.index : i + 1,
+      // The same shape `PlanStep.rendered` produces server-side, minus the
+      // number the list already supplies.
+      text: item.file ? `${item.file} — ${item.action}` : item.action,
+      accepts: item.accepts ?? '',
+      status: STATUS[item.status] ?? 'unknown',
+      file: item.file ?? '',
+      note: item.note ?? '',
+    }));
+    const scope: string[] = [];
+    for (const step of steps) {
+      if (step.file && !scope.includes(step.file)) scope.push(step.file);
+    }
+    return { goal: goalFrom(text), steps, scope };
+  }
+
   const lines = text.split(/\r?\n/);
   const steps: PlanStep[] = [];
   const scope: string[] = [];
@@ -461,6 +524,8 @@ export function parsePlan(text: string): { goal: string; steps: PlanStep[]; scop
         text: line.replace(STEP, '').trim(),
         accepts: '',
         status: 'unknown',
+        file: '',
+        note: '',
       };
       steps.push(current);
       continue;
@@ -473,4 +538,12 @@ export function parsePlan(text: string): { goal: string; steps: PlanStep[]; scop
     if (!goal && line.trim() && !STEP.test(line)) goal = line.trim();
   }
   return { goal, steps, scope: [...new Set(scope)] };
+}
+
+/** The plan's summary line: the first line that is not itself a step. */
+function goalFrom(text: string): string {
+  for (const line of text.split(/\r?\n/)) {
+    if (line.trim() && !STEP.test(line)) return line.trim();
+  }
+  return '';
 }

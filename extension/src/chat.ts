@@ -786,7 +786,11 @@ function strings(): Record<string, string> {
     planScope: vscode.l10n.t('Files in scope'),
     planAccepts: vscode.l10n.t('Accepts: {0}'),
     planStatusUnknown: vscode.l10n.t('—'),
-    planFootnote: vscode.l10n.t('Per-step status is shown as a dash because no field on the wire carries it. The runtime reports the plan text and a step count; inferring progress from anything else would be a guess presented as a fact.'),
+    planStatusPending: vscode.l10n.t('pending'),
+    planStatusPassed: vscode.l10n.t('done'),
+    planStatusFailed: vscode.l10n.t('failed'),
+    planStatusSkipped: vscode.l10n.t('skipped'),
+    planFootnote: vscode.l10n.t('A step shows a dash when this runtime is older than the field that carries per-step status. Where a status is shown it comes from the change set — a step is done when a write landed on its file — never from what the model said about its own progress.'),
 
     // gate
     gateInner: vscode.l10n.t('Inner gate'),

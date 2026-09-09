@@ -49,7 +49,11 @@ class ScriptedClient:
         self.calls += 1
         if response_format is not None:
             name = response_format.get("json_schema", {}).get("name")
-            body = {"kind": self.kind} if name == "intent" else {"goal": "scripted"}
+            body = (
+                {"kind": self.kind, "why": f"scripted: {self.kind}"}
+                if name == "intent"
+                else {"goal": "scripted"}
+            )
             return ChatResult(
                 content=json.dumps(body), finish_reason="stop", usage=Usage(prompt_tokens=10)
             )
@@ -74,20 +78,69 @@ class ScriptedClient:
                 # guided decoding for a named choice, so what comes back is
                 # schema-shaped; a stub that sent the wrong keys would be
                 # testing the refusal path and calling it the happy one.
-                body = {
-                    "submit_plan": {"steps": [{"file": "handler/user.go",
-                                               "action": "forced",
-                                               "accepts": "go build"}]},
-                    "ask_developer": {"questions": ["Which table?"]},
-                }.get(wanted, {"answer": "Nothing further to add."})
-                return calls((wanted, json.dumps(body)))
+                return calls((wanted, json.dumps(forced_args(wanted))))
         elif tool_choice == "none" and turn.tool_calls:
             self.turns.insert(0, turn)
             return say(f"I cannot call a tool this turn ({self.calls}).")
-        elif tool_choice == "required" and not turn.tool_calls:
-            self.turns.insert(0, turn)
-            return calls(("repo_map", "{}"))
+        elif tool_choice == "required":
+            # `required` means the reply *is* a call, and the endpoint can only
+            # return one of the tools the request offered. Both halves matter
+            # now that a turn ending a phase is sent the terminals alone: a stub
+            # that answered `repo_map` there would be modelling a reply the
+            # endpoint cannot produce, and the narrowing would be untestable.
+            offered = [t["function"]["name"] for t in (tools or [])]
+            scripted = turn.tool_calls[0].name if turn.tool_calls else ""
+            if scripted not in offered:
+                self.turns.insert(0, turn)
+                pick = "repo_map" if "repo_map" in offered else (offered or ["repo_map"])[0]
+                return calls((pick, json.dumps(forced_args(pick))))
         return turn
+
+
+#: The three calls that end a phase, by name.
+TERMINALS = frozenset({"submit_plan", "ask_developer", "finish"})
+
+
+def terminal_forces(client: "ScriptedClient") -> list[list[str]]:
+    """The offered tool list of every turn that could only end the phase.
+
+    Two shapes count, because the loop uses both. A *named* terminal choice
+    constrains the reply directly. ``required`` over a tool list holding
+    nothing but terminals constrains it just as tightly -- the endpoint can
+    only answer with a tool the request offered -- and that is the shape a
+    first force takes now: naming `submit_plan` handed a Planner one legal
+    move, so a run that had spent twelve turns validating a document wrote a
+    migration plan instead (BUG L-28).
+
+    What every fence test actually asserts is "this turn could not do anything
+    but stop", so that is what this answers.
+    """
+    out: list[list[str]] = []
+    for choice, offered in zip(client.tool_choices, client.seen_tools):
+        if isinstance(choice, dict):
+            if choice.get("function", {}).get("name", "") in TERMINALS:
+                out.append(list(offered))
+        elif choice == "required" and offered and set(offered) <= TERMINALS:
+            out.append(list(offered))
+    return out
+
+
+def forced_args(name: str) -> dict:
+    """Arguments the named tool actually takes.
+
+    The endpoint uses guided decoding for a constrained choice, so what comes
+    back is schema-shaped; a stub that sent the wrong keys would be testing the
+    refusal path and calling it the happy one.
+    """
+    return {
+        "submit_plan": {
+            "steps": [
+                {"file": "handler/user.go", "action": "forced", "accepts": "go build"}
+            ]
+        },
+        "ask_developer": {"questions": ["Which table?"]},
+        "repo_map": {},
+    }.get(name, {"answer": "Nothing further to add."})
 
 
 def say(text: str) -> ChatResult:

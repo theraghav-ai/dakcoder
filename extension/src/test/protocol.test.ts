@@ -169,9 +169,11 @@ describe('parsePlan', () => {
     assert.equal(plan.steps[2].accepts, 'rules_lint reports no layer-sql-boundary violation');
   });
 
-  it('leaves every step status unknown, because no field carries it', () => {
-    // The honest rendering. Tying "the gate passed" to "the step advanced" would
-    // be a fabrication, and a fabricated status is worse than a visible dash.
+  it('leaves every step status unknown when parsing prose alone', () => {
+    // Still the honest rendering *for this input*: prose carries no status, and
+    // inventing one from gate results would be a fabrication. What changed is
+    // that the runtime now sends the status it already had, so a dash means "an
+    // older runtime" rather than "unknowable" -- see the suite below.
     for (const step of parsePlan(PLAN).steps) {
       assert.equal(step.status, 'unknown');
     }
@@ -278,5 +280,78 @@ describe('normaliseQuota', () => {
     assert.equal(normaliseQuota({ tightest: 'window_runs' }).tightest, undefined);
     assert.deepEqual(normaliseQuota(null), {});
     assert.deepEqual(normaliseQuota('nonsense'), {});
+  });
+});
+
+describe('parsePlan, from the runtime typed steps', () => {
+  /**
+   * The plan from the 2026-09-09 field run, as `submit_plan` accepted it.
+   *
+   * One step, one file — `MIGRATION_PLAN.md` — and a description that mentions
+   * two Go files as *examples of what the section should say*. The panel
+   * reported "Files in scope: handler/response.go, helper.go" and never
+   * mentioned the file the run would actually write, because the scope line was
+   * recovered by matching path-shaped tokens anywhere in the prose and the
+   * pattern only knew Go, SQL and YAML.
+   */
+  const FIELD_ITEMS = [
+    {
+      index: 1,
+      file: 'MIGRATION_PLAN.md',
+      action:
+        "Add a 'Validation Findings' section documenting: repository signatures " +
+        'changing from *gin.Context to context.Context, handler/response.go ' +
+        'helper file deletion, and the null.*From() helpers in helper.go.',
+      accepts: "The file contains a new 'Validation Findings' section.",
+      status: 'pending',
+      note: '',
+    },
+  ];
+  const FIELD_TEXT = [
+    'Add a Validation Findings section to MIGRATION_PLAN.md.',
+    '',
+    `1. ${FIELD_ITEMS[0].file} — ${FIELD_ITEMS[0].action}`,
+    `   Accepts: ${FIELD_ITEMS[0].accepts}`,
+  ].join('\n');
+
+  it('scopes the plan to the files its steps name, not the ones they mention', () => {
+    const plan = parsePlan(FIELD_TEXT, FIELD_ITEMS);
+    assert.deepEqual(plan.scope, ['MIGRATION_PLAN.md']);
+  });
+
+  it('reproduces the old failure when the runtime sends no items', () => {
+    // Not a nostalgia test: this is the fallback a runtime older than `items`
+    // still gets, and its limits should be visible rather than discovered.
+    const scope = parsePlan(FIELD_TEXT).scope;
+    assert.ok(scope.includes('handler/response.go'), 'the old parse read the prose');
+    assert.ok(!scope.includes('MIGRATION_PLAN.md'), 'and could not see a .md target');
+  });
+
+  it('takes each step status from the runtime rather than showing a dash', () => {
+    const items = [
+      { index: 1, file: 'a.go', action: 'edit', accepts: 'builds', status: 'done', note: '' },
+      { index: 2, file: 'b.go', action: 'edit', accepts: 'builds', status: 'failed', note: '' },
+      { index: 3, file: 'c.go', action: 'edit', accepts: 'builds', status: 'pending', note: '' },
+      { index: 4, file: 'd.go', action: 'edit', accepts: 'builds', status: 'skipped', note: 'not needed' },
+    ];
+    const steps = parsePlan('Goal.', items).steps;
+    assert.deepEqual(
+      steps.map((s) => s.status),
+      ['passed', 'failed', 'pending', 'skipped'],
+    );
+    assert.equal(steps[3].note, 'not needed');
+  });
+
+  it('still says unknown for a status it does not recognise', () => {
+    const items = [
+      { index: 1, file: 'a.go', action: 'edit', accepts: 'builds', status: 'weather', note: '' },
+    ];
+    assert.equal(parsePlan('Goal.', items).steps[0].status, 'unknown');
+  });
+
+  it('falls back to the prose parse when items is empty', () => {
+    const plan = parsePlan(FIELD_TEXT, []);
+    assert.equal(plan.steps.length, 1);
+    assert.equal(plan.steps[0].file, '', 'the prose parse cannot know a step file');
   });
 });

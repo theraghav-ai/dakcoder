@@ -411,6 +411,16 @@ class Recap:
     #: because it is a fact about what was dropped and the loop already knows it.
     files_read: tuple[str, ...] = ()
     decisions: tuple[str, ...] = ()
+    #: What the run established about the code, as facts a reader could act on.
+    #:
+    #: The field an *answering* run needs and none of the others gave it. Every
+    #: other key here describes what the run did -- files created, decisions
+    #: taken, steps verified -- which is the right vocabulary for a change and
+    #: the wrong one for a review, where the reading is the work. A validation
+    #: of a 470-line document against fifteen files compacted at turn 10 into a
+    #: list of filenames, and the three turns after it re-read seven of those
+    #: files to get the analysis back (BUG L-30).
+    findings: tuple[str, ...] = ()
     verified: tuple[str, ...] = ()
     open_items: tuple[str, ...] = ()
     do_not_retry: tuple[str, ...] = ()
@@ -454,6 +464,7 @@ class Recap:
             files_modified=fold(previous.files_modified, self.files_modified),
             files_read=fold(previous.files_read, self.files_read),
             decisions=fold(previous.decisions, self.decisions),
+            findings=fold(previous.findings, self.findings),
             verified=fold(previous.verified, self.verified),
             open_items=fold(previous.open_items, self.open_items),
             do_not_retry=fold(previous.do_not_retry, self.do_not_retry),
@@ -485,6 +496,7 @@ class Recap:
                 f"{'':17}is what caused this compaction.)\n"
             )
         out.append(block("Decisions", self.decisions))
+        out.append(block("Findings", self.findings))
         out.append(block("Verified", self.verified))
         out.append(block("Open", self.open_items))
         out.append(block("Do not retry", self.do_not_retry))

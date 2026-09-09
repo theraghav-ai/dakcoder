@@ -87,11 +87,22 @@ class PlanStep:
 STEP_STATUSES = ("pending", "done", "failed", "skipped")
 MODEL_STATUSES = ("pending", "skipped")
 
-#: How much of a `finish` answer reaches the developer. It is what they read,
-#: and it goes out as one tool call: an unbounded answer is the reply most
-#: likely to be cut off by the output limit -- and the one call that should
-#: never be. Roughly 900 words.
-MAX_ANSWER_CHARS = 6_000
+#: How much of a `finish` answer reaches the developer.
+#:
+#: The cap exists because the answer goes out as one tool call and an unbounded
+#: one is the reply most likely to meet the output limit. What it must not do is
+#: bite on ordinary work: at 6,000 characters it did. A live validation run
+#: delivered an answer of exactly 6,000 characters -- meaning it was cut -- and
+#: the tokens were already spent by then, so the cap saved nothing and lost the
+#: end of the analysis.
+#:
+#: Three numbers say this and they have to agree: this one, the `maxLength` on
+#: `finish`'s schema, and the sentence in its description that the model
+#: actually reads. Change one and change all three.
+#:
+#: Deliberately *not* `loop.CACHED_RESULT_CHARS`, which was also 6,000 and meant
+#: something else entirely.
+MAX_ANSWER_CHARS = 24_000
 
 
 def steps_from_meta(meta: dict[str, Any]) -> tuple[PlanStep, ...]:
@@ -217,7 +228,13 @@ def finish(inv: Invocation) -> ToolResult:
         cut = len(answer) - MAX_ANSWER_CHARS
         answer = answer[:MAX_ANSWER_CHARS].rstrip() + f"\n\n[answer cut at {MAX_ANSWER_CHARS:,} characters; {cut:,} more were sent]"
     blocked = str(inv.arg("blocked") or "").strip()
-    body = answer if not blocked else f"{answer}\n\nBlocked: {blocked}"
+    body = "Answered; the developer has your reply."
+    if cut:
+        # The one thing about the answer the model still needs told, because it
+        # is the one thing it can act on: the tail did not reach anybody.
+        body += f" The last {cut:,} characters did not fit and were cut."
+    if blocked:
+        body += f" Recorded as blocked on: {blocked}"
     return ToolResult.success(
         body,
         meta={"control": "finish", "answer": answer, "blocked": blocked, "answer_cut": cut},

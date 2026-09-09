@@ -776,8 +776,20 @@
     return shell({ state: row.state === 'running' ? 'running' : row.state }, glyph, label, meta, body);
   }
 
+  /** Runtime step status -> the label and glyph this panel shows for it. */
+  const PLAN_STATUS = {
+    pending: 'planStatusPending',
+    passed: 'planStatusPassed',
+    failed: 'planStatusFailed',
+    skipped: 'planStatusSkipped',
+  };
+
   function renderPlan(row) {
-    const parsed = parsePlan(row.text);
+    // `row.plan` is parsed once, in `protocol.parsePlan`, from the runtime's
+    // typed steps when it sent them. This used to re-derive it here from the
+    // prose with a second copy of the regex, which is how the panel came to
+    // list two files a plan merely *mentioned* and hide the one it named.
+    const parsed = row.plan || parsePlan(row.text);
     const wrap = el('div', 'plan');
     wrap.appendChild(el('h2', null, plural('plan', row.steps || parsed.steps.length)));
     if (parsed.goal) {
@@ -787,16 +799,25 @@
       wrap.appendChild(goal);
     }
 
+    let anyUnknown = false;
     const list = el('ol');
     parsed.steps.forEach(function (step) {
       const item = el('li');
-      // A dash, always. See the footnote — no field carries per-step status and
-      // deriving one from gate results would be a fabrication.
-      const status = el('span', 'status', S.planStatusUnknown);
-      status.setAttribute('aria-label', S.planStatusUnknown);
+      // The runtime's own status, derived from the change set rather than from
+      // anything the model said. A dash still means exactly what the footnote
+      // says — nothing on the wire carried it — and now that only happens on a
+      // runtime too old to send `items`.
+      const key = PLAN_STATUS[step.status];
+      if (!key) anyUnknown = true;
+      const label = key ? S[key] : S.planStatusUnknown;
+      const status = el('span', 'status status-' + (step.status || 'unknown'), label);
+      status.setAttribute('aria-label', label);
       item.appendChild(status);
       const text = el('span');
       text.appendChild(document.createTextNode(step.text));
+      if (step.note) {
+        text.appendChild(document.createTextNode(' (' + step.note + ')'));
+      }
       if (step.accepts) {
         text.appendChild(document.createElement('br'));
         text.appendChild(el('span', 'accepts', fmt(S.planAccepts, step.accepts)));
@@ -810,7 +831,7 @@
       wrap.appendChild(el('p', 'footnote', S.planScope));
       wrap.appendChild(pathList(parsed.scope, []));
     }
-    wrap.appendChild(el('p', 'footnote', S.planFootnote));
+    if (anyUnknown) wrap.appendChild(el('p', 'footnote', S.planFootnote));
     return wrap;
   }
 

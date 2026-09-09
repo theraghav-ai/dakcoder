@@ -1694,7 +1694,12 @@ def test_the_research_fence_still_ends_a_phase_that_only_reads(
     loop.state.last_gate = None
 
     assert not loop._gate_wants_an_edit(), "no gate has spoken, so nothing is contradicted"
-    assert loop._terminal_choice() == {"type": "function", "function": {"name": "finish"}}
+    # `required` over a one-tool list, which constrains the reply exactly as
+    # tightly as naming it did. The acting mode holds one terminal, so this is
+    # the same turn it always was -- the widening is the Planner's, where the
+    # three terminals are three different answers to "what was this task?".
+    assert loop._terminal_choice() == "required"
+    assert [t["function"]["name"] for t in loop._terminal_tools()] == ["finish"]
 
 
 # ── L-18: a steer must not re-prefill the conversation ─────────────────────

@@ -551,9 +551,16 @@ _SPECS: tuple[ToolSpec, ...] = (
         ),
         parameters=_obj(
             answer=_str(
-                "What you found or did. This is what they read; keep it under about "
-                "900 words.",
-                maxLength=6000,
+                # Two facts, and the prefix budget allows about this much. That
+                # there is no reply after `answer` is what a model writing for a
+                # chat channel does not assume: two field runs delivered the
+                # sentence that introduces the findings and stopped. The second
+                # sentence is the length cue, which is the half that keeps a
+                # finished edit from being reported in five paragraphs.
+                "What you found or did, in full -- the developer reads this and "
+                "nothing after it. A sentence for a finished edit, the findings "
+                "for a review.",
+                maxLength=24000,
             ),
             blocked=_str("What stopped you, if anything did. Omit when nothing did."),
         ),

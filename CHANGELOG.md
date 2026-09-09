@@ -1,5 +1,140 @@
 # Changelog
 
+## 0.3.5 — 2026-09-09
+
+Extension `0.3.5`, `dakcoder-agent` `0.3.5`, `dakcoder-shared` `0.3.5`,
+`dakcoder-gateway` `0.3.5`. Runtime API unchanged at **1.1**.
+
+**No deploy order.** The `plan` and `turn_start` events gained fields; nothing
+was removed or renamed and the gateway is untouched, so a 0.3.4 gateway serves
+a 0.3.5 runtime and the reverse. An older panel ignores the new fields; a 0.3.5
+panel falls back to the old parse when a runtime does not send them.
+
+Two field runs, three days apart, both asking the agent to *validate* a
+migration document against the codebase. Both ended without an answer: one
+after 25 turns of `no_progress`, the other having started executing an
+eight-step migration nobody had asked for. This release is the account of why,
+and every prompt in it was chosen by measurement against the live endpoint
+rather than by argument — three of the fixes below read plausibly and scored
+zero, and are documented as such in `docs/ENDPOINT-CAPABILITIES.md`.
+
+### Fixed — a question routed as work
+
+The intent classifier enumerated the *subjects* of a change — "a feature, a
+fix, a migration, a refactor" — so "validate the migration plan" matched on the
+noun and the verb was never consulted. Measured against 60 labelled requests,
+three samples each: **44/60**.
+
+It now asks one question — *after a perfect reply, is any file in the
+repository different?* — which is the decision the loop is actually making, and
+which puts the awkward boundary in the right place for free: writing findings
+into `AUDIT.md` is a change however analytical the request sounds. **60/60**,
+including on eight verbs the prompt does not name (diagnose, critique,
+sanity-check, map out), so it is not winning by vocabulary.
+
+- **`why` is required, and short.** The field was in the schema from the start,
+  optional, and the model omitted it on every classification — so the one
+  artefact that could explain a misroute never existed. Requiring it cost 2
+  cases in 60: left alone the model writes forty words, the reply lands on the
+  token boundary, the JSON is cut, and an unparseable classification falls back
+  to ASK — safe, but silently wrong on a change. Asking for eight words *in the
+  prompt* fixed it; `maxLength` on the schema did nothing, because guided
+  decoding here does not enforce it.
+- **`turn_start` carries `intent_source` and `intent_why`.** Whether a person
+  said this was work or a 64-token call guessed it, and on what grounds.
+  Twenty turns into an unrequested migration is a late moment to find out.
+
+Measured end to end at production settings, ten runs: routing correct 10/10,
+and a validation now touches **no files at all** — structurally, because the
+answering mode holds no write tools.
+
+### Fixed — a fence that offered one move
+
+`_terminal_choice` named `submit_plan`, so a Planner twelve turns into
+validating a document had exactly one legal call and wrote a migration plan.
+The turn now offers all three terminals with `tool_choice: "required"` over a
+tool list narrowed to them, which constrains the reply as tightly as naming one
+without deciding *which* ending the task deserves.
+
+The widened choice alone did nothing: **the text decides it.** A fence message
+listing the three calls and what each is for scored `finish` **0/10** on a
+validation — the Planner overlay says "plan the work" and one closing paragraph
+does not outweigh it. Posing it as a single question also scored 0/10. Telling
+the model to re-read what the developer actually asked for, and naming their
+verbs, scores **9/10**, with change tasks still **10/10** on `submit_plan`.
+
+- **`plan_forced`.** A plan the fence extracted, on a run that has written
+  nothing since, is not a commitment, and all three enforcement paths now say
+  so. Scoping this to the verdict alone was tried and reverted — it protected
+  change tasks (5/5) and took the field scenario to **0/5**, because the pushes
+  are what turn a validation into a migration. A "reconsider before writing"
+  message was also tried and reverted: it read as an invitation to stop and
+  took change tasks from 4/4 to 2/4.
+
+### Fixed — twenty turns of work delivered as a colon
+
+Both field runs ended by funnelling everything into one `finish` whose `answer`
+held only the sentence that introduces the findings. In the first, the
+developer's next message was "where is the assessment".
+
+- **A preamble is sent back, once.** An answer that ends on a colon, or
+  promises findings and is too short to have delivered them, is returned with
+  one instruction. Cheap to reject on purpose: re-sending the same text
+  unchanged is taken as final, so a wrong guess costs a turn rather than an
+  argument.
+- **The cap is 24,000 characters, not 6,000.** A live run delivered an answer
+  of exactly 6,000 — meaning it was cut, after the tokens were already spent.
+  Three numbers had to move together and now cannot drift apart: the constant,
+  the schema's `maxLength`, and the sentence in the tool description the model
+  actually reads.
+- **`finish` no longer echoes the answer into the transcript.** It appeared
+  twice — once as the call's arguments, once as its result — and a session that
+  reuses its context carried both into the next message, demonstrating to the
+  model that the way to respond is to repeat what it said last time. One field
+  run did exactly that.
+- **Ask mode says what "in full" means.** Letting findings accumulate as prose
+  with `finish` as a summary was on the roadmap twice as the real fix for the
+  single-string channel. Measured, it was **worse than the status quo** (3.7/6
+  against 4.0/6): told the detail was already above it, the model wrote a
+  summary of a summary. The channel was not the problem. What the text never
+  said is that the developer sees no tool calls, so anything outside `answer`
+  reaches nobody, and that the things which turned out fine still have to be
+  reported by name. That is worth **4.8/6 against 2.0/6**, in two fewer turns
+  and a fifth of the characters — an instruction to answer "in full" with no
+  account of what full means is as easily satisfied by padding as by checking.
+
+### Fixed — the panel showed files the run would never touch
+
+The `plan` event carried `{text, steps: N}` and left the panel to recover the
+rest with a regex over the rendered prose — one that matched path-shaped tokens
+anywhere in a step and only knew Go, SQL and YAML. On the field plan, whose one
+step targeted `MIGRATION_PLAN.md` and whose description mentioned two Go files
+as examples, it rendered "Files in scope: handler/response.go, helper.go" and
+never named the file being written. `_unfinished` had this same bug server-side
+and fixed it; the UI kept the old version.
+
+The event now carries the typed steps `submit_plan` already validated. Both
+parsers consume them, per-step status comes from the change set — a step is
+done when a write lands on its file, never because the model said so — and the
+footnote explaining that no field carries status now appears only against a
+runtime old enough for that to be true.
+
+### Fixed — a re-read the acting mode needed
+
+A `read_file` on a file the plan sets out to change is exempt from the coverage
+refusal while acting. `patch_file` takes an `old` that must match the bytes on
+disk, and "you have already seen those lines" is not the same as having them
+accurate enough to anchor an edit — twenty turns and a phase switch back, under
+a summariser. Coverage only; the call-count backstop is untouched.
+
+### Fixed — a compaction that threw away the analysis
+
+The recap's vocabulary was about *doing* — decisions taken, files modified,
+steps verified — and a run whose work is reading has none of those. A validation
+of fifteen files compacted at turn 10 into a list of filenames, and the three
+turns after it re-read seven of them to recover what it had already found.
+`findings` is now part of the recap, its schema and its merge.
+
 ## 0.3.4 — 2026-09-09
 
 Extension `0.3.4`, `dakcoder-agent` `0.3.4`, `dakcoder-shared` `0.3.4`,

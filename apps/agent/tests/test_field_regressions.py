@@ -31,14 +31,22 @@ from pathlib import Path
 import pytest
 
 from dakcoder_agent.context import ContextManager, Recap
-from dakcoder_agent.loop import AgentLoop, Intent
+from dakcoder_agent.loop import AgentLoop, Intent, Outcome
 from dakcoder_agent.modes import Mode
 from dakcoder_agent.tools import control
 from dakcoder_agent.tools.router import Router
 from dakcoder_shared.envelope import EventType
 from dakcoder_shared.llm import ChatResult, ToolCall, Usage
 
-from scripted import build, calls, plan_call  # noqa: E402 - shared scripted model
+from scripted import (  # noqa: E402 - shared scripted model
+    TERMINALS,
+    ScriptedClient,
+    build,
+    calls,
+    patch,
+    plan_call,
+    terminal_forces,
+)
 
 # Fixtures defined in `scripted` are re-exported here so pytest collects them.
 from scripted import gated, planning_router  # noqa: F401,E402
@@ -512,7 +520,9 @@ def test_a_repeated_finish_is_never_answered_from_the_cache(planning_router, gat
 
     Measured before the fix: 1 dispatch, 5 intercepts, 8 turns, NO_PROGRESS.
     """
-    answer = json.dumps({"answer": "I have validated the plan. Here is my assessment."})
+    # Deliberately not a preamble: `_is_preamble` would send this back too, and
+    # this test is about the cache, not the delivery.
+    answer = json.dumps({"answer": "Validated. Step 3 names a file that does not exist."})
     loop, _ = build(
         planning_router,
         [plan_call()] + [calls(("finish", answer))] * 6,
@@ -614,3 +624,390 @@ def test_a_file_outside_the_plan_is_still_refused(planning_router, gated):
     assert reads[1].data.get("intercept") == "re_read", (
         "coverage refusal was dropped for a file the plan never mentions"
     )
+
+
+# ── a fence must not turn a question into a migration ───────────────────────
+
+#: Twelve searches that each find somewhere new, so every turn genuinely
+#: informs the run and the *fence* ends the phase rather than the stall guard.
+_DISTINCT = [
+    "package domain", "package postgres", "package handler", "package request",
+    "package bootstrap", "package main", "GetAll", "GetByID", "Routes",
+    "CreateUserRequest", "FxRepo", "FirstName", "serial4", "owns SQL",
+]
+
+
+def _to_the_fence(n: int) -> list:
+    return [calls(("search_repo", json.dumps({"pattern": p}))) for p in _DISTINCT[:n]]
+
+
+def test_a_planner_at_the_fence_may_finish_instead_of_planning(planning_router, gated):
+    """The run that read a migration document and wrote a migration.
+
+    Field transcript, 2026-09-09. The developer asked the agent to *validate* a
+    plan against the codebase. Twelve turns of reading later the fence fired,
+    `_terminal_choice` named `submit_plan` alone, and `_fence_ask` said "submit
+    the plan now; this turn accepts only `submit_plan`". The model still knew
+    what it had been asked -- its next narration says so in words -- but the
+    turn had one legal move, so it wrote an eight-step migration nobody had
+    requested, and the loop then spent the rest of the session enforcing it.
+
+    The fence knows the phase has to end. It does not know whether the task was
+    work or a question. The model does, so it gets to say.
+    """
+    from dakcoder_agent.loop import MAX_RESEARCH_TURNS
+
+    answer = json.dumps({"answer": "The plan is accurate except for step 3."})
+    loop, client = build(
+        planning_router,
+        _to_the_fence(MAX_RESEARCH_TURNS) + [calls(("finish", answer))],
+        max_turns=MAX_RESEARCH_TURNS + 4,
+    )
+    events = list(loop.run("validate MIGRATION_PLAN.md against the codebase",
+                           intent=Intent.AGENT))
+
+    forced = terminal_forces(client)
+    assert forced, "the fence never ended the phase"
+    assert set(forced[0]) == TERMINALS, (
+        f"the turn that had to end the phase offered {forced[0]}"
+    )
+    # And the model took the exit that matched the task.
+    assert not loop.state.plan, "a validation produced a plan"
+    assert not loop.router.touched, "a validation changed a file"
+    assert loop.result is not None and loop.result.outcome is Outcome.DONE, (
+        loop.result.summary if loop.result else "no result"
+    )
+    said = [e.data["text"] for e in events if e.type is EventType.ASSISTANT]
+    assert any("step 3" in t for t in said), "the answer never reached the developer"
+
+
+def test_a_forced_plan_does_not_make_the_run_a_failure(planning_router, gated):
+    """The other half: when the model *does* write a plan under the fence.
+
+    The widened choice makes this rarer, not impossible -- `submit_plan` is
+    still salient to a model that has been reading code, and it happened in
+    1 live run in 10. What must not follow is the rest of the field failure:
+    a NO_PROGRESS verdict on a plan the developer never asked for.
+
+    The *pushes* still fire, deliberately. `_phase_ended` sends the first
+    `finish` back once and the fence says "write them now", and both name
+    `finish` as the way to decline -- so a question costs one turn and then
+    delivers. Excusing those too was measured and reverted: it took change
+    tasks from writing the code 7 times in 8 to once in 3. Only the verdict,
+    which has nothing after it, reads `_open_targets`.
+    """
+    from dakcoder_agent.loop import MAX_RESEARCH_TURNS
+
+    answer = json.dumps({"answer": "Validated. Steps 1-7 hold; step 8 is wrong."})
+    loop, _ = build(
+        planning_router,
+        # One search past the fence, so the turn that must end the phase carries
+        # a non-terminal call the narrowed request cannot accept. The stub then
+        # answers with the first tool it *does* offer -- `submit_plan` -- which
+        # is the field behaviour this test is about.
+        _to_the_fence(MAX_RESEARCH_TURNS + 1) + [calls(("finish", answer))] * 3,
+        max_turns=MAX_RESEARCH_TURNS + 6,
+    )
+    list(loop.run("validate the migration plan", intent=Intent.AGENT))
+
+    assert loop.state.plan, "this test is about a plan that did get written"
+    assert loop.state.plan_forced, "the plan came off a forced turn and was not marked"
+    assert not loop._open_targets(), (
+        "the verdict is still holding a question to a plan nobody asked for"
+    )
+    # Pushed once, and once only -- then believed.
+    refusals = [
+        m.content for m in loop.context.build()
+        if str(m.role) == "user" and "Not yet" in m.content
+    ]
+    assert len(refusals) <= 1, f"the answer was refused more than once: {len(refusals)}"
+    assert loop.result is not None and loop.result.outcome is not Outcome.NO_PROGRESS, (
+        loop.result.summary
+    )
+
+
+def test_a_volunteered_plan_is_still_a_commitment(planning_router, gated):
+    """The guard is scoped to forced plans, and this is the other side of it."""
+    answer = json.dumps({"answer": "Nothing to do."})
+    loop, _ = build(
+        planning_router, [plan_call()] + [calls(("finish", answer))] * 3, max_turns=10
+    )
+    list(loop.run("add the Routes method", intent=Intent.AGENT))
+
+    assert loop.state.plan and not loop.state.plan_forced
+    assert loop._open_targets() == ["handler/user.go"]
+    assert loop.result is not None and loop.result.outcome is Outcome.NO_PROGRESS, (
+        "a plan the model volunteered and abandoned is not a run that went well"
+    )
+    refusals = [
+        m.content for m in loop.context.build()
+        if str(m.role) == "user" and "Not yet" in m.content
+    ]
+    assert refusals, "a plan the model volunteered was abandoned without challenge"
+
+
+def test_a_forced_plan_stops_excusing_the_run_once_anything_is_written(
+    planning_router, gated
+):
+    """A run that has started acting on a plan is working to it, whatever
+    produced it -- and half-finished work is what these paths exist to catch."""
+    loop, _ = build(planning_router, [plan_call()], max_turns=6)
+    list(loop.run("add the Routes method", intent=Intent.AGENT))
+    loop.state.plan_forced = True
+
+    assert not loop._open_targets(), "nothing written yet, so nothing is owed"
+    loop.router.touched.append("core/domain/user.go")
+    assert loop._open_targets() == ["handler/user.go"], (
+        "the run started the work and is still answerable for finishing it"
+    )
+
+
+# ── an answer that is only its own opening line ─────────────────────────────
+
+
+def _finish(answer: str):
+    return calls(("finish", json.dumps({"answer": answer})))
+
+
+PREAMBLE = (
+    "I have validated the migration plan against the actual codebase. "
+    "Here is my assessment of each step's accuracy:"
+)
+
+
+def test_an_answer_that_is_only_its_opening_line_is_sent_back(planning_router, gated):
+    """Twenty turns of work, delivered as a colon.
+
+    Two field runs, three days apart, ended the same way: the model did the
+    reading, called `finish`, and put only the sentence that introduces the
+    findings into `answer`. The developer's next message in the first was
+    "where is the assessment". `answer` is the whole delivery -- there is no
+    prose after it the way there is in a chat -- and nothing said so.
+    """
+    full = "Step 1 is accurate. Step 2 misses that repositories take *gin.Context."
+    loop, _ = build(planning_router, [_finish(PREAMBLE), _finish(full)], max_turns=8)
+    events = list(loop.run("validate the plan", intent=Intent.ASK))
+
+    sent_back = [
+        m.content for m in loop.context.build()
+        if str(m.role) == "user" and "opening of something longer" in m.content
+    ]
+    assert len(sent_back) == 1, "the preamble was not sent back exactly once"
+    said = [e.data["text"] for e in events if e.type is EventType.ASSISTANT]
+    assert any("gin.Context" in t for t in said), "the real answer never arrived"
+    assert loop.result is not None and loop.result.outcome is Outcome.DONE
+
+
+def test_the_same_answer_sent_again_is_taken_as_final(planning_router, gated):
+    """The bounce has to be cheap to reject, or it argues with a model that is right.
+
+    A short answer that trips the detector and *is* the whole answer costs one
+    turn: the message says so, and the second identical call is honoured.
+    """
+    loop, _ = build(planning_router, [_finish(PREAMBLE), _finish(PREAMBLE)], max_turns=8)
+    events = list(loop.run("validate the plan", intent=Intent.ASK))
+
+    assert loop.state.preamble_refused == 1, "the bound is one, not a loop"
+    said = [e.data["text"] for e in events if e.type is EventType.ASSISTANT]
+    assert any(t.startswith("I have validated") for t in said), (
+        "the answer was refused twice and never reached the developer"
+    )
+    assert loop.result is not None and loop.result.outcome is Outcome.DONE
+
+
+def test_a_short_answer_from_a_run_that_wrote_something_is_not_bounced(
+    planning_router, gated
+):
+    """"Added the Routes method." is a complete answer to a completed edit."""
+    loop, _ = build(
+        planning_router,
+        [plan_call(), patch(), _finish("Here is what changed: handler/user.go.")],
+        max_turns=10,
+    )
+    list(loop.run("add the Routes method", intent=Intent.AGENT))
+    assert loop.state.preamble_refused == 0, (
+        "a run that wrote a file had its one-line report challenged"
+    )
+
+
+def _evicted_reads(count: int) -> list:
+    """A working set of ``count`` read turns, as compaction hands them over."""
+    from dakcoder_agent.context import Layer, Message, Role
+
+    out: list = []
+    for i in range(count):
+        path = f"handler/file{i:03d}.go"
+        call = ToolCall(id=f"r{i}", name="read_file", arguments=json.dumps({"path": path}))
+        out.append(Message(Role.ASSISTANT, "", Layer.WORKING_SET, tool_calls=(call,), turn=i + 1))
+        out.append(
+            Message(Role.TOOL, f"{path} (40 lines)\n" + "x" * 400, Layer.WORKING_SET,
+                    path=path, tool_call_id=f"r{i}", turn=i + 1)
+        )
+    return out
+
+
+# ── a compaction must not throw away what an answering run has found ────────
+
+
+def test_a_recap_carries_what_the_run_established_not_just_what_it_read(
+    planning_router,
+):
+    """The compaction that made a validation re-read seven files to remember it.
+
+    Field transcript, 2026-09-09: "validate MIGRATION_PLAN.md against the
+    codebase, every file". Fifteen files, several over a thousand lines, 189k
+    tokens by turn 10. The recap's vocabulary was all about *doing* -- decisions
+    taken, files modified, steps verified -- and a run whose work is reading has
+    none of those, so nine turns of analysis compacted into a list of filenames.
+    Turns 11 to 13 re-read seven of them.
+    """
+    from dakcoder_agent.loop import _RECAP_PROMPT, _RECAP_SCHEMA
+
+    assert "findings" in _RECAP_SCHEMA["json_schema"]["schema"]["properties"]
+    assert "findings" in _RECAP_PROMPT, "the summariser is never asked for them"
+
+    loop, _ = build(planning_router, [])
+
+    class Answering(ScriptedClient):
+        """A summariser that reports findings, as the schema now allows."""
+
+        def chat(self, messages, *, response_format=None, **kwargs):
+            if (response_format or {}).get("json_schema", {}).get("name") == "recap":
+                return ChatResult(
+                    content=json.dumps({
+                        "goal": "validate the migration plan",
+                        "findings": [
+                            "handler/objection.go: all 14 handlers take *gin.Context",
+                            "go.mod: gin and volatiletech/null are both still required",
+                        ],
+                    }),
+                    finish_reason="stop",
+                    usage=Usage(prompt_tokens=10),
+                )
+            return super().chat(messages, response_format=response_format, **kwargs)
+
+    loop.client = Answering([], kind="question")
+    recap = loop._summarise(_evicted_reads(4))
+
+    assert recap.findings, "the summariser reported findings and the recap dropped them"
+    assert any("gin.Context" in f for f in recap.findings)
+    # And they reach the model, which is the only reason to keep them.
+    assert "gin.Context" in recap.markdown()
+    assert "Findings" in recap.markdown()
+
+
+def test_findings_survive_a_second_compaction(planning_router):
+    """Long runs are exactly the runs that compact twice, and the merge is what
+    carried `do_not_retry` across the second one. Findings need the same."""
+    from dakcoder_agent.context import Recap
+
+    first = Recap(goal="validate", findings=("step 1 holds",))
+    second = Recap(goal="validate", findings=("step 8 is wrong",))
+
+    merged = second.merge(first)
+    assert merged.findings == ("step 1 holds", "step 8 is wrong"), merged.findings
+
+
+# ── the answer is not the tool result ───────────────────────────────────────
+
+
+def test_finish_does_not_echo_the_answer_back_into_the_transcript(planning_router):
+    """An 8k answer used to land in the transcript twice, then be carried into
+    the next message of the session as a worked example of what to say."""
+    long_answer = ("The plan is accurate. " + "Detail. " * 400).strip()
+    out = planning_router.dispatch("finish", {"answer": long_answer}, mode=Mode.ASK)
+
+    assert out.ok
+    assert out.meta["answer"] == long_answer, "the developer's copy must be whole"
+    assert len(out.content) < 200, f"the tool result still carries the answer: {len(out.content)}"
+    assert "Detail." not in out.content
+
+
+# ── the decision the run turns on, named on the wire ────────────────────────
+
+
+def test_a_classified_intent_says_so_and_says_why(planning_router, gated):
+    """Twenty turns into an unrequested migration is a late moment to learn
+    that a 64-token call decided this was work.
+
+    `_INTENT_SCHEMA` has asked for `why` since the classifier was written and
+    the reply went straight in the bin, so the one artefact that could explain
+    a misroute never existed. Both facts now ride on every `turn_start`.
+    """
+    loop, _ = build(planning_router, [calls(("finish", json.dumps({"answer": "x"})))],
+                    kind="question", max_turns=4)
+    starts = [e for e in loop.run("what does the User model hold?")
+              if e.type is EventType.TURN_START]
+
+    assert starts, "no turn was started"
+    assert starts[0].data["intent"] == "ask"
+    assert starts[0].data["intent_source"] == "classified"
+    assert starts[0].data["intent_why"] == "scripted: question", starts[0].data
+    assert loop.state.intent_why == "scripted: question"
+
+
+def test_an_intent_the_developer_gave_is_not_reported_as_a_guess(
+    planning_router, gated
+):
+    """The panel's Ask/Agent toggle is a statement, not a classification, and a
+    panel that offers "treating this as work -- switch?" must not offer it to
+    someone who just said so."""
+    loop, _ = build(planning_router, [calls(("finish", json.dumps({"answer": "x"})))],
+                    max_turns=4)
+    starts = [e for e in loop.run("tell me about the model", intent=Intent.ASK)
+              if e.type is EventType.TURN_START]
+
+    assert starts[0].data["intent_source"] == "given"
+    assert starts[0].data["intent_why"] == "", "nothing guessed, so nothing to explain"
+
+
+# ── the plan on the wire, not a count and some prose ────────────────────────
+
+
+def test_the_plan_event_carries_the_steps_it_was_given(planning_router, gated):
+    """The panel listed two files the run would never touch and hid the one it would.
+
+    `submit_plan` validates that every step names a file, an action and an
+    acceptance criterion, and `_normalise_plan` puts each path into the form the
+    change set uses. The event then threw all of that away and sent
+    `{text, steps: 1}`, leaving the panel to recover it with a regex over the
+    rendered prose -- one that matched path-shaped tokens anywhere in a step and
+    only knew Go, SQL and YAML.
+
+    On the 2026-09-09 plan, whose one step targeted `MIGRATION_PLAN.md` and
+    whose description mentioned two Go files as examples, that produced
+    "Files in scope: handler/response.go, helper.go" and no mention of the file
+    being written. `_unfinished` had this same bug server-side and fixed it; the
+    UI kept the old version (BUG EXT-19).
+    """
+    loop, _ = build(planning_router, [plan_call()], max_turns=4)
+    events = list(loop.run("add the Routes method", intent=Intent.AGENT))
+
+    plans = [e for e in events if e.type is EventType.PLAN]
+    assert plans, "no plan was announced"
+    items = plans[0].data.get("items")
+    assert items, "the plan event still carries only a count and prose"
+    assert [i["file"] for i in items] == ["handler/user.go"]
+    assert items[0]["action"] and items[0]["accepts"], items[0]
+    assert items[0]["status"] == "pending"
+    assert items[0]["index"] == 1
+    # And the count still agrees with the list, because the panel renders both.
+    assert plans[0].data["steps"] == len(items)
+
+
+def test_a_step_reports_done_from_the_change_set(planning_router, gated):
+    """The status the panel shows is derived from a write landing, never from
+    the model saying so -- which is the whole reason it is worth sending."""
+    loop, _ = build(
+        planning_router,
+        [plan_call(), patch(), calls(("finish", json.dumps({"answer": "Added it."})))],
+        max_turns=8,
+    )
+    events = list(loop.run("add the Routes method", intent=Intent.AGENT))
+
+    assert "handler/user.go" in loop.router.touched
+    assert [s.status for s in loop.state.plan] == ["done"]
+    # The last plan event the panel saw carries that status.
+    plans = [e for e in events if e.type is EventType.PLAN]
+    if len(plans) > 1:
+        assert plans[-1].data["items"][0]["status"] == "done"

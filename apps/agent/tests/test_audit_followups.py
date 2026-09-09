@@ -35,7 +35,9 @@ from dakcoder_agent.tools.router import Router
 from dakcoder_shared.envelope import EventType
 from dakcoder_shared.llm import ChatResult, ToolCall, UnsupportedParameterError, Usage
 from scripted import (  # noqa: F401 - fixtures are used by name
+    TERMINALS,
     ScriptedClient,
+    terminal_forces,
     build,
     calls,
     gated,
@@ -170,8 +172,15 @@ def test_a_failed_piece_is_announced_and_the_rest_is_still_summarised(
 def test_the_planner_fence_asks_only_for_what_it_forces(
     planning_router: Router, gated, written
 ) -> None:
-    """The Planner was told "submit the plan now, or ask the developer" on a
-    turn whose `tool_choice` named `submit_plan` alone."""
+    """The fence text and the fence request have to describe the same turn.
+
+    The Planner was once told "submit the plan now, or ask the developer" on a
+    turn whose `tool_choice` named `submit_plan` alone, so half the instruction
+    was a move the request forbade. Naming one call was itself the deeper bug:
+    a run twelve turns into validating a document had exactly one legal move
+    and wrote an eight-step migration nobody asked for (BUG L-28). Now the turn
+    offers the three terminals and the text names the same three.
+    """
     # Each search finds a different place, so every turn genuinely informs the
     # run and the fence -- not the stall guard -- is what ends the phase.
     found = [
@@ -193,9 +202,16 @@ def test_the_planner_fence_asks_only_for_what_it_forces(
         if m.source == "user" and "turns calling tools in this phase" in m.content
     ]
     assert fence, "the research fence never fired"
-    assert "submit_plan" in fence[0]
-    assert "ask the developer" not in fence[0]
-    assert {"type": "function", "function": {"name": "submit_plan"}} in client.tool_choices
+    # Every call the text names is one the turn accepts, and vice versa.
+    named = {name for name in TERMINALS if f"`{name}`" in fence[0]}
+    assert named == TERMINALS, f"the fence text names {named}"
+    assert "ask the developer" not in fence[0], "prose where a tool name belongs"
+
+    forced = terminal_forces(client)
+    assert forced, "the fence did not constrain the turn to ending the phase"
+    assert set(forced[0]) == TERMINALS, (
+        f"the text offers three ways to end the phase and the request offers {forced[0]}"
+    )
 
 
 # ── an empty range is a refusal, not a one-line success ─────────────────────
@@ -392,7 +408,7 @@ def test_an_empty_search_does_not_count_as_progress(planning_router: Router) -> 
     ]
     loop, client = build(planning_router, empties, kind="question", max_turns=8)
     list(loop.run("where is NoSuchSymbol used", intent=Intent.ASK))
-    assert any(isinstance(c, dict) for c in client.tool_choices), (
+    assert terminal_forces(client), (
         "the empty searches were counted as progress, so the run was never made to answer"
     )
 
@@ -584,8 +600,14 @@ def test_a_finish_answer_is_capped_and_says_so(planning_router: Router) -> None:
         "finish", {"answer": "y" * (MAX_ANSWER_CHARS + 500)}, mode=Mode.ASK
     )
     assert out.ok
-    assert "answer cut at" in out.content
     assert out.meta["answer_cut"] == 500
+    # The developer's copy carries the notice; `meta["answer"]` is what
+    # `_phase_ended` emits and what they read.
+    assert "answer cut at" in out.meta["answer"]
+    # The tool result is one line -- echoing the answer put it in the transcript
+    # twice -- but it still tells the model the tail was lost, which is the part
+    # it can act on.
+    assert "were cut" in out.content and len(out.content) < 200, out.content
 
 
 def test_a_cut_off_write_names_the_file_and_what_has_landed(

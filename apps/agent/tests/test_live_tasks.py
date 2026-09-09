@@ -31,7 +31,17 @@ from pathlib import Path
 import pytest
 
 from dakcoder_agent.context import ContextManager
-from dakcoder_agent.loop import AgentLoop, Intent, Outcome
+import json
+from unittest import mock
+
+from dakcoder_agent import loop as loop_module
+from dakcoder_agent.loop import (
+    MAX_PREAMBLE_REFUSALS,
+    AgentLoop,
+    Intent,
+    Outcome,
+    _is_preamble as is_preamble,
+)
 from dakcoder_agent.modes import Mode
 from dakcoder_agent.prompts import system_prompt
 from dakcoder_agent.tools import commands, control, fs, knowledge
@@ -185,3 +195,156 @@ def test_a_run_never_claims_a_write_it_did_not_make(client, workspace) -> None:
     for step in loop.state.plan:
         if step.status == "done":
             assert step.file in touched, f"{step.file} is done but was never written"
+
+
+# ── the field failure, end to end ───────────────────────────────────────────
+
+#: A plan document and a service that plainly does not match it. Small on
+#: purpose: the field run met 1,800-line handlers and spent its whole budget
+#: reading them, and what is being tested here is the *decision* at the end of
+#: the reading, not how long the reading takes.
+_PLAN_DOC = """# Migration plan
+
+1. Swap every api-* import for its n-api-* equivalent, and drop gin.
+2. Delete routes/routes.go; each handler declares its own routes.
+3. Handlers take (sctx *route.Context, req T) and return (*resp.R, error).
+4. Repositories take context.Context, not *gin.Context.
+"""
+
+_LEGACY = {
+    "MIGRATION_PLAN.md": _PLAN_DOC,
+    "routes/routes.go": (
+        "package routes" + chr(10) * 2
+        + "func Routes(r *gin.Engine, h *handler.UserHandler) {" + chr(10)
+        + chr(9) + "r.GET(" + chr(34) + "/users" + chr(34) + ", h.List)" + chr(10)
+        + "}" + chr(10)
+    ),
+    "handler/objection.go": (
+        "package handler" + chr(10) * 2
+        + "func (h *ObjectionHandler) Create(ctx *gin.Context) {}" + chr(10) * 2
+        + "func (h *ObjectionHandler) List(ctx *gin.Context) {}" + chr(10)
+    ),
+}
+
+
+@pytest.fixture
+def legacy(workspace: Workspace) -> Workspace:
+    for rel, body in _LEGACY.items():
+        path = workspace.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8", newline="")
+    return workspace
+
+
+def _drive(client, workspace, task, intent, *, fence: int | None = None):
+    """Run one task, returning the events that say what the developer got.
+
+    ``fence`` lowers `MAX_RESEARCH_TURNS` for the run. The fixture is nine
+    files; the field service was fifteen with 1,800-line handlers, and what is
+    under test is the *decision at the fence*, not how many turns of reading it
+    takes to get there. Lowering it puts the real model in front of the real
+    fence with the real prompts, which is the integration that matters.
+    """
+    handlers = {**fs.HANDLERS, **knowledge.HANDLERS, **commands.HANDLERS, **control.HANDLERS}
+    router = Router(workspace, handlers)
+    context = ContextManager(mode=Mode.ASK, system_prompt=system_prompt())
+    loop = AgentLoop(context, client, router, approve=lambda _r: True, max_turns=MAX_TURNS)
+
+    said: list[str] = []
+    finishes: list[str] = []
+    with mock.patch.object(loop_module, "MAX_RESEARCH_TURNS", fence or loop_module.MAX_RESEARCH_TURNS):
+        for event in loop.run(task, intent=intent):
+            if event.type is EventType.ASSISTANT:
+                said.append(str(event.data.get("text", "")))
+            elif event.type is EventType.TOOL_CALL and event.data.get("name") == "finish":
+                args = event.data.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = {}
+                finishes.append(str((args or {}).get("answer", "")))
+    return {"loop": loop, "said": said, "finishes": finishes, "result": loop.result}
+
+
+#: Trials per behavioural claim below. These assert a *rate*, not an outcome:
+#: the runs vary, the fence decision is a model decision, and a single-sample
+#: assertion on one would be a coin flip dressed as a test. Same reasoning as
+#: `test_live_endpoint.SAMPLES`.
+FENCE_TRIALS = int(os.environ.get("DAKCODER_FENCE_TRIALS", "3"))
+
+
+def test_a_validation_routed_as_work_is_not_turned_into_one(client, legacy):
+    """The 2026-09-09 field failure, against the live endpoint.
+
+    The developer asked the agent to *validate* a migration plan. The run was
+    routed to the Planner -- the classifier reads "migration" as work, and the
+    panel toggle can say so outright -- read to the research fence, and was
+    offered exactly one legal move: `submit_plan`. So it wrote an eight-step
+    migration nobody asked for, and every enforcement path downstream held it
+    to that plan. Both field runs ended the same way: no answer, and in one of
+    them the agent phase began executing the migration.
+
+    `Intent.AGENT` is passed deliberately. Fixing the classifier is worth doing
+    and is not what this asserts: the run has to survive being routed wrongly.
+
+    What is measured is what the developer gets. The fence is lowered because
+    the fixture is nine files and the field service was fifteen with 1,800-line
+    handlers; the decision at the fence is the subject, not the reading.
+
+    Measured 2026-09-09, 15 runs: 11 delivered a real answer and changed
+    nothing, against a field baseline of 0 for 2. The residual is the misroute
+    itself. Nothing pushes a forced plan any more, but nothing stops a model
+    that decides to work it either -- the acting overlay says "make the edit"
+    -- and that is the classifier's to prevent, not this guard's.
+    """
+    task = "read MIGRATION_PLAN.md and validate it against the codebase. every file"
+    good, notes = 0, []
+    for _ in range(FENCE_TRIALS):
+        out = _drive(client, legacy, task, Intent.AGENT, fence=4)
+        loop, result = out["loop"], out["result"]
+        delivered = out["finishes"][-1] if out["finishes"] else ""
+        clean = (
+            not loop.router.touched
+            and result.outcome is not Outcome.NO_PROGRESS
+            and len(delivered) > 500
+            and not is_preamble(delivered)
+        )
+        good += clean
+        notes.append(
+            f"{result.outcome}/{result.turns}t/{len(loop.router.touched)}f/"
+            f"{len(delivered)}ch"
+        )
+        # Whatever it decided, a forced plan must never be enforced against a
+        # run that wrote nothing. That part is deterministic.
+        if loop.state.plan_forced and not loop.router.touched:
+            assert not loop._open_targets(), f"a forced plan is being enforced: {notes}"
+
+    assert good > FENCE_TRIALS // 2, (
+        f"only {good}/{FENCE_TRIALS} runs delivered an answer without doing "
+        f"unrequested work: {notes}"
+    )
+
+
+def test_a_change_task_at_the_fence_still_writes_the_code(client, legacy):
+    """The control, and it is the one that must not regress.
+
+    Two interventions aimed at the validation case were tried here and both
+    were reverted on this measurement. Asking the model to reconsider before
+    its first write took change tasks from 4/4 to 2/4. Narrowing `plan_forced`
+    to the verdict alone protected change (5/5) and took validation to 0/5.
+
+    Measured 2026-09-09, 17 runs of the shipped configuration: 14 wrote the
+    code, including a clean 6/6.
+    """
+    task = "add a LastName string field to the User domain model and to CreateUserRequest"
+    wrote, notes = 0, []
+    for _ in range(FENCE_TRIALS):
+        out = _drive(client, legacy, task, Intent.AGENT, fence=4)
+        loop = out["loop"]
+        wrote += bool(loop.router.touched)
+        notes.append(f"{out['result'].outcome}/{sorted(loop.router.touched)}")
+
+    assert wrote > FENCE_TRIALS // 2, (
+        f"only {wrote}/{FENCE_TRIALS} change tasks wrote anything: {notes}"
+    )

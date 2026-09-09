@@ -53,6 +53,7 @@ from dakcoder_shared.paths import Workspace
 
 from scripted import (  # noqa: E402 - the shared scripted model
     PLAN,
+    terminal_forces,
     ScriptedClient,
     build,
     calls,
@@ -463,8 +464,10 @@ def test_a_repeat_loop_is_broken_before_it_can_end_the_session(
         f"the run reached {loop.state.stalled_turns} stalled turns; it should have "
         "been made to answer at " + str(STALLS_BEFORE_ANSWER)
     )
-    assert any(isinstance(c, dict) for c in client.tool_choices), (
-        "the stalled turn was not forced to call `finish`"
+    forced = terminal_forces(client)
+    assert forced, "the stalled turn was not constrained to a call that ends the phase"
+    assert set(forced[0]) == {"finish"}, (
+        f"an ASK turn that must stop was offered {forced[0]}; `finish` is its only exit"
     )
     # And it cost a handful of turns, not the whole budget.
     assert loop.result.turns <= STALLS_BEFORE_ANSWER + 3, loop.result.turns
@@ -598,9 +601,11 @@ def test_a_phase_that_never_stops_researching_is_made_to_finish(
     )
     list(loop.run("migrate this service to the template", intent=Intent.AGENT))
 
-    forced = [c for c in client.tool_choices if isinstance(c, dict)]
+    forced = terminal_forces(client)
     assert forced, "a phase called tools forever and was never made to finish"
-    assert forced[0]["function"]["name"] == "submit_plan"
+    # All three, not `submit_plan` alone. The fence knows the phase must end; it
+    # does not know whether the task was work or a question, and the model does.
+    assert set(forced[0]) == {"submit_plan", "ask_developer", "finish"}, forced[0]
     assert loop.state.research_turns <= MAX_RESEARCH_TURNS + 1, loop.state.research_turns
 
 
@@ -707,9 +712,9 @@ def test_a_stalled_turn_is_followed_by_one_forced_to_call_finish(
     )
     list(loop.run("where are the routes", intent=Intent.ASK))
 
-    forced = [c for c in client.tool_choices if isinstance(c, dict)]
+    forced = terminal_forces(client)
     assert forced, "the run was never made to answer"
-    assert forced[0]["function"]["name"] == "finish"
+    assert set(forced[0]) == {"finish"}, forced[0]
     assert loop.result.outcome == Outcome.DONE
 
 

@@ -484,8 +484,8 @@
         "properties": {
           "answer": {
             "type": "string",
-            "description": "What you found or did. This is what they read; keep it under about 900 words.",
-            "maxLength": 6000
+            "description": "What you found or did, in full -- the developer reads this and nothing after it. A sentence for a finished edit, the findings for a review.",
+            "maxLength": 24000
           },
           "blocked": {
             "type": "string",
