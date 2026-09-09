@@ -38,6 +38,11 @@ from dakcoder_agent.tools.router import Router
 from dakcoder_shared.envelope import EventType
 from dakcoder_shared.llm import ChatResult, ToolCall, Usage
 
+from scripted import build, calls, plan_call  # noqa: E402 - shared scripted model
+
+# Fixtures defined in `scripted` are re-exported here so pytest collects them.
+from scripted import gated, planning_router  # noqa: F401,E402
+
 
 def say(text: str) -> ChatResult:
     return ChatResult(content=text, finish_reason="stop", usage=Usage(prompt_tokens=100))
@@ -486,3 +491,126 @@ def test_a_search_that_returns_nothing_new_says_so_and_is_eventually_withdrawn(r
 
 
 # ── a compound request is work, and a conjoined noun phrase is not ──────────
+
+
+# ── a refused `finish` was cached, so its retry never dispatched ────────────
+
+
+def test_a_repeated_finish_is_never_answered_from_the_cache(planning_router, gated):
+    """The run that read a plan, planned an edit, and made none.
+
+    Field transcript, 2026-09-09. The developer asked for four additions to a
+    migration document. The Planner produced a one-step plan naming the file;
+    the acting mode called `finish` without writing it; `_phase_ended` sent it
+    back once, correctly. Then the model called `finish` again with the same
+    answer -- which is exactly what the refusal asked it to do if it disagreed
+    -- and `_intercept` answered it from the cache the first dispatch had
+    written. It never reached `_phase_ended`, so `finish_refused` stayed at 1
+    against a MAX_FINISH_REFUSALS of 1 and the escape was unreachable. Four
+    turns of "that is the current answer. Use it and move to the next step"
+    replied to a model whose next step was the exit it was being denied.
+
+    Measured before the fix: 1 dispatch, 5 intercepts, 8 turns, NO_PROGRESS.
+    """
+    answer = json.dumps({"answer": "I have validated the plan. Here is my assessment."})
+    loop, _ = build(
+        planning_router,
+        [plan_call()] + [calls(("finish", answer))] * 6,
+        max_turns=10,
+    )
+    events = list(loop.run("update the doc"))
+
+    finishes = [
+        e for e in events
+        if e.type is EventType.TOOL_RESULT and e.data.get("name") == "finish"
+    ]
+    assert finishes, "the run never called finish"
+    assert not any(e.data.get("intercept") for e in finishes), (
+        "a phase-ending call was answered from a ledger instead of dispatched"
+    )
+    # The bound in `_phase_ended` is what ends this, and it can only do that if
+    # every retry reaches it. Two dispatches: the one that is refused and the
+    # one that is honoured.
+    assert len(finishes) == 2, f"expected refuse-then-honour, got {len(finishes)}"
+    assert loop.result is not None and loop.result.turns < 5, (
+        "the run did not stop promptly once the model asked to"
+    )
+
+
+def test_a_terminal_call_leaves_no_cache_entry(planning_router, gated):
+    """Belt and braces for the above: nothing writes the entry in the first place."""
+    answer = json.dumps({"answer": "Done."})
+    loop, _ = build(planning_router, [plan_call(), calls(("finish", answer))], max_turns=6)
+    list(loop.run("update the doc"))
+    assert not loop.state.last_results, (
+        "a terminal call was cached; the next ledger added here would deadlock again"
+    )
+
+
+# ── an edit needs anchor text, whatever the coverage ledger believes ────────
+
+
+def _read(path: str, **span) -> ChatResult:
+    return calls(("read_file", json.dumps({"path": path, **span})))
+
+
+def test_the_acting_mode_may_re_read_a_file_it_was_sent_to_change(planning_router, gated):
+    """Same transcript, the half that stopped the edit from being written.
+
+    `patch_file` takes an `old` that must match the bytes on disk, so the model
+    said what it needed and why -- "let me check the end of the file to find the
+    right anchor" -- and `_re_reading` refused it because those lines were
+    technically still in context, twenty turns and a phase switch back. Four
+    refusals across the planning and acting phases; nothing was ever written.
+
+    The narrower span is the point: it is a *different* call from the whole-file
+    read, so the exact-repeat cache never sees it and only the coverage ledger
+    can answer. That ledger returns no file content at all -- which is what
+    leaves a model with nothing to anchor a patch on. The repeat cache is not
+    part of this: it replays the text, so a model that asks twice still gets it.
+
+    Coverage refusal only. The call-count backstop is untouched, which is what
+    keeps this from buying unbounded turns.
+    """
+    loop, _ = build(
+        planning_router,
+        [_read("handler/user.go"), plan_call(), _read("handler/user.go", start=1, end=3)],
+        max_turns=8,
+    )
+    events = list(loop.run("add the Routes method"))
+
+    reads = [
+        e for e in events
+        if e.type is EventType.TOOL_RESULT and e.data.get("name") == "read_file"
+    ]
+    assert len(reads) == 2, f"the script did not get its two reads: {len(reads)}"
+    # The first is ASK, before a plan exists. The second is the acting mode
+    # asking for an anchor inside a file the plan sent it to change.
+    assert not reads[1].data.get("intercept"), (
+        "the acting mode was refused a re-read of a file the plan sent it to change"
+    )
+
+
+def test_a_file_outside_the_plan_is_still_refused(planning_router, gated):
+    """The exemption is scoped to plan targets, and this is the other side of it.
+
+    Identical shape to the test above, pointed at a file no step names. The
+    coverage ledger must still answer it, or the fix has simply deleted the
+    protection rather than narrowing it.
+    """
+    other = "bootstrap/bootstrapper.go"
+    loop, _ = build(
+        planning_router,
+        [_read(other), plan_call(), _read(other, start=1, end=1)],
+        max_turns=8,
+    )
+    events = list(loop.run("add the Routes method"))
+
+    reads = [
+        e for e in events
+        if e.type is EventType.TOOL_RESULT and e.data.get("name") == "read_file"
+    ]
+    assert len(reads) == 2, f"the script did not get its two reads: {len(reads)}"
+    assert reads[1].data.get("intercept") == "re_read", (
+        "coverage refusal was dropped for a file the plan never mentions"
+    )

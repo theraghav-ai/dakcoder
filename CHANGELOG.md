@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.3.4 — 2026-09-09
+
+Extension `0.3.4`, `dakcoder-agent` `0.3.4`, `dakcoder-shared` `0.3.4`,
+`dakcoder-gateway` `0.3.4`. Runtime API unchanged at **1.1**.
+
+**No deploy order.** Nothing on the wire changed and the gateway is untouched;
+a 0.3.3 gateway serves a 0.3.4 runtime and the reverse.
+
+One field run, two causes. The developer asked for four additions to a
+migration document. The run read the plan, planned the edit, and wrote
+nothing — twenty-five turns, ending `no_progress`.
+
+### Fixed — a phase-ending call is never answered from a ledger
+
+`_intercept` ran ahead of the terminal check and its `continue` skipped it, so
+`finish` was cached like a search result. That only mattered on the one path
+where a `finish` is *sent back*: `_phase_ended` refuses a `finish` that left
+plan targets unwritten, once, and asks the model to call it again if it
+disagrees. The retry it asked for was answered from the cache and never
+reached the check that would have let it through, so `finish_refused` stuck at
+1 against a `MAX_FINISH_REFUSALS` of 1 and the escape was unreachable.
+
+What the model read, having asked to stop: *"that is the current answer. The
+call ran earlier, nothing in the workspace has changed since... Use it and
+move to the next step."* There was no next step. It called `finish` again.
+Four more times, until the turn budget ran out.
+
+- `_intercept` returns `None` for anything in `_TERMINAL`. A repeated terminal
+  call is a signal — the model is trying to stop — and the bounded refusals in
+  `_phase_ended` are what answer it.
+- Terminal results are no longer written to `last_results` at all. Belt and
+  braces, but the entry that deadlocked the run is one no ledger should be
+  able to find again.
+
+Measured on the repro: 1 dispatch and 5 intercepts across 8 turns, before;
+2 dispatches across 3 turns, after.
+
+### Fixed — an edit needs anchor text, whatever the coverage ledger believes
+
+The same run, the half that stopped the edit being written. `patch_file` takes
+an `old` that must match the bytes on disk, and the model said what it needed
+and why — *"let me check the end of the file to find the right anchor"*.
+`_re_reading` refused it, because those lines were technically still in
+context twenty turns and a phase switch back, and returned no file content at
+all. Four refusals across the planning and acting phases.
+
+A read of a file the plan sets out to change is now exempt from the coverage
+refusal while in `AGENT` mode. Coverage only: the call-count backstop is
+untouched, so this buys the acting mode at least `MIN_READS` looks at a file
+it is supposed to edit rather than unbounded turns. A file no step names is
+still refused exactly as before.
+
+The exact-repeat cache is deliberately not part of this — it replays the file
+text, so a model that asks twice still gets what it came for.
+
 ## 0.3.3 — 2026-09-04
 
 Extension `0.3.3`, `dakcoder-agent` `0.3.3`, `dakcoder-shared` `0.3.3`,

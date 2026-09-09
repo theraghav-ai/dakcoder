@@ -1844,7 +1844,11 @@ class AgentLoop:
                 self.state.dependencies_changed = True
 
             self.state.seen_calls[fingerprint] = self.state.seen_calls.get(fingerprint, 0) + 1
-            if not refused_by_mode:
+            # Terminal calls are never cached. `_intercept` already declines to
+            # answer them from a ledger, so this is belt and braces -- but the
+            # entry it used to write is the one that deadlocked the run, and a
+            # cache nothing reads is a trap for the next ledger added here.
+            if not refused_by_mode and call.name not in _TERMINAL:
                 whole = outcome.for_model()
                 self.state.last_results[fingerprint] = whole[:CACHED_RESULT_CHARS]
                 # Remembered, so the replay can say so. A cache cut at 6,000
@@ -2071,6 +2075,22 @@ class AgentLoop:
         is what the old detector did on a third read of a file that was not
         there, one turn after being told correctly what to do instead.
         """
+        # A phase-ending call is a state transition, not a question, and all
+        # three ledgers below answer questions. `finish` dispatched once and
+        # sent back by `_phase_ended` -- "your plan set out to write this file
+        # and it has not been written" -- was cached like any other result, so
+        # the retry that refusal asks for was answered from the cache and never
+        # reached the check that would let it through. `MAX_FINISH_REFUSALS` is
+        # one, `finish_refused` therefore stuck at one forever, and the run
+        # spent its whole budget replaying "that is the current answer. Use it
+        # and move to the next step" at a model whose next step was the exit it
+        # kept being denied. Six turns of it, then NO_PROGRESS (BUG L-26).
+        #
+        # A repeated terminal call is a *signal* -- the model is trying to stop
+        # -- and the bounded refusals in `_phase_ended` are what answer it.
+        if call.name in _TERMINAL:
+            return None
+
         # A known dead end. The tool itself declared this exact call unable to
         # succeed, so asking again cannot change the answer.
         if reason := self.state.dead_ends.get(fingerprint):
@@ -2762,6 +2782,23 @@ class AgentLoop:
             if s.file and s.open and s.file not in touched
         ]
 
+    def _is_plan_target(self, path: str) -> bool:
+        """Whether ``path`` is a file the current plan sets out to change.
+
+        Compared against the normalised step paths, which is the same form
+        ``router.touched`` uses -- `_normalise_plan` put them there so that a
+        dot-slash prefix and a Windows separator stop making three names out of
+        one file. The read arrives already confined and workspace-relative for
+        the same reason, so both sides of this are POSIX and relative.
+
+        Status is not consulted. A step already `done` had its read ledger
+        cleared by the mutation that finished it, so the question does not
+        arise; a step `skipped` is one the model may still be reading to
+        justify skipping. What matters is only that the run was sent here to
+        change this file.
+        """
+        return any(step.file == path for step in self.state.plan)
+
     def _retrieval_overlap(self, call: ToolCall, outcome: ToolResult) -> str:
         """What to tell a run that keeps asking the corpus the same thing.
 
@@ -3052,12 +3089,27 @@ class AgentLoop:
             return ""
         ledger = self._live_reads(path, recorded)
 
+        # A file the plan sets out to change is one the acting mode has to
+        # quote back **exactly**: `patch_file` takes an `old` that must match
+        # the bytes on disk, and "you have already seen those lines" is not the
+        # same thing as having them accurate enough to anchor an edit -- twenty
+        # turns and a phase switch back, under a summariser, past a mode
+        # instruction. The refusal landed at precisely the moment the model
+        # said what it needed it for ("let me check the end of the file to find
+        # the right anchor") and gave it nothing, so it never wrote the file
+        # and reached for `finish` instead (BUG L-27).
+        #
+        # Coverage only. The call-count backstop below still applies, so this
+        # buys the acting mode at least MIN_READS looks at a file it is
+        # supposed to edit, not unbounded turns.
+        anchoring = self.state.mode is Mode.AGENT and self._is_plan_target(path)
+
         start, end = _as_line(parsed.get("start")), _as_line(parsed.get("end"))
         if start is None and end is None:
             # A whole-file read. Only redundant once the whole file has been
             # delivered, which `covers` can answer exactly when the length is
             # known and cannot when it is not.
-            if ledger.lines and ledger.covers(1, ledger.lines):
+            if not anchoring and ledger.lines and ledger.covers(1, ledger.lines):
                 return (
                     f"You have already read all {ledger.lines:,} lines of this file this "
                     "run, and every one of those reads is still in context above.\n\n"
@@ -3075,7 +3127,7 @@ class AgentLoop:
             # coverage; dispatch it.
             return ""
         high = end or (ledger.lines or low)
-        if ledger.covers(low, high):
+        if not anchoring and ledger.covers(low, high):
             return (
                 f"Lines {low}-{high} of this file are already in context above, from "
                 f"{ledger.summary()}.\n\n"
