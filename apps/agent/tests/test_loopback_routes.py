@@ -443,3 +443,193 @@ async def test_a_follow_up_with_no_mode_carries_on_where_the_conversation_is(
     assert "Plan first" not in overlays[-1], (
         "a bare follow-up re-entered the Planner instead of carrying on"
     )
+
+
+# ── the agenda: work proposed but not yet done ──────────────────────────────
+
+
+async def test_the_agenda_starts_empty(client: httpx.AsyncClient, scripted: Loopback) -> None:
+    response = await client.get("/v1/agenda")
+    assert response.status_code == 200
+    assert response.json() == {"tasks": [], "state": "open"}
+
+
+async def test_work_can_be_proposed_and_read_back(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """The gap this closes: a run that notices a fourth N+1 while fixing three
+    had two options, do it or say it in prose that scrolls away."""
+    posted = await client.post(
+        "/v1/agenda",
+        json={
+            "title": "audit the other handlers for the same N+1",
+            "why": "handler/objection.go:412 does what handler/pension.go:88 just stopped doing",
+            "paths": ["handler/objection.go"],
+            "priority": 2,
+        },
+    )
+    assert posted.status_code == 200, posted.text
+    task = posted.json()
+    assert task["state"] == "proposed"
+
+    listed = await client.get("/v1/agenda")
+    assert [t["id"] for t in listed.json()["tasks"]] == [task["id"]]
+
+
+async def test_a_proposal_needs_a_title(client: httpx.AsyncClient, scripted: Loopback) -> None:
+    response = await client.post("/v1/agenda", json={"why": "no title"})
+    assert response.status_code == 400
+
+
+async def test_the_same_work_is_refused_twice(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    await client.post("/v1/agenda", json={"title": "split the god handler"})
+    again = await client.post("/v1/agenda", json={"title": "Split The God Handler"})
+    assert again.status_code == 409
+
+
+async def test_a_person_approves_or_drops_it(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """The state is moved by a person. That is the whole reason the agenda is
+    separate from the plan, whose statuses are derived from the change set."""
+    task = (await client.post("/v1/agenda", json={"title": "split the god handler"})).json()
+
+    approved = await client.post(
+        f"/v1/agenda/{task['id']}", json={"state": "approved", "by": "dev", "note": "next sprint"}
+    )
+    assert approved.status_code == 200
+    assert approved.json()["state"] == "approved"
+    assert approved.json()["decided_by"] == "dev"
+
+    dropped = await client.post(f"/v1/agenda/{task['id']}", json={"state": "dropped"})
+    assert dropped.json()["state"] == "dropped"
+    assert (await client.get("/v1/agenda")).json()["tasks"] == []
+
+
+async def test_an_unknown_state_is_refused(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    task = (await client.post("/v1/agenda", json={"title": "x"})).json()
+    response = await client.post(f"/v1/agenda/{task['id']}", json={"state": "running"})
+    assert response.status_code == 400
+
+
+async def test_moving_a_task_that_is_not_there_is_a_404(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    response = await client.post("/v1/agenda/nope", json={"state": "approved"})
+    assert response.status_code == 404
+
+
+async def test_the_agenda_needs_a_token(scripted: Loopback) -> None:
+    from dakcoder_agent.loopback import create_app
+
+    transport = httpx.ASGITransport(app=create_app(scripted))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as anon:
+        assert (await anon.get("/v1/agenda")).status_code == 401
+
+
+# ── the plan, after the process that made it is gone ────────────────────────
+
+
+async def test_a_session_with_no_plan_says_so(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    session = await start(client)
+    await settle(session["id"], scripted)
+    response = await client.get(f"/v1/sessions/{session['id']}/plan")
+    assert response.status_code in (200, 404)
+
+
+async def test_the_plan_route_reads_from_disk(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """From disk rather than from the live loop, so it answers after a restart
+    and for a session this daemon has never run -- which is most of them."""
+    from dakcoder_agent.plan import PlanRecord
+    from dakcoder_agent.tools.control import PlanStep
+
+    session = await start(client)
+    await settle(session["id"], scripted)
+    PlanRecord(session_id=session["id"]).record(
+        (PlanStep("handler/pension.go", "add it", "it builds"),), "migrate pensions"
+    ).save(scripted.workspace)
+
+    response = await client.get(f"/v1/sessions/{session['id']}/plan")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["summary"] == "migrate pensions"
+    assert [s["file"] for s in body["steps"]] == ["handler/pension.go"]
+    assert len(body["revisions"]) == 1
+
+
+# ── compacting on demand ────────────────────────────────────────────────────
+
+
+async def test_the_compact_command_finally_has_something_behind_it(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """The extension has had a `dakcoder.compactContext` command with no route,
+    so the command could not do what its name says."""
+    session = await start(client)
+    await settle(session["id"], scripted)
+
+    response = await client.post(f"/v1/sessions/{session['id']}/compact")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["strategy"] == "basic"
+    assert body["after"] <= body["before"]
+
+
+async def test_compacting_an_unknown_session_is_a_404(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    assert (await client.post("/v1/sessions/nope/compact")).status_code == 404
+
+
+# ── the canonical transcript, end to end ────────────────────────────────────
+
+
+async def test_a_run_leaves_a_canonical_transcript_on_disk(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    """The record `events.jsonl` was never quite: the conversation the model was
+    actually having, with tool results whole."""
+    session = await start(client)
+    await settle(session["id"], scripted)
+
+    from dakcoder_agent.journal import Journal
+
+    records = Journal(scripted.workspace, session["id"]).read_records()
+
+    assert records, "the run wrote no canonical transcript"
+    assert {r["role"] for r in records} & {"assistant", "tool"}
+    assert all("seq" in r for r in records)
+    assert [r["seq"] for r in records] == sorted(r["seq"] for r in records)
+
+
+async def test_the_two_views_are_both_available_and_different(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    session = await start(client)
+    await settle(session["id"], scripted)
+
+    canonical = await client.get(f"/v1/sessions/{session['id']}/transcript?view=canonical")
+    model = await client.get(f"/v1/sessions/{session['id']}/transcript?view=model")
+
+    assert canonical.status_code == 200, canonical.text
+    assert model.status_code == 200, model.text
+    # The projection carries the pinned head; the record does not, because the
+    # head is derived rather than something that happened.
+    assert any(m["role"] == "system" for m in model.json()["messages"])
+    assert all(r["role"] != "system" for r in canonical.json()["messages"])
+
+
+async def test_the_transcript_route_needs_a_session(
+    client: httpx.AsyncClient, scripted: Loopback
+) -> None:
+    assert (await client.get("/v1/sessions/nope/transcript")).status_code == 404

@@ -6,7 +6,7 @@ have" — and the word meant "appended to a list in this process". A daemon
 restart, which a VS Code reload causes, took every transcript with it, and with
 them the mutation list `revert` reads (BUG L-7, DOC-1).
 
-Two files per session, under `.dakcoder/sessions/<id>/`:
+Four files per session, under `.dakcoder/sessions/<id>/`:
 
 * `events.jsonl` — one JSON object per stored event, append-only, in id order.
   Transient events are not in it for the same reason they are not in the
@@ -14,6 +14,15 @@ Two files per session, under `.dakcoder/sessions/<id>/`:
 * `session.json` — the summary a list view needs (task, status, timing, the
   mutation list). Rewritten whenever it changes, which is a handful of times per
   run.
+* `transcript.jsonl` — the canonical conversation (`transcript.py`), one record
+  per line, append-only, tool results **whole**. `events.jsonl` is what the
+  panel replays; this is what the model was actually talking to, and the two are
+  different things. Written incrementally, because the list only ever grows.
+* `compaction.json` — the compaction sidecar (`compaction.py`): the recap, how
+  many leading records it stands in for, and a hash of exactly those records.
+  This is the file that makes a restart restore *the context the run was using*
+  rather than a differently-derived approximation of it. Rewritten on each
+  compaction, which is a handful of times in a long run.
 
 Three properties this is written for, in order:
 
@@ -36,7 +45,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from .undo import ensure_private, session_dir
 
@@ -56,6 +65,8 @@ class Journal:
         self.root = session_dir(workspace, session_id)
         self._events = self.root / "events.jsonl"
         self._meta = self.root / "session.json"
+        self._records = self.root / "transcript.jsonl"
+        self._compaction = self.root / "compaction.json"
         self._buffer: list[str] = []
         #: Set once a write has failed. Retrying every event on a read-only
         #: checkout would put an exception in the hot path a few times a second.
@@ -123,6 +134,86 @@ class Journal:
         except OSError:
             return []
         return out
+
+    # -- the canonical transcript ------------------------------------------
+
+    def append_records(self, records: Sequence[dict[str, Any]]) -> None:
+        """Append canonical records. Best-effort, like everything else here.
+
+        Not buffered, unlike events: the caller already batches this at a turn
+        boundary, and a record is the thing a restart needs most.
+        """
+        if self._broken or not records:
+            return
+        try:
+            ensure_private(self.root.parents[2])
+            self.root.mkdir(parents=True, exist_ok=True)
+            with self._records.open("a", encoding="utf-8") as fh:
+                for record in records:
+                    fh.write(json.dumps(record, separators=(",", ":"), default=str) + "\n")
+        except OSError:
+            self._broken = True
+
+    def read_records(self) -> list[dict[str, Any]]:
+        """Every canonical record, in order. A truncated last line is dropped."""
+        out: list[dict[str, Any]] = []
+        try:
+            with self._records.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(parsed, dict):
+                        out.append(parsed)
+        except OSError:
+            return []
+        return out
+
+    def records_on_disk(self) -> int:
+        """How many records have been written, without reading them all back."""
+        count = 0
+        try:
+            with self._records.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip():
+                        count += 1
+        except OSError:
+            return 0
+        return count
+
+    def write_compaction(self, state: dict[str, Any] | None) -> None:
+        """Replace the compaction sidecar, or remove it when there is none.
+
+        Atomic, like the summary: a half-written sidecar would be discarded by
+        its own hash check on the next start, which is safe but throws away a
+        compaction the developer paid for.
+        """
+        if self._broken:
+            return
+        try:
+            ensure_private(self.root.parents[2])
+            self.root.mkdir(parents=True, exist_ok=True)
+            if state is None:
+                self._compaction.unlink(missing_ok=True)
+                return
+            tmp = self._compaction.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(state, indent=1, sort_keys=True, default=str), encoding="utf-8"
+            )
+            tmp.replace(self._compaction)
+        except OSError:
+            self._broken = True
+
+    def read_compaction(self) -> dict[str, Any] | None:
+        try:
+            parsed = json.loads(self._compaction.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def read_meta(self) -> dict[str, Any] | None:
         try:

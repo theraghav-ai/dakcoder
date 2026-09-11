@@ -30,4 +30,10 @@ error.txt
 # The deployment env holds the JWT secret and model key; only the example ships.
 deploy/dakcoder.env
 
-extension/dakcoder-go-0.2.10.vsix
+# --- Packaged extensions (managed by scripts/release.py) ---
+# A .vsix is build output — 18 MB of it per release. Only the current
+# one stays visible to git; `scripts/release.py` moves the exception
+# forward on every bump.
+extension/*.vsix
+!extension/dakcoder-go-0.3.6.vsix
+# --- end packaged extensions ---

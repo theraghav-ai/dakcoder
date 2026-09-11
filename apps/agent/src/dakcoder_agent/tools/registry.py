@@ -131,6 +131,20 @@ class ToolSpec:
     #: started -- that are not the model's to assert. Putting them in the schema
     #: would offer the model a way to declare its own violations pre-existing.
     gate_params: frozenset[str] = frozenset()
+    #: Whether this tool may run beside others in the same batch.
+    #:
+    #: Opt-in, and stated per tool rather than inferred, because the inference
+    #: that looks obvious is wrong. "Does not mutate" is not enough: `go_build`
+    #: mutates nothing and spawns the Go toolchain, so four at once contend on
+    #: one build cache; `finish` mutates nothing and ends the phase. Nor is the
+    #: provider enough: `go_build` is a Python tool that shells out, and
+    #: `repo_map` is a sidecar call that the sidecar serialises anyway.
+    #:
+    #: What is marked is the set of pure lookups -- a read, a search, a status
+    #: -- which is the batch shape worth parallelising and the only one whose
+    #: concurrency is obviously safe. A tool author adding a new one has to say
+    #: so, which is the right way round for a flag whose failure mode is a race.
+    parallel: bool = False
 
     def __post_init__(self) -> None:
         if not _NAME.match(self.name):
@@ -252,6 +266,7 @@ _SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="read_file",
+        parallel=True,
         description=(
             "Read a slice of one file. Always pass start and end when you know roughly "
             "where to look; whole-file reads crowd out everything else in context."
@@ -266,6 +281,7 @@ _SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="search_repo",
+        parallel=True,
         description=(
             "Search file contents by regular expression. Use this instead of grep, and "
             "prefer it over reading files to find something."
@@ -280,6 +296,7 @@ _SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="search_docs",
+        parallel=True,
         description=(
             "Search the n-api-template knowledge base for the contract rule behind a "
             "pattern. Use it before inventing an approach, not after."
@@ -435,6 +452,7 @@ _SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="playbook",
+        parallel=True,
         description=(
             "Get the known-good fix procedure for a failure class or rule id. Consult "
             "this before attempting a fix you have not made before."
@@ -819,12 +837,14 @@ _SPECS: tuple[ToolSpec, ...] = (
     # -- version control ----------------------------------------------------
     ToolSpec(
         name="git_status",
+        parallel=True,
         description="List changed, staged and untracked files. Cheap; use it to confirm what you changed.",
         parameters=_obj(),
         modes=_READERS,
     ),
     ToolSpec(
         name="git_diff",
+        parallel=True,
         description="Show the diff of the working tree, or of one path. Read this before claiming a change is done.",
         parameters=_obj(
             path=_str("Limit the diff to one path."),
@@ -839,6 +859,7 @@ _SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="git_blame",
+        parallel=True,
         description="Show who last changed each line of a file, and when. Use it to date a legacy pattern.",
         parameters=_obj(
             path=_str("Workspace-relative path."),

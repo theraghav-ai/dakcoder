@@ -18,6 +18,42 @@ Your side is `apps/agent/src/dakcoder_agent` (`loop.py`, `context.py`,
 
 ---
 
+## 0. What has since been built
+
+**Read this before section 1.** Sections 1 and 2 describe dakcoder as it was on
+2026-09-09. The analysis still holds as reasoning; several of its findings have
+since been acted on, and the rows they describe no longer match the code. What
+changed, and where:
+
+| Was | Now | Files |
+|---|---|---|
+| One `ContextManager` list; compaction replaced it with a recap | Append-only `Transcript`, whole tool results, never rewritten | `transcript.py` |
+| Compaction rewrote history | Compaction writes a `CompactionState` sidecar; the projection applies it; a prefix hash refuses one that no longer describes the records under it | `compaction.py` |
+| Caps, slice supersession and repeat-collapse applied at insertion | All three applied at projection, so the record keeps the full text | `projection.py` |
+| Nine loop ledgers invalidated by hand on every eviction | The loop asks the projection: `context.coverage()`, `visible_results`, `visible_bodies`. `_forget_evicted` is four lines | `loop.py`, `projection.py` |
+| `_State`, 38 flat fields | Five groups — `TaskState`, `CallLedger`, `ReadState`, `GateState`, `Progress` — behind a name table | `loopstate.py` |
+| Tool behaviour hard-wired in `_tool_calls` | `beforeTool`/`afterTool` seam; a hook may rewrite, deny, answer or annotate, and cannot impersonate a tool | `hooks.py` |
+| Every call dispatched in sequence | A batch that is all pure lookups runs at once, bounded at four threads; `ToolSpec.parallel` is opt-in per tool | `hooks.py`, `tools/registry.py` |
+| Plan lived in a tuple, lost on restart | `PlanRecord` with step statuses and a revision history, on disk, restored on resume | `plan.py` |
+| No cross-session backlog | `AgendaTask` / `AgendaStore`: the agent proposes, a person approves | `plan.py` |
+| An endpoint context-length 400 ended the run `ERROR` | Classified, compacted deterministically, retried once, and only if the prompt actually shrank | `loop.py` |
+| `_digest` buried inside the summariser | `basic` is a named strategy: no model call, selectable | `compaction.py` |
+| Three separate "is this run done" checks | One `_why_not_done()` predicate | `loop.py` |
+| `dakcoder.compactContext` had no route | `POST /v1/sessions/{id}/compact` | `loopback.py` |
+| "What did the model see at turn 30" had no answer | `GET /v1/sessions/{id}/transcript`, `view=canonical` or `view=model` | `loopback.py` |
+
+New tests: `test_transcript.py`, `test_hooks.py`, `test_plan.py`,
+`test_recovery.py`, plus route tests in `test_loopback_routes.py`.
+
+**Still outstanding** from section 3: per-turn git checkpoints with compare and
+partial restore (item 1, and still the clearest single gap), session ownership
+and optimistic locking, approvals as routed state, the three runtime roles,
+read-only subagents, and the hosted-product items. Those are the ones that need
+the runtime in [host-plan.md](../host-plan.md) rather than a change inside the
+loop.
+
+---
+
 ## 1. Summary
 
 | # | Dimension | Your agent | Cline | Edge |

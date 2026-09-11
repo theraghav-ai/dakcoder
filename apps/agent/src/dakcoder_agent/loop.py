@@ -50,6 +50,7 @@ import logging
 import re
 import threading
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -71,9 +72,9 @@ from .context import (
     OverBudgetError,
     Recap,
     Role,
+    Visibility,
 )
 from .gate import (
-    Baseline,
     GateReport,
     StageResult,
     full_gate,
@@ -82,8 +83,18 @@ from .gate import (
 )
 from .llm import TurnResult, complete, reasoning_leaked
 from . import metrics
+from .hooks import (
+    MAX_PARALLEL_CALLS,
+    HookContext,
+    Hooks,
+    hook_context_block,
+    parallel_batch,
+)
+from .loopstate import CallLedger, GateState, Progress, ReadState, TaskState
 from .modes import CONTEXT_WINDOW, Intent, Mode, config_for
+from .plan import PlanRecord
 from .prompts import mode_instruction, system_prompt
+from .tools import registry
 from .tools.control import PlanStep, steps_from_meta
 from .tools.router import ApprovalRequest, Router
 
@@ -210,207 +221,127 @@ class _ReadLedger:
         return f"earlier reads covering lines {shown}{more}"
 
 
+#: Which group owns each of ``_State``'s field names.
+#:
+#: The table *is* the decomposition: one line per field saying which question it
+#: answers. It exists rather than forty properties because a table can be read
+#: end to end -- "what does the gate group hold" is a grep for ``"gate"`` in one
+#: place, not a walk through four hundred lines of boilerplate -- and because
+#: moving a field between groups is a one-line change here instead of a rename
+#: at two hundred and seventy-nine call sites.
+_OWNER: dict[str, str] = {
+    # What the run was asked for, and what it committed to.
+    "mode": "task",
+    "intent": "task",
+    "intent_source": "task",
+    "intent_why": "task",
+    "plan": "task",
+    "plan_summary": "task",
+    "plan_forced": "task",
+    # What has been asked and answered. Invalidated as a unit.
+    "seen_calls": "calls",
+    "mutations_seen": "calls",
+    "last_results": "calls",
+    "partial_results": "calls",
+    "dead_ends": "calls",
+    "truncated_at": "calls",
+    # What has been read and searched, and how much of each.
+    "reads": "reading",
+    "retrievals": "reading",
+    "retrieval_repeats": "reading",
+    "search_hits": "reading",
+    "search_repeats": "reading",
+    # What the gate has said, and what has happened since.
+    "baseline": "gate",
+    "last_gate": "gate",
+    "gate_key": "gate",
+    "gate_failures": "gate",
+    "gate_mutations": "gate",
+    "idle_since_gate": "gate",
+    "gate_turn": "gate",
+    "dependencies_changed": "gate",
+    # How the turn budget is being spent, and every bound on spending it.
+    "stalled_turns": "progress",
+    "research_turns": "progress",
+    "must_answer": "progress",
+    "answer_because": "progress",
+    "forced": "progress",
+    "forced_terminal": "progress",
+    "terminal_forced": "progress",
+    "truncated_turns": "progress",
+    "truncations": "progress",
+    "finish_refused": "progress",
+    "preamble_refused": "progress",
+    "replans": "progress",
+    "revisions": "progress",
+    "compactions": "progress",
+    "tried": "progress",
+}
+
+
 @dataclass
 class _State:
     """Everything the loop tracks that is not in the context manager.
 
-    Twenty fields, where there were thirty-four -- and the count matters less
-    than what went. What is gone, and why:
+    Five groups, not thirty-eight fields. Each group is a question -- what was
+    asked for, what has been called, what has been read, what the gate said, how
+    the budget is being spent -- and each owns the fields and the invalidation
+    rules that answer it. ``loopstate.py`` has the groups and the reasoning.
 
-    ``attempts``, ``cycles``, ``blocked_stage``, ``route_mutations`` -- the
-    escalation ladder. Coder twice, then Debugger three times, then stop. It
-    spent its budget on Verifier turns that had attempted nothing, and its whole
-    purpose was to get a second model persona to look at a gate failure that, on
-    the legacy corpus, no persona could have fixed.
+    Every old field name still resolves, through ``_OWNER`` above. That is
+    deliberate and it is transitional: the split had to be a refactor rather
+    than a rewrite, so the two hundred and seventy-nine existing uses keep
+    working and can move to ``state.calls.seen_calls`` group by group, with the
+    table saying where each one goes. New code should reach for the group.
 
-    ``said``, ``echoes`` -- text detectors that ended runs. "The same reply three
-    turns running" is a symptom; the loop now ends runs on decisions about the
-    work.
+    What is gone, and why. ``attempts``, ``cycles``, ``blocked_stage``,
+    ``route_mutations`` -- the escalation ladder, which spent its budget on
+    Verifier turns that had attempted nothing. ``said``, ``echoes`` -- text
+    detectors that ended runs on a symptom. ``idle``, ``planner_idle``,
+    ``planner_research``, ``executing_research`` and five more -- one counter
+    per mode with no stopping condition; a mode that must call a tool is now
+    made to, and a mode that must not is over when it stops. ``scaffolded`` --
+    there is no Scaffolder. ``dup_results``, ``intercepts`` -- ledgers of
+    messages to delete from the transcript later, which is not a thing that
+    happens to an append-only transcript.
 
-    ``idle``, ``idle_mutations``, ``planner_idle``, ``planner_research``,
-    ``planner_nudged``, ``executing_research``, ``executing_nudged``,
-    ``research_mutations``, ``unfinished_nudges`` -- nine counters, each with its
-    own watermark, each existing because a mode had no stopping condition. A
-    mode that must call a tool is now made to; a mode that must not is over when
-    it stops.
-
-    ``scaffolded`` -- the Scaffolder's hand-off. There is no Scaffolder.
-
-    ``dup_results``, ``intercepts`` -- ledgers of messages to delete from the
-    transcript later. History is append-only.
+    And two that went with the canonical/projection split, because the
+    projection answers them from the request instead: ``echoes`` (repeated
+    answers collapse in ``projection``) and ``seen_bodies``
+    (``context.visible_bodies``). Both were copies of what the model could see,
+    and a copy of that is exactly what goes stale.
     """
 
-    mode: Mode = Mode.ASK
-    #: What the developer asked for. Fixed before the first turn.
-    intent: Intent = Intent.AUTO
-    #: Where `intent` came from: "given" (the panel's Ask/Agent toggle, or an
-    #: explicit caller), "start" (a legacy mode name), or "classified".
-    #:
-    #: The decision the whole run turns on, and nothing on the wire distinguished
-    #: a developer who *said* this was work from a 64-token call that guessed it.
-    #: Twenty turns into an unrequested migration is a late moment to find out
-    #: which it was.
-    intent_source: str = "given"
-    #: The classifier's own one-line reason. The schema has asked for it since
-    #: the classifier was written and the reply was thrown away.
-    intent_why: str = ""
-    #: The plan, as ``submit_plan`` typed it. Empty in ASK.
-    plan: tuple[PlanStep, ...] = ()
-    plan_summary: str = ""
-    #: How many times each exact call has been asked this run. Cleared when a
-    #: mutation lands, because repeating a call after an edit is re-checking
-    #: work rather than looping.
-    seen_calls: dict[str, int] = field(default_factory=dict)
-    #: ``router.mutations`` as of the last call, so the ledgers can be cleared
-    #: when something actually changed.
-    mutations_seen: int = 0
-    #: What each fingerprinted call last returned, so a repeat is answered with
-    #: the result rather than run again. Cut to ``CACHED_RESULT_CHARS``.
-    last_results: dict[str, str] = field(default_factory=dict)
-    #: Fingerprints whose cached result is only the head of what the tool
-    #: returned, and how long the whole thing was. A replay of one of these has
-    #: to say it is partial: presenting a third of a result as "the current
-    #: answer" is what makes asking again the reasonable move (BUG L-17).
-    partial_results: dict[str, int] = field(default_factory=dict)
-    #: Calls the tools themselves declared can never succeed as asked.
-    #: fingerprint -> the tool's one-line reason.
-    dead_ends: dict[str, str] = field(default_factory=dict)
-    #: Fingerprint -> the ``max``/``limit`` that produced a *truncated* answer,
-    #: so raising the cap genuinely asks for something the ledger does not hold.
-    truncated_at: dict[str, int] = field(default_factory=dict)
-    #: Consecutive tool-calling turns that added nothing new -- every call in
-    #: them answered from a ledger rather than dispatched.
-    stalled_turns: int = 0
-    #: What has already been delivered of each path, as line intervals. See
-    #: ``_ReadLedger``: the old form was a list of range *labels* and a count,
-    #: which could say how often a file had been asked for and not how much of
-    #: it the model had actually seen.
-    reads: dict[str, _ReadLedger] = field(default_factory=dict)
-    #: What each ``search_docs`` query returned, as section citations.
-    retrievals: list[tuple[str, frozenset[str]]] = field(default_factory=list)
-    retrieval_repeats: int = 0
-    #: The turn each compaction fired on, for the thrash detector.
-    compactions: list[int] = field(default_factory=list)
-    #: What was already broken when the run started. See ``_take_baseline``.
-    baseline: Baseline = field(default_factory=Baseline)
-    last_gate: GateReport | None = None
-    #: The workspace state the last full gate ran against.
-    gate_key: tuple[int, tuple[str, ...]] | None = None
-    #: Failing gates in a row with no new edit between them.
-    gate_failures: int = 0
-    dependencies_changed: bool = False
-    #: Whether a turn has already been re-asked with ``tool_choice: required``.
-    #:
-    #: Once per **phase**, not once per turn. Forcing on every prose turn reads as
-    #: harmless and is not: a Planner that has decided there is nothing to plan
-    #: says so, is forced, complies with some call it does not need, says so
-    #: again, is forced again -- two model calls a turn to relitigate a decision
-    #: it has already made twice. The first refusal might be a turn whose call
-    #: was never emitted; the second is an answer, and the loop already knows
-    #: what to do with it.
-    #:
-    #: Reset when a phase ends. Run scope was the wrong reading of that argument:
-    #: it is about one mode relitigating one decision, and a Planner that used
-    #: the re-ask left the acting mode without one (prior-audit TC-4).
-    forced: bool = False
-    #: The most recent intercept result per fingerprint, so the next repeat can
-    #: supersede it rather than stack beside it. Measured: one such pair in
-    #: history and the model moves on; two and it repeats forever. See
-    #: ``ContextManager.supersede``.
-    echoes: dict[str, Message] = field(default_factory=dict)
-    #: Set when a turn asked for nothing it had not already been given, and the
-    #: next turn must therefore answer rather than call. Cleared once used.
-    must_answer: bool = False
-    #: Why the next turn is being made to answer. Two situations reach the same
-    #: mechanism and they are not the same thing: a *stall* is the model asking
-    #: for what it has already been given; a *refused terminal* is the model
-    #: reaching for the exit with arguments the schema would not take. Telling it
-    #: "that call has already been answered and asking it again returns the same
-    #: thing" after the second is false on every clause, and it teaches the wrong
-    #: correction -- the arguments, not the repetition, are the problem
-    #: (BUG L-14).
-    answer_because: str = ""
-    #: ``router.mutations`` as of the last failing gate, so turns that follow it
-    #: without editing anything can be counted. See ``_gate_stalled``.
-    gate_mutations: int = 0
-    #: Turns since a failing gate in which nothing was written.
-    idle_since_gate: int = 0
-    #: Tool-calling turns in this phase that have not reached a terminal tool.
-    #: Reset when a phase ends, because the next one starts its own count.
-    research_turns: int = 0
-    #: How many times a `finish` that abandoned the plan has been sent back.
-    #: Bounded: the model may have decided a step is unnecessary, and this reads
-    #: paths out of the plan rather than out of the work, so it is not the
-    #: arbiter of who is right.
-    finish_refused: int = 0
-    #: How many times an answer that was only its own opening line was sent
-    #: back. Separate from `finish_refused` because they are different
-    #: mistakes -- one is work not done, the other is work done and not
-    #: delivered -- and a run may honestly make both.
-    preamble_refused: int = 0
-    #: Terminal calls forced that did not land -- the model was made to call
-    #: `submit_plan` and sent arguments the schema refused, say. Bounded,
-    #: because forcing the same call again is the loop this exists to escape.
-    forced_terminal: int = 0
-    #: Whether the turn just sent was one the loop forced to end the phase.
-    #: Read by `_phase_ended`, which is the only thing that can tell a plan the
-    #: model volunteered from one it was left no other move to produce.
-    terminal_forced: bool = False
-    #: Whether the current plan came out of a forced `submit_plan`.
-    #:
-    #: A plan is normally a commitment, and `_unwritten_targets` treats it as
-    #: one. A plan extracted at the research fence is not: the developer asked
-    #: a question, the fence fired, and the only call the turn accepted was
-    #: `submit_plan`, so the model wrote one. Enforcing it turns a question
-    #: into an unrequested migration and gives the run no exit (BUG L-28).
-    #:
-    #: Asking the model to reconsider before acting on a forced plan was tried
-    #: and reverted. It read as an invitation to stop: measured live at the
-    #: fence, genuine change tasks went from 4/4 writing the code to 2/4, to
-    #: buy one analysis run in four. The misroute is worth preventing at the
-    #: classifier, not worth talking every forced plan out of existence.
-    #:
-    #: Set by `_phase_ended`, cleared by any plan the model submits of its own
-    #: accord. It stops mattering the moment anything is written -- a forced
-    #: plan the run has started acting on is a plan, whatever produced it --
-    #: and that condition lives in `_open_targets`, which is the one place
-    #: every enforcement path reads.
-    plan_forced: bool = False
-    #: Consecutive replies the output budget cut off. Reset by any reply that
-    #: completes. The per-turn handling of a truncated reply is careful -- every
-    #: declared call answered, the cause named accurately -- but nothing counted
-    #: the *repetition*, so a model that always overran its output budget spent
-    #: the entire turn budget doing it and ended EXHAUSTED without truncation
-    #: ever being mentioned (BUG L-13).
-    truncated_turns: int = 0
-    #: Truncated replies in the whole run, never reset. The streak above can be
-    #: dodged by one complete reply between two overruns, which is exactly what
-    #: a model does while it hunts for a way to send something too large
-    #: (BUG FS-3).
-    truncations: int = 0
-    #: What has been tried and did not work, one line each, oldest first:
-    #: a gate failure and the stage it blocked at, a `revise_plan` and its
-    #: reason, a search the corpus could not answer. Rendered into the state
-    #: block every turn, so the model reads its own dead ends rather than
-    #: reconstructing them from a transcript that contains its statements of
-    #: intent. Bounded by ``STATE_ITEMS`` at render time.
-    tried: list[str] = field(default_factory=list)
-    #: Digests of tool-result bodies already shown this run. A dispatched call
-    #: whose result the model has seen before -- the same search under other
-    #: words, the same build log -- did not inform the run, whatever its
-    #: arguments looked like. Cleared with the cached-result ledgers on
-    #: eviction, because a body the context no longer holds is news again.
-    seen_bodies: set[str] = field(default_factory=set)
-    #: What each ``search_repo`` returned, as ``path:line`` keys, for the same
-    #: overlap test ``search_docs`` has had all along.
-    search_hits: list[tuple[str, frozenset[str]]] = field(default_factory=list)
-    search_repeats: int = 0
-    #: The turn the last full gate ran on, for the state block.
-    gate_turn: int = 0
-    #: Loop-initiated returns to the Planner this run. See ``_replan``.
-    replans: int = 0
-    #: Model-initiated ``revise_plan`` calls this run.
-    revisions: int = 0
+    task: TaskState = field(default_factory=TaskState)
+    calls: CallLedger = field(default_factory=CallLedger)
+    reading: ReadState = field(default_factory=ReadState)
+    gate: GateState = field(default_factory=GateState)
+    progress: Progress = field(default_factory=Progress)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached for names the dataclass itself does not define, so the
+        # five groups above never come through here.
+        owner = _OWNER.get(name)
+        if owner is None:
+            raise AttributeError(name)
+        return getattr(object.__getattribute__(self, owner), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        owner = _OWNER.get(name)
+        if owner is None:
+            object.__setattr__(self, name, value)
+            return
+        setattr(getattr(self, owner), name, value)
+
+    def groups(self) -> dict[str, Any]:
+        """The five groups by name, for diagnostics and for ``carry_from``."""
+        return {
+            "task": self.task,
+            "calls": self.calls,
+            "reading": self.reading,
+            "gate": self.gate,
+            "progress": self.progress,
+        }
 
 
 _RECAP_PROMPT = """Summarise this agent transcript for a handover to a fresh context.
@@ -833,6 +764,24 @@ class AgentLoop:
         self.max_turns = max_turns
         self.session_id = session_id
         self.state = _State()
+        #: The before/after seam around a tool call. Empty by default, and
+        #: cheap when empty -- the loop's fast path is a length check.
+        #:
+        #: It exists so that a policy, a linter, a redaction pass or an audit
+        #: log can be added without editing this file. Everything load-bearing
+        #: -- the router's six checks, the intercept ledgers, the gate -- stays
+        #: hard-wired, because those are not opinions a deployment gets to
+        #: hold. See ``hooks.py``.
+        self.hooks = Hooks()
+        #: The plan as it will be written to disk. Held here rather than
+        #: derived at save time so the revision history accumulates across the
+        #: run instead of being one entry deep.
+        self._plan_record = PlanRecord()
+        #: Whether this run has already recovered from the endpoint refusing a
+        #: request as too large. Once per run: a second overflow after a
+        #: deterministic compaction to 15% is not a estimate that drifted, it is
+        #: a context that cannot be made to fit, and retrying it is a bill.
+        self._overflow_recovered = False
         self.result: RunResult | None = None
         #: The background baseline. See ``_take_baseline``.
         self._baseline_thread: threading.Thread | None = None
@@ -927,6 +876,12 @@ class AgentLoop:
                 self.result = self._abort()
                 break
             yield from self._turn()
+            # The canonical transcript and the compaction sidecar, written at
+            # the boundary where the run is already waiting on something slower
+            # than a disk. Best-effort, like the journal it goes through: a
+            # read-only checkout costs the ability to resume this session
+            # exactly, never the work the developer is waiting for.
+            self.context.persist()
             if self.result is None and self.winding_down():
                 self.result = RunResult(
                     Outcome.ABORTED,
@@ -1529,6 +1484,42 @@ class AgentLoop:
                 )
                 return None
         except Exception as exc:  # noqa: BLE001 - the transport failing is not the model's fault
+            # The endpoint refusing the request as too large is the one failure
+            # here that is recoverable, and it was being ended as ERROR with the
+            # machinery to recover sitting three lines above.
+            #
+            # It happens because the local estimate and the server's tokeniser
+            # disagree: `Calibration` narrows that gap but cannot close it, and
+            # the disagreement is largest exactly where it matters, on a context
+            # near the budget. `OverBudgetError` is the estimate noticing; this
+            # is the server noticing first.
+            #
+            # Deterministic compaction, not the summariser: a run that has just
+            # been refused for sending too much should not answer by sending a
+            # summarisation request built from the same context. One retry, and
+            # only if the prompt actually got smaller -- retrying an unchanged
+            # request is how a recovery becomes a loop with a bill attached.
+            if _context_length_error(exc) and not self._overflow_recovered:
+                self._overflow_recovered = True
+                before = self.context.usage().total
+                yield from self._compact(
+                    retain_pct=0.15, reason="overflow recovery", strategy="basic"
+                )
+                after = self.context.usage().total
+                yield Event(
+                    EventType.GATE,
+                    {
+                        "kind": "overflow_recovery",
+                        "before": before,
+                        "after": after,
+                        "retrying": after < before,
+                    },
+                )
+                if after < before:
+                    try:
+                        return dispatch(tool_choice)
+                    except Exception as retried:  # noqa: BLE001 - report the second one
+                        exc = retried
             yield Event(EventType.ERROR, {"message": str(exc)})
             self.result = RunResult(
                 Outcome.ERROR, str(exc), self.context.turn, tuple(self.router.touched)
@@ -1797,13 +1788,9 @@ class AgentLoop:
         # The world changed since the ledgers were written: forget them. A
         # mutation invalidates all of them at once -- a cached search may now be
         # wrong, a missing path may now exist, and a repeat is re-checking work
-        # rather than looping.
-        if self.router.mutations != self.state.mutations_seen:
-            self.state.mutations_seen = self.router.mutations
-            self.state.seen_calls.clear()
-            self.state.last_results.clear()
-            self.state.dead_ends.clear()
-            self.state.truncated_at.clear()
+        # rather than looping. The rule lives on the ledger that owns the
+        # fields, so a sixth one added there cannot be missed here.
+        self.state.calls.world_changed(self.router.mutations)
 
         mutated = False
         #: Dispatched calls that told the run something it did not already have.
@@ -1841,6 +1828,44 @@ class AgentLoop:
                     "ask for it again in a later turn."
                 )
 
+        # A batch that is all reads runs at once.
+        #
+        # The calls used to run one after another on the worker thread, which
+        # is right for writes -- two `patch_file` calls against one file must
+        # not interleave, and the undo store's first-write-wins rule is about
+        # order -- and needlessly slow for six `read_file` calls that touch
+        # nothing. `hooks.parallel_safe` is the predicate and it is
+        # conservative: nothing that mutates, nothing that needs approval,
+        # nothing whose provider serialises its own work anyway.
+        #
+        # All or nothing. Splitting a batch into a parallel group and a serial
+        # one would reorder results relative to the calls that produced them,
+        # and a transcript's value depends on a read appearing where the model
+        # asked for it. The loop below is unchanged: it consumes a result that
+        # is already in hand instead of dispatching one.
+        runnable = [c for c in calls if c.id not in skipped]
+        prefetched: dict[str, ToolResult] = {}
+        prefetched_intercepts: dict[str, tuple[str, str, str]] = {}
+        intercepts_ready = False
+        if (
+            len(runnable) >= 2
+            and not self.cancelled()
+            and parallel_batch(runnable, registry.get)
+        ):
+            # The intercept decisions are taken first, once, for the whole
+            # batch -- otherwise a call answered from a ledger would still have
+            # been dispatched in parallel, and the ledgers would be consulted
+            # twice. Safe to hoist *here* and nowhere else: every call in a
+            # parallel batch is a read, so none of them can change what the
+            # ledgers would have said about the ones after it.
+            intercepts_ready = True
+            for call in runnable:
+                if (answer := self._intercept(call, _fingerprint(call))) is not None:
+                    prefetched_intercepts[call.id] = answer
+            fresh = [c for c in runnable if c.id not in prefetched_intercepts]
+            if len(fresh) >= 2:
+                prefetched = self._dispatch_parallel(fresh)
+
         for index, call in enumerate(calls):
             if call.id in skipped:
                 self.context.append_tool_result(
@@ -1877,13 +1902,19 @@ class AgentLoop:
             fingerprint = _fingerprint(call)
             args = _safe_args(call)
 
-            if intercepted := self._intercept(call, fingerprint):
+            intercepted = (
+                prefetched_intercepts.get(call.id)
+                if intercepts_ready
+                else self._intercept(call, fingerprint)
+            )
+            if intercepted:
                 body, said, intercept_kind = intercepted
-                # The previous answer to this same question is stubbed out
-                # before the new one is appended.
+                # The previous answers to this same question are stubbed out in
+                # the projection when the new one is appended.
                 #
-                # Not deleted -- the message keeps its place and its
-                # `tool_call_id`, so nothing is orphaned. What is removed is the
+                # Not deleted -- the record keeps its place and its
+                # `tool_call_id`, so nothing is orphaned. What is removed from
+                # *what the model reads* is the
                 # *pattern*: N identical (call -> "answered from the previous
                 # result") pairs sitting in history are a few-shot demonstration
                 # of exactly the behaviour the answer is asking the model to
@@ -1893,14 +1924,15 @@ class AgentLoop:
                 # commit` call seven times and another the same `search_repo`
                 # eight times, each intercepted correctly and each answered into
                 # a transcript that told it to do it again.
-                if (prior := self.state.echoes.get(fingerprint)) is not None:
-                    self.context.supersede(
-                        prior,
-                        f"[{call.name} was asked again with these arguments and answered "
-                        "from the earlier result; the newest answer is below]",
-                    )
-                self.state.echoes[fingerprint] = self.context.append_tool_result(
-                    call.name, body, tool_call_id=call.id
+                #
+                # Tagged as an echo of this exact call, and that is the whole
+                # of it: the projection keeps the newest answer to each repeated
+                # question and stubs the rest, on every turn, without the loop
+                # having to remember which message to go back and rewrite --
+                # and without anything being rewritten. The earlier answers are
+                # still in the canonical transcript exactly as they were sent.
+                self.context.append_tool_result(
+                    call.name, body, tool_call_id=call.id, echo=fingerprint
                 )
                 yield Event(
                     EventType.TOOL_RESULT,
@@ -1936,7 +1968,38 @@ class AgentLoop:
                 },
             )
 
-            outcome = self.router.dispatch(call.name, call.arguments, mode=self.state.mode)
+            hook_notes: list[str] = []
+            arguments_to_run: Any = call.arguments
+            if self.hooks.any_before:
+                context = HookContext(
+                    call=call,
+                    arguments=args if isinstance(args, dict) else {},
+                    mode=self.state.mode,
+                    turn=self.context.turn,
+                )
+                decision = self.hooks.run_before(context)
+                if decision.note:
+                    hook_notes.append(decision.note)
+                if decision.arguments is not None:
+                    arguments_to_run = decision.arguments
+                if decision.stops:
+                    # A hook that stops a call answers it, exactly as a router
+                    # refusal does. The alternative -- dropping the call -- is
+                    # the malformed shape the coherence pass exists to repair,
+                    # manufactured on purpose.
+                    stopped = (
+                        ToolResult.success(decision.answer)
+                        if decision.answer
+                        else ToolResult.failure(decision.deny, fix=decision.fix)
+                    )
+                    yield from self._hooked_result(call, stopped, hook_notes)
+                    continue
+
+            outcome = prefetched.get(call.id)
+            if outcome is None:
+                outcome = self.router.dispatch(
+                    call.name, arguments_to_run, mode=self.state.mode
+                )
 
             if isinstance(outcome, ApprovalRequest):
                 request = outcome
@@ -1965,6 +2028,21 @@ class AgentLoop:
 
             assert isinstance(outcome, ToolResult)
 
+            if self.hooks.any_after:
+                after = self.hooks.run_after(
+                    HookContext(
+                        call=call,
+                        arguments=args if isinstance(args, dict) else {},
+                        mode=self.state.mode,
+                        turn=self.context.turn,
+                    ),
+                    outcome,
+                )
+                if after.result is not None:
+                    outcome = after.result
+                if after.note:
+                    hook_notes.append(after.note)
+
             # A tool refused because this mode does not hold it says nothing
             # about the call, only about who is asking. It is not progress and
             # it is never cached: the fingerprint carries no mode, so a refusal
@@ -1981,15 +2059,20 @@ class AgentLoop:
             # other words returns the same body), it is not an empty finding,
             # and the overlap test below did not say it repeats.
             digest = _body_digest(call.name, outcome.for_model())
-            novel = digest not in self.state.seen_bodies
-            self.state.seen_bodies.add(digest)
+            # Asked of the context, not of a set the loop keeps. "Has this run
+            # already been told this" and "can the model read it right now" are
+            # the same question, and keeping two answers to it is what made a
+            # compaction silently turn news back into old news -- or, worse,
+            # leave a body counted as seen after the message carrying it had
+            # stopped being visible.
+            novel = digest not in self.context.visible_bodies
             if not refused_by_mode and novel and not _empty_finding(outcome):
                 informed += 1
             mutated = mutated or bool(outcome.mutations)
             if call.name == "go_mod":
                 self.state.dependencies_changed = True
 
-            self.state.seen_calls[fingerprint] = self.state.seen_calls.get(fingerprint, 0) + 1
+            self.state.calls.asked(fingerprint)
             # Terminal calls are never cached. `_intercept` already declines to
             # answer them from a ledger, so this is belt and braces -- but the
             # entry it used to write is the one that deadlocked the run, and a
@@ -2028,6 +2111,13 @@ class AgentLoop:
                 tool_call_id=call.id,
                 path=slice_path,
                 line_range=slice_range,
+                # Recorded on the message so the projection can answer, later
+                # and without the loop's help, whether this exact call's result
+                # is still readable and whether its body is still news.
+                fingerprint=fingerprint,
+                body=digest,
+                ok=outcome.ok,
+                mutation=bool(outcome.mutations),
             )
             if slice_path is not None:
                 # Recorded from what is *in context*, not from what the tool
@@ -2043,6 +2133,15 @@ class AgentLoop:
                     appended.line_range,
                     int(outcome.meta.get("lines") or 0),
                     delivered=appended.line_range is not None or slice_range is None,
+                )
+
+            for note in hook_notes:
+                # As a `role: user` message inside a `<hook_context>` block
+                # with sanitised attributes. A hook that could emit a
+                # `role: tool` message could tell the model that `go_build`
+                # passed, and the model has no way to tell the difference.
+                self.context.append_user(
+                    hook_context_block("hook", call, note), visibility=Visibility.MODEL
                 )
 
             if note := self._overlap(call, outcome):
@@ -2148,6 +2247,72 @@ class AgentLoop:
             self.state.research_turns = 0
             yield from self._inner_loop()
 
+    def _dispatch_parallel(self, calls: Sequence[ToolCall]) -> dict[str, ToolResult]:
+        """Run a batch of read-only calls at once, and return them by call id.
+
+        Bounded by ``MAX_PARALLEL_CALLS`` threads: the work is IO-bound on one
+        developer's disk, and the marginal thread past four buys contention.
+
+        Anything that does not come back as a plain ``ToolResult`` is dropped
+        from the map rather than used, so the sequential path below dispatches
+        it normally. That covers the case ``parallel_safe`` is written to
+        exclude and cannot fully guarantee -- a tool that asks for approval --
+        and it fails towards the slow, correct behaviour rather than towards a
+        blocked thread pool.
+
+        A raised exception is dropped the same way. It will be raised again on
+        the sequential dispatch, where the loop's existing error handling can
+        see it in the right order.
+        """
+        out: dict[str, ToolResult] = {}
+        if not calls:
+            return out
+        mode = self.state.mode
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_CALLS, len(calls))) as pool:
+            futures = {
+                pool.submit(self.router.dispatch, call.name, call.arguments, mode=mode): call
+                for call in calls
+            }
+            for future in futures:
+                call = futures[future]
+                try:
+                    outcome = future.result()
+                except Exception:  # noqa: BLE001 - re-run in sequence, in order
+                    continue
+                if isinstance(outcome, ToolResult):
+                    out[call.id] = outcome
+        return out
+
+    def _hooked_result(
+        self, call: ToolCall, outcome: ToolResult, notes: Sequence[str]
+    ) -> Iterator[Event]:
+        """Record a result a hook produced instead of the tool, and report it.
+
+        Kept separate from the dispatch path because a hook's decision is not a
+        tool call: nothing was dispatched, no mutation happened, and no ledger
+        should learn anything about the tool from it. What the model gets is the
+        same shape it gets from any refusal, which is the whole point -- a
+        denied call the model is never told about is a call it will make again.
+        """
+        self.context.append_tool_result(
+            call.name, outcome.for_model(), tool_call_id=call.id, ok=outcome.ok
+        )
+        for note in notes:
+            self.context.append_user(
+                hook_context_block("hook", call, note), visibility=Visibility.MODEL
+            )
+        yield Event(
+            EventType.TOOL_RESULT,
+            {
+                "id": call.id,
+                "name": call.name,
+                "turn": self.context.turn,
+                "dispatched": False,
+                "hooked": True,
+                **outcome.as_dict(),
+            },
+        )
+
     def _stalled(self) -> RunResult:
         """End a run that stopped asking for anything new, and say what it did.
 
@@ -2240,7 +2405,7 @@ class AgentLoop:
         # A known dead end. The tool itself declared this exact call unable to
         # succeed, so asking again cannot change the answer.
         if reason := self.state.dead_ends.get(fingerprint):
-            self.state.seen_calls[fingerprint] = self.state.seen_calls.get(fingerprint, 0) + 1
+            self.state.calls.asked(fingerprint)
             return (
                 f"{call.name} with these arguments cannot succeed: {reason}. That was "
                 "established earlier this run and nothing has changed since, so it was "
@@ -2257,9 +2422,18 @@ class AgentLoop:
         capped = self.state.truncated_at.get(fingerprint)
         wants_more = capped is not None and _volume(call) > capped
         cached = self.state.last_results.get(fingerprint)
+        # ...and only while the model can still read the answer it is being
+        # pointed at. This is the exact shape of the failure the canonical
+        # transcript exists to prevent: the cache said "you already have this",
+        # a compaction had projected a recap over the message carrying it, and
+        # the two statements could not both be obeyed (BUG L-10, L-25). The
+        # ledger is no longer the authority on that -- the request is, and
+        # ``visible_results`` is computed from the request.
+        if cached is not None and fingerprint not in self.context.visible_results:
+            self.state.calls.forget(fingerprint)
+            cached = None
         if cached is not None and not wants_more:
-            asks = self.state.seen_calls.get(fingerprint, 0) + 1
-            self.state.seen_calls[fingerprint] = asks
+            asks = self.state.calls.asked(fingerprint)
             # The answer first, the bookkeeping after. This used to open "Not
             # run:" with ok=false, which is how a call that succeeded came to
             # look like a call that failed -- and a model that reads a failure
@@ -2341,6 +2515,45 @@ class AgentLoop:
             "a refactor? Then call `submit_plan`, naming the files you would change.\n"
             "- `ask_developer` only if one unknown blocks everything else."
         )
+
+    def _why_not_done(self) -> str:
+        """Why this run is not finished, or ``""`` when nothing says otherwise.
+
+        One predicate over what were three separate checks, in three places,
+        each with its own bound and its own idea of what "done" means:
+        ``_open_targets`` (the plan names files nothing has written),
+        ``_gate_wants_an_edit`` (a failing gate is asking for a change), and the
+        ``finish_refused`` counter that decides whether either may speak again.
+
+        Folding them is Cline's ``completionGuard`` -- a predicate that returns
+        the reason the run is not done, or nothing -- and it is worth taking for
+        a reason their version does not have: here the three checks *interact*.
+        A plan with unwritten targets and a failing gate is one situation, and
+        answering it twice reads to the model as two different objections to the
+        same move. A run that has been pushed back on once has had its say.
+
+        The bounds stay where they were and stay measured. What changes is that
+        "is this run done" is answerable in one place, by callers that used to
+        each ask half the question.
+        """
+        if self.state.finish_refused >= MAX_FINISH_REFUSALS:
+            # It has been sent back once. The model may have decided a step is
+            # unnecessary, and it is entitled to say so and be believed; what it
+            # is not entitled to is silence, and it has now spoken twice.
+            return ""
+        if missing := self._open_targets():
+            return (
+                "your plan set out to write "
+                + ", ".join(missing)
+                + (" and none of them have been written" if len(missing) > 1
+                   else " and it has not been written")
+            )
+        if self._gate_wants_an_edit():
+            report = self.state.last_gate
+            blocker = getattr(report, "blocked_by", None) if report else None
+            where = f" at {blocker}" if blocker else ""
+            return f"the verification gate is failing{where} and nothing has been edited since"
+        return ""
 
     def _gate_wants_an_edit(self) -> bool:
         """Whether a failing gate is currently asking for a change that has not come.
@@ -2438,17 +2651,24 @@ class AgentLoop:
             # step is unnecessary, and it is entitled to say so and be believed.
             # What it is not entitled to is silence.
             missing = self._open_targets()
-            if missing and self.state.finish_refused < MAX_FINISH_REFUSALS:
+            if reason := self._why_not_done():
                 self.state.finish_refused += 1
+                plural = len(missing) > 1
                 self.context.append_user(
-                    "Not yet. Your plan set out to write " + ", ".join(missing)
-                    + " and " + ("none of them have" if len(missing) > 1 else "it has not")
-                    + " been written.\n\n"
-                    + "You have read enough to write "
-                    + ("them" if len(missing) > 1 else "it")
-                    + " now. Do that. If a file genuinely should not be written after "
-                    "all, call `finish` again and say which and why in `blocked` -- "
-                    "that will be taken at face value."
+                    f"Not yet. {reason[0].upper()}{reason[1:]}.\n\n"
+                    + (
+                        "You have read enough to write "
+                        + ("them" if plural else "it")
+                        + " now. Do that. "
+                        if missing
+                        else "Make the change the gate is asking for. "
+                    )
+                    + "If "
+                    + ("a file" if missing else "that")
+                    + " genuinely should not be "
+                    + ("written" if missing else "done")
+                    + " after all, call `finish` again and say which and why in "
+                    "`blocked` -- that will be taken at face value."
                 )
                 return
 
@@ -2503,17 +2723,16 @@ class AgentLoop:
         # Whether this plan was volunteered or extracted. The turn that
         # produced it recorded which; `_open_targets` is what reads it.
         self.state.plan_forced = self.state.terminal_forced
-        self.state.research_turns = 0
         self.state.forced_terminal = 0
-        # And the narration re-ask. It is once per *phase*, which is what the
-        # reasoning behind it was always about: a Planner that has decided there
-        # is nothing to plan should not be forced twice over the same decision.
-        # It was scoped to the run, so a Planner that consumed it handed the
-        # acting mode a phase with no narration recovery at all — and the acting
-        # mode is where narration costs the most, because a "Making the edit
-        # now" with no tool call is a turn in which nothing was edited
-        # (prior-audit TC-4).
-        self.state.forced = False
+        # The research fence and the narration re-ask are both once per
+        # *phase*, which is what the reasoning behind them was always about: a
+        # Planner that has decided there is nothing to plan should not be
+        # forced twice over the same decision. `forced` was scoped to the run,
+        # so a Planner that consumed it handed the acting mode a phase with no
+        # narration recovery at all — and the acting mode is where narration
+        # costs the most, because a "Making the edit now" with no tool call is
+        # a turn in which nothing was edited (prior-audit TC-4).
+        self.state.progress.phase_ended()
         steps = self._normalise_plan(steps_from_meta(dict(outcome.meta)))
         replanned = bool(self.state.plan) and self.state.replans > 0
         yield from self._adopt_plan(steps, str(outcome.meta.get("summary") or ""))
@@ -2814,6 +3033,33 @@ class AgentLoop:
             "cannot have moved" + self._unfinished()
         )
 
+    def restore_plan(self, session_id: str) -> bool:
+        """Reload this session's plan from disk. ``False`` when there is none.
+
+        The restart counterpart of ``carry_from``. A plan lived in a tuple in a
+        process, so a VS Code window reload at step 4 of 7 left the panel
+        showing four steps done and the agent believing it had never planned
+        anything -- and the first thing it did was plan again, against a
+        workspace its own earlier steps had already changed.
+
+        The statuses come back with the steps. They were derived from the change
+        set, and the change set is on disk, so restoring them is restoring a
+        conclusion the loop had already reached from evidence that has not
+        moved.
+        """
+        record = PlanRecord.load(self.router.workspace.root, session_id)
+        if record is None or not record.steps:
+            return False
+        self._plan_record = record
+        self.state.plan = record.steps
+        self.state.plan_summary = record.summary
+        self.state.plan_forced = record.forced
+        rendered = "\n".join(step.rendered(i) for i, step in enumerate(record.steps, 1))
+        if record.summary:
+            rendered = f"{record.summary}\n\n{rendered}"
+        self.context.set_plan(rendered)
+        return True
+
     def carry_from(self, previous: "AgentLoop") -> None:
         """Inherit the previous message's ledgers, the way the context is inherited.
 
@@ -2867,6 +3113,10 @@ class AgentLoop:
         # `_State`, so without this the "you planned to write these" refusal
         # fires again on a plan the developer never asked for.
         self.state.plan_forced = previous.state.plan_forced
+        # And its history, so a follow-up that revises the plan appends to the
+        # record rather than starting a new one that claims this is the first
+        # plan the session has had.
+        self._plan_record = previous._plan_record
         self.state.dependencies_changed = previous.state.dependencies_changed
         # Read off the Router that is now shared, so the two agree by
         # construction rather than by both being copied and hoping.
@@ -3185,10 +3435,42 @@ class AgentLoop:
         """Set the status of every plan step that names ``path``."""
         if not self.state.plan:
             return
+        before = self.state.plan
         self.state.plan = tuple(
             replace(step, status=status, note=note) if step.file == path else step
             for step in self.state.plan
         )
+        if self.state.plan != before:
+            # A status change is not a new plan, so it updates the record
+            # without adding a revision -- the loop sets `done` from the change
+            # set on every mutation, and recording each of those would bury the
+            # two or three that are actually revisions.
+            self._save_plan()
+
+    def _record_plan(self, cause: str, reason: str = "") -> None:
+        """Write the plan and the revision that produced it.
+
+        Silent when there is no session: a loop driven directly by a test or a
+        CLI has no directory to write to, and inventing one would put files in
+        whatever the working directory happened to be.
+        """
+        if not self.session_id:
+            return
+        self._plan_record = self._plan_record.record(
+            self.state.plan, self.state.plan_summary, cause=cause, reason=reason
+        )
+        self._plan_record.session_id = self.session_id
+        self._plan_record.forced = self.state.plan_forced
+        self._plan_record.save(self.router.workspace.root)
+
+    def _save_plan(self) -> None:
+        """Write the current step statuses, without recording a revision."""
+        if not self.session_id:
+            return
+        self._plan_record = self._plan_record.with_steps(self.state.plan)
+        self._plan_record.session_id = self.session_id
+        self._plan_record.forced = self.state.plan_forced
+        self._plan_record.save(self.router.workspace.root)
 
     def _note_tried(self, report: GateReport) -> None:
         """Record a gate failure after an edit as an attempt that did not work."""
@@ -3247,6 +3529,12 @@ class AgentLoop:
         self.state.plan = kept + tuple(steps)
         if summary:
             self.state.plan_summary = summary
+        # Recorded before it is rendered. A plan was a tuple in a process,
+        # lost on a daemon restart, with no record of how it reached its
+        # current shape -- so a developer who reloads their window at step 4 of
+        # 7 came back to an agent holding the edits and none of the plan that
+        # produced them. See ``plan.py``.
+        self._record_plan("replanned" if self.state.replans else "submitted")
         rendered = "\n".join(step.rendered(i) for i, step in enumerate(self.state.plan, 1))
         if self.state.plan_summary:
             rendered = f"{self.state.plan_summary}\n\n{rendered}"
@@ -3300,6 +3588,11 @@ class AgentLoop:
         # it replaces, this one is volunteered.
         self.state.plan_forced = False
         yield from self._adopt_plan(steps, "")
+        # Overwrites the revision `_adopt_plan` just recorded with one that
+        # names the cause and the model's reason. Two entries for one event
+        # would make the history harder to read than no history.
+        self._plan_record.revisions = self._plan_record.revisions[:-1]
+        self._record_plan("revised", reason)
 
     def _overlap(self, call: ToolCall, outcome: ToolResult) -> str:
         """What to tell a run whose search returned only places it already had."""
@@ -3543,7 +3836,13 @@ class AgentLoop:
             "files at once"
         )
 
-    def _compact(self, *, retain_pct: float = 0.35, reason: str = "threshold") -> Iterator[Event]:
+    def _compact(
+        self,
+        *,
+        retain_pct: float = 0.35,
+        reason: str = "threshold",
+        strategy: str = "agentic",
+    ) -> Iterator[Event]:
         """Compact, invalidate the ledgers, and say what it actually freed.
 
         Every compaction goes through here, including the emergency one in
@@ -3555,7 +3854,9 @@ class AgentLoop:
         """
         self.state.compactions.append(self.context.turn)
         before = self.context.usage().total
-        recap = self.context.compact(self._summarise, retain_pct=retain_pct)
+        recap = self.context.compact(
+            self._summarise, retain_pct=retain_pct, strategy=strategy
+        )
         evicted = self.context.last_eviction
         self._forget_evicted(evicted)
         yield Event(
@@ -3563,6 +3864,7 @@ class AgentLoop:
             {
                 "kind": "compaction",
                 "reason": reason,
+                "strategy": strategy,
                 "before": before,
                 "after": self.context.usage().total,
                 "turns": getattr(recap, "turns", None),
@@ -3574,22 +3876,32 @@ class AgentLoop:
         )
 
     def _forget_evicted(self, evicted: Eviction) -> None:
-        """Drop every ledger entry that described content compaction removed.
+        """Re-sync the one ledger that is still a copy, and say what was hidden.
 
-        This is the second half of the prior audit's central finding: the
-        context manager evicts, the loop's ledgers refuse, and nothing connects
-        them. The recap tells the model "re-read one only if you need a line
-        range you have not seen" while the read intercept answers that same
-        re-read with "those lines are already in context above" — two true-
-        sounding messages, neither of which can be obeyed, and the model has no
-        way to recover the content (BUG L-10).
+        This used to be a page of invalidation: rebuild the read spans, clear
+        five call ledgers outright, reset two counters. It existed because the
+        context evicted, the loop's ledgers refused, and nothing connected them
+        — the recap told the model "re-read one only if you need a line range
+        you have not seen" while the read intercept answered that same re-read
+        with "those lines are already in context above", two true-sounding
+        messages neither of which could be obeyed (BUG L-10).
 
-        The read ledger is *rebuilt* from what the context still holds rather
-        than cleared, so a file with surviving reads keeps its coverage and only
-        the evicted spans become askable again. The call ledgers
-        (``last_results``, ``echoes``, ``truncated_at``) are cleared for evicted
-        ids: they exist to answer a repeat with "you already have this", and
-        after eviction that claim is simply false.
+        Almost all of it is gone because the disagreement is gone. Compaction no
+        longer removes anything; it writes a sidecar, the projection applies it,
+        and every "can the model see this" question is answered from the
+        projection on the turn it is asked:
+
+        * the read intercept reads ``context.coverage()`` (see ``_live_reads``);
+        * the cached-result intercept checks ``context.visible_results``;
+        * "has this body been seen" is ``context.visible_bodies``;
+        * repeated answers collapse in the projection, so there is no echo
+          ledger left to clear.
+
+        What remains is the *stored* read ledger, which is not a claim about the
+        context — it is the per-file dispatch budget and the file's length, both
+        facts about the run. Its spans are re-derived here anyway so that a
+        ledger read directly (by ``carry_from``, or by a future persistence
+        path) does not carry coverage the model has lost.
 
         ``seen_calls`` and ``dead_ends`` survive deliberately. A dead end is a
         fact about the world, not about the transcript — the arguments are still
@@ -3601,32 +3913,17 @@ class AgentLoop:
             ledger = self.state.reads.get(path)
             if ledger is None:
                 continue
-            spans = coverage.get(path, [])
-            if not spans:
-                # Nothing of this file is left in context. The dispatch count
-                # stays -- it is a budget against re-reading, and the reads did
-                # happen -- but the run has seen none of it any more.
-                ledger.covered = []
-                continue
             ledger.covered = []
-            for low, high in spans:
+            for low, high in coverage.get(path, []):
                 ledger.add(low, high)
 
         if not evicted.messages:
             return
-        # The cached-result ledgers are keyed by fingerprint, not by message, so
-        # they cannot be pruned precisely. Any eviction makes "you already have
-        # this answer above" unreliable, and answering a repeat from a cache of
-        # a message that is gone is exactly the failure this is fixing.
-        self.state.last_results.clear()
-        self.state.partial_results.clear()
-        self.state.truncated_at.clear()
-        self.state.echoes.clear()
-        # A result the context no longer holds is news again when it comes
-        # back, and a search's places are worth re-seeing once.
-        self.state.seen_bodies.clear()
-        self.state.search_hits.clear()
-        self.state.search_repeats = 0
+        # A search's places are worth re-seeing once after the messages naming
+        # them stop being visible. Unlike the ledgers above, this one is a
+        # record of what a *query* returned rather than of what is in context,
+        # so the projection cannot re-derive it.
+        self.state.reading.forget_searches()
 
     def _summarise(self, messages: Sequence[Message]) -> Recap:
         """Summarise the evicted working set into a structured recap.
@@ -3959,6 +4256,36 @@ def _partial_path(arguments: str) -> str:
     """The ``path`` in a cut-off call's arguments, when the prefix reached it."""
     match = _PARTIAL_PATH.search(arguments or "")
     return match.group(1) if match else ""
+
+
+#: What an endpoint says when the request will not fit.
+#:
+#: Matched on the message rather than on a status code, because the status is
+#: 400 for a dozen unrelated things and this is the one that is recoverable.
+#: Several phrasings because the request passes through LiteLLM in front of
+#: vLLM and either may be the one to refuse it; all of them are lower-cased
+#: before matching.
+_CONTEXT_LENGTH_MARKERS = (
+    "context length",
+    "context_length",
+    "maximum context",
+    "too many tokens",
+    "reduce the length",
+    "prompt is too long",
+    "input is too long",
+    "exceeds the maximum",
+)
+
+
+def _context_length_error(exc: BaseException) -> bool:
+    """Whether this failure is the endpoint refusing an over-long request.
+
+    Conservative on purpose. A false positive costs one deterministic
+    compaction and a retry; a false negative costs the run, which is what
+    happens today for every one of these.
+    """
+    message = str(exc).lower()
+    return any(marker in message for marker in _CONTEXT_LENGTH_MARKERS)
 
 
 def _body_digest(name: str, body: str) -> str:

@@ -155,17 +155,17 @@ def test_wire_keeps_an_orphaned_result_as_prose() -> None:
     Deleting it edits the model's history; leaving it as `role: "tool"` is
     malformed. It becomes a user message carrying the same text.
     """
-    from dakcoder_agent.context import ContextManager, Layer, Message, Role
+    from dakcoder_agent.context import ContextManager
 
     context = ContextManager(system_prompt="sys")
-    context._working.append(  # noqa: SLF001 - constructing the state compaction can leave
-        Message(
-            role=Role.TOOL,
-            content="the important finding",
-            layer=Layer.WORKING_SET,
-            tool_call_id="gone",
-            source="read_file",
-        )
+    # Constructing the state a restore can leave: a result whose declaring
+    # assistant is not in the transcript.
+    context.transcript.append(  # noqa: SLF001 - deliberate, see above
+        "tool",
+        "the important finding",
+        source="read_file",
+        tool="read_file",
+        tool_call_id="gone",
     )
 
     wire = context.wire()
@@ -561,21 +561,25 @@ def test_write_heavy_compaction_frees_tokens() -> None:
 
 def test_the_cut_and_the_budget_agree_on_every_message() -> None:
     """Invariant #3: one cost model, asserted over messages with and without calls."""
-    from dakcoder_agent.context import ContextManager, Layer, Message, Role
+    from dakcoder_agent.context import ContextManager, Layer
     from dakcoder_shared.llm import ToolCall
 
     context = ContextManager(system_prompt="sys")
-    samples = [
-        Message(Role.USER, "plain text"),
-        Message(Role.ASSISTANT, "", tool_calls=(ToolCall(id="1", name="write_file",
-                                                         arguments='{"content":"' + "y" * 5000 + '"}'),)),
-        Message(Role.ASSISTANT, "prose and a call", tool_calls=(
-            ToolCall(id="2", name="read_file", arguments='{"path":"a.go"}'),)),
-        Message(Role.TOOL, "a result", tool_call_id="1"),
-    ]
-    for message in samples:
-        context._working.append(message)
+    context.append_user("plain text")
+    context.append_assistant(
+        "",
+        tool_calls=(
+            ToolCall(id="1", name="write_file",
+                     arguments='{"content":"' + "y" * 5000 + '"}'),
+        ),
+    )
+    context.append_assistant(
+        "prose and a call",
+        tool_calls=(ToolCall(id="2", name="read_file", arguments='{"path":"a.go"}'),),
+    )
+    context.append_tool_result("write_file", "a result", tool_call_id="1")
 
+    samples = [m for m in context.build() if m.layer is Layer.WORKING_SET]
     charged = context.usage().by_layer[Layer.WORKING_SET]
     counted = sum(context._message_cost(m) for m in samples)
     assert charged == counted

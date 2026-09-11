@@ -13,6 +13,12 @@ unbypassable (Part A §15.4).
     POST /v1/sessions/{id}/abort        stop it
     POST /v1/sessions/{id}/revert       restore what it touched to HEAD
     POST /v1/approvals/{id}             accept / reject / edit
+    GET  /v1/sessions/{id}/transcript   what happened, or what the model saw
+    POST /v1/sessions/{id}/compact      compact the context on demand
+    GET  /v1/sessions/{id}/plan         the plan, its statuses and its revisions
+    GET  /v1/agenda                     work proposed for later
+    POST /v1/agenda                     propose some
+    POST /v1/agenda/{id}                approve, drop or complete it
     GET  /v1/health                     version, toolchain, readiness
     GET  /v1/tools                      contract C1
 
@@ -55,10 +61,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from dakcoder_shared.envelope import Event, EventType
 
+from .compaction import CompactionState
+from .context import Recap
+from .journal import Journal
 from .loop import AgentLoop, Outcome, RunResult
 from .modes import Intent
-from .rehydrate import rehydrate, restorable
+from .plan import AGENDA_STATES, AgendaStore, AgendaTask, PlanRecord
+from .rehydrate import rehydrate, restorable, restore_canonical
 from .session import Session, SessionStore, Status
+from .transcript import Transcript
 from .tools.router import ApprovalRequest
 
 __all__ = ["API_VERSION", "Loopback", "PendingApproval", "create_app"]
@@ -298,6 +309,13 @@ class Loopback:
         # nothing about sessions stays a factory. Without it every ledger row
         # this run produces is attributed to no session at all.
         agent.session_id = session.id
+        # The canonical transcript goes to the same directory as the event
+        # stream, and for the reason the two files are different: `events.jsonl`
+        # is what the panel replays, `transcript.jsonl` is what the model was
+        # actually talking to. Only the second can restore a conversation
+        # exactly, and only if it is written as it happens.
+        if session.journal is not None:
+            agent.context.attach_journal(session.journal)
         if continued:
             # The conversation *is* the context manager. ``build_loop`` hands
             # back a fresh one because most runs want one; a follow-up wants the
@@ -315,6 +333,14 @@ class Loopback:
             previous = self.loops.get(session.id)
             if previous is not None:
                 agent.carry_from(previous)
+            else:
+                # No loop in this process means a restart. The context comes
+                # back from the canonical transcript above; the plan comes back
+                # from its own file, because it is the one piece of the run's
+                # state that a developer can see on screen and that the agent
+                # would otherwise have forgotten -- "step 4 of 7" in the panel
+                # beside an agent starting again from step 1.
+                agent.restore_plan(session.id)
         self.loops[session.id] = agent
         agent.on_pending = register
         agent.cancelled = session.cancel.is_set
@@ -533,6 +559,28 @@ class Loopback:
         re-seeding the task, which is what it did before.
         """
         try:
+            # The canonical transcript first. It is the conversation the run was
+            # actually having -- the same records, with the same compaction
+            # sidecar projected over them -- rather than a reconstruction from
+            # the event stream, which is what the fallback below produces. A
+            # session recorded before the transcript existed has no such file,
+            # and falls through.
+            if session.journal is not None:
+                canonical = restore_canonical(
+                    session.journal,
+                    context=agent.context,
+                    task=session.task,
+                    acceptance=tuple(getattr(session, "acceptance", ()) or ()),
+                )
+                if canonical is not None:
+                    log.info(
+                        "restored %s from its canonical transcript: %d record(s)",
+                        session.id,
+                        canonical.events,
+                    )
+                    self.contexts[session.id] = canonical.context
+                    return canonical.context
+
             session.hydrate()
             events = [
                 {"type": str(event.type), "data": event.data} for event in session.events
@@ -994,6 +1042,235 @@ def create_app(runtime: Loopback) -> FastAPI:
                 status_code=404, detail="no context is held for that session any more"
             )
         return context.inspect()
+
+    @app.get("/v1/sessions/{session_id}/transcript")
+    async def session_transcript(
+        session_id: str,
+        view: str = Query(default="model"),
+        limit: int = Query(default=200),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """What happened, or what the model saw. They are different, and both exist.
+
+        ``view=canonical`` is the record: every message in the order it was
+        appended, tool results **whole**, nothing elided, nothing hidden by a
+        compaction. ``view=model`` is the projection -- the bytes that actually
+        went on the wire on the most recent turn, with the caps applied, the
+        superseded reads stubbed and the recap standing in for the turns it
+        replaced.
+
+        Before the split there was no way to ask either question after the first
+        compaction, because the answer to both had been overwritten by the same
+        list. Being able to put them side by side is most of what makes a run
+        that went wrong diagnosable.
+
+        Reads from the live context when the daemon holds one and from disk when
+        it does not, so it answers for a session this process has never run.
+        """
+        authorise(authorization)
+        runtime.sessions.get(session_id) or _missing()
+        limit = max(1, min(2_000, limit))
+
+        context = runtime.contexts.get(session_id)
+        if context is not None:
+            records = context.transcript.records
+            sidecar = context.compaction
+        else:
+            journal = Journal(runtime.workspace, session_id)
+            raw = journal.read_records()
+            if not raw:
+                raise HTTPException(
+                    status_code=404, detail="that session has no canonical transcript"
+                )
+            records = Transcript.from_records(raw).records
+            sidecar = CompactionState.from_dict(journal.read_compaction() or {})
+
+        if view == "canonical":
+            rows = [
+                {
+                    "seq": r.seq,
+                    "role": str(r.role),
+                    "turn": r.turn,
+                    "tool": r.tool,
+                    "path": r.path,
+                    "visibility": str(r.visibility),
+                    "characters": len(r.content),
+                    "content": r.content,
+                }
+                for r in records[-limit:]
+            ]
+        elif context is not None:
+            rows = [
+                {
+                    "seq": m.seq,
+                    "role": str(m.role),
+                    "layer": str(m.layer),
+                    "turn": m.turn,
+                    "path": m.path,
+                    "line_range": list(m.line_range) if m.line_range else None,
+                    "characters": len(m.content),
+                    "content": m.content,
+                }
+                for m in context.view().messages[-limit:]
+            ]
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail="no context is held for that session; ask for view=canonical",
+            )
+
+        return {
+            "session_id": session_id,
+            "view": view,
+            "records": len(records),
+            "returned": len(rows),
+            "compaction": sidecar.as_dict() if sidecar else None,
+            "messages": rows,
+        }
+
+    @app.post("/v1/sessions/{session_id}/compact")
+    async def compact_now(
+        session_id: str,
+        strategy: str = Query(default="basic"),
+        retain: float = Query(default=0.35),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Compact this session's context on demand.
+
+        The extension has had a ``dakcoder.compactContext`` command with nothing
+        behind it: there was no route, so the command could not do what its name
+        says. There is one now, and the default is the deterministic strategy --
+        a developer asking for a compaction did not ask to be billed for a
+        summariser call, and the tier exists precisely so that they need not be.
+
+        Refused while a run is in flight. Compaction changes the sidecar, and a
+        turn assembling its request against the old one would be reading a
+        context that moved underneath it. There is no reason to allow it: the
+        run compacts itself at the threshold.
+        """
+        authorise(authorization)
+        session = runtime.sessions.get(session_id) or _missing()
+        if session.status is Status.RUNNING:
+            raise HTTPException(
+                status_code=409,
+                detail="the run is in flight; it compacts itself when it needs to",
+            )
+        context = runtime.contexts.get(session_id)
+        if context is None:
+            raise HTTPException(
+                status_code=404, detail="no context is held for that session any more"
+            )
+        loop = runtime.loops.get(session_id)
+        summariser = loop._summarise if loop is not None else (lambda _m: Recap())
+        before = context.usage().total
+        recap = context.compact(
+            summariser,
+            retain_pct=max(0.05, min(0.9, retain)),
+            strategy="agentic" if strategy == "agentic" else "basic",
+        )
+        context.persist()
+        return {
+            "session_id": session_id,
+            "strategy": strategy,
+            "before": before,
+            "after": context.usage().total,
+            "evicted_messages": context.last_eviction.messages,
+            "evicted_paths": list(context.last_eviction.paths),
+            "goal": recap.goal,
+        }
+
+    @app.get("/v1/sessions/{session_id}/plan")
+    async def session_plan(
+        session_id: str, authorization: str | None = Header(default=None)
+    ) -> dict[str, Any]:
+        """This session's plan, its step statuses and how it got here.
+
+        From disk rather than from the live loop, so it answers after a restart
+        and for a session this daemon has never run -- which is most of them,
+        and all the interesting ones.
+        """
+        authorise(authorization)
+        runtime.sessions.get(session_id) or _missing()
+        record = PlanRecord.load(runtime.workspace, session_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="that session has no plan")
+        return record.as_dict()
+
+    @app.get("/v1/agenda")
+    async def list_agenda(
+        state: str = Query(default="open"),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """The repository's backlog: work proposed but not yet done.
+
+        ``state=open`` is the default because that is the question anyone
+        actually has. The others are there so a UI can show what was dropped
+        without a second endpoint.
+        """
+        authorise(authorization)
+        store = AgendaStore(runtime.workspace)
+        tasks = store.open_tasks() if state == "open" else [
+            t for t in store.load() if state == "all" or t.state == state
+        ]
+        return {"tasks": [t.as_dict() for t in tasks], "state": state}
+
+    @app.post("/v1/agenda")
+    async def add_agenda_task(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> dict[str, Any]:
+        """Propose work for later.
+
+        Deliberately open to the developer as well as to the agent. The agent is
+        the one most likely to notice a fourth N+1 while fixing three; the
+        developer is the one who will be reading this list on Monday.
+        """
+        authorise(authorization)
+        body = await request.json()
+        if not isinstance(body, dict) or not str(body.get("title") or "").strip():
+            raise HTTPException(status_code=400, detail="a task needs a title")
+        task = AgendaTask.propose(
+            str(body["title"]),
+            why=str(body.get("why") or ""),
+            paths=[str(p) for p in body.get("paths") or () if p],
+            priority=int(body.get("priority") or 3),
+            origin_session=str(body.get("session_id") or ""),
+        )
+        added = AgendaStore(runtime.workspace).add(task)
+        if added is None:
+            raise HTTPException(
+                status_code=409,
+                detail="that work is already on the agenda, or the agenda could not be written",
+            )
+        return added.as_dict()
+
+    @app.post("/v1/agenda/{task_id}")
+    async def move_agenda_task(
+        task_id: str,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Approve, drop or complete a proposal.
+
+        The state is moved by a person, which is the whole point of the agenda
+        existing separately from the plan: a plan step's status is derived from
+        the change set and this one is a decision.
+        """
+        authorise(authorization)
+        body = await request.json()
+        state = str((body or {}).get("state") or "")
+        if state not in AGENDA_STATES:
+            raise HTTPException(
+                status_code=400, detail=f"state must be one of {', '.join(AGENDA_STATES)}"
+            )
+        moved = AgendaStore(runtime.workspace).move(
+            task_id,
+            state,
+            by=str((body or {}).get("by") or "developer"),
+            note=str((body or {}).get("note") or ""),
+        )
+        if moved is None:
+            raise HTTPException(status_code=404, detail="no such task, or it could not be written")
+        return moved.as_dict()
 
     @app.post("/v1/approvals/{approval_id}/extend")
     async def extend_approval(

@@ -42,9 +42,11 @@ from dakcoder_shared.envelope import EventType
 from dakcoder_shared.llm import ToolCall
 from dakcoder_shared.tokens import estimate_tokens
 
+from .compaction import CompactionState
 from .context import ContextManager
+from .transcript import Transcript, Visibility
 
-__all__ = ["Restored", "rehydrate", "restorable"]
+__all__ = ["Restored", "rehydrate", "restorable", "restore_canonical"]
 
 #: Fraction of the prompt budget a restored conversation may occupy.
 #:
@@ -127,6 +129,68 @@ def rehydrate(
         _replay(turn, context)
 
     return Restored(context, len(kept), dropped, len(stored))
+
+
+def restore_canonical(
+    journal: Any,
+    *,
+    context: ContextManager,
+    task: str = "",
+    acceptance: Sequence[str] = (),
+) -> Restored | None:
+    """Restore the conversation the run was *actually having*, or ``None``.
+
+    The preferred path, and the one that only became possible when compaction
+    stopped rewriting history. It reads two files:
+
+    * ``transcript.jsonl`` -- the canonical records, tool results whole. Not a
+      replay of the event stream through the append methods, which is a
+      reconstruction and can differ from what was sent; these are the records
+      themselves.
+    * ``compaction.json`` -- the sidecar, which is only adopted if its hash
+      still matches the records under it. When it matches, the restored context
+      projects exactly the recap the run was using; when it does not, the
+      records are kept and the next threshold compacts them afresh.
+
+    ``None`` when there is no canonical transcript on disk -- a session recorded
+    before this existed, or one whose journal was never attached -- and the
+    caller falls back to ``rehydrate``, which rebuilds an approximation from the
+    event stream.
+
+    Deliberately *not* budget-trimmed. ``rehydrate`` keeps the newest whole
+    turns that fit 55% of the budget because it has no better rule; here the
+    sidecar already says how the run was staying inside its budget, and
+    second-guessing it would restore a different context from the one being
+    resumed. An oversized restore compacts on its first turn, which is the
+    correct behaviour and the same thing the live run would have done.
+    """
+    raw = journal.read_records()
+    if not raw:
+        return None
+    transcript = Transcript.from_records(raw)
+    if not len(transcript):
+        return None
+
+    context._transcript = transcript  # noqa: SLF001 - the restore seam
+    context._projector.invalidate()  # noqa: SLF001
+    if task:
+        context.set_task(task, acceptance=tuple(acceptance))
+
+    sidecar = CompactionState.from_dict(journal.read_compaction() or {})
+    adopted = sidecar is not None and context.adopt_compaction(sidecar)
+    # Resume writing where the previous process stopped, so restoring does not
+    # duplicate every record it just read.
+    context.attach_journal(journal, persisted=len(transcript))
+
+    turns = len({r.turn for r in transcript if r.turn}) or 1
+    if not adopted and sidecar is not None:
+        context.append_user(
+            "[Restored from disk. A compaction summary was on disk but no longer "
+            "describes this conversation, so the full transcript below is what you "
+            "have; it may be compacted again on this turn.]",
+            visibility=Visibility.MODEL,
+        )
+    return Restored(context, turns, 0, len(raw))
 
 
 # ── shaping the stream into turns ───────────────────────────────────────────
