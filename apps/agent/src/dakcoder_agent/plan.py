@@ -46,6 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .migration import MigrationState
 from .tools.control import STEP_STATUSES, PlanStep
 from .undo import ensure_private
 
@@ -92,6 +93,7 @@ class PlanRevision:
             "reason": self.reason,
             "steps": [
                 {"file": s.file, "action": s.action, "accepts": s.accepts,
+                 "phase": s.phase, "part": s.part,
                  "status": s.status, "note": s.note}
                 for s in self.steps
             ],
@@ -121,6 +123,8 @@ def _steps_from(raw: Any) -> tuple[PlanStep, ...]:
                 file=str(item.get("file") or ""),
                 action=str(item.get("action") or ""),
                 accepts=str(item.get("accepts") or ""),
+                phase=str(item.get("phase") or ""),
+                part=str(item.get("part") or ""),
                 status=status if status in STEP_STATUSES else "pending",
                 note=str(item.get("note") or ""),
             )
@@ -147,6 +151,14 @@ class PlanRecord:
     #: not a commitment (BUG L-28) -- so it has to survive a restart with the
     #: plan, or the resumed run enforces something nobody asked for.
     forced: bool = False
+    #: The migration this plan is one phase of, when it is one.
+    #:
+    #: Here rather than in a file of its own because it is answering the same
+    #: question the plan answers -- what did this session commit to -- and a
+    #: roadmap that survived a restart while the plan did not, or the reverse,
+    #: would resume a run into a phase whose steps it had lost. One file, one
+    #: atomic write, one answer.
+    migration: MigrationState = field(default_factory=MigrationState)
     updated_at: str = field(default_factory=_now)
 
     @property
@@ -188,8 +200,10 @@ class PlanRecord:
             "summary": self.summary,
             "forced": self.forced,
             "updated_at": self.updated_at,
+            "migration": self.migration.as_dict(),
             "steps": [
                 {"file": s.file, "action": s.action, "accepts": s.accepts,
+                 "phase": s.phase, "part": s.part,
                  "status": s.status, "note": s.note}
                 for s in self.steps
             ],
@@ -209,6 +223,9 @@ class PlanRecord:
             steps=_steps_from(raw.get("steps")),
             revisions=revisions,
             forced=bool(raw.get("forced")),
+            migration=MigrationState.from_dict(
+                raw.get("migration") if isinstance(raw.get("migration"), Mapping) else {}
+            ),
             updated_at=str(raw.get("updated_at") or _now()),
         )
 

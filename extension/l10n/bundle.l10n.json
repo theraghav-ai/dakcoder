@@ -259,6 +259,7 @@
   "Proposed changes — {0}": "Proposed changes — {0}",
   "Protected path — the runtime never auto-approves this.": "Protected path — the runtime never auto-approves this.",
   "Proxy": "Proxy",
+  "Put the cursor on a dakcoder finding to migrate that handler, or run /migrate in the chat to convert the whole service.": "Put the cursor on a dakcoder finding to migrate that handler, or run /migrate in the chat to convert the whole service.",
   "Put the cursor on a dakcoder finding, then try again.": "Put the cursor on a dakcoder finding, then try again.",
   "Queued — read before the next turn": "Queued — read before the next turn",
   "Quota": "Quota",

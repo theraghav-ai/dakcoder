@@ -331,7 +331,13 @@ def test_the_state_block_shows_the_change_set_the_plan_and_the_gate(
     block = _state_blocks(loop)[-1]
     assert "# Current state" in block
     assert "Written this run: handler/user.go" in block
-    assert "[done] handler/user.go" in block, "the step is done because the file was written"
+    # The plan renders as a cursor rather than a checklist. Here the one step
+    # was written and passed the fast checks, so it is settled -- but the gate
+    # blocked at go_build, and the block must not declare completion ahead of
+    # verification.
+    assert "Done: 1 handler/user.go" in block
+    assert "the gate is failing at go_build" in block
+    assert "the work is not done" in block
     assert "Last gate: FAIL at go_build" in block
     assert "gate failed at go_build" in block, "the failure is listed under what was tried"
 
@@ -358,7 +364,11 @@ def test_the_state_block_is_rebuilt_from_ground_truth_not_from_prose(
     list(loop.run("add Routes", intent=Intent.AGENT))
     block = _state_blocks(loop)[-1]
     assert "Written this run: nothing yet" in block
-    assert "[pending] handler/user.go" in block
+    # The cursor still points at step 1 and carries no status marker: a pending
+    # step is unannotated, and the model's claim to have written the file moved
+    # nothing.
+    assert "Now: step 1 of 1 — handler/user.go" in block
+    assert "[written]" not in block and "[done]" not in block
 
 
 # ── Fix 2: plan steps carry a status ────────────────────────────────────────

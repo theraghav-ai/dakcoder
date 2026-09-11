@@ -64,6 +64,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdFxWire(args[1:], stdout, stderr)
 	case "repo-map":
 		return cmdRepoMap(args[1:], stdout, stderr)
+	case "routes":
+		return cmdRoutes(args[1:], stdout, stderr)
 	case "db-roundtrip-audit":
 		return cmdDBRoundTripAudit(args[1:], stdout, stderr)
 	case "validation-audit":
@@ -105,6 +107,8 @@ USAGE
   gotools project-scaffold   [flags]   create a new service from a spec
   gotools fx-wire            [flags]   register a constructor in bootstrapper.go
   gotools repo-map           [flags]   module, package tree, exported symbols, FX graph
+  gotools routes             [flags]   every registered route; --save before a migration,
+                                       --against after it, to prove none were lost
   gotools db-roundtrip-audit [flags]   per-method database round trips, N+1s first
   gotools validation-audit   [flags]   request fields and what their validate tags miss
   gotools temporal-audit     [flags]   work on the request path that may belong off it

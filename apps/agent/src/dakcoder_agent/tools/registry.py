@@ -269,7 +269,7 @@ _SPECS: tuple[ToolSpec, ...] = (
         parallel=True,
         description=(
             "Read a slice of one file. Always pass start and end when you know roughly "
-            "where to look; whole-file reads crowd out everything else in context."
+            "where to look; without `end` you get 800 lines from `start`."
         ),
         parameters=_obj(
             path=_str("Workspace-relative path, e.g. 'handler/user.go'."),
@@ -450,6 +450,37 @@ _SPECS: tuple[ToolSpec, ...] = (
         modes=_SURVEY,
         provider=Provider.GOTOOLS,
     ),
+    # The migration's before-and-after. `save` takes the inventory while the
+    # service is still the one being replaced; `against` reports what the
+    # converted one no longer serves.
+    #
+    # Harness-run, like the gate stages, and for their reason: both moments this
+    # is needed at are moments the model does not choose. The inventory is taken
+    # on the way past the migration's branch guard, which is the last turn on
+    # which the answer is still the *legacy* service's; the comparison is a gate
+    # stage, which runs when the last phase closes whether or not anybody
+    # remembered to ask for it. "The model forgot to check" is the failure that
+    # design exists to prevent, and a route nobody notices is missing is the
+    # most expensive version of it.
+    #
+    # Kept out of every schema list as a consequence, which is worth about 140
+    # tokens per turn of every task in the product -- and this one is relevant
+    # to roughly one task in fifty.
+    ToolSpec(
+        name="route_inventory",
+        description=(
+            "Every route the service registers, gin or template, prefixes resolved. "
+            "save= records them before a migration; against= reports which a finished "
+            "one no longer serves."
+        ),
+        parameters=_obj(
+            save=_str("Write the inventory here, e.g. '.dakcoder/routes-before.json'."),
+            against=_str("Compare against a saved inventory and report what is missing."),
+        ),
+        modes=_READERS,
+        gate_only=True,
+        provider=Provider.GOTOOLS,
+    ),
     ToolSpec(
         name="playbook",
         parallel=True,
@@ -485,7 +516,8 @@ _SPECS: tuple[ToolSpec, ...] = (
         name="submit_plan",
         description=(
             "Submit the plan and start the work. Each step names one file, what "
-            "changes in it, and how you will know it worked."
+            "changes in it, and how it is checked. A whole-service migration also "
+            "sends phases, with steps for the first phase only."
         ),
         parameters=_obj(
             steps=_array(
@@ -508,11 +540,43 @@ _SPECS: tuple[ToolSpec, ...] = (
                             "type": "string",
                             "description": "How this step is checked once done.",
                         },
+                        "phase": {
+                            "type": "string",
+                            "description": "A name from phases, if the plan has any.",
+                        },
+                        "part": {
+                            "type": "string",
+                            "description": "Which of that phase's parts.",
+                        },
                     },
                     "required": ["file", "action", "accepts"],
                     "additionalProperties": False,
                 },
                 maxItems=8,
+            ),
+            # The roadmap, and the reason it is a second field rather than a
+            # longer `steps`: a migration is forty files and `steps` caps at
+            # eight, so a plan that tried to hold the whole conversion could only
+            # hold it as directories -- which is the plan whose cursor never
+            # advances. Phases are cheap and inert; only the open one becomes
+            # work. See `migration.py`.
+            phases=_array(
+                "Migrations only: the phases in order, at least three. Omit for "
+                "ordinary tasks.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Short name, e.g. handlers."},
+                        "covers": {"type": "string", "description": "What it does, one line."},
+                        "parts": {
+                            "type": "string",
+                            "description": "Its sub-categories, comma-separated, two or more.",
+                        },
+                    },
+                    "required": ["name", "covers", "parts"],
+                    "additionalProperties": False,
+                },
+                maxItems=12,
             ),
             summary=_str("One sentence on what the whole plan achieves."),
         ),
@@ -534,7 +598,13 @@ _SPECS: tuple[ToolSpec, ...] = (
             assumed=_str("What you inferred rather than asking about."),
         ),
         required=("questions",),
-        modes=frozenset({_PLAN}),
+        # The acting phase too, and shown there only during a migration
+        # (`AgentLoop._tools` withholds it otherwise). A conversion meets its
+        # unknowns while converting -- the field type, the route base, which
+        # branch to cut -- and an acting phase that can only guess or stop is
+        # what turns "ask often" into a sentence in a prompt that nothing can
+        # obey. `_phase_ended` has always handled this call from any mode.
+        modes=frozenset({_PLAN, _AGENT}),
     ),
     # -- ending a turn ------------------------------------------------------
     #
@@ -611,6 +681,8 @@ _SPECS: tuple[ToolSpec, ...] = (
                         "file": {"type": "string", "description": "Path this step changes."},
                         "action": {"type": "string", "description": "What changes in it."},
                         "accepts": {"type": "string", "description": "How it is checked."},
+                        "phase": {"type": "string", "description": "Its phase, if any."},
+                        "part": {"type": "string", "description": "Its part of that phase."},
                         "status": {
                             "type": "string",
                             "enum": ["pending", "skipped"],
@@ -881,7 +953,12 @@ _SPECS: tuple[ToolSpec, ...] = (
                 enum=["branch", "add", "commit"],
             ),
             paths=_str("Comma-separated paths for add. Omit to stage tracked changes."),
-            message=_str("Commit message, for commit."),
+            message=_str("Commit message for commit, or the branch name for branch."),
+            # What the new branch replicates, and the reason `branch` grew a
+            # second argument: without it the branch is cut from wherever HEAD
+            # happened to be. A migration cut from a stale feature branch has to
+            # be redone, and "cut it from development" is the SOP's first line.
+            base=_str("For branch: the branch to cut from, e.g. 'development'."),
         ),
         required=("op",),
         modes=_ACTS,

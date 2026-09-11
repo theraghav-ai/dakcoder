@@ -609,10 +609,28 @@ export class GoDiagnostics implements vscode.Disposable {
     });
   }
 
-  /** *Migrate this handler* — one unit of the migration flow (plan §11.4). */
+  /**
+   * *Migrate this handler* — one unit of the migration flow (plan §11.4).
+   *
+   * The target comes from the lightbulb, or from the cursor sitting on a
+   * dakcoder finding. When it comes from neither, say so: this returned in
+   * silence, and because the chat's `/migrate` used to route here, the visible
+   * behaviour was a slash command that did nothing at all. `fixDiagnostic`
+   * beside it has always said what it needed; this one never did.
+   *
+   * `/migrate` is a whole-service conversion now and does not come through
+   * here, so the message can say what this command is actually for.
+   */
   async migrateHandler(arg?: unknown): Promise<void> {
     const target = this.resolveTarget(arg);
-    if (!target) return;
+    if (!target) {
+      void vscode.window.showInformationMessage(
+        vscode.l10n.t(
+          'Put the cursor on a dakcoder finding to migrate that handler, or run /migrate in the chat to convert the whole service.',
+        ),
+      );
+      return;
+    }
     const { relative, violation } = target;
 
     // The migration plan viewer owns the flow when it is present. Checked rather

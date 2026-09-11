@@ -50,6 +50,7 @@
       "search_docs",
       "rules_lint",
       "playbook",
+      "ask_developer",
       "finish",
       "revise_plan",
       "write_file",
@@ -102,7 +103,7 @@
     },
     {
       "name": "read_file",
-      "description": "Read a slice of one file. Always pass start and end when you know roughly where to look; whole-file reads crowd out everything else in context.",
+      "description": "Read a slice of one file. Always pass start and end when you know roughly where to look; without `end` you get 800 lines from `start`.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -372,6 +373,34 @@
       "provider": "gotools"
     },
     {
+      "name": "route_inventory",
+      "description": "Every route the service registers, gin or template, prefixes resolved. save= records them before a migration; against= reports which a finished one no longer serves.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "save": {
+            "type": "string",
+            "description": "Write the inventory here, e.g. '.dakcoder/routes-before.json'."
+          },
+          "against": {
+            "type": "string",
+            "description": "Compare against a saved inventory and report what is missing."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "agent",
+        "ask",
+        "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools",
+      "gate_only": true
+    },
+    {
       "name": "playbook",
       "description": "Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before.",
       "parameters": {
@@ -396,7 +425,7 @@
     },
     {
       "name": "submit_plan",
-      "description": "Submit the plan and start the work. Each step names one file, what changes in it, and how you will know it worked.",
+      "description": "Submit the plan and start the work. Each step names one file, what changes in it, and how it is checked. A whole-service migration also sends phases, with steps for the first phase only.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -417,6 +446,14 @@
                 "accepts": {
                   "type": "string",
                   "description": "How this step is checked once done."
+                },
+                "phase": {
+                  "type": "string",
+                  "description": "A name from phases, if the plan has any."
+                },
+                "part": {
+                  "type": "string",
+                  "description": "Which of that phase's parts."
                 }
               },
               "required": [
@@ -427,6 +464,34 @@
               "additionalProperties": false
             },
             "maxItems": 8
+          },
+          "phases": {
+            "type": "array",
+            "description": "Migrations only: the phases in order, at least three. Omit for ordinary tasks.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "Short name, e.g. handlers."
+                },
+                "covers": {
+                  "type": "string",
+                  "description": "What it does, one line."
+                },
+                "parts": {
+                  "type": "string",
+                  "description": "Its sub-categories, comma-separated, two or more."
+                }
+              },
+              "required": [
+                "name",
+                "covers",
+                "parts"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 12
           },
           "summary": {
             "type": "string",
@@ -470,6 +535,7 @@
         "additionalProperties": false
       },
       "modes": [
+        "agent",
         "planner"
       ],
       "mutates": false,
@@ -529,6 +595,14 @@
                 "accepts": {
                   "type": "string",
                   "description": "How it is checked."
+                },
+                "phase": {
+                  "type": "string",
+                  "description": "Its phase, if any."
+                },
+                "part": {
+                  "type": "string",
+                  "description": "Its part of that phase."
                 },
                 "status": {
                   "type": "string",
@@ -1033,7 +1107,11 @@
           },
           "message": {
             "type": "string",
-            "description": "Commit message, for commit."
+            "description": "Commit message for commit, or the branch name for branch."
+          },
+          "base": {
+            "type": "string",
+            "description": "For branch: the branch to cut from, e.g. 'development'."
           }
         },
         "required": [

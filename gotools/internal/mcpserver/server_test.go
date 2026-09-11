@@ -169,7 +169,7 @@ func TestToolNamesAreStable(t *testing.T) {
 	}
 	want := []string{
 		"rules_lint", "legacy_audit", "list_rules",
-		"resource_scaffold", "project_scaffold", "fx_wire", "repo_map",
+		"resource_scaffold", "project_scaffold", "fx_wire", "repo_map", "route_inventory",
 		// The four audits, added deliberately. They reproduce the sheets the
 		// manual review of 41 services was assembled by hand.
 		"db_roundtrip_audit", "validation_audit", "temporal_audit", "lib_version_check",

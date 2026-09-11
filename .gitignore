@@ -35,5 +35,5 @@ deploy/dakcoder.env
 # one stays visible to git; `scripts/release.py` moves the exception
 # forward on every bump.
 extension/*.vsix
-!extension/dakcoder-go-0.3.6.vsix
+!extension/dakcoder-go-0.3.11.vsix
 # --- end packaged extensions ---

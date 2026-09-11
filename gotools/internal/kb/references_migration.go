@@ -37,6 +37,18 @@ var migrationReferences = []Reference{
 		Intro: "The migration program's SOP, in execution order: branch, swap the " +
 			"dependencies, convert every handler, wire the bootstrap graph, regenerate " +
 			"validation, modernise the tests, prove the swagger document exists.\n\n" +
+			// How the programme is *run* comes before what it changes, because
+			// these are the sentences a Planner reads before it writes a plan,
+			// and the plan is where a conversion is won or lost. A run that
+			// plans a whole service as eight steps has already failed; it does
+			// not find out until it opens the 6,500-line handler, by which
+			// point the budget has gone.
+			"The first section says how the programme is run: phased, one phase per " +
+			"run, a branch confirmed before anything is written, a big file split across " +
+			"several steps, progress recorded on disk, every route recorded before the " +
+			"first write and checked against that record at the end, and no " +
+			"verification gate until " +
+			"the last phase closes.\n\n" +
 			// Points at the section rather than counting the rules. The
 			// previous wording promised "the CRITICAL rules" and "two mistakes
 			// that fail only at runtime", and the word CRITICAL then appeared
@@ -57,7 +69,60 @@ var migrationReferences = []Reference{
 			"as blocking.\n\n" +
 			"Run `legacy_audit` before starting and after finishing \u2014 it should go " +
 			"from a page of findings to none.",
-		Body: `## The CRITICAL rules, in one place
+		Body: `## How this migration is run
+
+A conversion is not a large task; it is a task with a different shape, and six
+rules follow from that. The agent enforces them rather than merely advising
+them: a plan that ignores one is sent back before any file changes.
+
+**Plan it in phases, and break each phase down.** ` + "`" + `submit_plan` + "`" + ` takes ` + "`" + `phases` + "`" + ` —
+the roadmap, in execution order, at least three, each naming in ` + "`" + `parts` + "`" + ` the
+sub-categories it contains — and ` + "`" + `steps` + "`" + ` for the *one phase that is open*. The
+steps below are the default phases: branch, dependencies, handlers, DTOs and
+validation, bootstrap and FX, tests, swagger. A plan that tries to hold the
+whole conversion is a plan whose steps are directories, and a directory step is
+one that nothing can finish.
+
+**Never the whole codebase in one go.** A phase closes, the agent reports what
+landed and what comes next, and the run stops there; the developer says when the
+next phase opens. Ten thousand lines across seven files is more than one context
+window, so a run that sets out to finish the conversion exhausts its budget with
+the work half applied.
+
+**A file bigger than one reply gets more than one step.** A 6,500-line handler
+with fifty methods is eight or nine steps, not one: several steps naming the
+same file, each saying in ` + "`" + `action` + "`" + ` which methods or which line range it
+converts, with the group in ` + "`" + `part` + "`" + `. One step for a file that size is a step that
+can never be finished, and it is discovered only after the file has been read —
+which is also after the budget has gone. Roughly one step per 800 lines.
+
+**Progress is recorded on disk.** The agent maintains ` + "`" + `.dakcoder/migration.md` + "`" + `
+from the roadmap and the change set: which phases have closed, which steps are
+done, which files this session changed. Read it first when resuming. It answers
+"where did the last session get to" in a few hundred tokens, where a transcript
+does not survive compaction and a hand-written summary is prose.
+
+**Every route is recorded before anything changes, and checked at the end.**
+The agent takes an inventory of every route the service registers — gin groups
+resolved, prefixes applied — into ` + "`" + `.dakcoder/routes-before.json` + "`" + `, on the last
+turn before the first write. When the last phase closes, the gate compares it
+against what the converted service registers and blocks on anything that is no
+longer served. A route lost in conversion is the failure nothing else here
+catches: an unregistered handler method is a method nobody calls, which
+compiles, lints and vets clean, and the first thing that notices is a client
+getting a 404. If a route was retired on purpose, say which and why.
+
+**The verification gate does not run until the last phase closes.** Between the
+dependency swap and the last converted handler the service cannot build, and
+that is the plan working rather than a fault — half the packages import
+` + "`" + `api-server` + "`" + ` and half import ` + "`" + `n-api-server` + "`" + `. A gate run there reports the
+conversion's own middle as a failure and asks for it to be fixed, which cannot
+be done without finishing every remaining phase in one turn. Run ` + "`" + `go_build` + "`" + `
+yourself against the package you just converted if you want a check. The full
+gate runs once, when the last phase closes, and without a baseline: a converted
+service that does not build has not been converted.
+
+## The CRITICAL rules, in one place
 
 Every rule below survives the compiler. Most surface only when the service
 starts or the first request arrives; one collides at build time. Each is
@@ -99,15 +164,25 @@ rule 1 is the dependency swap's one wrong turn.
 
 Run ` + "`" + `legacy_audit` + "`" + ` first: it names every file carrying a pre-template pattern, with a line for each. ` + "`" + `@skill:legacy-patterns` + "`" + ` maps each finding to its replacement, and ` + "`" + `@skill:data-access-library` + "`" + ` covers the one swap that is import-only.
 
-## Step 1 — an isolated branch
+## Step 1 — an isolated branch, confirmed before it is cut
 
-Work on a ` + "`" + `template-conversion` + "`" + ` branch cut from ` + "`" + `development` + "`" + `, pushed with ` + "`" + `-u` + "`" + ` so the migration is reviewable and revertible as one unit:
+Work on a ` + "`" + `template-conversion` + "`" + ` branch cut from ` + "`" + `development` + "`" + `, so the conversion
+is reviewable and revertible as one unit and the new branch carries
+` + "`" + `development` + "`" + `'s code rather than whatever happened to be checked out.
+
+**Confirm it first.** ` + "`" + `git_status` + "`" + ` lists the branches, so it answers whether
+` + "`" + `development` + "`" + ` exists. Then ` + "`" + `ask_developer` + "`" + `: which branch to cut, and which to
+cut it from, naming what you found. The base decides what the conversion is
+built on, and a migration cut from a stale feature branch has to be redone — it
+is not a thing to infer about somebody else's repository. Then:
 
 ` + "```" + `
-git checkout development && git pull origin development
-git checkout -b template-conversion
-git push -u origin template-conversion
+git_ops op=branch message=template-conversion base=development
 ` + "```" + `
+
+which runs ` + "`" + `git checkout -b template-conversion development` + "`" + `. Nothing is written
+until that branch exists. The agent never pushes; push it yourself with ` + "`" + `-u` + "`" + `
+when you want it reviewable remotely.
 
 ## Step 2 — dependencies: the api-* to n-api-* swap
 

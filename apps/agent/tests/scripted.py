@@ -35,13 +35,24 @@ class ScriptedClient:
     the turns it actually cares about.
     """
 
-    def __init__(self, turns: Sequence[ChatResult], *, kind: str = "change") -> None:
+    def __init__(
+        self, turns: Sequence[ChatResult], *, kind: str = "change", migration: bool = False
+    ) -> None:
         self.turns = list(turns)
         self.seen_tools: list[list[str]] = []
         self.tool_choices: list[str | None] = []
         self.calls = 0
         #: What the intent classifier answers.
         self.kind = kind
+        #: And whether it calls this a whole-service migration, which is a
+        #: different question with different consequences -- the gate is
+        #: deferred, the plan must be phased, the writes wait for a branch.
+        self.migration = migration
+        #: How many times the intent classifier was asked. Counted separately
+        #: from `calls`, which also holds the turns: "was the classifier run"
+        #: is a question about cost and about routing, and subtracting turns to
+        #: get at it makes a test that breaks when the turn count changes.
+        self.classifications = 0
 
     def chat(
         self, messages, *, tools=None, tool_choice=None, response_format=None, **kwargs
@@ -49,8 +60,14 @@ class ScriptedClient:
         self.calls += 1
         if response_format is not None:
             name = response_format.get("json_schema", {}).get("name")
+            if name == "intent":
+                self.classifications += 1
             body = (
-                {"kind": self.kind, "why": f"scripted: {self.kind}"}
+                {
+                    "kind": self.kind,
+                    "why": f"scripted: {self.kind}",
+                    "migration": self.migration,
+                }
                 if name == "intent"
                 else {"goal": "scripted"}
             )
@@ -259,11 +276,12 @@ def build(
     turns: Sequence[ChatResult],
     *,
     kind: str = "change",
+    migration: bool = False,
     max_turns: int = 12,
     approve=lambda _r: True,
     cancelled=lambda: False,
 ) -> tuple[AgentLoop, ScriptedClient]:
-    client = ScriptedClient(turns, kind=kind)
+    client = ScriptedClient(turns, kind=kind, migration=migration)
     context = ContextManager(mode=Mode.ASK, system_prompt="You are dakcoder.")
     loop = AgentLoop(
         context,

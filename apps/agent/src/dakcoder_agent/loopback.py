@@ -63,6 +63,7 @@ from dakcoder_shared.envelope import Event, EventType
 
 from .compaction import CompactionState
 from .context import Recap
+from .debug import DebugLog
 from .journal import Journal
 from .loop import AgentLoop, Outcome, RunResult
 from .modes import Intent
@@ -316,6 +317,12 @@ class Loopback:
         # exactly, and only if it is written as it happens.
         if session.journal is not None:
             agent.context.attach_journal(session.journal)
+        # Full-fidelity turn recording, when DAKCODER_DEBUG is set. Attached
+        # here because this is where the session id and the workspace are both
+        # known, and it writes beside the transcript and the plan.
+        agent._debug = DebugLog.for_session(self.workspace, session.id)
+        if agent._debug is not None:
+            log.info("debug recording to %s", agent._debug.path)
         if continued:
             # The conversation *is* the context manager. ``build_loop`` hands
             # back a fresh one because most runs want one; a follow-up wants the

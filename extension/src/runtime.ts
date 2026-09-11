@@ -337,6 +337,17 @@ export class Runtime implements vscode.Disposable {
           .getConfiguration('dakcoder')
           .get<number>('approvalTimeoutSeconds', 0),
       ),
+      // Full-fidelity turn recording, as a setting rather than as an
+      // environment variable the developer has to get into this process
+      // somehow. `childEnv` inherits `process.env`, so `DAKCODER_DEBUG=1` in a
+      // shell only reaches the runtime if VS Code itself was launched from that
+      // shell -- which is not how anyone starts an editor, and is a miserable
+      // answer to "where do I run this".
+      ...(vscode.workspace
+        .getConfiguration('dakcoder')
+        .get<boolean>('debugRecording', false)
+        ? { DAKCODER_DEBUG: '1' }
+        : {}),
       // The sidecar ships inside the `.vsix` under a platform-suffixed name
       // (`bin/gotools-win32-x64.exe`, §4.5) and the runtime is a venv under
       // globalStorage, so the child can reach it neither by PATH — which holds

@@ -11,6 +11,7 @@ one turn is dispatched.
 
 from __future__ import annotations
 
+import time as _time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -77,6 +78,7 @@ def complete(
     session_id: str = "",
     on_delta: Callable[[str], None] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
+    debug: Any = None,
 ) -> TurnResult:
     """Dispatch one turn from a context manager.
 
@@ -106,6 +108,12 @@ def complete(
     turn with prose -- and the decision of how to spell it on the wire is the
     client's. This is the seam between them, and it holds nothing of its own.
 
+    ``debug`` is a recorder or ``None``, and it is handed the assembled request
+    *before* the call and the result after it. This is the only place either can
+    be captured -- it is the one seam every request passes through -- and it is
+    optional for the same reason ``on_delta`` is: a sink is none of this
+    module's business.
+
     ``role`` defaults to the mode's own -- Planner turns dispatch as ``planner``,
     Ask turns as ``ask`` -- so that the gateway's per-role routing can actually
     be reached. It stays overridable for the calls that are not a mode's turn at
@@ -122,8 +130,27 @@ def complete(
             f"by-layer: { {str(k): v for k, v in usage.by_layer.items() if v} }"
         )
 
+    wire = context.wire()
+    if debug is not None:
+        # Before the call, so a run that dies inside the endpoint still leaves
+        # the prompt that killed it on disk.
+        debug.request(
+            wire,
+            turn=context.turn,
+            role=role,
+            tools=tools,
+            tool_choice=tool_choice,
+            estimated_tokens=usage.total,
+            mode=str(context.mode),
+            max_tokens=mode_config.max_tokens,
+            temperature=mode_config.temperature,
+            enable_thinking=mode_config.enable_thinking,
+            by_layer={str(k): v for k, v in usage.by_layer.items() if v},
+        )
+
+    started = _time.monotonic()
     result = client.chat(
-        context.wire(),
+        wire,
         role=role,
         max_tokens=mode_config.max_tokens,
         enable_thinking=mode_config.enable_thinking,
@@ -138,6 +165,20 @@ def complete(
             estimated_tokens=usage.total,
         ),
     )
+
+    if debug is not None:
+        debug.response(
+            turn=context.turn,
+            content=result.content or "",
+            tool_calls=tuple(result.tool_calls),
+            finish_reason=str(result.finish_reason),
+            usage={
+                "prompt_tokens": result.usage.prompt_tokens,
+                "completion_tokens": result.usage.completion_tokens,
+                "reasoning_tokens": result.usage.reasoning_tokens,
+            },
+            seconds=_time.monotonic() - started,
+        )
 
     if result.usage.prompt_tokens > 0:
         context.observe_usage(prompt_tokens=result.usage.prompt_tokens)

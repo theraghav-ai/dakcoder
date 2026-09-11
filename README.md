@@ -77,6 +77,41 @@ python -m pytest apps -q
 `gotools/README.md` covers the sidecar in detail — what it checks, what it
 writes, and the design notes behind both.
 
+### Watching a run turn by turn
+
+Recording captures, for every turn, the exact request sent, the loop's own state
+in its five groups, the context accounting, and the raw response — into
+`.dakcoder/sessions/<id>/debug.jsonl` in the workspace, beside the transcript
+and the plan.
+
+**Turn it on.** You do not start the runtime yourself; the extension spawns it,
+and it inherits the environment VS Code was launched with — so an environment
+variable set in a shell reaches it only if VS Code was started from that shell.
+Use the setting instead:
+
+> Settings → `dakcoder.debugRecording` → on, then **Reload Window**.
+
+`DAKCODER_DEBUG=1` still works for anyone starting `dakcoderd` by hand.
+
+**Read it back**, from the workspace you ran against:
+
+```bash
+python scripts/debug.py                     # which sessions have a recording
+python scripts/debug.py latest              # the newest one, turn by turn
+python scripts/debug.py latest --prompt 14  # the exact request sent on turn 14
+python scripts/debug.py <id> -C /path/to/workspace
+```
+
+`scripts/debug.py` is the wrapper for a checkout, where `dakcoder_agent` is not
+installed; inside the runtime's own venv the module is `python -m
+dakcoder_agent.debug` with the same arguments.
+
+Off by default, one `is None` check per seam when off. Cheap when on because the
+prompt is prefix-stable by design: turn 1 stores the assembled request whole and
+every turn after stores only the messages that changed, so replay is exact
+rather than approximate. `apps/agent/src/dakcoder_agent/debug.py` has the
+reasoning.
+
 ## What is built
 
 All of it: the agent loop and tool router (`apps/agent`), the gateway — auth,

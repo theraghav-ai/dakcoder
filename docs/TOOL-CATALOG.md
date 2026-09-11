@@ -15,16 +15,16 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 
 | Mode | Tools | Schema cost |
 |---|---|---|
-| **ask** | 15 | ~1,682 tokens |
-| **planner** | 17 | ~2,045 tokens |
-| **agent** | 24 | ~3,091 tokens |
+| **ask** | 15 | ~1,680 tokens |
+| **planner** | 17 | ~2,227 tokens |
+| **agent** | 25 | ~3,296 tokens |
 
 ## The catalogue
 
 | Tool | Modes | Mutates | Approval | Runs in | Description |
 |---|---|---|---|---|---|
 | `repo_map` | AAP |  |  | gotools | Get the module path, package tree, exported symbols and FX providers. Call this first in an unfamiliar repository. Pass package to see one directory in full. |
-| `read_file` | AAP |  |  | agent | Read a slice of one file. Always pass start and end when you know roughly where to look; whole-file reads crowd out everything else in context. |
+| `read_file` | AAP |  |  | agent | Read a slice of one file. Always pass start and end when you know roughly where to look; without `end` you get 800 lines from `start`. |
 | `search_repo` | AAP |  |  | agent | Search file contents by regular expression. Use this instead of grep, and prefer it over reading files to find something. |
 | `search_docs` | AAP |  |  | agent | Search the n-api-template knowledge base for the contract rule behind a pattern. Use it before inventing an approach, not after. |
 | `go_symbols` | AAP |  |  | gopls | Find a symbol's definition, references or package API through gopls. Use this rather than searching for a name textually. _(not yet available: gopls is not yet wired (Part A section 8.3). Use search_repo, or go_build for type errors.)_ |
@@ -35,9 +35,10 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `validation_audit` | AP |  |  | gotools | List every request field, its validate tag, and what the tag leaves unbounded. `required` alone means only 'not empty', so a 10MB string passes. |
 | `temporal_audit` | AP |  |  | gotools | List inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only — it makes no recommendation. |
 | `lib_version_check` | AP |  |  | gotools | Report CEPT library drift: which are behind, which are superseded by n-api-*. Reports only — never edit go.mod on it, tell the user. |
+| `route_inventory` | gate |  |  | gotools | Every route the service registers, gin or template, prefixes resolved. save= records them before a migration; against= reports which a finished one no longer serves. |
 | `playbook` | AAP |  |  | agent | Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before. |
-| `submit_plan` | P |  |  | agent | Submit the plan and start the work. Each step names one file, what changes in it, and how you will know it worked. |
-| `ask_developer` | P |  |  | agent | Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base. |
+| `submit_plan` | P |  |  | agent | Submit the plan and start the work. Each step names one file, what changes in it, and how it is checked. A whole-service migration also sends phases, with steps for the first phase only. |
+| `ask_developer` | AP |  |  | agent | Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base. |
 | `finish` | AAP |  |  | agent | End your turn and hand the developer your answer. Call this when the work is done, or when going further will not help. |
 | `revise_plan` | A |  |  | agent | Replace the remaining plan steps after an approach failed. Say what was tried and why it did not work; steps already done are kept. |
 | `write_file` | A | ✓ | if protected | agent | Create a new file, or append=true to add to the end — the way to write a file too big for one reply. Refuses to overwrite. Write complete, compiling Go, not a sketch. |
@@ -76,7 +77,7 @@ Get the module path, package tree, exported symbols and FX providers. Call this 
 
 ### `read_file`
 
-Read a slice of one file. Always pass start and end when you know roughly where to look; whole-file reads crowd out everything else in context.
+Read a slice of one file. Always pass start and end when you know roughly where to look; without `end` you get 800 lines from `start`.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -160,6 +161,15 @@ Report CEPT library drift: which are behind, which are superseded by n-api-*. Re
 
 _No parameters._
 
+### `route_inventory`
+
+Every route the service registers, gin or template, prefixes resolved. save= records them before a migration; against= reports which a finished one no longer serves.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `save` | string |  | Write the inventory here, e.g. '.dakcoder/routes-before.json'. |
+| `against` | string |  | Compare against a saved inventory and report what is missing. |
+
 ### `playbook`
 
 Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before.
@@ -170,11 +180,12 @@ Get the known-good fix procedure for a failure class or rule id. Consult this be
 
 ### `submit_plan`
 
-Submit the plan and start the work. Each step names one file, what changes in it, and how you will know it worked.
+Submit the plan and start the work. Each step names one file, what changes in it, and how it is checked. A whole-service migration also sends phases, with steps for the first phase only.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `steps` | array | yes | The steps, in order. At most eight. |
+| `phases` | array |  | Migrations only: the phases in order, at least three. Omit for ordinary tasks. |
 | `summary` | string |  | One sentence on what the whole plan achieves. |
 
 ### `ask_developer`
@@ -359,7 +370,8 @@ Stage, commit, or switch to the session branch. Never pushes and never rewrites 
 |---|---|---|---|
 | `op` | string (branch \| add \| commit) | yes | One of: branch, add, commit. |
 | `paths` | string |  | Comma-separated paths for add. Omit to stage tracked changes. |
-| `message` | string |  | Commit message, for commit. |
+| `message` | string |  | Commit message for commit, or the branch name for branch. |
+| `base` | string |  | For branch: the branch to cut from, e.g. 'development'. |
 
 ### `run_terminal`
 

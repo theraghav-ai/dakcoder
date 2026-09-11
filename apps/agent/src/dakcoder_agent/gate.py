@@ -622,6 +622,14 @@ def _split_by_charge(content: str, charged: frozenset[str]) -> tuple[str, str]:
 #: skip reason the developer cannot act on costs the same turn a failure does.
 _NO_MODULE = "workspace root has no go.mod; open the service directory to gate it"
 
+#: Where a migration saves what the service served before it started.
+#:
+#: Named here rather than in `migration.py` because the gate is the half that
+#: cannot import it -- `migration` is loop state and this is the toolchain --
+#: and a path spelled twice is a path that eventually differs. `migration.py`
+#: imports this one.
+ROUTES_BEFORE = ".dakcoder/routes-before.json"
+
 
 def _has_go(ctx: GateContext) -> bool:
     return ctx.is_go_module
@@ -752,6 +760,27 @@ GATE: tuple[Stage, ...] = (
         blocking=False,
         when=_has_go,
         skip_reason=_NO_MODULE,
+    ),
+    # Did the conversion lose an endpoint?
+    #
+    # The last blocking stage and the only one that can answer a question about
+    # the *service* rather than about the code: a route that never reached the
+    # converted handler is a method nobody calls, which compiles, lints and vets
+    # clean. Nothing else here notices. The first thing that does is a client
+    # getting a 404.
+    #
+    # Conditioned on the saved inventory existing, which needs no flag and is
+    # the honest test either way: that file is written when a migration starts
+    # and by nothing else, so its presence *is* "a migration is under way, and
+    # here is what the service served before it". Unbaselined on purpose -- a
+    # route the service had before the conversion and does not have after it is
+    # this run's doing by construction.
+    Stage(
+        "routes_check",
+        "route_inventory",
+        lambda ctx: {"against": ROUTES_BEFORE},
+        when=lambda ctx: (ctx.router.workspace.root / ROUTES_BEFORE).is_file(),
+        skip_reason="no route inventory was saved; this is not a migration",
     ),
     Stage(
         "govulncheck",
@@ -1143,6 +1172,36 @@ def _stage_findings(stage: Stage, result: ToolResult) -> frozenset[str]:
         # contain the findings at all past the third of each rule.
         return frozenset(str(k) for k in (result.meta.get("violation_keys") or ()))
     return _finding_keys(result.for_model())
+
+
+def finding_path(tool: str, key: str) -> str:
+    """The workspace-relative path a finding key names, or ``""``.
+
+    Two shapes, because ``_stage_findings`` produces two: ``rules_lint`` keys
+    are ``rule|path|message`` -- the rule leads, because the baseline groups by
+    rule class -- and everything else is ``path|message`` from ``_line_key``, or
+    the whole line when it had no ``file:line:`` prefix to key at all.
+
+    Kept here, beside the function that builds the keys, so the two cannot
+    drift: anyone changing the key shape has the parser in view.
+
+    Returning ``""`` is the load-bearing case. A stage that failed because its
+    tool is not installed, or timed out, produces a key that is a sentence
+    rather than a path, and a caller asking "did this stage object to *my
+    file*" must get "no" -- not "yes, to a file called ``go_diagnostics is not
+    available``". The caller that needs this is the plan's verification node,
+    and answering it wrongly would hold every step open on a machine that
+    happens to be missing gopls.
+    """
+    parts = key.split("|")
+    if tool == "rules_lint":
+        return parts[1].strip() if len(parts) >= 2 else ""
+    head = parts[0].strip()
+    if len(parts) == 1 and (not head or " " in head):
+        # No `file:line:` prefix and it reads as prose: a tool's own error
+        # message, not a finding about a file.
+        return ""
+    return head
 
 
 def _stage_passed(stage: Stage, result: ToolResult) -> bool:

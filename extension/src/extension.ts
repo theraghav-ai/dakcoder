@@ -632,8 +632,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       scaffold: 'dakcoder.scaffoldResource',
       audit: 'dakcoder.auditTemplate',
       legacy: 'dakcoder.auditLegacy',
-      // `dakcoder.migrate` was never registered; `migrateHandler` is.
-      migrate: 'dakcoder.migrateHandler',
       // `dakcoder.debugLastFailure` was never registered; `debugDiagnostic` is.
       debug: 'dakcoder.debugDiagnostic',
       compact: 'dakcoder.compactContext',
@@ -641,6 +639,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       fix: 'dakcoder.fixDiagnostic',
       rule: 'dakcoder.explainRule',
     };
+
+    // `/migrate` is the service conversion, and it is not a command at all.
+    //
+    // It used to route to `dakcoder.migrateHandler`, which is the *lightbulb's*
+    // migration: it resolves its target from the cursor's position on a
+    // dakcoder finding, and from the chat panel there is no such cursor. The
+    // command ran, `resolveTarget` returned undefined, and the handler returned
+    // without a word — so `/migrate` did nothing at all, silently, which is the
+    // same symptom as the unregistered-command bug this table was written to
+    // fix, one layer further in.
+    //
+    // Two different jobs had one name. The lightbulb's means "convert this
+    // handler, the one I am looking at"; the panel's hint says "Migrate to
+    // n-api-template" and is offered on the empty panel as a first action,
+    // where it can only mean the service. So this is the service one, and
+    // `/migrate handler/paogen.go` narrows it.
+    if (command === 'migrate') {
+      void startMigration(argument.trim());
+      return;
+    }
 
     // Asked of the agent, not of a command. `/explain` opened a *rule document*
     // - so asking "explain this handler" got the text of a lint rule, or
@@ -666,6 +684,59 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     const phrase = asked[command];
     void submit(phrase ? phrase(argument.trim()) : `/${command} ${argument}`.trim(), false);
+  }
+
+  /**
+   * Start a migration, as its own conversation.
+   *
+   * `intent: 'agent'` explicitly, not the configured default: `/migrate` is a
+   * developer saying what they want done, and a window left on
+   * `dakcoder.defaultMode: ask` would answer it read-only — "nothing moves
+   * forward", by a second route, after the first one was fixed.
+   *
+   * A new session rather than a message into the open one, because a conversion
+   * is a session: it holds a roadmap, a branch and a phase cursor that outlive
+   * every message in it, and appending it to a conversation about something
+   * else buries all three.
+   */
+  async function startMigration(target: string): Promise<void> {
+    if (!(await ready())) return;
+
+    // Not localised: this is the instruction to the model, not UI. A translated
+    // prompt changes what the agent is asked to do. See diagnostics.ts's header.
+    const task = target
+      ? [
+          `Migrate ${target} to the n-api-template contract.`,
+          '',
+          'Read @skill:legacy-migration first. Plan it in phases even for one unit,',
+          'and split any file too large to rewrite in a single reply.',
+        ].join('\n')
+      : [
+          'Migrate this service from the legacy api-* libraries to the n-api-template.',
+          '',
+          'Read @skill:legacy-migration first, then run legacy_audit to see the scope.',
+          'Plan the whole conversion as phases and send the steps for the first phase',
+          'only. Confirm the branch to cut, and from which branch, before writing',
+          'anything.',
+        ].join('\n');
+
+    try {
+      const session = await runtime.client.startTask(task, {
+        intent: 'agent',
+        acceptance: ['gotools legacy-audit reports no violations'],
+      });
+      chatView.showSession(session.id);
+      state.hydrate(session);
+      state.attach(session.id);
+      void approvalService.discover();
+      treeSet.sessions.refresh();
+      void statusBar.refresh(true);
+      await focusPanel();
+    } catch (err) {
+      // Never silent. The whole point of this change is that a developer who
+      // typed something gets an answer, including when the answer is a failure.
+      reportRunError(err, log, chatView);
+    }
   }
 
   async function openWorkspacePath(relative: string): Promise<void> {

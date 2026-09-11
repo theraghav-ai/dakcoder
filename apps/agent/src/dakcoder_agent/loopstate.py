@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .gate import Baseline
+from .migration import MigrationState
 from .modes import Intent, Mode
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -99,6 +100,61 @@ class TaskState:
     #: fence, genuine change tasks went from 4/4 writing the code to 2/4, to buy
     #: one analysis run in four.
     plan_forced: bool = False
+    #: The step the plan cursor points at, and the turn it first pointed there:
+    #: ``(file, turn)``. Not a bound and not derivable -- it is the one fact the
+    #: cursor needs and cannot recompute, because "how long have I been here" is
+    #: a property of the *history* of the plan rather than of its current state.
+    #:
+    #: It exists because the cursor block was otherwise byte-identical on every
+    #: turn while a step stayed pending, and a standing order in the recency
+    #: slot with nothing in it that moves is a standing order the model obeys
+    #: from the top each turn. A field session restated it verbatim fifteen
+    #: times and wrote nothing.
+    cursor: tuple[str, int] = ("", 0)
+    #: Whether this session is converting a legacy service, and where that
+    #: conversion has got to.
+    #:
+    #: On ``TaskState`` because it is the same kind of fact as ``plan``: what
+    #: the run committed to. It is carried between messages and persisted with
+    #: the plan, because a migration outlives a message by construction -- the
+    #: roadmap is agreed on message one and phase five lands on message nine,
+    #: and a roadmap rebuilt per message is a roadmap the run restarts from.
+    #: See ``migration.py`` for what it changes about the gate, the plan and
+    #: the branch.
+    migration: MigrationState = field(default_factory=MigrationState)
+    #: Whether the pre-migration route inventory has been taken, and how many
+    #: routes it held.
+    #:
+    #: Once per session, and the flag is set before the attempt rather than
+    #: after it: a workspace with no sidecar answers the same way every time,
+    #: and retrying on each of forty write calls costs a subprocess launch
+    #: apiece to learn it again.
+    routes_saved: bool = False
+    routes_before: int = 0
+    #: Files this session deleted that nothing has written again.
+    #:
+    #: `write_file` refuses to overwrite, so replacing a file means deleting it
+    #: and writing it back, and a field run did the first half four times --
+    #: `handler/paogen.go` at 6,571 lines among them -- and never the second.
+    #: The deletion counted as the step's mutation, so the step read as written
+    #: and the cursor moved on. This is the set that disagrees.
+    #:
+    #: Carried between messages, because "you deleted this and did not replace
+    #: it" does not stop being true when the developer sends another message.
+    #: Checked against the disk when it is read, so a file the developer
+    #: restored drops out of it by itself.
+    removed: set[str] = field(default_factory=set)
+    #: The intent of the run that stopped to ask the developer something, held
+    #: until their answer arrives and then spent.
+    #:
+    #: An answer to `ask_developer` is a continuation of the work that asked,
+    #: and it is the one follow-up whose intent is known without guessing. The
+    #: classifier guessed anyway and guessed wrong: a field session's Planner
+    #: asked four questions about a migration, the developer answered them, and
+    #: the reply was classified "Asking for validation, not code changes" --
+    #: read-only. Thirteen turns later the run had no write tools, no
+    #: `submit_plan`, and a migration plan it could only emit as prose.
+    awaiting: Intent = Intent.AUTO
 
 
 @dataclass
@@ -285,6 +341,18 @@ class Progress:
     #: mistakes -- one is work not done, the other is work done and not
     #: delivered -- and a run may honestly make both.
     preamble_refused: int = 0
+    #: How many times an answer that had stopped being language was sent back.
+    #: The third of the same family, and the one with a cost the other two do
+    #: not have: a `finish` answer travels as the assistant's tool-call
+    #: arguments, so a degenerate one is not merely shown to the developer, it
+    #: is kept in the conversation and read back on every turn after it.
+    degenerate_refused: int = 0
+    #: How many times a migration plan was sent back for not being phased.
+    #: Bounded like the three above it and for the same reason: a plan the
+    #: model cannot reshape to the loop's satisfaction must eventually be
+    #: adopted, because a push-back that never stops asking spends the whole
+    #: budget on the shape of the work instead of the work.
+    plan_objections: int = 0
     #: Loop-initiated returns to the Planner this run. See ``_replan``.
     replans: int = 0
     #: Model-initiated ``revise_plan`` calls this run.

@@ -39,10 +39,14 @@ func TestCatalogueCoversEveryTool(t *testing.T) {
 	// Alphabetical, as the catalogue is built. The four *_audit / *_check tools
 	// are read-only reports added for the code-review findings; every one of
 	// them must stay out of the mutating set asserted below.
+	//
+	// `route_inventory` belongs with them: it writes the inventory file when
+	// asked to and never touches the service, which is why it is read-only here
+	// while having a `save` argument.
 	want := []string{
 		"db_roundtrip_audit", "fx_wire", "legacy_audit", "lib_version_check",
 		"list_rules", "project_scaffold", "repo_map", "resource_scaffold",
-		"rules_lint", "temporal_audit", "validation_audit",
+		"route_inventory", "rules_lint", "temporal_audit", "validation_audit",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("tools = %v, want %v", got, want)

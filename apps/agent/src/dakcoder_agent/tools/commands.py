@@ -771,7 +771,29 @@ def git_status(inv: Invocation) -> ToolResult:
             done.output or "git status failed",
             fix="This directory may not be a git repository.",
         )
-    return ToolResult.success(done.output or "working tree clean")
+    body = done.output or "working tree clean"
+
+    # The branch list, appended, because "does `development` exist" is a
+    # question this tool is the natural place to answer and could not.
+    #
+    # A migration cuts its branch from `development` and has to confirm that
+    # with the developer before it does; without this the model's only routes to
+    # the answer were `run_terminal` -- which refuses most of `git` -- or
+    # guessing, and a guess here cuts the conversion from the wrong base. Remote
+    # branches are included because a fresh clone has `origin/development` and
+    # no local one, which is the common case and the one a local-only listing
+    # answers wrongly.
+    branches = run(
+        ["git", "branch", "--all", "--format=%(refname:short)"],
+        inv.workspace.root,
+        timeout=30,
+    )
+    if branches.ok and branches.output.strip():
+        names = [n.strip() for n in branches.output.splitlines() if n.strip()]
+        body += "\n\nbranches: " + ", ".join(names[:40])
+        if len(names) > 40:
+            body += f" and {len(names) - 40} more"
+    return ToolResult.success(body, meta={"branches": True})
 
 
 def _has_diff(output: str) -> bool:
@@ -847,9 +869,59 @@ def git_ops(inv: Invocation) -> ToolResult:
 
     if op == "branch":
         name = inv.arg("message") or "agent/session"
+        base = str(inv.arg("base") or "").strip()
         done = run(["git", "rev-parse", "--verify", name], root, timeout=30)
-        argv = ["git", "checkout", name] if done.ok else ["git", "checkout", "-b", name]
-        return _result(run(argv, root, timeout=30), what=f"git checkout {name}")
+        if done.ok:
+            # It exists already; `base` cannot apply and silently ignoring it
+            # would report a branch cut from somewhere it was not.
+            moved = run(["git", "checkout", name], root, timeout=30)
+            out = _result(moved, what=f"git checkout {name}")
+            if not moved.ok:
+                return out
+            note = (
+                f"\n\n{name} already existed, so it was checked out as it is; "
+                f"`base` ({base}) was not applied."
+                if base
+                else ""
+            )
+            return ToolResult.success(
+                (out.content or f"switched to {name}") + note,
+                meta={"argv": moved.argv, "branch": name, "base": "", "existed": True},
+            )
+
+        # A new branch, and `base` is what makes it a *replica* of the branch
+        # the work belongs on rather than a copy of wherever the developer was
+        # standing. A migration cut from a stale feature branch is a migration
+        # that has to be redone.
+        argv = ["git", "checkout", "-b", name]
+        resolved = ""
+        if base:
+            found = run(["git", "rev-parse", "--verify", base], root, timeout=30)
+            remote = f"origin/{base}"
+            if not found.ok:
+                found = run(["git", "rev-parse", "--verify", remote], root, timeout=30)
+                if not found.ok:
+                    return ToolResult.failure(
+                        f"there is no branch {base!r}, and no {remote!r} either.",
+                        fix="Run git_status to see which branches exist, and ask the "
+                        "developer which one to cut from. Do not fall back to the "
+                        "current branch: what the new branch replicates is the point.",
+                        meta={"dead_end": f"{base} does not exist in this repository"},
+                    )
+                resolved = remote
+            else:
+                resolved = base
+            argv.append(resolved)
+
+        made = run(argv, root, timeout=30)
+        out = _result(made, what=f"git checkout -b {name}")
+        if not made.ok:
+            return out
+        return ToolResult.success(
+            (out.content or f"created {name}")
+            + (f"\n\n{name} was cut from {resolved}." if resolved else ""),
+            meta={"argv": made.argv, "branch": name, "base": resolved},
+        )
 
     if op == "add":
         raw = inv.arg("paths") or ""

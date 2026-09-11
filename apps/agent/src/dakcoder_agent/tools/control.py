@@ -41,6 +41,7 @@ for the one call a run cannot afford to get wrong.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from typing import Any
 
 from dakcoder_shared.envelope import ToolResult
@@ -64,6 +65,19 @@ class PlanStep:
     file: str
     action: str
     accepts: str
+    #: Which phase of a phased plan this step belongs to, and which
+    #: sub-category of that phase. Empty for an ordinary task, which is every
+    #: task that is not a migration: a three-step bug fix has no phases and
+    #: asking for them would be ceremony.
+    #:
+    #: They are on the *step* rather than in a parallel structure because the
+    #: step is what the loop already tracks, saves and restores. A phase is
+    #: closed when every step naming it has settled, which is a question this
+    #: field makes answerable from the plan the loop is already holding --
+    #: rather than from a second list that would have to be kept in step with
+    #: it. See ``migration.py``.
+    phase: str = ""
+    part: str = ""
     #: Where the step stands. Set by the loop from ground truth -- ``done`` when
     #: a mutation lands on ``file``, ``failed`` when a gate failure names it --
     #: and by the model only for ``skipped``, through ``revise_plan``. A plan
@@ -75,16 +89,87 @@ class PlanStep:
     note: str = ""
 
     def rendered(self, index: int) -> str:
-        return f"{index}. {self.file} — {self.action}\n   Accepts: {self.accepts}"
+        where = ""
+        if self.phase:
+            where = f" [{self.phase}" + (f" · {self.part}" if self.part else "") + "]"
+        return f"{index}. {self.file}{where} — {self.action}\n   Accepts: {self.accepts}"
 
     @property
     def open(self) -> bool:
-        """Whether the step still asks for work: pending, or tried and failed."""
+        """Whether the step still asks for work: pending, or tried and failed.
+
+        ``written`` is deliberately not open. The file was written; what is
+        outstanding is the verification, and "you planned to write this and did
+        not" is the wrong objection to raise about it.
+        """
         return self.status in ("pending", "failed")
+
+    def covers(self, path: str) -> bool:
+        """Whether a change to ``path`` is a change this step asked for.
+
+        Exact match, **or** ``path`` sits under ``file`` when the step names a
+        directory. Both sides are normalised workspace-relative POSIX paths --
+        ``_normalise_plan`` puts the step in that form and ``_confine`` puts
+        every touched path in it -- so this is a string comparison and not a
+        filesystem question.
+
+        The directory case is not a nicety. A migration plan routinely names
+        ``handler`` or ``repo/postgres`` as a step, and equality made those
+        steps *unsatisfiable*: a write to ``handler/objection.go`` never equals
+        ``handler``, so the step stayed pending for the life of the run and
+        ``_unwritten_targets`` reported it forever. That permanently non-empty
+        list spent the single ``MAX_FINISH_REFUSALS`` push-back on turn one and
+        left every later ``finish`` accepted unconditionally, whatever was
+        actually unwritten.
+
+        A directory step is still coarse: the first write under it satisfies
+        it, and the loop cannot know that ``handler`` meant eight files. What it
+        buys is that the step is *reachable*, which equality never made it. A
+        plan that wants per-file tracking has to name per-file steps.
+
+        **And the same for a glob**, which is the shape the field actually
+        produced. A migration plan writes ``handler/response/*.go`` and
+        ``repo/postgres/*.go`` at least as readily as it writes a bare
+        directory, and those were exactly as unsatisfiable: `_normalise_plan`
+        keeps the ``*`` verbatim, so no write ever equalled the step and none
+        ever sat under it as a prefix either. A whole field session ran with
+        `_open_targets` permanently non-empty because of two glob steps -- every
+        `finish` refused once on an objection the model could not satisfy, every
+        run summarised as "the plan set out to write ... and those were never
+        written" with a clean gate underneath it.
+
+        ``fnmatch`` semantics, deliberately including ``*`` matching ``/``: a
+        step that says ``handler/response/*.go`` means the response types
+        wherever they land, and a run that put one in a subpackage has done what
+        the step asked.
+
+        The empty string and ``.`` cover nothing by prefix. A step that named
+        the workspace root would otherwise match every path in it, which is not
+        a plan step, it is the absence of one.
+        """
+        if not self.file or not path:
+            return False
+        if self.file == path:
+            return True
+        if any(ch in self.file for ch in "*?["):
+            # Case-sensitive on purpose. Both sides are already normalised to
+            # the repository's own spelling, and `fnmatch` (without `case`)
+            # would fold them through the *host* filesystem's rules -- so the
+            # same plan would match differently on Windows and Linux.
+            return fnmatchcase(path, self.file)
+        root = self.file.rstrip("/")
+        if root in ("", "."):
+            return False
+        return path.startswith(root + "/")
 
 
 #: The statuses a step may carry, and the two the model may set itself.
-STEP_STATUSES = ("pending", "done", "failed", "skipped")
+#:
+#: ``written`` sits between ``pending`` and ``done`` and is the verification
+#: node the plan did not have: a mutation on the step's file sets it, and only
+#: a clean inner gate over that file promotes it to ``done``. Before it,
+#: ``done`` meant "a write happened" and a file written wrongly was finished.
+STEP_STATUSES = ("pending", "written", "done", "failed", "skipped")
 MODEL_STATUSES = ("pending", "skipped")
 
 #: How much of a `finish` answer reaches the developer.
@@ -117,6 +202,8 @@ def steps_from_meta(meta: dict[str, Any]) -> tuple[PlanStep, ...]:
                 file=str(raw.get("file", "")).strip(),
                 action=str(raw.get("action", "")).strip(),
                 accepts=str(raw.get("accepts", "")).strip(),
+                phase=str(raw.get("phase", "") or "").strip(),
+                part=str(raw.get("part", "") or "").strip(),
                 status=status if status in STEP_STATUSES else "pending",
                 note=str(raw.get("note", "") or "").strip(),
             )
@@ -140,6 +227,8 @@ def submit_plan(inv: Invocation) -> ToolResult:
             file=str(s.get("file", "")).strip(),
             action=str(s.get("action", "")).strip(),
             accepts=str(s.get("accepts", "")).strip(),
+            phase=str(s.get("phase", "") or "").strip(),
+            part=str(s.get("part", "") or "").strip(),
         )
         for s in raw
         if isinstance(s, dict)
@@ -153,18 +242,55 @@ def submit_plan(inv: Invocation) -> ToolResult:
         )
 
     summary = str(inv.arg("summary") or "").strip()
+    # The roadmap, when there is one. Optional in the schema and checked by the
+    # loop rather than here: only the loop knows whether this run is a migration,
+    # and a tool that demanded phases of every plan would demand them of the
+    # three-step bug fixes too. See `migration.plan_objection`.
+    phases = [
+        {
+            "name": str(p.get("name", "") or "").strip(),
+            "covers": str(p.get("covers", "") or "").strip(),
+            "parts": str(p.get("parts", "") or "").strip(),
+        }
+        for p in (inv.arg("phases") or [])
+        if isinstance(p, dict) and str(p.get("name", "") or "").strip()
+    ]
+
     body = "\n".join(step.rendered(i) for i, step in enumerate(steps, 1))
+    if phases:
+        roadmap = "\n".join(
+            f"{i}. {p['name']}"
+            + (f" — {p['covers']}" if p["covers"] else "")
+            + (f"\n   Parts: {p['parts']}" if p["parts"] else "")
+            for i, p in enumerate(phases, 1)
+        )
+        body = f"Phases:\n{roadmap}\n\nSteps for this phase:\n{body}"
     if summary:
         body = f"{summary}\n\n{body}"
 
+    opening = f"Plan accepted, {len(steps)} step(s)."
+    if phases:
+        opening = (
+            f"Plan accepted: {len(phases)} phase(s), and {len(steps)} step(s) for the "
+            "one that is open. The rest of the roadmap is recorded and is not work "
+            "for this run."
+        )
     return ToolResult.success(
-        f"Plan accepted, {len(steps)} step(s). Work starts now — you hold the "
-        f"write tools from this turn on.\n\n{body}",
+        f"{opening} Work starts now — you hold the write tools from this turn "
+        f"on.\n\n{body}",
         meta={
             "control": "plan",
             "summary": summary,
+            "phases": phases,
             "steps": [
-                {"file": s.file, "action": s.action, "accepts": s.accepts} for s in steps
+                {
+                    "file": s.file,
+                    "action": s.action,
+                    "accepts": s.accepts,
+                    "phase": s.phase,
+                    "part": s.part,
+                }
+                for s in steps
             ],
         },
     )
@@ -228,7 +354,18 @@ def finish(inv: Invocation) -> ToolResult:
         cut = len(answer) - MAX_ANSWER_CHARS
         answer = answer[:MAX_ANSWER_CHARS].rstrip() + f"\n\n[answer cut at {MAX_ANSWER_CHARS:,} characters; {cut:,} more were sent]"
     blocked = str(inv.arg("blocked") or "").strip()
-    body = "Answered; the developer has your reply."
+    # Recorded, not delivered -- and the difference is the whole point.
+    #
+    # This used to say "Answered; the developer has your reply", which the
+    # handler is in no position to know: `_phase_ended` reads the plan and the
+    # gate *after* this result is already in the transcript, and a `finish` that
+    # walks away from unwritten work is sent straight back. So on exactly the
+    # turn that matters the model held two statements about the same call --
+    # "the developer has your reply" from the tool, "Not yet" from the loop one
+    # message later -- and acted on neither.
+    # One line, because echoing the answer put it in the transcript twice and it
+    # came back as a worked example on the next message of the session.
+    body = "finish recorded. Whether it ends the phase is decided after this call."
     if cut:
         # The one thing about the answer the model still needs told, because it
         # is the one thing it can act on: the tail did not reach anybody.
@@ -262,6 +399,8 @@ def revise_plan(inv: Invocation) -> ToolResult:
             file=str(s.get("file", "")).strip(),
             action=str(s.get("action", "")).strip(),
             accepts=str(s.get("accepts", "")).strip(),
+            phase=str(s.get("phase", "") or "").strip(),
+            part=str(s.get("part", "") or "").strip(),
             status=(
                 str(s.get("status", "pending") or "pending").strip().lower()
                 if str(s.get("status", "pending") or "pending").strip().lower() in MODEL_STATUSES
@@ -301,6 +440,8 @@ def revise_plan(inv: Invocation) -> ToolResult:
                     "file": s.file,
                     "action": s.action,
                     "accepts": s.accepts,
+                    "phase": s.phase,
+                    "part": s.part,
                     "status": s.status,
                     "note": s.note,
                 }

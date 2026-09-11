@@ -119,7 +119,55 @@ ${uncontributed.length} command(s) registered with no entry in package.json:
   process.exit(1);
 }
 
+/**
+ * And the slash table, which is a third way to name a command and was the one
+ * nobody checked.
+ *
+ * `slash()` in extension.ts maps `/name` to a command id and calls
+ * `executeCommand`, whose rejection nothing awaits — so a typo there is a slash
+ * command that does nothing, silently, which is exactly how `/migrate`,
+ * `/debug`, `/scaffold` and `/test` shipped broken. Two of those were among the
+ * four suggestions the empty panel offers as a first action.
+ *
+ * The table is read out of the source rather than imported, because this script
+ * runs before the bundle exists and importing `extension.ts` would pull in
+ * `vscode`.
+ */
+const extensionSrc = readFileSync(join(SRC, 'extension.ts'), 'utf8');
+const table = /const routed: Record<string, string> = \{([\s\S]*?)\n {4}\};/.exec(extensionSrc);
+if (!table) {
+  console.error(
+    [
+      '',
+      "the slash routing table could not be found in extension.ts.",
+      'It is matched by shape, so renaming `routed` or reformatting its closing',
+      'brace silently disables this check — which is the check that catches a',
+      'slash command wired to a command id that does not exist.',
+      '',
+    ].join(EOL),
+  );
+  process.exit(1);
+}
+
+const routedIds = [...table[1].matchAll(/:\s*['"]([\w.]+)['"]/g)].map((m) => m[1]);
+const danglingSlash = routedIds.filter((c) => !registered.has(c)).sort();
+
+if (danglingSlash.length > 0) {
+  console.error(`${EOL}${danglingSlash.length} slash command(s) route to an id nothing registers:${EOL}`);
+  for (const c of danglingSlash) console.error(`  ${c}`);
+  console.error(
+    [
+      '',
+      '`executeCommand` rejects, nothing awaits the rejection, and the slash',
+      'command does nothing at all — with no error anywhere the developer looks.',
+      '',
+    ].join(EOL),
+  );
+  process.exit(1);
+}
+
 console.log(
   `all ${declared.size} declared commands are registered, all ${registered.size} ` +
-    `registered commands are contributed, none over a view's own id`,
+    `registered commands are contributed, all ${routedIds.length} slash routes resolve, ` +
+    `none over a view's own id`,
 );

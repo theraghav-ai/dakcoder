@@ -178,7 +178,23 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 #: had -- a forced `finish`, a turn cap, a gate bound -- ended the run; the
 #: reported transcripts ended `unverified` with the fix one different approach
 #: away. About 250 tokens in the stable prefix, paid once per run.
-PREFIX_CEILING = {Mode.ASK: 2_700, Mode.PLANNER: 3_100, Mode.AGENT: 4_100}
+#: Both moved again for the migration work: `planner` 3,100 to 3,250 and `agent`
+#: 4,100 to 4,350. The tripwire fired, the schemas were trimmed to the shortest
+#: wording that still names the fields, and what is left is two decisions.
+#:
+#: `submit_plan` gained `phases`, and the steps gained `phase` and `part`. That
+#: is what makes a whole-service conversion plannable at all: `steps` caps at
+#: eight and a service has forty handlers, so without a roadmap held separately
+#: the only plan that fits is one whose steps are directories -- the plan whose
+#: cursor never advances and whose every `finish` is refused on an objection it
+#: cannot satisfy. About 150 tokens, and only on the planning turns.
+#:
+#: `agent` grew because `ask_developer` is now dispatchable there. Note what
+#: this number measures: `registry.schemas_for`, which does not know whether the
+#: run is a migration. `AgentLoop._tools` withholds the tool on every acting
+#: turn that is not one, so an ordinary agent turn still pays the old prefix and
+#: this ceiling is the migration case, measured against the looser of the two.
+PREFIX_CEILING = {Mode.ASK: 2_700, Mode.PLANNER: 3_250, Mode.AGENT: 4_350}
 
 
 @pytest.mark.parametrize("mode", list(Mode))

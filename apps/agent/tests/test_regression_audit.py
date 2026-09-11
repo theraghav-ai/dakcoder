@@ -408,11 +408,19 @@ def test_capped_read_then_tail_read_dispatches(planning_router: Router, workspac
     exactly that re-read as "already in context above". Two true-sounding
     messages that could not both be obeyed, and on any file over ~150KB the
     tail was unreachable for the rest of the run.
+
+    The explicit `end` is what now reaches the cap at all: a read with no range
+    is windowed to `READ_WINDOW_LINES` by the tool (see `fs.read_file`), so the
+    projection's cap is reached only by a model that asked for the width. That
+    is the case the invariant has to hold for — the cap and the ledger still
+    have to agree about what survived — so the test asks for it.
     """
     path = _big_file(workspace)
     loop, _client = build(planning_router, [say("noop")])
 
-    out = planning_router.dispatch("read_file", {"path": path}, mode="agent")
+    out = planning_router.dispatch(
+        "read_file", {"path": path, "start": 1, "end": 8000}, mode="agent"
+    )
     assert out.ok
     span = tuple(out.meta["span"])
     appended = loop.context.append_tool_result(
@@ -440,10 +448,16 @@ def test_capped_read_then_tail_read_dispatches(planning_router: Router, workspac
 
 def test_the_elision_marker_names_what_survived(planning_router: Router, workspace) -> None:
     """"Re-read with a narrower range" is only actionable if the model can tell
-    which range is missing."""
+    which range is missing.
+
+    An explicit `end`, for the reason given in the test above: the tool windows
+    a range-less read before the cap can see it.
+    """
     path = _big_file(workspace)
     loop, _client = build(planning_router, [say("noop")])
-    out = planning_router.dispatch("read_file", {"path": path}, mode="agent")
+    out = planning_router.dispatch(
+        "read_file", {"path": path, "start": 1, "end": 8000}, mode="agent"
+    )
 
     appended = loop.context.append_tool_result(
         "read_file", out.for_model(), tool_call_id="t1", path=path,
@@ -1097,19 +1111,33 @@ def test_subprocess_timeout_kills_process_tree(tmp_path) -> None:
 def test_capture_is_bounded(tmp_path) -> None:
     """`capture_output=True` buffered everything and the cap was applied after
     the process had finished, so a runaway `go test -v` could exhaust the
-    runtime's memory before anything looked at the result."""
+    runtime's memory before anything looked at the result.
+
+    The loud process is ``sys.executable``, not ``sh``. It was a shell script,
+    and that made a portable assertion accidentally POSIX-only: `sh` is on PATH
+    under Git Bash and is not under PowerShell, so this passed for anyone
+    running the suite from one shell and failed the release for anyone running
+    it from the other. Nothing here is about shells -- it is about `_pump`
+    bounding a producer faster than the reader -- and `sys.executable` is the
+    one binary a Python test can always name.
+
+    Not skipped on Windows, deliberately. ``run`` has a Windows-specific
+    process-group path, so this is the platform where an unbounded pump would
+    be least likely to be noticed any other way.
+    """
+    import sys
+
     from dakcoder_agent.tools.commands import MAX_CAPTURE, run
 
-    script = tmp_path / "loud.sh"
-    script.write_text(
-        "#!/bin/sh\ni=0\nwhile [ $i -lt 20000 ]; do "
-        "echo 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; "
-        "i=$((i+1)); done\n",
-        encoding="utf-8",
+    # 20,000 lines of 60 characters: comfortably past the 400k cap.
+    loud = (
+        "import sys\n"
+        "line = 'a' * 60 + '\\n'\n"
+        "for _ in range(20000): sys.stdout.write(line)\n"
     )
-    script.chmod(0o755)
 
-    done = run(["sh", str(script)], tmp_path, timeout=60)
+    done = run([sys.executable, "-c", loud], tmp_path, timeout=60)
+
     assert len(done.output) <= MAX_CAPTURE + 200
     assert "truncated" in done.output
 

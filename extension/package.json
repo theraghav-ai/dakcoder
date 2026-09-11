@@ -2,7 +2,7 @@
   "name": "dakcoder-go",
   "displayName": "dakcoder",
   "description": "The India Post IT 2.0 backend coding agent for Go services on the n-api-template contract.",
-  "version": "0.3.6",
+  "version": "0.3.11",
   "publisher": "dop",
   "license": "UNLICENSED",
   "private": true,
@@ -157,6 +157,11 @@
           "type": "number",
           "default": 0,
           "markdownDescription": "How many seconds an approval waits before the runtime records it as a rejection. `0` waits indefinitely — a slow review must never auto-reject. This is the deadline the runtime itself acts on, and the panel counts down against the same number. **Give me more time** on the warning extends it. Takes effect when the runtime restarts."
+        },
+        "dakcoder.debugRecording": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Record every turn in full — the exact request sent, the loop's own state, the context accounting and the raw response — to `.dakcoder/sessions/<id>/debug.jsonl`. Off by default and free when off. Read one back with `python scripts/debug.py latest` from a checkout, or `python -m dakcoder_agent.debug latest`. Takes effect when the runtime restarts."
         },
         "dakcoder.autoApproveTrivialPatches": {
           "type": "boolean",
