@@ -1,5 +1,23 @@
 # dakcoder
 
+Usage
+
+python scripts/release.py 0.3.7
+
+You choose the version; it's validated as major.minor.patch (VS Code rejects anything else). Written in Python rather than shell because scripts/ is already Python by convention, and it runs identically from PowerShell or Git Bash.
+
+Flags: --skip-tests, --full-tests, --no-isolation (offline wheel builds), --keep-tracked-vsix, --allow-dirty.
+
+What it does
+Preflight — checks node/npm/go/git, extension/node*modules, and picks an interpreter that actually has build (prefers .venv, falls back to the current one).
+Bumps all four declarations — extension/package.json plus the three pyproject.tomls. Each regex is anchored to the top-level key; I verified each matches exactly once, so nested "version" keys deeper in package.json can't be hit. Line endings are preserved.
+Rebuilds the gotools binaries — 4 platforms, stamped with the new version, checksum manifest regenerated.
+Rebuilds both wheels — deletes every old dakcoder_agent-*/dakcoder*shared-* wheel first, then builds shared before agent.
+Python tests — fast suite by default.
+npm run package — typecheck, extension tests, esbuild, credential/command/l10n/checksum checks, then the VSIX.
+Verifies the artifacts — the step that catches the bug I hit manually yesterday.
+Updates .gitignore.
+
 python -m build --wheel --outdir extension/runtime apps/shared
 python -m build --wheel --outdir extension/runtime apps/agent
 cd extension && npm run package
