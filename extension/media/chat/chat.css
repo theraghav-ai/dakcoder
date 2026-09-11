@@ -152,22 +152,59 @@
   --dak-add-bg: rgba(63, 185, 80, 0.12);
   --dak-del-bg: rgba(248, 81, 73, 0.12);
 
-  /* type */
+  /* ── type ──────────────────────────────────────────────────────────────
+   *
+   * Two monospaces, and the split is the point.
+   *
+   * `--dak-mono` is Martian Mono, which is a *display* face: very wide, very
+   * even, built to be set large and sparse. It is the design's signature and it
+   * works beautifully on a four-word uppercase label. It was also, until now,
+   * the font for every code span, every file path, every line of tool output and
+   * every code block — and at 11px in running prose it is close to unreadable.
+   * Its letterforms are a third wider than a reading mono, so a path wraps that
+   * would otherwise fit, and its even stroke weight gives the eye no word shape
+   * to lock onto. That is what made the panel hard to read.
+   *
+   * `--dak-code-font` is the font the developer already chose for reading code.
+   * Everything that *is* code — spans, blocks, paths, tool output, identifiers —
+   * uses it. Martian Mono keeps the labels, which is the job it is good at.
+   */
   --dak-sans: 'Instrument Sans', var(--vscode-font-family), system-ui, sans-serif;
   --dak-mono: 'Martian Mono', var(--vscode-editor-font-family), ui-monospace, monospace;
+  --dak-code-font: var(--vscode-editor-font-family), ui-monospace, 'Cascadia Mono',
+    Consolas, 'SF Mono', Menlo, monospace;
 
   /*
-   * The mock is drawn at a fixed 13px base. Everything below is an `em` ratio
-   * off that, not a hard px, so a developer who set 16px because they need 16px
-   * gets the design's proportions rather than the design's absolute sizes.
+   * The ramp, as `em` ratios off the workbench's own font size rather than as
+   * hard pixels — a developer who set 16px because they need 16px gets the
+   * design's proportions, not the design's absolute sizes.
+   *
+   * Every step is larger than it was. The mock is drawn at a 13px base and its
+   * ramp bottomed out at 9.5px, which is a size you can lay out with and cannot
+   * read: the meter, the tool timings and the gate stage names were all down
+   * there. Nothing here is below 11px now, and the prose sits slightly above the
+   * workbench's own size rather than below it, because the transcript is the
+   * thing this panel is for.
    */
-  --dak-micro: 0.73em; /* 9.5px — mono section labels, uppercase, tracked */
-  --dak-meta: 0.77em; /* 10px  — timings, counts, tabular figures */
-  --dak-small: 0.81em; /* 10.5px — inline paths, footnotes */
-  --dak-code-fs: 0.846em; /* 11px  — code and mono body */
-  --dak-body-2: 0.885em; /* 11.5px — secondary prose */
-  --dak-body: 0.96em; /* 12.5px — primary prose */
-  --dak-title: 1.077em; /* 14px  — card headings */
+  --dak-micro: 0.85em; /* 11px   — mono section labels, uppercase, tracked */
+  --dak-meta: 0.88em; /* 11.4px — timings, counts, tabular figures */
+  --dak-small: 0.92em; /* 12px   — inline paths, footnotes */
+  --dak-code-fs: 0.95em; /* 12.3px — code and mono body */
+  --dak-body-2: 0.96em; /* 12.5px — secondary prose */
+  --dak-body: 1.05em; /* 13.7px — primary prose */
+  --dak-title: 1.18em; /* 15.3px — card headings */
+
+  /*
+   * The ground behind an inline code span.
+   *
+   * Inline code used to be painted amber. The design's own first rule is that
+   * amber means "running, or waiting on you, and nothing else ever earns it" —
+   * and a paragraph in which every identifier, path and flag is amber both
+   * breaks that rule and is exhausting to read: half the sentence competes with
+   * the other half. A faint chip separates code from prose without colouring it,
+   * which is what every editor and every code host does.
+   */
+  --dak-chip: rgba(255, 255, 255, 0.07);
 
   --dak-track: 0.12em;
   --dak-track-wide: 0.14em;
@@ -250,6 +287,9 @@ body.vscode-light {
 
   --dak-add-bg: rgba(26, 127, 55, 0.1);
   --dak-del-bg: rgba(207, 34, 46, 0.09);
+
+  /* Darker on a light ground, same job: separate code from prose, quietly. */
+  --dak-chip: rgba(20, 20, 24, 0.06);
 }
 
 /* ── tier three · high contrast ────────────────────────────────────────────
@@ -324,6 +364,11 @@ body.vscode-high-contrast-light {
      the system's own legibility settings, not for ours. */
   --dak-sans: var(--vscode-font-family), system-ui, sans-serif;
   --dak-mono: var(--vscode-editor-font-family), ui-monospace, monospace;
+  --dak-code-font: var(--vscode-editor-font-family), ui-monospace, monospace;
+
+  /* The workbench's own code ground, so a chip reads as a chip in a theme that
+     has deliberately flattened everything else. */
+  --dak-chip: var(--vscode-textCodeBlock-background, transparent);
 }
 
 /* ── frame ─────────────────────────────────────────────────────────────────── */
@@ -360,7 +405,17 @@ body {
   line-height: 1.5;
   color: var(--dak-fg);
   background: var(--dak-bg);
-  -webkit-font-smoothing: antialiased;
+  /*
+   * No `-webkit-font-smoothing: antialiased`.
+   *
+   * It forces greyscale antialiasing, which thins every stroke. On a dark ground
+   * — which is where this panel spends most of its life — thin light text on
+   * dark already looks lighter than it is, and forcing greyscale on top of that
+   * is what made 11px labels look like a low-resolution screenshot. Left
+   * unset, the platform uses the rendering the developer's other editor text
+   * already uses, which is the one their eyes are calibrated to.
+   */
+  text-size-adjust: 100%;
 }
 
 /* Focus is visible everywhere, including on rows the developer tabbed to. */
@@ -468,7 +523,7 @@ button.skip:focus {
   align-items: center;
   gap: 0;
   height: 26px;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-micro);
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -533,7 +588,7 @@ button.skip:focus {
   min-height: 22px;
   padding-bottom: 7px;
   border-bottom: 1px solid var(--dak-hair);
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-micro);
   color: var(--dak-fg-4);
 }
@@ -670,7 +725,7 @@ button.skip:focus {
 .empty .suggestion .cmd {
   flex: none;
   min-width: 70px;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-body-2);
   color: var(--dak-fg-2);
 }
@@ -752,13 +807,13 @@ button.skip:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-code-fs);
   color: var(--dak-fg-2);
 }
 
 .row .meta {
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-micro);
   color: var(--dak-fg-4);
   font-variant-numeric: tabular-nums;
@@ -797,7 +852,7 @@ button.skip:focus {
   display: flex;
   align-items: baseline;
   gap: 5px;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-code-fs);
   color: var(--dak-fg-2);
 }
@@ -913,10 +968,12 @@ button.skip:focus {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-small);
-  line-height: 1.65;
-  color: var(--dak-fg-3);
+  line-height: 1.6;
+  /* One step up the ramp. Forty lines of compiler output at caption grey is
+     readable for four words and tiring for forty lines. */
+  color: var(--dak-fg-2);
   tab-size: 4;
 }
 
@@ -992,7 +1049,7 @@ button.skip:focus {
 }
 
 .dump-count {
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-micro);
   letter-spacing: var(--dak-track);
   color: var(--dak-fg-4);
@@ -1216,7 +1273,7 @@ button.chip-btn:hover {
 }
 
 .find-count {
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-micro);
   color: var(--dak-fg-4);
   font-variant-numeric: tabular-nums;
@@ -1264,7 +1321,7 @@ mark.hit.on {
   margin: 15px 0 6px;
   background: transparent;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: break-word;
   font-size: var(--dak-body);
   line-height: 1.55;
   color: var(--dak-fg);
@@ -1293,12 +1350,22 @@ mark.hit.on {
 
 /* ── assistant markdown ──────────────────────────────────────────────────── */
 
+/*
+ * The model's answer is the primary content of this panel, so it is set in the
+ * primary text colour.
+ *
+ * It was one step down the ramp — the same grey the panel uses for captions and
+ * secondary labels — which read as though the transcript were an aside to
+ * something else on screen. There is nothing else on screen. `break-word` is
+ * narrowed to `overflow-wrap` so ordinary prose breaks between words and only a
+ * genuinely unbreakable token is split.
+ */
 .assistant {
   padding: 2px 0 6px;
-  word-break: break-word;
+  overflow-wrap: break-word;
   font-size: var(--dak-body);
-  line-height: 1.6;
-  color: var(--dak-fg-2);
+  line-height: 1.65;
+  color: var(--dak-fg);
 }
 
 .assistant p {
@@ -1321,13 +1388,39 @@ mark.hit.on {
   padding-left: 1.4em;
 }
 
+/*
+ * A chip, not a colour.
+ *
+ * This span used to be amber with no ground, and it is the single biggest reason
+ * the panel was hard to read: a paragraph explaining a change names four or five
+ * identifiers and paths, so half of every sentence was set in a wide display
+ * monospace in the accent colour, competing with the other half. The design's own
+ * first rule reserves amber for "running, or waiting on you" — this was spending
+ * it on punctuation.
+ *
+ * A faint ground and the reading monospace separate code from prose without
+ * shouting, and `break-word` is what stops a long path from pushing the column
+ * sideways at a 340px sidebar width.
+ */
 .assistant code {
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: 0.92em;
+  background: var(--dak-chip);
+  color: var(--dak-fg-hi);
+  padding: 0.08em 0.34em;
+  border-radius: 3px;
+  overflow-wrap: break-word;
+}
+
+/* Inside a heading or a link the chip would fight the thing it sits in. */
+.assistant h1 code,
+.assistant h2 code,
+.assistant h3 code,
+.assistant h4 code,
+.assistant a code {
   background: transparent;
-  color: var(--dak-amber);
   padding: 0;
-  border-radius: 0;
+  color: inherit;
 }
 
 .assistant a {
@@ -1472,7 +1565,7 @@ table.md-table td {
 .code-head button.name.file {
   all: unset;
   cursor: pointer;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   text-transform: none;
   letter-spacing: 0;
   color: var(--dak-fg-2);
@@ -1488,7 +1581,8 @@ table.md-table td {
 }
 
 .code-head .lines {
-  color: var(--dak-fg-5);
+  font-family: var(--dak-code-font);
+  color: var(--dak-fg-4);
   font-variant-numeric: tabular-nums;
 }
 
@@ -1512,10 +1606,10 @@ table.md-table td {
 
 .code pre {
   margin: 0;
-  font-family: var(--dak-mono);
-  font-size: var(--dak-small);
-  line-height: 1.7;
-  color: var(--dak-fg-2);
+  font-family: var(--dak-code-font);
+  font-size: var(--dak-code-fs);
+  line-height: 1.6;
+  color: var(--dak-fg);
 }
 
 .code > pre.out {
@@ -1563,7 +1657,7 @@ table.md-table td {
   font-size: var(--dak-body-2);
   line-height: 1.45;
   color: var(--dak-fg-2);
-  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 .plan ol {
@@ -1589,9 +1683,11 @@ table.md-table td {
 /* A dash, not a checkbox: nothing on the wire says whether a step is done, and
    a checkbox would be a guess rendered as a fact. */
 .plan .status {
-  font-family: var(--dak-mono);
-  font-size: var(--dak-code-fs);
-  color: var(--dak-fg-5);
+  font-family: var(--dak-code-font);
+  font-size: var(--dak-meta);
+  /* Two steps up the ramp: this is the fact the plan card exists to report,
+     and it was set in the faintest grey the panel has. */
+  color: var(--dak-fg-3);
   text-align: center;
 }
 
@@ -1621,7 +1717,7 @@ table.md-table td {
   all: unset;
   cursor: pointer;
   color: var(--dak-fg-3);
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-small);
 }
 
@@ -1678,14 +1774,14 @@ table.grid th[scope='row'] {
   width: 100%;
   text-align: left;
   font-weight: normal;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-small);
   color: var(--dak-fg-2);
 }
 
 table.grid thead th {
   border-top: 0;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-micro);
   font-weight: 400;
   color: var(--dak-fg-4);
@@ -1815,7 +1911,7 @@ table.grid tr.blocking th[scope='row'] {
   display: flex;
   align-items: baseline;
   gap: var(--gap);
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-micro);
   color: var(--dak-notice-dim);
 }
@@ -1907,7 +2003,7 @@ table.grid tr.blocking th[scope='row'] {
 
 .approval .outcome .tool {
   margin-left: auto;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-micro);
   font-weight: 400;
   color: var(--dak-fg-4);
@@ -1942,7 +2038,7 @@ table.grid tr.blocking th[scope='row'] {
 .approval .subject {
   display: block;
   margin-top: 7px;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-small);
   color: var(--dak-fg-3);
   word-break: break-word;
@@ -1989,7 +2085,7 @@ table.grid tr.blocking th[scope='row'] {
 
 .notice-card pre {
   margin: 0 14px 9px;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-small);
   line-height: 1.6;
   color: var(--dak-fg-3);
@@ -2021,7 +2117,7 @@ table.grid tr.blocking th[scope='row'] {
 
 .notice-card .pct {
   margin-left: auto;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-micro);
   font-weight: 400;
   color: var(--dak-amber);
@@ -2125,7 +2221,7 @@ button.changeset-row:hover .file {
   margin-left: auto;
   display: inline-flex;
   gap: 5px;
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-micro);
   font-variant-numeric: tabular-nums;
 }
@@ -2164,7 +2260,7 @@ button.changeset-row:hover .file {
 }
 
 .changeset-row .file {
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-small);
   color: var(--dak-fg-2);
   min-width: 0;
@@ -2400,8 +2496,10 @@ button.changeset-row:hover .file {
   flex: 1 1 auto;
 }
 
+/* "Working - read_file - 4s" names a tool and counts seconds; both belong in
+   the font the panel's other identifiers and figures use. */
 .working {
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-meta);
   color: var(--dak-fg-4);
   font-variant-numeric: tabular-nums;
@@ -2418,8 +2516,9 @@ button.changeset-row:hover .file {
 }
 
 /* The keyboard hint beside an open popup. */
+/* A sentence, not a label. */
 .hint-keys {
-  font-family: var(--dak-mono);
+  font-family: var(--dak-sans);
   font-size: var(--dak-meta);
   color: var(--dak-fg-4);
 }
@@ -2537,7 +2636,7 @@ button:disabled {
 }
 
 .popup .name {
-  font-family: var(--dak-mono);
+  font-family: var(--dak-code-font);
   font-size: var(--dak-code-fs);
   color: var(--dak-fg-2);
   overflow: hidden;

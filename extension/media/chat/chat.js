@@ -59,7 +59,26 @@
    * empty state before `init` has arrived and a viewport with no height is a
    * viewport that shows nothing.
    */
-  let DISPLAY = { expandOutput: 'failures', previewLines: 20, syntaxHighlighting: true };
+  let DISPLAY = {
+    expandOutput: 'failures',
+    previewLines: 20,
+    syntaxHighlighting: true,
+    fontSize: 0,
+  };
+
+  /**
+   * The panel's base text size, when the developer has set one.
+   *
+   * Every size in the stylesheet is an `em` ratio off `body`, so this one
+   * declaration moves the whole transcript in proportion — prose, labels, code
+   * and the viewport heights that are measured in lines. 0 leaves the workbench
+   * font size in place, which is the default.
+   */
+  function applyFontSize() {
+    const px = DISPLAY.fontSize;
+    if (!document.body || !document.body.style) return;
+    document.body.style.fontSize = typeof px === 'number' && px > 0 ? px + 'px' : '';
+  }
 
   const restored = vs.getState() || {};
   /** Ordered row descriptors. The render is a pure function of these. */
@@ -2451,6 +2470,7 @@
         MENTIONS = message.mentions || [];
         MAX_ROWS = message.maxRows || 500;
         if (message.display) DISPLAY = message.display;
+        applyFontSize();
         if (typeof message.epoch === 'string' && message.epoch !== epoch) {
           epoch = message.epoch;
           lastSeq = 0;

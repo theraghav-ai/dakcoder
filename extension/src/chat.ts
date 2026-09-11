@@ -72,6 +72,14 @@ export interface DisplaySettings {
   expandOutput: 'failures' | 'always' | 'never';
   previewLines: number;
   syntaxHighlighting: boolean;
+  /**
+   * Base text size in px, or 0 to follow the workbench.
+   *
+   * Every size in the panel is an `em` ratio off this one value, so it moves the
+   * whole transcript coherently rather than scaling one thing out of proportion
+   * with the rest.
+   */
+  fontSize: number;
 }
 
 /** One event as the ring holds it: the event, whose session it was, and where
@@ -1167,7 +1175,16 @@ function display(): DisplaySettings {
     // hand-edited settings.json could be told to lay out a 10,000-line viewport.
     previewLines: Math.max(4, Math.min(200, Math.round(config.get<number>('previewLines', 20)))),
     syntaxHighlighting: config.get<boolean>('syntaxHighlighting', true) !== false,
+    // 0 means "follow the workbench". Clamped either side, because a base size
+    // of 2 or 200 makes the panel unusable in a way that is hard to undo from
+    // inside the panel.
+    fontSize: clampFontSize(config.get<number>('fontSize', 0)),
   };
+}
+
+function clampFontSize(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.max(9, Math.min(24, Math.round(value)));
 }
 
 /** The `init` payload, built once per webview resolve. */

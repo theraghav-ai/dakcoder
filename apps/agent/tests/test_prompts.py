@@ -194,7 +194,24 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 #: run is a migration. `AgentLoop._tools` withholds the tool on every acting
 #: turn that is not one, so an ordinary agent turn still pays the old prefix and
 #: this ceiling is the migration case, measured against the looser of the two.
-PREFIX_CEILING = {Mode.ASK: 2_700, Mode.PLANNER: 3_250, Mode.AGENT: 4_350}
+#: Every mode moved again, by about 110 tokens, and this one is the cheapest
+#: arithmetic in the file.
+#:
+#: The system prompt gained two rules: that a reply may carry several calls, and
+#: that a whole-file read is re-sent on every turn after it. Both are paid once
+#: per turn in the stable prefix. What they buy is *turns removed*, and a turn is
+#: the expensive unit here by three orders of magnitude.
+#:
+#: Measured on a real 74-turn run before the change: 7,597,219 prompt tokens
+#: against 36,891 completion — 206 to 1 — with a mean prompt of 102,665 and
+#: 71 of 74 turns making exactly one tool call (none made more than one). Eleven
+#: file edits cost 1,691,433 prompt tokens between them, about 154,000 each,
+#: because each one was its own turn and each turn re-sent the conversation.
+#:
+#: So 110 tokens a turn against ~103,000 per turn removed: the rules pay for
+#: themselves nine hundred times over on the first turn they save, and there
+#: were sixty spare. See `test_batching_cost.py`.
+PREFIX_CEILING = {Mode.ASK: 2_800, Mode.PLANNER: 3_350, Mode.AGENT: 4_420}
 
 
 @pytest.mark.parametrize("mode", list(Mode))

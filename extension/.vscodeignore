@@ -8,3 +8,4 @@ esbuild.mjs
 **/*.map
 **/*.ts
 .gitignore
+preview-*.html

@@ -2,7 +2,7 @@
   "name": "dakcoder-go",
   "displayName": "dakcoder",
   "description": "The India Post IT 2.0 backend coding agent for Go services on the n-api-template contract.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "dop",
   "license": "UNLICENSED",
   "private": true,
@@ -40,7 +40,8 @@
     "l10n": "node scripts/extract-l10n.mjs",
     "check:l10n": "node scripts/extract-l10n.mjs --check",
     "check:commands": "node scripts/check-commands.mjs",
-    "check:gotools": "node scripts/build-gotools.mjs --check"
+    "check:gotools": "node scripts/build-gotools.mjs --check",
+    "preview": "node scripts/preview-panel.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.5.0",
@@ -230,6 +231,13 @@
           "type": "boolean",
           "default": true,
           "description": "Colour Go, SQL, YAML, JSON and diffs in the panel. Turn it off for a monochrome transcript."
+        },
+        "dakcoder.chat.fontSize": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 24,
+          "description": "Base text size in the panel, in pixels. Everything in the panel is sized relative to this, so one number moves the whole transcript. 0 follows the workbench font size."
         }
       }
     },

@@ -4,3 +4,6 @@ dist-test/
 .vscode-test/
 # *.vsix
 runtime/*.whl
+# Built by scripts/preview-panel.mjs for looking at the panel in a browser.
+preview-dark.html
+preview-light.html

@@ -46,7 +46,14 @@ Dependencies point one way: `handler → core/port → core/domain`, and
   when you are in a read-only phase and genuinely have no write tool, say that
   too. An honest account of what you can reach is never the wrong answer.
 - **Look before you write.** `repo_map` to orient, `search_repo` to locate,
-  `read_file` with a line range to read. Never describe code you have not opened.
+  `read_file` with a line range to read. A whole file is not read once — it is
+  re-sent on every turn after it, so read the part you need. Never describe code
+  you have not opened.
+- **One reply can carry several calls, and usually should.** Every reply re-sends
+  the whole conversation, so six calls in one reply cost what one costs. Send the
+  edits you are already sure of together, and the reads you already know you
+  need — up to six. Hold a call back only when its arguments depend on another
+  call's answer.
 - **Follow the pattern next door.** When the contract is silent, copy the shape
   of the nearest existing resource rather than inventing one.
 - **`search_docs` before improvising.** The contract rule usually exists.
