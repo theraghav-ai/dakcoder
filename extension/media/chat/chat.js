@@ -38,12 +38,28 @@
   const consoleEl = document.getElementById('console');
   const modePill = document.getElementById('mode-pill');
   const keysEl = document.getElementById('keys');
+  const jumpBtn = document.getElementById('jump');
+  const findEl = document.getElementById('find');
+  const findInput = document.getElementById('find-input');
+  const findLabel = document.getElementById('find-label');
+  const findCount = document.getElementById('find-count');
+  const findPrev = document.getElementById('find-prev');
+  const findNext = document.getElementById('find-next');
+  const findClose = document.getElementById('find-close');
 
   /** Strings arrive from the host; `vscode.l10n` does not exist in here. */
   let S = {};
   let SLASH = [];
   let MENTIONS = [];
   let MAX_ROWS = 500;
+  /**
+   * How the panel is set to present output, from `dakcoder.chat.*`.
+   *
+   * Defaults stated here rather than left undefined, because the panel draws its
+   * empty state before `init` has arrived and a viewport with no height is a
+   * viewport that shows nothing.
+   */
+  let DISPLAY = { expandOutput: 'failures', previewLines: 20, syntaxHighlighting: true };
 
   const restored = vs.getState() || {};
   /** Ordered row descriptors. The render is a pure function of these. */
@@ -216,6 +232,7 @@
         session: session,
         localSeq: localSeq,
         runIndex: runIndex,
+        history: history,
       });
     }, 400);
   }
@@ -261,6 +278,10 @@
     if (old && old.isConnected) old.replaceWith(node);
     else transcript.appendChild(node);
     nodes.set(row.key, node);
+    // A repainted row has lost whatever the find marked in it, and a new row may
+    // contain a match. Both are answered by re-running the search, debounced.
+    refind();
+    syncJump();
   }
 
   function trim() {
@@ -459,75 +480,310 @@
 
   // ── disclosure ────────────────────────────────────────────────────────────
 
-  const LONG_CHARS = 250;
-  const LONG_LINES = 3;
+  /*
+   * How much output the panel shows without being asked.
+   *
+   * The previous rule was 250 characters or three lines, past which the text was
+   * clamped to 3.3em under `overflow: hidden` and the *only* way to read the
+   * rest was "Open in editor". A five-line `go vet` failure — the single most
+   * common thing this panel prints — therefore cost a disclosure click, a button
+   * click, a new editor tab and a context switch to read five lines. Every other
+   * agent panel in this class shows that inline. This is the defect the
+   * disclosure model below is rebuilt around.
+   *
+   * The rule now: the text is always in the DOM, and it is always reachable by
+   * scrolling. Short output renders whole with no chrome at all. Long output
+   * renders whole inside a viewport capped at `peekLines()`, which scrolls, with
+   * full height one click away. The editor is still offered — a 4,000-line test
+   * log genuinely wants search and folding, which the panel should not
+   * reimplement — but it is now a choice rather than the toll.
+   */
 
-  function isLong(text) {
-    return text.length > LONG_CHARS || text.split('\n').length > LONG_LINES;
+  /** At or under this, the text is printed plainly. No viewport, no buttons. */
+  const INLINE_LINES = 12;
+  const INLINE_CHARS = 1400;
+  /**
+   * The scrolling viewport's height, in lines, before "Show all" is pressed.
+   *
+   * `dakcoder.chat.previewLines` overrides it; the host clamps the value, so a
+   * hand-edited settings.json cannot ask this to lay out a 10,000-line block.
+   */
+  function peekLines() {
+    const n = DISPLAY.previewLines;
+    return typeof n === 'number' && isFinite(n) ? Math.max(4, Math.min(200, n)) : 20;
+  }
+  /**
+   * Past this the DOM holds a head and a tail rather than the whole thing.
+   *
+   * 40,000 lines of `go test -v` in one `<pre>` is tens of megabytes of layout
+   * in a webview with a 60 MB budget, and the panel stops responding while it
+   * reflows. The middle is elided with a line saying exactly how much was cut
+   * and the editor button beside it opens the complete text, so nothing is lost
+   * — only deferred.
+   */
+  const HUGE_LINES = 4000;
+  const HUGE_HEAD = 1200;
+  const HUGE_TAIL = 600;
+
+  function lineCount(text) {
+    if (!text) return 0;
+    let n = 1;
+    for (let i = 0; i < text.length; i += 1) if (text.charCodeAt(i) === 10) n += 1;
+    return n;
+  }
+
+  function isShort(text) {
+    return text.length <= INLINE_CHARS && lineCount(text) <= INLINE_LINES;
   }
 
   /**
-   * The second and third levels of disclosure.
+   * A `<pre>` of highlighted code, built node by node.
    *
-   * Short output sits inline in the hairline body. Anything past ~250 characters
-   * or three lines is clamped and handed to a real editor instead, because a
-   * 4,000-line `go test` log rendered into the panel destroys the density that
-   * makes a long run readable — and an editor gives search, folding and
-   * highlighting the panel would have to reimplement badly.
+   * `dakHighlight` is loaded as a separate classic script and may legitimately
+   * be absent — in the renderer's unit tests it is, because those run the file
+   * in a bare VM context. An absent highlighter means uncoloured text, never a
+   * missing code block.
    */
-  function bodyFor(text, language) {
-    const body = el('div', 'body');
-    if (!isLong(text)) {
-      body.appendChild(el('pre', null, text));
-      return body;
+  function pre(text, language, cls) {
+    const node = el('pre', cls || null);
+    const hl = typeof globalThis !== 'undefined' ? globalThis.dakHighlight : null;
+    if (!hl || !language || !DISPLAY.syntaxHighlighting || !hl.supports(language)) {
+      node.textContent = text;
+      return node;
     }
-    const clamp = el('div', 'clamp', text);
-    body.appendChild(clamp);
+    let tokens;
+    try {
+      tokens = hl.tokenize(text, language);
+    } catch (err) {
+      node.textContent = text;
+      return node;
+    }
+    tokens.forEach(function (token) {
+      if (!token[0]) {
+        node.appendChild(document.createTextNode(token[1]));
+        return;
+      }
+      node.appendChild(el('span', 'hl-' + token[0], token[1]));
+    });
+    return node;
+  }
 
-    const actions = el('div', 'overflow-actions');
-    const open = el('button', 'small', S.openInEditor);
+  /** Head + tail of something too large to lay out, and an honest note between. */
+  function elide(text) {
+    const lines = text.split('\n');
+    if (lines.length <= HUGE_LINES) return null;
+    return {
+      head: lines.slice(0, HUGE_HEAD).join('\n'),
+      tail: lines.slice(lines.length - HUGE_TAIL).join('\n'),
+      cut: lines.length - HUGE_HEAD - HUGE_TAIL,
+      total: lines.length,
+    };
+  }
+
+  /**
+   * The panel's one way of showing a block of output.
+   *
+   * `opts.language` colours it, `opts.filename` names it in the bar, and
+   * `opts.expanded` starts it at full height — which failures do, because the
+   * reason a run stopped is not something to make anyone hunt for.
+   */
+  function dump(text, opts) {
+    const options = opts || {};
+    const language = options.language || 'plaintext';
+    const total = lineCount(text);
+
+    if (isShort(text) && !options.forceViewport) {
+      const plain = pre(text, language, 'out');
+      plain.setAttribute('tabindex', '0');
+      return plain;
+    }
+
+    const wrap = el('div', 'dump');
+    const big = elide(text);
+    const scroll = el('div', 'scroll');
+    scroll.setAttribute('tabindex', '0');
+    scroll.setAttribute('role', 'group');
+    scroll.setAttribute('aria-label', plural('lines', total));
+
+    if (big) {
+      scroll.appendChild(pre(big.head, language, 'out'));
+      const gap = el('div', 'elision');
+      gap.appendChild(el('span', null, plural('elidedLines', big.cut)));
+      scroll.appendChild(gap);
+      scroll.appendChild(pre(big.tail, language, 'out'));
+    } else {
+      scroll.appendChild(pre(text, language, 'out'));
+    }
+    wrap.appendChild(scroll);
+
+    /*
+     * The viewport's height, in lines rather than pixels, so it tracks whatever
+     * font size the developer set instead of assuming the design's 13px base.
+     *
+     * 1.65 is `.dump pre`'s line-height and 16px is `.scroll`'s own vertical
+     * padding. The `em` resolves against `.scroll`, which the stylesheet gives
+     * the code's font size for exactly this reason - see the note there.
+     */
+    const peek = Math.min(total, peekLines());
+    const height = function (lines) {
+      return 'calc(' + lines + ' * 1.65em + 16px)';
+    };
+    scroll.style.maxHeight = height(peek);
+
+    /*
+     * The bar names the size and nothing else.
+     *
+     * Deliberately not the path: every caller of `dump` already sits under
+     * something that names it — a tool row's label, a fence's header, the
+     * approval card's own head — and a third copy in a 340px column is the kind
+     * of repetition that makes a panel feel crowded without telling anyone
+     * anything.
+     */
+    const bar = el('div', 'dump-bar');
+    bar.appendChild(el('span', 'dump-count', plural('lines', total)));
+    bar.appendChild(el('span', 'spacer'));
+
+    /*
+     * "Show all" only when there is something the viewport is not showing.
+     *
+     * A block between the inline threshold and the viewport height fits whole
+     * inside its own viewport, and offering to expand it there is a button that
+     * does nothing visible — which teaches the reader that the button means
+     * nothing, on the rows where it means everything.
+     */
+    if (total > peek) {
+      let expanded = options.expanded === true;
+      const more = el('button', 'link', '');
+      more.type = 'button';
+      const applyExpanded = function () {
+        scroll.style.maxHeight = expanded ? 'none' : height(peek);
+        wrap.classList.toggle('expanded', expanded);
+        more.textContent = expanded ? S.showLess : fmt(S.showAllLines, total);
+        more.setAttribute('aria-expanded', String(expanded));
+      };
+      more.addEventListener('click', function () {
+        expanded = !expanded;
+        applyExpanded();
+      });
+      applyExpanded();
+      bar.appendChild(more);
+    }
+
+    bar.appendChild(wrapToggle(scroll));
+    // `noCopy` is for a block whose own header already carries Copy; two copy
+    // buttons eighteen pixels apart is a choice nobody has to make.
+    if (!options.noCopy) bar.appendChild(copyButton(text));
+    bar.appendChild(editorButton(text, language));
+    wrap.appendChild(bar);
+    return wrap;
+  }
+
+  /**
+   * Soft-wrap on or off for one block.
+   *
+   * Log output wants wrapping so nothing is off-screen; a table of Go struct
+   * tags wants the columns to stay columns. Which one a given block is cannot be
+   * decided here, so it is a per-block control rather than a setting.
+   */
+  function wrapToggle(scroll) {
+    /*
+     * The label never changes; `aria-pressed` does.
+     *
+     * A two-label toggle in a bar this small is genuinely ambiguous — a button
+     * reading "No wrap" could as easily be describing the current state as
+     * offering the next one, and the reader has to click it to find out. One
+     * label plus a pressed state answers both questions at once, and the
+     * stylesheet dims it when it is off.
+     */
+    const button = el('button', 'link', S.wrapOn);
+    button.type = 'button';
+    let on = true;
+    const apply = function () {
+      scroll.classList.toggle('nowrap', !on);
+      button.setAttribute('aria-pressed', String(on));
+      button.title = on ? S.wrapOnHint : S.wrapOffHint;
+    };
+    apply();
+    button.addEventListener('click', function () {
+      on = !on;
+      apply();
+    });
+    return button;
+  }
+
+  /** Kept, and no longer the only route to the text it opens. */
+  function editorButton(text, language) {
+    const open = el('button', 'link', S.openInEditor);
     open.type = 'button';
+    open.title = S.openInEditorHint || '';
     open.addEventListener('click', function () {
       post({ type: 'open-in-editor', content: text, language: language || 'plaintext' });
     });
-    actions.appendChild(open);
-    actions.appendChild(copyButton(text));
-    body.appendChild(actions);
+    return open;
+  }
+
+  /** Backwards-compatible name: every caller wants a `.body` wrapper. */
+  function bodyFor(text, language, opts) {
+    const body = el('div', 'body');
+    body.appendChild(dump(text, Object.assign({ language: language }, opts || {})));
     return body;
   }
 
-  function copyButton(text) {
-    const button = el('button', 'small', S.copy);
+  function copyButton(text, label) {
+    const button = el('button', 'link', label || S.copy);
     button.type = 'button';
     button.addEventListener('click', function () {
       // Through the host: `navigator.clipboard` is unreliable in a webview that
       // does not have focus, which is exactly when a copy button gets clicked.
       post({ type: 'copy', text: text });
+      button.textContent = S.copied_short || S.copy;
+      setTimeout(function () {
+        button.textContent = label || S.copy;
+      }, 1400);
       say(S.copied, true);
     });
     return button;
   }
 
-  /** A row whose label is a disclosure button for its own body. */
-  function shell(row, glyph, label, meta, body) {
+  /**
+   * A row whose label is a disclosure button for its own body.
+   *
+   * `open` decides whether the body starts visible. Everything that reports a
+   * failure passes true: the old panel collapsed failures the same as successes,
+   * so the one row anybody needed to read was the one that took two clicks. A
+   * successful read stays shut, because forty of them expanded is the wall of
+   * text the collapse exists to prevent.
+   */
+  function shell(row, glyph, label, meta, body, open) {
     const node = el('div', 'row ' + (row.state || ''));
     node.appendChild(el('span', 'glyph', glyph));
 
     if (body) {
       const bodyId = nextId('body');
       body.id = bodyId;
-      body.hidden = true;
-      const toggle = el('button', 'toggle', label);
+      const start = open === true;
+      body.hidden = !start;
+      const toggle = el('button', 'toggle');
       toggle.type = 'button';
-      toggle.setAttribute('aria-expanded', 'false');
+      toggle.setAttribute('aria-expanded', String(start));
       toggle.setAttribute('aria-controls', bodyId);
+      // The caret is the affordance, and it lives *inside* the button rather
+      // than beside it: `.row` is a three-column grid and a fourth child would
+      // land in the `.meta` column. A plain label gives no sign there is
+      // anything behind it, which is how output came to be unread rather than
+      // merely collapsed.
+      const caret = el('span', 'caret', start ? '▾' : '▸');
+      caret.setAttribute('aria-hidden', 'true');
+      toggle.appendChild(caret);
+      toggle.appendChild(el('span', 'toggle-label', label));
       toggle.addEventListener('click', function () {
-        const open = body.hidden;
-        body.hidden = !open;
-        toggle.setAttribute('aria-expanded', String(open));
-        toggle.title = open ? S.hide : S.show;
+        const nowOpen = body.hidden;
+        body.hidden = !nowOpen;
+        toggle.setAttribute('aria-expanded', String(nowOpen));
+        toggle.title = nowOpen ? S.hide : S.show;
+        caret.textContent = nowOpen ? '▾' : '▸';
       });
-      toggle.title = S.show;
+      toggle.title = start ? S.hide : S.show;
       node.appendChild(toggle);
     } else {
       node.appendChild(el('span', 'label', label));
@@ -554,17 +810,63 @@
     const head = el('div', 'changeset-head');
     head.appendChild(el('span', null, S.changeset || ''));
     head.appendChild(el('span', 'count', plural('files', mutations.length)));
+    head.appendChild(el('span', 'spacer'));
+
+    /*
+     * The total, in the shape every reviewer already reads it in.
+     *
+     * `+18 −4` over a change set is the first thing anyone looks at in a code
+     * review, and the runtime has carried per-mutation counts all along — the
+     * panel simply never showed them. Absent counts are absent, not zero: an
+     * older runtime that sends no figures gets no stat rather than "+0 −0",
+     * which would be a claim the panel cannot support.
+     */
+    const totals = mutations.reduce(
+      function (acc, m) {
+        if (typeof m.added === 'number') acc.added += m.added;
+        if (typeof m.removed === 'number') acc.removed += m.removed;
+        if (typeof m.added === 'number' || typeof m.removed === 'number') acc.any = true;
+        return acc;
+      },
+      { added: 0, removed: 0, any: false },
+    );
+    if (totals.any) head.appendChild(stat(totals.added, totals.removed));
     wrap.appendChild(head);
+
     mutations.forEach(function (m) {
-      const row = el('div', 'changeset-row');
+      /*
+       * A row, and a button: the path is the most clickable thing on screen and
+       * for three revisions it was inert text. Opening the file is what anyone
+       * does next after reading that it changed.
+       */
+      const row = el('button', 'changeset-row');
+      row.type = 'button';
+      row.title = fmt(S.openPathTitle, m.path);
       const kind = el('span', 'kind', S['kind.' + m.kind] || m.kind);
       kind.setAttribute('data-kind', m.kind);
       row.appendChild(kind);
       row.appendChild(el('span', 'file', m.path));
+      if (typeof m.added === 'number' || typeof m.removed === 'number') {
+        row.appendChild(stat(m.added, m.removed));
+      }
       if (m.protected) row.appendChild(el('span', 'why', protectedReason(m.path)));
+      row.addEventListener('click', function () {
+        post({ type: 'open-path', path: m.path });
+      });
       wrap.appendChild(row);
     });
     return wrap;
+  }
+
+  /** `+18 −4`, as one node, with an accessible name that says it in words. */
+  function stat(added, removed) {
+    const node = el('span', 'stat');
+    const plus = typeof added === 'number' ? added : 0;
+    const minus = typeof removed === 'number' ? removed : 0;
+    node.appendChild(el('span', 'added', '+' + plus));
+    node.appendChild(el('span', 'removed', '−' + minus));
+    node.setAttribute('aria-label', fmt(S.statLabel, plus, minus));
+    return node;
   }
 
   /** Why this path is protected, in the words that suggest what to do instead. */
@@ -596,67 +898,320 @@
 
   // ── markdown ──────────────────────────────────────────────────────────────
 
-  const INLINE = /(`[^`]+`)|(\*\*[^*]+\*\*)|(_[^_]+_)|(https?:\/\/[^\s<>)]+)/g;
+  /*
+   * A deliberately small CommonMark subset — but no longer so small that ordinary
+   * model output renders wrong.
+   *
+   * The previous renderer knew four things: fenced code, ATX headings, flat
+   * bullet lists and paragraphs. Everything else fell through to a paragraph, so
+   * a numbered list printed as "1. …2. …" run together, a table printed as pipes,
+   * and a `[label](url)` link printed its own punctuation. Those are not exotic:
+   * they are what an agent writes when it explains a change.
+   *
+   * What is still deliberately absent: raw HTML (it would be an injection sink),
+   * images (the CSP admits no remote origin, so they could only ever be broken),
+   * and reference links. Everything reaches the DOM through `textContent`.
+   */
+
+  /*
+   * Order matters. Code spans come first so nothing inside them is re-parsed —
+   * `**` inside a backticked Go string is punctuation, not emphasis.
+   */
+  /*
+   * One alternative per inline construct, and — apart from the code span, whose
+   * fence is a run of backticks of any length — no backreferences at all.
+   *
+   * That is a deliberate constraint rather than a style. These alternatives are
+   * joined into one regex, so a `\1` written inside the third of them refers to
+   * the *first* group of the joined expression, not to its own. Written the
+   * natural way, the strong rule's closing `\1` pointed at the code span's
+   * backtick group, and `**fail**` rendered as a bold "f" followed by "ail".
+   * Spelling both delimiters out costs two extra alternatives and removes the
+   * whole class of mistake.
+   *
+   * Group numbers are load-bearing and are listed against each line; `inline()`
+   * tests them by index.
+   */
+  const INLINE_SOURCE = [
+    '(`+)([\\s\\S]*?)\\1', // 1 fence, 2 code span
+    '\\[([^\\]]*)\\]\\(([^\\s)]+)(?:\\s+"[^"]*")?\\)', // 3 label, 4 href
+    '\\*\\*(?=\\S)([\\s\\S]*?\\S)\\*\\*', // 5 strong
+    '__(?=\\S)([\\s\\S]*?\\S)__', // 6 strong
+    '~~(?=\\S)([\\s\\S]*?\\S)~~', // 7 strike
+    '\\*(?=\\S)([^*\\n]*?\\S)\\*', // 8 emphasis
+    // Underscores only delimit emphasis at a word boundary, or `fx_provide_x`
+    // and every snake_case identifier in prose becomes italic.
+    '(?:^|(?<=[^A-Za-z0-9_]))_(?=\\S)([^_\\n]*?\\S)_(?![A-Za-z0-9_])', // 9 emphasis
+    '(https?:\\/\\/[^\\s<>)\\]]+)', // 10 autolink
+  ].join('|');
+
+  /** Only http(s) ever becomes an anchor; anything else stays as text. */
+  function safeHref(url) {
+    return /^https?:\/\//i.test(url) ? url : '';
+  }
+
+  function link(label, url, parent) {
+    const href = safeHref(url);
+    if (!href) {
+      parent.appendChild(document.createTextNode(label));
+      return;
+    }
+    const anchor = el('a', null, label);
+    anchor.href = href;
+    anchor.title = href;
+    parent.appendChild(anchor);
+  }
+
+  /**
+   * Inline spans, into `parent`.
+   *
+   * The regex is built per call and never shared. `inline` recurses — emphasis
+   * inside strong, a code span inside a link label — and a `/g` regex carries
+   * `lastIndex` as state on the object itself. With one shared instance the
+   * nested call rewound the cursor its caller was still walking, so the outer
+   * loop re-matched the span it had just consumed and the renderer allocated
+   * until the webview died. Construction is cheap: the engine caches the
+   * compiled program by source, and this runs once per block of prose.
+   */
+  /** An emphasis wrapper whose own content is parsed again — `**a `b`**`. */
+  function nested(tag, text) {
+    const node = el(tag);
+    inline(text, node);
+    return node;
+  }
 
   function inline(text, parent) {
+    const re = new RegExp(INLINE_SOURCE, 'g');
     let cursor = 0;
     let match;
-    INLINE.lastIndex = 0;
-    while ((match = INLINE.exec(text)) !== null) {
+    while ((match = re.exec(text)) !== null) {
+      // A zero-width match cannot advance `lastIndex`, so it would spin here.
+      if (match[0] === '') {
+        re.lastIndex += 1;
+        continue;
+      }
       if (match.index > cursor) {
         parent.appendChild(document.createTextNode(text.slice(cursor, match.index)));
       }
-      if (match[1]) parent.appendChild(el('code', null, match[1].slice(1, -1)));
-      else if (match[2]) parent.appendChild(el('strong', null, match[2].slice(2, -2)));
-      else if (match[3]) parent.appendChild(el('em', null, match[3].slice(1, -1)));
-      else {
-        const link = el('a', null, match[4]);
-        link.href = match[4];
-        parent.appendChild(link);
+      const strong = match[5] !== undefined ? match[5] : match[6];
+      const emphasis = match[8] !== undefined ? match[8] : match[9];
+      if (match[2] !== undefined) {
+        // A code span's own padding space is stripped, per CommonMark, so
+        // `` ` a ` `` is "a" rather than " a ".
+        parent.appendChild(el('code', null, match[2].replace(/^ (.*) $/, '$1')));
+      } else if (match[4] !== undefined) {
+        link(match[3], match[4], parent);
+      } else if (strong !== undefined) {
+        parent.appendChild(nested('strong', strong));
+      } else if (match[7] !== undefined) {
+        parent.appendChild(nested('s', match[7]));
+      } else if (emphasis !== undefined) {
+        parent.appendChild(nested('em', emphasis));
+      } else if (match[10] !== undefined) {
+        link(match[10], match[10], parent);
       }
       cursor = match.index + match[0].length;
     }
     if (cursor < text.length) parent.appendChild(document.createTextNode(text.slice(cursor)));
   }
 
+  const BULLET = /^(\s*)([-*+])\s+(.*)$/;
+  const ORDERED = /^(\s*)(\d{1,9})[.)]\s+(.*)$/;
+  const TASK = /^\[([ xX])\]\s+(.*)$/;
+  const QUOTE = /^\s{0,3}>\s?(.*)$/;
+  const RULE = /^\s{0,3}(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$/;
+  const TABLE_SEP = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+
+  /**
+   * One list, however deeply nested.
+   *
+   * Indentation decides nesting, two spaces per level, which is what every model
+   * emits. A flat renderer turned a nested list into a single column of items
+   * and lost the structure that was the point of writing it as a list.
+   */
+  function listAt(lines, start, depth) {
+    const first = BULLET.exec(lines[start]) || ORDERED.exec(lines[start]);
+    const ordered = !BULLET.exec(lines[start]);
+    const list = el(ordered ? 'ol' : 'ul');
+    if (ordered && first && Number(first[2]) !== 1) list.setAttribute('start', first[2]);
+
+    let i = start;
+    let item = null;
+    while (i < lines.length) {
+      const bullet = BULLET.exec(lines[i]);
+      const numbered = ORDERED.exec(lines[i]);
+      const marker = bullet || numbered;
+      if (!marker) {
+        // A plain continuation line belongs to the item above it.
+        if (item && lines[i].trim() && !RULE.test(lines[i])) {
+          item.appendChild(document.createTextNode(' '));
+          inline(lines[i].trim(), item);
+          i += 1;
+          continue;
+        }
+        break;
+      }
+      const indent = marker[1].replace(/\t/g, '  ').length;
+      if (indent > depth + 1) {
+        const nested = listAt(lines, i, indent);
+        if (item) item.appendChild(nested.node);
+        else list.appendChild(nested.node);
+        i = nested.next;
+        continue;
+      }
+      if (indent < depth - 1) break;
+      if (Boolean(bullet) === ordered) break; // the other kind of list starts here
+
+      item = el('li');
+      const body = marker[3];
+      const task = TASK.exec(body);
+      if (task) {
+        // A checkbox, not a literal "[x]". Disabled: the transcript is a record
+        // of what the agent said, and a box the reader can tick would imply the
+        // panel does something with it.
+        const box = el('input');
+        box.setAttribute('type', 'checkbox');
+        box.setAttribute('disabled', 'true');
+        if (task[1] !== ' ') box.setAttribute('checked', 'true');
+        item.classList.add('task');
+        item.appendChild(box);
+        inline(task[2], item);
+      } else {
+        inline(body, item);
+      }
+      list.appendChild(item);
+      i += 1;
+    }
+    return { node: list, next: i };
+  }
+
+  /**
+   * A GFM pipe table.
+   *
+   * Worth the forty lines: the agent's audit output is a table, and rendered as
+   * pipes it is the single least readable thing the panel printed.
+   */
+  function tableAt(lines, start) {
+    const cells = function (line) {
+      const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+      return trimmed.split('|').map(function (c) {
+        return c.trim();
+      });
+    };
+    const header = cells(lines[start]);
+    const aligns = cells(lines[start + 1]).map(function (spec) {
+      if (/^:-+:$/.test(spec)) return 'center';
+      if (/-+:$/.test(spec)) return 'right';
+      return '';
+    });
+
+    const wrap = el('div', 'table-wrap');
+    const table = el('table', 'md-table');
+    const thead = el('thead');
+    const hrow = el('tr');
+    header.forEach(function (text, c) {
+      const th = el('th');
+      th.scope = 'col';
+      if (aligns[c]) th.style.textAlign = aligns[c];
+      inline(text, th);
+      hrow.appendChild(th);
+    });
+    thead.appendChild(hrow);
+    table.appendChild(thead);
+
+    const tbody = el('tbody');
+    let i = start + 2;
+    while (i < lines.length && lines[i].trim() && lines[i].indexOf('|') !== -1) {
+      const row = el('tr');
+      cells(lines[i]).forEach(function (text, c) {
+        const td = el('td');
+        if (aligns[c]) td.style.textAlign = aligns[c];
+        inline(text, td);
+        row.appendChild(td);
+      });
+      tbody.appendChild(row);
+      i += 1;
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    return { node: wrap, next: i };
+  }
+
   function markdown(text) {
     const root = el('div', 'assistant');
-    const lines = String(text || '').split(/\r?\n/);
+    blocks(String(text || '').split(/\r?\n/), root);
+    return root;
+  }
+
+  function blocks(lines, root) {
     let i = 0;
 
     while (i < lines.length) {
-      const fence = /^```(\S*)\s*$/.exec(lines[i]);
+      // A fence may be ``` or ~~~, may be indented, and its info string may
+      // carry a filename: ```go:handler/user.go
+      const fence = /^(\s{0,3})(`{3,}|~{3,})\s*([^\s`]*)\s*$/.exec(lines[i]);
       if (fence) {
-        const language = fence[1] || 'plaintext';
+        const closing = new RegExp('^\\s{0,3}' + fence[2].charAt(0) + '{' + fence[2].length + ',}\\s*$');
+        const info = fence[3] || '';
+        const colon = info.indexOf(':');
+        const language = colon === -1 ? info : info.slice(0, colon);
+        const filename = colon === -1 ? '' : info.slice(colon + 1);
         const collected = [];
         i += 1;
-        while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+        while (i < lines.length && !closing.test(lines[i])) {
           collected.push(lines[i]);
           i += 1;
         }
         i += 1;
-        root.appendChild(codeBlock(collected.join('\n'), language));
+        root.appendChild(codeBlock(collected.join('\n'), language || 'plaintext', filename));
         continue;
       }
 
-      const heading = /^(#{1,4})\s+(.*)$/.exec(lines[i]);
+      const heading = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/.exec(lines[i]);
       if (heading) {
-        const node = el('h' + Math.min(3, heading[1].length));
+        const node = el('h' + Math.min(4, heading[1].length));
         inline(heading[2], node);
         root.appendChild(node);
         i += 1;
         continue;
       }
 
-      if (/^\s*[-*]\s+/.test(lines[i])) {
-        const list = el('ul');
-        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
-          const item = el('li');
-          inline(lines[i].replace(/^\s*[-*]\s+/, ''), item);
-          list.appendChild(item);
+      if (RULE.test(lines[i])) {
+        root.appendChild(el('hr'));
+        i += 1;
+        continue;
+      }
+
+      // A pipe table is its header plus a delimiter row; without the second
+      // line a row of pipes is just a sentence with pipes in it.
+      if (
+        lines[i].indexOf('|') !== -1 &&
+        i + 1 < lines.length &&
+        TABLE_SEP.test(lines[i + 1]) &&
+        lines[i + 1].indexOf('-') !== -1
+      ) {
+        const table = tableAt(lines, i);
+        root.appendChild(table.node);
+        i = table.next;
+        continue;
+      }
+
+      if (QUOTE.test(lines[i])) {
+        const quoted = [];
+        while (i < lines.length && QUOTE.test(lines[i])) {
+          quoted.push(QUOTE.exec(lines[i])[1]);
           i += 1;
         }
-        root.appendChild(list);
+        const quote = el('blockquote');
+        blocks(quoted, quote);
+        root.appendChild(quote);
+        continue;
+      }
+
+      if (BULLET.test(lines[i]) || ORDERED.test(lines[i])) {
+        const list = listAt(lines, i, 0);
+        root.appendChild(list.node);
+        i = list.next;
         continue;
       }
 
@@ -666,7 +1221,21 @@
       }
 
       const paragraph = [];
-      while (i < lines.length && lines[i].trim() && !/^```/.test(lines[i])) {
+      while (
+        i < lines.length &&
+        lines[i].trim() &&
+        !/^\s{0,3}(?:`{3,}|~{3,})/.test(lines[i]) &&
+        !/^\s{0,3}#{1,6}\s/.test(lines[i]) &&
+        !BULLET.test(lines[i]) &&
+        !ORDERED.test(lines[i]) &&
+        !QUOTE.test(lines[i]) &&
+        !RULE.test(lines[i])
+      ) {
+        paragraph.push(lines[i]);
+        i += 1;
+      }
+      if (!paragraph.length) {
+        // Nothing consumed and nothing matched: take the line rather than spin.
         paragraph.push(lines[i]);
         i += 1;
       }
@@ -674,25 +1243,69 @@
       inline(paragraph.join('\n'), node);
       root.appendChild(node);
     }
-    return root;
   }
 
-  function codeBlock(code, language) {
+  /**
+   * A fenced code block, with the actions the developer actually wants.
+   *
+   * Copy alone is what the panel used to offer, so every snippet meant a copy,
+   * a click into the editor, a hunt for the insertion point and a paste. Insert
+   * and Apply close that loop: Insert drops the snippet at the cursor, Apply
+   * opens a diff against the named file so the change can be read before it
+   * lands. Neither writes anything without the developer saying so — Apply goes
+   * through the editor's own diff, which is where accept and reject live.
+   */
+  function codeBlock(code, language, filename) {
     const block = el('div', 'code');
+    const total = lineCount(code);
     const head = el('div', 'code-head');
-    head.appendChild(el('span', 'name', language));
-    head.appendChild(el('span', 'spacer'));
-    head.appendChild(copyButton(code));
-    if (isLong(code)) {
-      const open = el('button', 'small', S.openInEditor);
-      open.type = 'button';
-      open.addEventListener('click', function () {
-        post({ type: 'open-in-editor', content: code, language: language });
+
+    if (filename) {
+      const name = el('button', 'name file', filename);
+      name.type = 'button';
+      name.title = S.openPath || '';
+      name.addEventListener('click', function () {
+        post({ type: 'open-path', path: filename });
       });
-      head.appendChild(open);
+      head.appendChild(name);
+    } else {
+      head.appendChild(el('span', 'name', language));
     }
+    head.appendChild(el('span', 'lines', plural('lines', total)));
+    head.appendChild(el('span', 'spacer'));
+
+    const insert = el('button', 'link', S.insertAtCursor);
+    insert.type = 'button';
+    insert.title = S.insertAtCursorHint || '';
+    insert.addEventListener('click', function () {
+      post({ type: 'insert-at-cursor', content: code });
+    });
+    head.appendChild(insert);
+
+    if (filename) {
+      const apply = el('button', 'link', S.applyToFile);
+      apply.type = 'button';
+      apply.title = fmt(S.applyToFileHint, filename);
+      apply.addEventListener('click', function () {
+        post({ type: 'apply-to-file', path: filename, content: code, language: language });
+      });
+      head.appendChild(apply);
+    }
+
+    head.appendChild(copyButton(code));
     block.appendChild(head);
-    block.appendChild(el('pre', null, code));
+
+    // The same viewport every other block of output in the panel gets, so a
+    // 300-line snippet is scrollable in place rather than 300 lines of scroll
+    // in the transcript.
+    block.appendChild(
+      dump(code, {
+        language: language,
+        forceViewport: total > INLINE_LINES,
+        expanded: false,
+        noCopy: true,
+      }),
+    );
     return block;
   }
 
@@ -703,7 +1316,7 @@
       case 'user':
         return renderUser(row);
       case 'assistant':
-        return markdown(row.text);
+        return renderAssistant(row);
       case 'turn':
         return renderTurn(row);
       case 'tool':
@@ -723,7 +1336,9 @@
       case 'quota':
         return renderQuota(row);
       case 'error':
-        return shell({ state: 'fail' }, '✗', S.error, '', bodyFor(row.message, 'plaintext'));
+        // Opened. An error the reader has to click to see is an error the panel
+        // is hiding, and it is the one row that always deserves the space.
+        return shell({ state: 'fail' }, '✗', S.error, '', bodyFor(row.message, 'plaintext'), shouldOpen(true));
       case 'notice':
         return shell({ state: row.level === 'error' ? 'fail' : '' }, 'ℹ', row.text, '');
       default:
@@ -732,6 +1347,64 @@
     }
   }
 
+  /**
+   * A hover toolbar for one message.
+   *
+   * Kept out of the flow — absolutely positioned and revealed on hover or focus
+   * within — so it costs no vertical space in a transcript where vertical space
+   * is the scarce thing. It is always in the DOM rather than built on hover, so
+   * it is reachable by keyboard.
+   */
+  /**
+   * The panel's attention policy, in one place.
+   *
+   * `wanted` is what the row itself thinks: a failure, a call that wrote files,
+   * the summary a run ended on. The default setting agrees with it, and the two
+   * overrides are the honest extremes — open everything, or open nothing.
+   *
+   * The rule is deliberately this blunt. The previous behaviour collapsed
+   * everything, so the single row that explains why a run stopped looked exactly
+   * like the thirty rows that worked, and cost the same two clicks to read as
+   * the thirty did. Nothing here changes what is *available*: the whole text of
+   * every result is in the DOM under all three settings.
+   */
+  function shouldOpen(wanted) {
+    if (DISPLAY.expandOutput === 'always') return true;
+    if (DISPLAY.expandOutput === 'never') return false;
+    return wanted === true;
+  }
+
+  function actionBar(buttons) {
+    const bar = el('div', 'msg-actions');
+    buttons.forEach(function (button) {
+      bar.appendChild(button);
+    });
+    return bar;
+  }
+
+  function iconButton(label, handler, extraClass) {
+    const button = el('button', 'chip-btn ' + (extraClass || ''), label);
+    button.type = 'button';
+    button.title = label;
+    button.addEventListener('click', handler);
+    return button;
+  }
+
+  function renderAssistant(row) {
+    const wrap = el('div', 'msg');
+    wrap.appendChild(markdown(row.text));
+    wrap.appendChild(actionBar([copyButton(row.text, S.copyMessage)]));
+    return wrap;
+  }
+
+  /**
+   * What the developer typed, and the two things they most often want next.
+   *
+   * "Edit" refills the composer with the message rather than resubmitting it
+   * silently: the reason to re-ask is almost always that the wording was wrong,
+   * and a one-click resend of the same wrong wording is a button that wastes a
+   * run.
+   */
   function renderUser(row) {
     const node = el('div', 'row user');
     node.appendChild(el('span', 'who', S.you));
@@ -740,6 +1413,17 @@
       node.appendChild(document.createElement('br'));
       node.appendChild(el('span', 'chip', S.queuedChip));
     }
+    node.appendChild(
+      actionBar([
+        iconButton(S.editMessage, function () {
+          input.value = row.text;
+          autosize();
+          input.focus();
+          refresh();
+        }),
+        copyButton(row.text, S.copy),
+      ]),
+    );
     return node;
   }
 
@@ -764,8 +1448,12 @@
     if (row.content || row.fix || (row.mutations && row.mutations.length)) {
       body = el('div', 'body');
       if (row.content) {
-        const inner = bodyFor(row.content, row.language || 'plaintext');
-        while (inner.firstChild) body.appendChild(inner.firstChild);
+        body.appendChild(
+          dump(row.content, {
+            language: row.language || languageFor(row.name, row.summary),
+            expanded: row.state === 'fail',
+          }),
+        );
       }
       if (row.truncated) body.appendChild(el('p', 'footnote', S.truncated));
       if (row.fix) body.appendChild(el('p', 'footnote', fmt(S.fixHint, row.fix)));
@@ -773,7 +1461,46 @@
         body.appendChild(changeset(row.mutations));
       }
     }
-    return shell({ state: row.state === 'running' ? 'running' : row.state }, glyph, label, meta, body);
+    const open = shouldOpen(
+      row.state === 'fail' || Boolean(row.mutations && row.mutations.length),
+    );
+    return shell(
+      { state: row.state === 'running' ? 'running' : row.state },
+      glyph,
+      label,
+      meta,
+      body,
+      open,
+    );
+  }
+
+  /**
+   * What language a tool's output should be coloured as.
+   *
+   * Guessed from the tool name and its subject, because the wire does not carry
+   * one: `read_file` on a `.go` path is Go, `go build` output is a compiler log,
+   * and a shell tool's output is a shell session. A wrong guess costs nothing —
+   * the highlighter's unknown-language arm is plain text.
+   */
+  function languageFor(name, subject) {
+    const tool = String(name || '');
+    if (/diff|patch/.test(tool)) return 'diff';
+    /*
+     * A build tool's *output* is a log, not Go.
+     *
+     * `go_build` returning `handler/pension.go:9:24: undefined: Pension` is a
+     * compiler message that happens to mention Go identifiers; run through the
+     * Go grammar, every `/`, every `:` and the word `go` in each filename takes
+     * a token colour and the one line that matters is the same confetti as the
+     * rest. `golog` marks the position and the verdict and nothing else.
+     */
+    if (/^(?:go_|gate|build|test|vet|lint)/.test(tool)) return 'golog';
+    if (/shell|command|exec|run/.test(tool)) return 'shell';
+    // A read or a write: colour it as whatever the file it names is.
+    const path = String(subject || '');
+    const dot = path.lastIndexOf('.');
+    if (dot !== -1 && dot > path.lastIndexOf('/')) return path.slice(dot + 1);
+    return 'plaintext';
   }
 
   /** Runtime step status -> the label and glyph this panel shows for it. */
@@ -971,8 +1698,14 @@
         card.appendChild(el('p', null, fmt(S.gateBlockedWhy, last.blocked_by)));
         wrap.appendChild(card);
       }
-      // Failure output belongs behind a disclosure, one per failing stage, so a
-      // grid stays a grid rather than becoming a wall of compiler errors.
+      /*
+       * Failure output, one disclosure per failing stage.
+       *
+       * The stage that is *blocking* the run opens itself; the others stay shut.
+       * That is the difference between a grid with the compiler error under it
+       * and a grid followed by a wall of them: exactly one stage is the reason
+       * the run stopped, and it is the one the grid has already named in amber.
+       */
       (last.stages || []).forEach(function (stage) {
         if (stage.ok || !stage.content) return;
         // The word as well as the seconds. In the grid above, a failure is a
@@ -985,7 +1718,8 @@
             '✗',
             stage.name,
             S.toolFailed + ' · ' + fmt(S.gateSeconds, stage.seconds),
-            bodyFor(stage.content, 'go'),
+            bodyFor(stage.content, 'golog', { expanded: true }),
+            shouldOpen(stage.name === blocking || !blocking),
           ),
         );
       });
@@ -1157,6 +1891,40 @@
     }
     card.appendChild(dl);
 
+    /*
+     * The change itself, in the card that is asking about it.
+     *
+     * This is the difference between "Accept this write to handler/user.go" and
+     * a decision anyone can actually make. The panel used to put the diff behind
+     * a button that opened an editor tab, so deciding meant leaving the panel
+     * and coming back to the Accept button — which is why "Show diff" is still
+     * below, for the change too large to read here, and why this is not.
+     *
+     * `preview` arrives after the card, as its own message: computing it reads
+     * the file off disk, and a blocked run has to say it is blocked before that
+     * finishes.
+     */
+    if (row.preview) {
+      const preview = row.preview;
+      if (preview.diff) {
+        const head = el('div', 'preview-head');
+        head.appendChild(el('span', 'file', preview.path));
+        head.appendChild(el('span', 'spacer'));
+        head.appendChild(stat(preview.added, preview.removed));
+        card.appendChild(head);
+        card.appendChild(
+          dump(preview.diff, { language: 'diff', expanded: false, noCopy: true }),
+        );
+        if (preview.cut) {
+          card.appendChild(el('p', 'footnote', fmt(S.previewCut, preview.cut)));
+        }
+      } else if (preview.why) {
+        // Not an error. "This tool builds its files from templates when it runs"
+        // is a fact about the tool, and the arguments above are still reviewable.
+        card.appendChild(el('p', 'footnote', preview.why));
+      }
+    }
+
     if (row.protectedPaths && row.protectedPaths.length) {
       card.appendChild(el('p', 'warn', '⚠ ' + S.approvalProtected));
     }
@@ -1235,10 +2003,28 @@
     let body = null;
     if (row.summary || mutations.length) {
       body = el('div', 'body');
-      if (row.summary) body.appendChild(el('pre', null, row.summary));
-      if (mutations.length) body.appendChild(pathList(mutations, []));
+      if (row.summary) body.appendChild(dump(row.summary, { language: 'plaintext' }));
+      if (mutations.length) {
+        body.appendChild(el('p', 'footnote ruled', plural('filesChanged', mutations.length)));
+        body.appendChild(pathList(mutations, []));
+      }
     }
-    const node = shell({ state: spec[2] }, spec[0], S[spec[1]], parts.join(' · '), body);
+    /*
+     * The last row of a run is the one everybody reads, so it opens itself.
+     *
+     * This is the summary of what happened and the list of files that changed —
+     * the two facts a reviewer came back to the panel for. Collapsing it meant a
+     * finished run showed one word, and the list of files it had written was
+     * behind a click nobody knew was there.
+     */
+    const node = shell(
+      { state: spec[2] },
+      spec[0],
+      S[spec[1]],
+      parts.join(' · '),
+      body,
+      shouldOpen(row.outcome !== 'running'),
+    );
     node.classList.add('finish');
     return node;
   }
@@ -1664,6 +2450,7 @@
         SLASH = message.commands || [];
         MENTIONS = message.mentions || [];
         MAX_ROWS = message.maxRows || 500;
+        if (message.display) DISPLAY = message.display;
         if (typeof message.epoch === 'string' && message.epoch !== epoch) {
           epoch = message.epoch;
           lastSeq = 0;
@@ -1727,6 +2514,31 @@
       case 'mentions':
         applyMentions(message.token, message.items || []);
         return;
+
+      /*
+       * The diff for a card that is already up.
+       *
+       * Stored on the row rather than drawn directly, so it survives the repaint
+       * that the countdown and the decision both cause. Dropped for an approval
+       * that has already been answered: a decided card is a receipt, and a diff
+       * of a change that already landed is an invitation to re-read a decision
+       * nobody can now change.
+       */
+      case 'approval-preview': {
+        const row = byKey.get('ap:' + String(message.id || ''));
+        if (!row || row.decision) return;
+        row.preview = {
+          path: String(message.path || ''),
+          diff: String(message.diff || ''),
+          added: typeof message.added === 'number' ? message.added : 0,
+          removed: typeof message.removed === 'number' ? message.removed : 0,
+          cut: typeof message.cut === 'number' ? message.cut : 0,
+          why: typeof message.why === 'string' ? message.why : '',
+        };
+        paint(row);
+        save();
+        return;
+      }
 
       case 'approval-resolved': {
         const row = byKey.get('ap:' + message.id);
@@ -1803,6 +2615,20 @@
     stopBtn.title = S.stopHint || '';
     windBtn.textContent = S.windDown || '';
     windBtn.title = S.windDownHint || '';
+    if (jumpBtn) {
+      jumpBtn.textContent = S.jumpToLatest || '';
+      jumpBtn.title = S.jumpToLatest || '';
+    }
+    if (canFind) {
+      findLabel.textContent = S.findLabel || '';
+      findInput.placeholder = S.findPlaceholder || '';
+      findPrev.textContent = '↑';
+      findPrev.title = S.findPrevious || '';
+      findNext.textContent = '↓';
+      findNext.title = S.findNext || '';
+      findClose.textContent = '×';
+      findClose.title = S.findClose || '';
+    }
     applyRunState();
     applyOffline();
     updateSkip();
@@ -2062,9 +2888,14 @@
     if (known) post({ type: 'slash', command: slash[1], argument: slash[2].trim() });
     else post({ type: 'submit', text: text, steering: steering });
 
+    remember(text);
     input.value = '';
     autosize();
     closePopup();
+    // Sending is an explicit "show me the new thing", so it always returns to
+    // the live edge even if the reader had scrolled back.
+    transcript.scrollTop = transcript.scrollHeight;
+    syncJump();
   }
 
   sendBtn.addEventListener('click', send);
@@ -2259,6 +3090,31 @@
       accept(active);
       return;
     }
+    /*
+     * History recall, on the same terms every shell offers it: Up only reaches
+     * for the past when the caret is on the first line, so a two-line message
+     * can still be edited with the arrow keys. The popup outranks it — Up there
+     * is already "previous completion".
+     */
+    if ((event.key === 'ArrowUp' || event.key === 'ArrowDown') && !open && !event.altKey) {
+      const caret = input.selectionStart;
+      const before = input.value.slice(0, caret);
+      const firstLine = before.indexOf('\n') === -1;
+      const lastLine = input.value.slice(caret).indexOf('\n') === -1;
+      if ((event.key === 'ArrowUp' && firstLine) || (event.key === 'ArrowDown' && lastLine)) {
+        if (recall(event.key === 'ArrowUp' ? -1 : 1)) {
+          event.preventDefault();
+          return;
+        }
+      }
+    }
+    // Ctrl/Cmd+Enter sends too, so the habit carried in from every other panel
+    // works here rather than inserting a newline and looking broken.
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      send();
+      return;
+    }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
       send();
@@ -2273,7 +3129,21 @@
    * twenty turns of work is a key nobody can press with confidence.
    */
   document.addEventListener('keydown', function (event) {
+    // Ctrl/Cmd+F opens the panel's own find. The workbench's does not reach
+    // inside a webview, so without this the key does nothing at all here — which
+    // reads as the panel being broken rather than as the feature being absent.
+    if ((event.ctrlKey || event.metaKey) && (event.key === 'f' || event.key === 'F')) {
+      if (!canFind) return;
+      event.preventDefault();
+      openFind();
+      return;
+    }
     if (event.key !== 'Escape') return;
+    if (canFind && !findEl.hidden) {
+      event.preventDefault();
+      closeFind();
+      return;
+    }
     if (!popup.hidden) {
       event.preventDefault();
       closePopup();
@@ -2291,6 +3161,230 @@
     // there rather than on click.
     setTimeout(closePopup, 0);
   });
+
+  // ── jump to latest ────────────────────────────────────────────────────────
+
+  /**
+   * The way back to the bottom of a running transcript.
+   *
+   * `atBottom()` already existed — the drain loop uses it to decide whether to
+   * stick — so the panel always knew it had been scrolled away from the live
+   * edge and simply never offered to go back. On a forty-turn run that left a
+   * drag through several thousand rows as the only route.
+   */
+  function syncJump() {
+    if (!jumpBtn) return;
+    jumpBtn.hidden = atBottom();
+  }
+
+  if (jumpBtn) {
+    jumpBtn.addEventListener('click', function () {
+      transcript.scrollTop = transcript.scrollHeight;
+      syncJump();
+    });
+  }
+  if (transcript.addEventListener) {
+    transcript.addEventListener('scroll', syncJump);
+  }
+
+  // ── find in transcript ────────────────────────────────────────────────────
+
+  /*
+   * The workbench's own Ctrl+F does not reach into a webview, so a panel that
+   * holds a forty-turn transcript had no search at all. This is a small one:
+   * literal, case-insensitive, capped, and it marks matches in place rather
+   * than filtering rows — the surrounding output is usually why a match
+   * matters.
+   */
+  const FIND_CAP = 400;
+  let marks = [];
+  let hits = [];
+  let hitAt = -1;
+  let findQuery = '';
+  let findTimer = null;
+
+  /** Everything here needs a real DOM; the renderer's unit tests have a stub. */
+  const canFind =
+    Boolean(findEl && findInput) && typeof document.createTreeWalker === 'function';
+
+  function clearMarks() {
+    marks.forEach(function (mark) {
+      const parent = mark.parentNode;
+      if (!parent) return;
+      parent.replaceChild(document.createTextNode(mark.textContent), mark);
+      if (parent.normalize) parent.normalize();
+    });
+    marks = [];
+    hits = [];
+    hitAt = -1;
+  }
+
+  function runFind() {
+    if (!canFind) return;
+    clearMarks();
+    const needle = findQuery.toLowerCase();
+    if (!needle) {
+      findCount.textContent = '';
+      return;
+    }
+
+    // Collected first, then rewritten. Splitting a text node while the walker is
+    // still traversing makes it visit the halves it just created.
+    const texts = [];
+    const walker = document.createTreeWalker(transcript, NodeFilter.SHOW_TEXT, null);
+    let node = walker.nextNode();
+    while (node) {
+      if (node.nodeValue && node.nodeValue.toLowerCase().indexOf(needle) !== -1) {
+        texts.push(node);
+      }
+      node = walker.nextNode();
+    }
+
+    texts.forEach(function (text) {
+      if (marks.length >= FIND_CAP) return;
+      let value = text.nodeValue;
+      let target = text;
+      let at = value.toLowerCase().indexOf(needle);
+      while (at !== -1 && marks.length < FIND_CAP) {
+        const tail = target.splitText(at);
+        const rest = tail.splitText(needle.length);
+        const mark = el('mark', 'hit', tail.nodeValue);
+        tail.parentNode.replaceChild(mark, tail);
+        marks.push(mark);
+        hits.push(mark);
+        target = rest;
+        value = target.nodeValue;
+        at = value.toLowerCase().indexOf(needle);
+      }
+    });
+
+    if (!hits.length) {
+      findCount.textContent = S.findNone || '';
+      return;
+    }
+    hitAt = 0;
+    focusHit();
+  }
+
+  function focusHit() {
+    hits.forEach(function (mark, i) {
+      mark.classList.toggle('on', i === hitAt);
+    });
+    const mark = hits[hitAt];
+    if (mark && mark.scrollIntoView) mark.scrollIntoView({ block: 'center' });
+    findCount.textContent = fmt(
+      S.findCount,
+      hitAt + 1,
+      hits.length + (marks.length >= FIND_CAP ? '+' : ''),
+    );
+  }
+
+  function step(delta) {
+    if (!hits.length) return;
+    hitAt = (hitAt + delta + hits.length) % hits.length;
+    focusHit();
+  }
+
+  function openFind() {
+    if (!canFind) return;
+    findEl.hidden = false;
+    findInput.focus();
+    if (findInput.select) findInput.select();
+  }
+
+  function closeFind() {
+    if (!canFind) return;
+    findEl.hidden = true;
+    findQuery = '';
+    findInput.value = '';
+    clearMarks();
+    findCount.textContent = '';
+    input.focus();
+  }
+
+  /** Re-run after a repaint, since painting a row throws its marks away. */
+  function refind() {
+    if (!canFind || !findQuery) return;
+    if (findTimer) clearTimeout(findTimer);
+    findTimer = setTimeout(function () {
+      findTimer = null;
+      runFind();
+    }, 200);
+  }
+
+  if (canFind) {
+    findInput.addEventListener('input', function () {
+      findQuery = findInput.value;
+      if (findTimer) clearTimeout(findTimer);
+      findTimer = setTimeout(function () {
+        findTimer = null;
+        runFind();
+      }, 150);
+    });
+    findInput.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        step(event.shiftKey ? -1 : 1);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeFind();
+      }
+    });
+    findPrev.addEventListener('click', function () {
+      step(-1);
+    });
+    findNext.addEventListener('click', function () {
+      step(1);
+    });
+    findClose.addEventListener('click', closeFind);
+  }
+
+  // ── composer history ──────────────────────────────────────────────────────
+
+  /*
+   * Up-arrow recalls what was typed before, the way every shell and every other
+   * agent panel does. Kept in the webview's own state so it survives the panel
+   * being torn down, and capped — a transcript's worth of prompts is not a
+   * history, it is a leak.
+   */
+  const HISTORY_CAP = 60;
+  let history = Array.isArray(restored.history) ? restored.history : [];
+  let historyAt = -1;
+  /** What was in the composer before the first recall, so Down can restore it. */
+  let draft = '';
+
+  function remember(text) {
+    if (!text) return;
+    if (history[history.length - 1] === text) return;
+    history.push(text);
+    if (history.length > HISTORY_CAP) history = history.slice(-HISTORY_CAP);
+    historyAt = -1;
+    save();
+  }
+
+  function recall(delta) {
+    if (!history.length) return false;
+    if (historyAt === -1) {
+      if (delta > 0) return false; // nothing newer than the live draft
+      draft = input.value;
+      historyAt = history.length - 1;
+    } else {
+      const next = historyAt - delta;
+      if (next >= history.length) {
+        historyAt = -1;
+        input.value = draft;
+        autosize();
+        return true;
+      }
+      historyAt = Math.max(0, next);
+    }
+    input.value = history[historyAt];
+    autosize();
+    if (input.setSelectionRange) input.setSelectionRange(input.value.length, input.value.length);
+    return true;
+  }
 
   // ── boot ──────────────────────────────────────────────────────────────────
 

@@ -268,16 +268,29 @@ def submit_plan(inv: Invocation) -> ToolResult:
     if summary:
         body = f"{summary}\n\n{body}"
 
-    opening = f"Plan accepted, {len(steps)} step(s)."
+    # Recorded, not accepted -- the same distinction `finish` learned the hard
+    # way, and for the same reason.
+    #
+    # This said "Plan accepted ... Work starts now, you hold the write tools
+    # from this turn on", which the handler is in no position to know: the loop
+    # reads the plan *after* this result is already in the transcript, and a
+    # migration plan with no phases, or one naming a file too big to convert in
+    # a single reply, is sent straight back. So on exactly the turn that matters
+    # the model held two statements about the same call -- "work starts now"
+    # from the tool, "that plan was not adopted" from the loop one message later
+    # -- and a field session believed the first: it went looking for the write
+    # tools it had been promised, was refused `git_ops` by mode five times, and
+    # asked the developer the same question four times without ever planning.
+    opening = f"submit_plan recorded, {len(steps)} step(s)."
     if phases:
         opening = (
-            f"Plan accepted: {len(phases)} phase(s), and {len(steps)} step(s) for the "
-            "one that is open. The rest of the roadmap is recorded and is not work "
-            "for this run."
+            f"submit_plan recorded: {len(phases)} phase(s), {len(steps)} step(s). Only "
+            "the open phase's steps become work; the rest of the roadmap is kept for "
+            "when those phases open."
         )
     return ToolResult.success(
-        f"{opening} Work starts now — you hold the write tools from this turn "
-        f"on.\n\n{body}",
+        f"{opening} Whether it is adopted, and what it starts, is decided after "
+        f"this call.\n\n{body}",
         meta={
             "control": "plan",
             "summary": summary,

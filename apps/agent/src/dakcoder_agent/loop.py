@@ -110,6 +110,7 @@ from .migration import (
     phases_from_meta,
     plan_objection,
     progress_document,
+    steps_for_phase,
 )
 from .modes import CONTEXT_WINDOW, Intent, Mode, config_for
 from .plan import PlanRecord
@@ -2447,6 +2448,10 @@ class AgentLoop:
             if call.name == "git_ops" and outcome.ok and outcome.meta.get("branch"):
                 self.state.migration.branch = str(outcome.meta["branch"])
                 self.state.migration.base = str(outcome.meta.get("base") or "")
+                # Written now rather than at the next plan change: the branch is
+                # the fact a developer opening the document first wants, and the
+                # next change to the plan may be several turns away.
+                self._save_progress()
 
             self.state.calls.asked(fingerprint)
             # Terminal calls are never cached. `_intercept` already declines to
@@ -3288,8 +3293,27 @@ class AgentLoop:
                 return
         if phases:
             self.state.migration.adopt(phases)
+        deferred: list[PlanStep] = []
+        if self.state.migration.active and self.state.migration.phases:
+            # Trimmed to the open phase rather than refused. A model that has
+            # just thought about seven phases sends the steps for two of them,
+            # and that is a good plan in the wrong shape -- see
+            # `migration.steps_for_phase`.
+            kept, deferred = steps_for_phase(self.state.migration.phases, steps)
+            steps = tuple(kept)
         replanned = bool(self.state.plan) and self.state.replans > 0
         yield from self._adopt_plan(steps, str(outcome.meta.get("summary") or ""))
+        if deferred:
+            # Said, not silently dropped. A plan whose second half vanished
+            # without a word is a plan the model will re-send.
+            names = ", ".join(dict.fromkeys(s.file for s in deferred if s.file))
+            self.context.append_user(
+                f"{len(deferred)} step(s) in that plan belong to a later phase and "
+                f"were not adopted: {names}. The roadmap has them; they become work "
+                "when their phase opens, and the plan for that phase is written then, "
+                "against a workspace this one will have changed.\n\n"
+                "Work the steps above and nothing else."
+            )
         if replanned:
             # A new approach gets the full gate bound. MAX_REPLANS is what keeps
             # this finite: the second failed approach ends the run as before.
@@ -3592,6 +3616,9 @@ class AgentLoop:
                 if self.state.routes_before
                 else ""
             )
+            + f". The plan, the phases and what is done are in {PROGRESS_PATH}, "
+            "rewritten on every change — the Migration view reads it, and so does "
+            "the next session"
             + ". The verification gate has not run and will not until the last "
             "phase closes — a half-converted service cannot build, so a gate now "
             "would report the conversion's own middle as a failure. Say when to "
@@ -4238,9 +4265,31 @@ class AgentLoop:
         # `_plan_block` does.
         lines.extend(self.state.migration.block(self._plan_phase()))
         if self.state.migration.active and not self.state.migration.branch:
+            # Two different instructions, because the two modes hold two
+            # different sets of tools and an instruction a mode cannot obey is
+            # the worst thing that can be put in front of a model.
+            #
+            # This said "confirm one with `ask_developer`, then `git_ops`
+            # op=branch" in both. `git_ops` is an acting tool; the Planner was
+            # being told, every turn, in the last position of its prompt, to
+            # make a call its own request did not offer. A field session did
+            # exactly that -- five refused `git_ops` calls, four identical
+            # questions to the developer, and no plan -- because the one move it
+            # had been told to make was the one it could not make, and the move
+            # that would have unblocked it was never named.
             lines.append(
-                "Migration: no branch yet — confirm one with `ask_developer`, then "
-                "`git_ops` op=branch. Writes are held until it exists."
+                "Migration: no branch yet. "
+                + (
+                    "Cut it before anything else: `git_ops` op=branch "
+                    "message=<name> base=<branch to cut from>. Every write is "
+                    "held until it exists."
+                    if self.state.mode is Mode.AGENT
+                    else "You cannot cut it here — `git_ops` is an acting tool. "
+                    "Settle *which* branch to cut it from (`ask_developer`, if the "
+                    "developer has not already said), then `submit_plan`. Cutting "
+                    "it is the first step of the first phase, and the acting "
+                    "phase does it."
+                )
             )
 
         if self.state.plan:

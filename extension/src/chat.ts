@@ -59,6 +59,21 @@ const TRANSIENT = new Set(['assistant_delta', 'heartbeat']);
 
 export type ApprovalDecision = 'accept' | 'reject' | 'edit';
 
+/**
+ * The three presentation choices `dakcoder.chat.*` exposes.
+ *
+ * All three are about *how much* is on screen, never about what is available:
+ * the whole of every tool result is in the panel's DOM under every setting, and
+ * these decide only how much of it is unfolded before anyone asks. That
+ * distinction is the point — the previous revision made "collapsed" and
+ * "unreachable without opening an editor tab" the same thing.
+ */
+export interface DisplaySettings {
+  expandOutput: 'failures' | 'always' | 'never';
+  previewLines: number;
+  syntaxHighlighting: boolean;
+}
+
 /** One event as the ring holds it: the event, whose session it was, and where
  *  it sits in the host's own ordering. */
 interface RingEntry {
@@ -180,6 +195,8 @@ type HostMessage =
        * receive. See `EPOCH`.
        */
       epoch: string;
+      /** How the panel is set to present output. See `display()`. */
+      display: DisplaySettings;
     }
   | { type: 'batch'; messages: HostMessage[] }
   | { type: 'event'; event: WireEvent; session: string; seq: number }
@@ -190,6 +207,19 @@ type HostMessage =
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; text: string }
   | { type: 'mentions'; token: number; items: MentionItem[] }
   | { type: 'approval-resolved'; id: string; decision: ApprovalDecision }
+  | {
+      type: 'approval-preview';
+      id: string;
+      path: string;
+      /** A unified diff, or '' when the change could not be previewed. */
+      diff: string;
+      added: number;
+      removed: number;
+      /** Lines of diff cut to keep the card a card; 0 when it is whole. */
+      cut: number;
+      /** Why there is no diff, when there is none. A sentence, already l10n'd. */
+      why?: string;
+    }
   | { type: 'session'; id: string }
   | { type: 'clear' }
   | { type: 'focus' };
@@ -327,6 +357,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    *  or gone (410). The card stops offering buttons either way. */
   approvalResolved(id: string, decision: ApprovalDecision): void {
     this.post({ type: 'approval-resolved', id, decision });
+  }
+
+  /**
+   * The change an approval is asking about, as a diff the card can show.
+   *
+   * Sent as a second message rather than carried on the `tool_pending` event,
+   * because computing it means reading the file off disk and the card must be on
+   * screen the instant the run blocks — a reviewer waiting on I/O to find out
+   * that they are being waited on is the wrong way round. The card renders
+   * without it and fills in when this arrives.
+   *
+   * Deliberately not put in the ring: it is derived from workspace state that
+   * has moved on by the time a transcript is replayed, and a stale diff beside a
+   * decided approval would be a claim about a file that is no longer true.
+   */
+  approvalPreview(message: Extract<HostMessage, { type: 'approval-preview' }>): void {
+    this.post(message);
   }
 
   /**
@@ -552,6 +599,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           );
           return;
 
+        case 'insert-at-cursor':
+          await this.insertAtCursor(stringOr(message['content'], ''));
+          return;
+
+        case 'apply-to-file':
+          await this.applyToFile(
+            stringOr(message['path'], ''),
+            stringOr(message['content'], ''),
+            stringOr(message['language'], 'plaintext'),
+          );
+          return;
+
         case 'copy':
           await vscode.env.clipboard.writeText(stringOr(message['text'], ''));
           return;
@@ -606,6 +665,97 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     });
   }
 
+  /**
+   * Drop a snippet where the caret is.
+   *
+   * The loop this closes: before, the only thing a code block offered was Copy,
+   * so taking a snippet meant copy, click into the editor, find the spot, paste.
+   * Three of those four steps are the panel's to remove.
+   *
+   * A selection is replaced rather than inserted around, which is what every
+   * editor means by "insert" when something is selected, and it is undoable in
+   * one step because it goes through the edit builder rather than the clipboard.
+   */
+  private async insertAtCursor(content: string): Promise<void> {
+    if (!content) return;
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      // Nowhere to insert is not an error worth a modal, but it must not be
+      // silent either: the button was pressed and nothing visibly happened.
+      this.note('warn', vscode.l10n.t('Open a file first — there is no cursor to insert at.'));
+      return;
+    }
+    const ok = await editor.edit((builder) => {
+      for (const selection of editor.selections) {
+        if (selection.isEmpty) builder.insert(selection.active, content);
+        else builder.replace(selection, content);
+      }
+    });
+    if (!ok) {
+      this.note('error', vscode.l10n.t('The editor refused the insert.'));
+      return;
+    }
+    await vscode.window.showTextDocument(editor.document, { viewColumn: editor.viewColumn });
+  }
+
+  /**
+   * Show a proposed file as a diff against what is on disk.
+   *
+   * Deliberately a diff and not a write. The agent's own edits go through the
+   * approval card, which is the audited path; this is for a snippet the model
+   * printed in prose, and writing those straight to disk would be a second,
+   * unaudited way to change the workspace. `vscode.diff` ends in the editor's
+   * own accept/discard, which is where that decision already lives.
+   *
+   * A path with no file behind it opens as a new untitled document seeded with
+   * the content — the "create this file" case, where there is nothing to diff.
+   */
+  private async applyToFile(path: string, content: string, language: string): Promise<void> {
+    if (!path || !content) return;
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {
+      await this.openScratch(content, language);
+      return;
+    }
+    // Joined against the workspace root and then checked, so a path that climbs
+    // out with `..` cannot address a file outside it.
+    const target = vscode.Uri.joinPath(folder.uri, path);
+    if (!target.path.startsWith(folder.uri.path)) {
+      this.log.warn(`chat: refused apply-to-file outside the workspace: ${path}`);
+      await this.openScratch(content, language);
+      return;
+    }
+
+    let exists = true;
+    try {
+      await vscode.workspace.fs.stat(target);
+    } catch {
+      exists = false;
+    }
+
+    if (!exists) {
+      const created = await vscode.workspace.openTextDocument({ content, language });
+      await vscode.window.showTextDocument(created, {
+        preview: false,
+        viewColumn: vscode.ViewColumn.Beside,
+      });
+      this.note(
+        'info',
+        vscode.l10n.t('{0} does not exist yet. Save this document to create it.', path),
+      );
+      return;
+    }
+
+    const proposed = await vscode.workspace.openTextDocument({ content, language });
+    await vscode.commands.executeCommand(
+      'vscode.diff',
+      target,
+      proposed.uri,
+      vscode.l10n.t('{0} — on disk ↔ proposed', path),
+      { preview: true, viewColumn: vscode.ViewColumn.Beside },
+    );
+  }
+
   // ── outbound, rate-capped ─────────────────────────────────────────────────
 
   private post(message: HostMessage): void {
@@ -648,6 +798,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       .replace(/\{\{nonce\}\}/g, nonce)
       .replace(/\{\{csp\}\}/g, webview.cspSource)
       .replace(/\{\{style\}\}/g, uri('chat.css'))
+      .replace(/\{\{highlight\}\}/g, uri('highlight.js'))
       .replace(/\{\{script\}\}/g, uri('chat.js'))
       .replace(/\{\{lang\}\}/g, vscode.env.language || 'en');
   }
@@ -751,10 +902,55 @@ function strings(): Record<string, string> {
     assistant: vscode.l10n.t('dakcoder'),
     show: vscode.l10n.t('Show detail'),
     hide: vscode.l10n.t('Hide detail'),
-    openInEditor: vscode.l10n.t('Open in editor'),
     copy: vscode.l10n.t('Copy'),
     copied: vscode.l10n.t('Copied to the clipboard.'),
+    copied_short: vscode.l10n.t('Copied'),
     truncated: vscode.l10n.t('Truncated by the runtime.'),
+
+    /*
+     * The disclosure controls.
+     *
+     * "Open in editor" used to be the only way to read anything longer than
+     * three lines. It is still here — a 4,000-line test log genuinely belongs in
+     * an editor, which has search and folding — but it is now one option beside
+     * reading the thing in place, which is what the other four strings are for.
+     */
+    openInEditor: vscode.l10n.t('Open in editor'),
+    openInEditorHint: vscode.l10n.t('Open the full output in an editor tab, with search and folding.'),
+    showAllLines: vscode.l10n.t('Show all {0} lines'),
+    showLess: vscode.l10n.t('Show less'),
+    // One label, two states. The button is a toggle and reports which it is in
+    // through `aria-pressed`; the two hints below are what the tooltip says.
+    wrapOn: vscode.l10n.t('Wrap'),
+    wrapOnHint: vscode.l10n.t('Long lines are wrapped. Click to let them run off to the right instead.'),
+    wrapOffHint: vscode.l10n.t('Long lines run off to the right. Click to wrap them.'),
+    elidedLines_one: vscode.l10n.t('1 line not shown — open in editor for all of it'),
+    elidedLines_other: vscode.l10n.t('{0} lines not shown — open in editor for all of it'),
+
+    // Code block actions. Insert and Apply are what close the loop between a
+    // snippet the model printed and the file it belongs in.
+    insertAtCursor: vscode.l10n.t('Insert'),
+    insertAtCursorHint: vscode.l10n.t('Insert this at the cursor in the active editor.'),
+    applyToFile: vscode.l10n.t('Apply'),
+    applyToFileHint: vscode.l10n.t('Open {0} as a diff against this, so the change can be read before it lands.'),
+    copyMessage: vscode.l10n.t('Copy message'),
+    editMessage: vscode.l10n.t('Edit'),
+    openPath: vscode.l10n.t('Open this file'),
+    openPathTitle: vscode.l10n.t('Open {0}'),
+    statLabel: vscode.l10n.t('{0} lines added, {1} removed'),
+    filesChanged_one: vscode.l10n.t('1 file changed'),
+    filesChanged_other: vscode.l10n.t('{0} files changed'),
+
+    // Navigation. The workbench's own find does not reach into a webview, so a
+    // panel holding a forty-turn transcript had no search at all.
+    jumpToLatest: vscode.l10n.t('Jump to latest'),
+    findLabel: vscode.l10n.t('Find in transcript'),
+    findPlaceholder: vscode.l10n.t('Find…'),
+    findNone: vscode.l10n.t('No matches'),
+    findCount: vscode.l10n.t('{0} of {1}'),
+    findPrevious: vscode.l10n.t('Previous match'),
+    findNext: vscode.l10n.t('Next match'),
+    findClose: vscode.l10n.t('Close find'),
 
     // steering
     queuedChip: vscode.l10n.t('Queued — read before the next turn'),
@@ -819,6 +1015,9 @@ function strings(): Record<string, string> {
     approvalReason: vscode.l10n.t('Reason'),
     approvalPaths: vscode.l10n.t('Paths'),
     approvalProtected: vscode.l10n.t('Protected path — the runtime never auto-approves this.'),
+    // The card shows the change it is asking about. "Show diff" survives for the
+    // change too large to read in a 340px column.
+    previewCut: vscode.l10n.t('{0} more lines of diff — Show diff opens the whole change.'),
     approvalUnconditional: vscode.l10n.t('This tool always asks, whatever the approval policy says.'),
     accept: vscode.l10n.t('Accept'),
     reject: vscode.l10n.t('Reject'),
@@ -952,6 +1151,25 @@ function mentionSpecs(s: Record<string, string>): MentionSpec[] {
  */
 const EPOCH = `${process.pid}-${Date.now().toString(36)}`;
 
+/**
+ * How the panel is set to present output.
+ *
+ * Read here rather than in the webview, which has no `vscode.workspace` — and
+ * re-read on every `init`, so a change takes effect the next time the panel is
+ * built rather than needing a window reload.
+ */
+function display(): DisplaySettings {
+  const config = vscode.workspace.getConfiguration('dakcoder.chat');
+  const expand = config.get<string>('expandOutput', 'failures');
+  return {
+    expandOutput: expand === 'always' || expand === 'never' ? expand : 'failures',
+    // Clamped to the same range the setting declares: a webview that trusted a
+    // hand-edited settings.json could be told to lay out a 10,000-line viewport.
+    previewLines: Math.max(4, Math.min(200, Math.round(config.get<number>('previewLines', 20)))),
+    syntaxHighlighting: config.get<boolean>('syntaxHighlighting', true) !== false,
+  };
+}
+
 /** The `init` payload, built once per webview resolve. */
 function initMessage(): HostMessage {
   const s = strings();
@@ -962,6 +1180,7 @@ function initMessage(): HostMessage {
     commands: slashCommands(s),
     mentions: mentionSpecs(s),
     epoch: EPOCH,
+    display: display(),
   };
 }
 

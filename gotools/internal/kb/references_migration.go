@@ -96,11 +96,19 @@ converts, with the group in ` + "`" + `part` + "`" + `. One step for a file that
 can never be finished, and it is discovered only after the file has been read —
 which is also after the budget has gone. Roughly one step per 800 lines.
 
-**Progress is recorded on disk.** The agent maintains ` + "`" + `.dakcoder/migration.md` + "`" + `
-from the roadmap and the change set: which phases have closed, which steps are
-done, which files this session changed. Read it first when resuming. It answers
-"where did the last session get to" in a few hundred tokens, where a transcript
-does not survive compaction and a hand-written summary is prose.
+**The plan is a document, and it is kept current.**
+` + "`" + `.dakcoder/migration/plan.md` + "`" + ` is written from the roadmap and the change set —
+every phase with its breakdown and status, every unit with what is planned for
+it and whether it landed, the branch, the route count, and a log of when each
+phase closed. It is rewritten on every change, so it is never behind. Read it
+first when resuming: it answers "where did the last session get to" in a few
+hundred tokens, where a transcript does not survive compaction and a
+hand-written summary is prose. The extension's Migration view reads the same
+file, so the developer is looking at what you are.
+
+Do not write your own plan document beside it. A field session wrote a
+` + "`" + `migration.md` + "`" + ` by hand and then read it back as evidence of work it had not
+done.
 
 **Every route is recorded before anything changes, and checked at the end.**
 The agent takes an inventory of every route the service registers — gin groups
@@ -170,11 +178,17 @@ Work on a ` + "`" + `template-conversion` + "`" + ` branch cut from ` + "`" + `d
 is reviewable and revertible as one unit and the new branch carries
 ` + "`" + `development` + "`" + `'s code rather than whatever happened to be checked out.
 
-**Confirm it first.** ` + "`" + `git_status` + "`" + ` lists the branches, so it answers whether
-` + "`" + `development` + "`" + ` exists. Then ` + "`" + `ask_developer` + "`" + `: which branch to cut, and which to
-cut it from, naming what you found. The base decides what the conversion is
-built on, and a migration cut from a stale feature branch has to be redone — it
-is not a thing to infer about somebody else's repository. Then:
+**Confirm it first, and cut it from the acting phase.** ` + "`" + `git_status` + "`" + ` lists the
+branches, so it answers whether ` + "`" + `development` + "`" + ` exists. Then ` + "`" + `ask_developer` + "`" + `:
+which branch to cut, and which to cut it from, naming what you found. The base
+decides what the conversion is built on, and a migration cut from a stale
+feature branch has to be redone — it is not a thing to infer about somebody
+else's repository.
+
+` + "`" + `git_ops` + "`" + ` is an acting tool and the planner does not hold it. So while planning,
+settle *which* branch and submit the plan; cutting it is the first step of the
+first phase. A planner that tries to cut the branch is refused by mode, and a
+run that keeps trying never reaches the phase that could have done it. Then:
 
 ` + "```" + `
 git_ops op=branch message=template-conversion base=development

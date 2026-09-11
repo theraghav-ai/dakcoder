@@ -130,6 +130,28 @@
   --dak-fg-4: #6e6e6b;
   --dak-fg-5: #4e4e51;
 
+  /*
+   * The syntax ramp.
+   *
+   * Six hues, and every one of them defers to the workbench's own token colour
+   * where the active theme defines one — a panel inside One Dark that coloured
+   * Go by its own rules would read as a different application embedded in the
+   * editor. The fallbacks are the design's, tuned against `--dak-code` at the
+   * 10.5px the panel actually renders code at, and kept deliberately low in
+   * chroma: this is a 340px column beside the real editor, not a replacement
+   * for it, and saturated syntax at that width is noise.
+   */
+  --dak-kw: var(--vscode-symbolIcon-keywordForeground, #c98bdb);
+  --dak-str: var(--vscode-symbolIcon-stringForeground, #9ccf7a);
+  --dak-num: var(--vscode-symbolIcon-numberForeground, #d6a06a);
+  --dak-type: var(--vscode-symbolIcon-classForeground, #6cc0d6);
+  --dak-fn: var(--vscode-symbolIcon-functionForeground, #82aaf5);
+  --dak-attr: var(--vscode-symbolIcon-propertyForeground, #d4b86a);
+
+  /* Diff grounds. Tinted, never the only signal — the +/- stays in the text. */
+  --dak-add-bg: rgba(63, 185, 80, 0.12);
+  --dak-del-bg: rgba(248, 81, 73, 0.12);
+
   /* type */
   --dak-sans: 'Instrument Sans', var(--vscode-font-family), system-ui, sans-serif;
   --dak-mono: 'Martian Mono', var(--vscode-editor-font-family), ui-monospace, monospace;
@@ -217,6 +239,17 @@ body.vscode-light {
   --dak-fg-3: #4e4e54;
   --dak-fg-4: #62626a;
   --dak-fg-5: #76767e;
+
+  /* Re-solved for a light ground; each checked at 4.5:1 against #F7F7F6. */
+  --dak-kw: var(--vscode-symbolIcon-keywordForeground, #8a3fa0);
+  --dak-str: var(--vscode-symbolIcon-stringForeground, #2c6e2c);
+  --dak-num: var(--vscode-symbolIcon-numberForeground, #8a4b0f);
+  --dak-type: var(--vscode-symbolIcon-classForeground, #0f6d80);
+  --dak-fn: var(--vscode-symbolIcon-functionForeground, #2c4fa8);
+  --dak-attr: var(--vscode-symbolIcon-propertyForeground, #7a5a00);
+
+  --dak-add-bg: rgba(26, 127, 55, 0.1);
+  --dak-del-bg: rgba(207, 34, 46, 0.09);
 }
 
 /* ── tier three · high contrast ────────────────────────────────────────────
@@ -265,6 +298,27 @@ body.vscode-high-contrast-light {
   --dak-fg-3: var(--vscode-foreground);
   --dak-fg-4: var(--vscode-descriptionForeground, var(--vscode-foreground));
   --dak-fg-5: var(--vscode-descriptionForeground, var(--vscode-foreground));
+
+  /*
+   * Syntax colour is given up entirely here, and that is the correct answer.
+   *
+   * A high-contrast theme is a declaration that hue is not a channel this
+   * developer can rely on. Six tuned hues at 10.5px is exactly the thing those
+   * themes exist to remove, so every token resolves to the foreground and the
+   * code renders as monochrome — which is what it looked like before this
+   * revision, and is no loss for a reader who chose HC.
+   */
+  --dak-kw: var(--vscode-foreground);
+  --dak-str: var(--vscode-foreground);
+  --dak-num: var(--vscode-foreground);
+  --dak-type: var(--vscode-foreground);
+  --dak-fn: var(--vscode-foreground);
+  --dak-attr: var(--vscode-foreground);
+
+  /* Diff keeps its grounds: it is the one place the +/- glyph is also in the
+     text, so the tint is redundant reinforcement rather than the only signal. */
+  --dak-add-bg: var(--vscode-diffEditor-insertedTextBackground, transparent);
+  --dak-del-bg: var(--vscode-diffEditor-removedTextBackground, transparent);
 
   /* The vendored faces are dropped too: a high-contrast theme is a request for
      the system's own legibility settings, not for ours. */
@@ -524,8 +578,12 @@ button.skip:focus {
 
 /* ── the transcript ──────────────────────────────────────────────────────── */
 
+/* The transcript is now a child of `.stage`, which exists only to give the
+   jump-to-latest button something to be positioned against. `.stage` is the
+   flex child; the transcript fills it. */
 .transcript {
   flex: 1 1 auto;
+  min-width: 0;
   overflow-y: auto;
   padding: 14px 16px 18px;
   background: var(--dak-surface);
@@ -736,18 +794,48 @@ button.skip:focus {
   all: unset;
   cursor: pointer;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
   font-family: var(--dak-mono);
   font-size: var(--dak-code-fs);
   color: var(--dak-fg-2);
+}
+
+.row .toggle .toggle-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   border-bottom: 1px dashed var(--dak-fg-5);
+}
+
+/*
+ * The caret.
+ *
+ * A dashed underline is a weak affordance for "there is output behind this" —
+ * weak enough that the panel's own output went unread rather than merely
+ * collapsed. A triangle that turns is the convention every tree in the
+ * workbench uses, and it says which state the row is in as well as that it has
+ * one. Fixed width so a row does not shift horizontally when it opens.
+ */
+.row .toggle .caret {
+  flex: none;
+  width: 0.8em;
+  font-size: 0.85em;
+  color: var(--dak-fg-5);
 }
 
 .row .toggle:hover {
   color: var(--dak-fg);
+}
+
+.row .toggle:hover .toggle-label {
   border-bottom-color: var(--dak-fg-3);
+}
+
+.row .toggle:hover .caret {
+  color: var(--dak-amber);
 }
 
 /* ── the timeline rail ─────────────────────────────────────────────────────
@@ -817,10 +905,11 @@ button.skip:focus {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
 }
 
 .body pre,
-.body .clamp {
+.dump pre {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
@@ -828,19 +917,338 @@ button.skip:focus {
   font-size: var(--dak-small);
   line-height: 1.65;
   color: var(--dak-fg-3);
+  tab-size: 4;
 }
 
-/* Third level: anything past ~250 chars or three lines goes to a real editor. */
-.clamp {
-  max-height: 3.3em;
+/* ── the output viewport ───────────────────────────────────────────────────
+   The replacement for `.clamp`, and the point of this revision.
+
+   The old rule cut anything past three lines to 3.3em under `overflow: hidden`
+   and offered no way to read the rest except an editor tab. This scrolls
+   instead: the whole text is in the DOM, the viewport is capped in `em` so it
+   tracks the reader's own font size, and the cap lifts on one click. Nothing is
+   ever unreachable, which is the property the old one lacked. */
+
+.dump {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--dak-hair);
+  border-radius: var(--dak-r);
+  background: var(--dak-code);
   overflow: hidden;
+}
+
+/*
+ * The viewport's own font size is the code's, not the row's.
+ *
+ * The renderer sets `max-height` in `em`, and `em` on `max-height` resolves
+ * against *this* element's font size. Left at the row's size the box was 23%
+ * taller than the line count it was given — "20 lines" showed nearer 25, which
+ * is wrong in the direction nobody notices and impossible to reason about.
+ * Declaring the size here and letting the `pre` inherit it makes one `em` one
+ * line of code exactly.
+ */
+.dump .scroll {
+  position: relative;
+  overflow: auto;
+  padding: 8px 10px;
+  font-size: var(--dak-small);
+  /* The inline max-height comes from the renderer, in lines. */
+}
+
+.dump .scroll pre {
+  font-size: inherit;
+}
+
+/* Per-block, because a log wants wrapping and a table of struct tags does not. */
+.dump .scroll.nowrap pre {
+  white-space: pre;
+  word-break: normal;
+}
+
+.dump .scroll:focus-visible {
+  outline-offset: -2px;
+}
+
+/*
+ * No gradient fade at the foot of the viewport, deliberately.
+ *
+ * It is the obvious thing to add and it is the wrong thing: a fade makes the
+ * last visible line unreadable in order to hint that there are more lines, which
+ * is a smaller version of exactly the fault this revision exists to fix. The
+ * scrollbar says there is more, and the bar below says how much in words
+ * ("Show all 340 lines"), which is the same information without costing a line.
+ */
+
+.dump-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 4px 8px;
+  border-top: 1px solid var(--dak-hair);
+  background: var(--dak-raised);
+}
+
+.dump-count {
+  font-family: var(--dak-mono);
+  font-size: var(--dak-micro);
+  letter-spacing: var(--dak-track);
+  color: var(--dak-fg-4);
+  font-variant-numeric: tabular-nums;
+}
+
+.elision {
+  margin: 6px 0;
+  padding: 3px 0;
+  border-top: 1px dashed var(--dak-edge);
+  border-bottom: 1px dashed var(--dak-edge);
+  font-family: var(--dak-mono);
+  font-size: var(--dak-micro);
+  letter-spacing: var(--dak-track);
+  text-transform: uppercase;
+  color: var(--dak-fg-4);
+  text-align: center;
+}
+
+/*
+ * A text button, not a bordered one.
+ *
+ * The viewport bar carries up to five of these at a 340px width. As bordered
+ * `.small` buttons they wrapped to three rows and read as a toolbar; as text
+ * they read as what they are — annotations on the block above them.
+ */
+button.link {
+  font: inherit;
+  font-size: var(--dak-meta);
+  background: none;
+  border: 0;
+  padding: 1px 2px;
+  color: var(--dak-fg-4);
+  cursor: pointer;
+  white-space: nowrap;
+  flex: none;
+  border-radius: 3px;
+}
+
+button.link:hover {
+  color: var(--dak-amber);
+}
+
+button.link[aria-pressed='false'] {
+  color: var(--dak-fg-5);
+}
+
+/* ── syntax highlighting ───────────────────────────────────────────────────
+   Eight classes, from media/chat/highlight.js. The hues are the workbench's own
+   token colours where a theme defines them, so a panel inside One Dark does not
+   read as a panel from somewhere else, with the design's palette behind them for
+   the themes that define nothing. */
+
+.hl-c {
+  color: var(--vscode-editorLineNumber-foreground, var(--dak-fg-5));
+  font-style: italic;
+}
+
+.hl-s {
+  color: var(--dak-str);
+}
+
+.hl-n {
+  color: var(--dak-num);
+}
+
+.hl-k {
+  color: var(--dak-kw);
+}
+
+.hl-t {
+  color: var(--dak-type);
+}
+
+.hl-f {
+  color: var(--dak-fn);
+}
+
+.hl-e {
+  color: var(--dak-attr);
+}
+
+.hl-o {
+  color: var(--dak-fg-4);
+}
+
+/* A diff is coloured by line, so the mark has to span the row, not the token. */
+.hl-add,
+.hl-del {
+  display: inline-block;
+  width: 100%;
+}
+
+.hl-add {
+  color: var(--dak-ok);
+  background: var(--dak-add-bg);
+}
+
+.hl-del {
+  color: var(--dak-bad-soft);
+  background: var(--dak-del-bg);
+}
+
+/* ── message actions ───────────────────────────────────────────────────────
+   Out of the flow and revealed on hover or keyboard focus, so they cost no
+   vertical space in the one dimension this panel is short of. Always in the DOM
+   rather than built on hover, so they are reachable by Tab. */
+
+.msg,
+.row.user {
   position: relative;
 }
 
-.overflow-actions {
+.msg-actions {
+  position: absolute;
+  top: 0;
+  right: 0;
   display: flex;
-  gap: var(--gap);
-  flex-wrap: wrap;
+  gap: 2px;
+  padding: 2px 3px;
+  border: 1px solid var(--dak-line);
+  border-radius: var(--dak-r-sm);
+  background: var(--dak-raised);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 90ms linear;
+}
+
+.msg:hover .msg-actions,
+.msg:focus-within .msg-actions,
+.row.user:hover .msg-actions,
+.row.user:focus-within .msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-actions {
+    transition: none;
+  }
+}
+
+button.chip-btn {
+  font: inherit;
+  font-size: var(--dak-meta);
+  background: none;
+  border: 0;
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: var(--dak-fg-3);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button.chip-btn:hover {
+  background: var(--dak-line);
+  color: var(--dak-fg-hi);
+}
+
+/* ── jump to latest ───────────────────────────────────────────────────────── */
+
+.stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
+.jump {
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  z-index: 5;
+  padding: 4px 11px;
+  font: inherit;
+  font-size: var(--dak-meta);
+  border: 1px solid var(--dak-edge);
+  border-radius: 20px;
+  background: var(--dak-raised);
+  color: var(--dak-fg-2);
+  cursor: pointer;
+  box-shadow: 0 6px 18px -8px rgba(0, 0, 0, 0.8);
+}
+
+.jump:hover {
+  border-color: var(--dak-amber-tint-edge);
+  color: var(--dak-amber);
+}
+
+.jump::before {
+  content: '↓ ';
+}
+
+/* ── find in transcript ───────────────────────────────────────────────────── */
+
+.find {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px var(--pad);
+  border-bottom: 1px solid var(--dak-hair);
+  background: var(--dak-raised);
+}
+
+.find-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 7px;
+  font: inherit;
+  font-size: var(--dak-body-2);
+  color: var(--dak-fg);
+  background: var(--dak-input);
+  border: 1px solid var(--dak-edge);
+  border-radius: var(--dak-r-sm);
+}
+
+.find-input:focus {
+  outline: none;
+  border-color: var(--dak-amber-dim);
+}
+
+.find-count {
+  font-family: var(--dak-mono);
+  font-size: var(--dak-micro);
+  color: var(--dak-fg-4);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+button.icon {
+  font: inherit;
+  font-size: var(--dak-body-2);
+  line-height: 1;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  color: var(--dak-fg-3);
+  cursor: pointer;
+}
+
+button.icon:hover {
+  background: var(--dak-line);
+  color: var(--dak-fg-hi);
+}
+
+mark.hit {
+  background: var(--dak-amber-tint);
+  color: var(--dak-amber-hi);
+  border-radius: 2px;
+}
+
+mark.hit.on {
+  background: var(--dak-amber);
+  color: var(--dak-on-amber);
 }
 
 /* ── what you said ─────────────────────────────────────────────────────────
@@ -930,8 +1338,110 @@ button.skip:focus {
   color: var(--dak-amber-hi);
 }
 
-.code {
+.assistant s {
+  color: var(--dak-fg-4);
+}
+
+.assistant hr {
+  height: 0;
+  margin: 0.9em 0;
+  border: 0;
+  border-top: 1px solid var(--dak-hair);
+}
+
+/* Nested lists tighten rather than indenting a second full step: at 340px a
+   third level at 1.4em each has a 60px gutter and a 12-character column. */
+.assistant ul ul,
+.assistant ul ol,
+.assistant ol ul,
+.assistant ol ol {
+  margin: 0.2em 0 0;
+  padding-left: 1.05em;
+}
+
+.assistant li {
+  margin: 0.1em 0;
+}
+
+.assistant li.task {
+  list-style: none;
+  margin-left: -1.15em;
+}
+
+.assistant li.task input {
+  margin: 0 6px 0 0;
+  vertical-align: baseline;
+  accent-color: var(--dak-amber);
+}
+
+/* A quote is an aside, and the design already spends its left rules on
+   attribution — so this one is a rule plus a step down the text ramp, not a
+   tinted box. Exactly one surface in this panel is ever tinted. */
+.assistant blockquote {
   margin: 0 0 0.6em;
+  padding: 1px 0 1px 11px;
+  border-left: 2px solid var(--dak-line);
+  color: var(--dak-fg-3);
+}
+
+.assistant blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+/* ── markdown tables ───────────────────────────────────────────────────────
+   The audit output is a table, and rendered as pipes it was the least readable
+   thing the panel printed. It scrolls inside its own box rather than widening
+   the transcript, which is the rule everywhere else here too. */
+
+.table-wrap {
+  margin: 0 0 0.7em;
+  overflow-x: auto;
+  border: 1px solid var(--dak-hair);
+  border-radius: var(--dak-r);
+}
+
+table.md-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: var(--dak-body-2);
+}
+
+table.md-table th,
+table.md-table td {
+  padding: 4px 9px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--dak-hair);
+}
+
+table.md-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--dak-raised);
+  font-family: var(--dak-mono);
+  font-size: var(--dak-micro);
+  letter-spacing: var(--dak-track);
+  text-transform: uppercase;
+  font-weight: 500;
+  color: var(--dak-fg-4);
+  white-space: nowrap;
+}
+
+table.md-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+table.md-table td {
+  color: var(--dak-fg-2);
+}
+
+/* ── fenced code ───────────────────────────────────────────────────────────
+   The header carries the language or the filename, the line count, and the
+   three things anyone does with a snippet: insert it, diff it against the file
+   it names, copy it. Before this the only one on offer was copy. */
+
+.code {
+  margin: 0 0 0.7em;
   border: 1px solid var(--dak-line);
   border-radius: var(--dak-r-md);
   background: var(--dak-code);
@@ -942,7 +1452,8 @@ button.skip:focus {
   display: flex;
   align-items: center;
   gap: var(--gap);
-  padding: 5px 9px;
+  flex-wrap: wrap;
+  padding: 4px 9px;
   border-bottom: 1px solid var(--dak-line);
   background: var(--dak-raised);
   font-family: var(--dak-mono);
@@ -950,18 +1461,67 @@ button.skip:focus {
   color: var(--dak-fg-3);
 }
 
+.code-head .name {
+  letter-spacing: var(--dak-track);
+  text-transform: uppercase;
+  color: var(--dak-fg-4);
+}
+
+/* A fence tagged with a path names a real file, so it is a link to it. The
+   case is left alone here — a path is not a label. */
+.code-head button.name.file {
+  all: unset;
+  cursor: pointer;
+  font-family: var(--dak-mono);
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--dak-fg-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+
+.code-head button.name.file:hover {
+  color: var(--dak-amber);
+  text-decoration: underline;
+}
+
+.code-head .lines {
+  color: var(--dak-fg-5);
+  font-variant-numeric: tabular-nums;
+}
+
 .code-head .spacer {
   flex: 1 1 auto;
 }
 
+/* The block's body is a `.dump`, same as every other block of output in the
+   panel — so a 300-line snippet scrolls in place instead of being 300 lines of
+   transcript. Its own border and ground would double the ones above. */
+.code .dump {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.code .dump-bar {
+  background: transparent;
+  border-top: 1px solid var(--dak-hair);
+}
+
 .code pre {
   margin: 0;
-  padding: 9px 11px;
-  overflow-x: auto;
   font-family: var(--dak-mono);
   font-size: var(--dak-small);
   line-height: 1.7;
   color: var(--dak-fg-2);
+}
+
+.code > pre.out {
+  padding: 9px 11px;
+  overflow-x: auto;
+  white-space: pre;
 }
 
 /* ── plan ────────────────────────────────────────────────────────────────── */
@@ -1246,6 +1806,50 @@ table.grid tr.blocking th[scope='row'] {
  * instead — it is the sentence that decides the answer, so it gets its own
  * ground rather than being one more line of the definition list.
  */
+/* ── the diff in the approval card ─────────────────────────────────────────
+   The card's own inset ground, so the change reads as the thing being decided
+   about rather than as another block of output that happens to be inside a
+   card. */
+
+.approval .preview-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--gap);
+  font-family: var(--dak-mono);
+  font-size: var(--dak-micro);
+  color: var(--dak-notice-dim);
+}
+
+.approval .preview-head .file {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dak-notice-fg);
+}
+
+.approval .preview-head .spacer {
+  flex: 1 1 auto;
+}
+
+.approval .dump {
+  border-color: var(--dak-notice-inset-edge);
+  background: var(--dak-notice-inset);
+}
+
+.approval .dump-bar {
+  background: transparent;
+  border-top-color: var(--dak-notice-inset-edge);
+}
+
+.approval .dump pre {
+  color: var(--dak-notice-fg);
+}
+
+.approval .footnote {
+  color: var(--dak-notice-dim);
+}
+
 .approval .warn {
   display: block;
   margin: 0 14px 12px;
@@ -1468,23 +2072,74 @@ table.grid tr.blocking th[scope='row'] {
 }
 
 .changeset-head .count {
-  margin-left: auto;
   letter-spacing: 0;
   text-transform: none;
   color: var(--dak-fg-4);
 }
 
-.changeset-row {
+.changeset-head .spacer {
+  flex: 1 1 auto;
+}
+
+/*
+ * A row is a button now.
+ *
+ * The path of a file the agent just wrote is the single most clickable thing
+ * the panel puts on screen, and for three revisions it was inert text — the
+ * reviewer's next move after reading "modify handler/user.go" is to look at
+ * handler/user.go, and they had to go and find it themselves.
+ */
+button.changeset-row {
+  all: unset;
+  box-sizing: border-box;
   display: flex;
+  width: 100%;
   align-items: baseline;
   gap: 9px;
   padding: 5px 10px;
   border-bottom: 1px solid var(--dak-hair);
   font-size: var(--dak-small);
+  cursor: pointer;
 }
 
-.changeset-row:last-child {
+button.changeset-row:last-child {
   border-bottom: 0;
+}
+
+button.changeset-row:hover {
+  background: var(--dak-raised);
+}
+
+button.changeset-row:hover .file {
+  color: var(--dak-amber);
+}
+
+/* ── diff stat ─────────────────────────────────────────────────────────────
+   `+18 −4`, in the shape every reviewer already reads it in. The figures come
+   from the runtime's own per-mutation counts; an older runtime that sends none
+   gets no stat rather than "+0 −0", which would be a claim about a change the
+   panel cannot actually see. */
+
+.stat {
+  flex: none;
+  margin-left: auto;
+  display: inline-flex;
+  gap: 5px;
+  font-family: var(--dak-mono);
+  font-size: var(--dak-micro);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat .added {
+  color: var(--dak-ok);
+}
+
+.stat .removed {
+  color: var(--dak-bad);
+}
+
+.changeset-head .stat {
+  margin-left: 0;
 }
 
 .changeset-row .kind {
@@ -1524,6 +2179,12 @@ table.grid tr.blocking th[scope='row'] {
   padding-left: 6px;
   font-size: var(--dak-micro);
   color: var(--dak-amber-dim);
+}
+
+/* The stat already took the auto margin; a second one would leave the reason
+   stranded mid-row instead of at the right edge. */
+.changeset-row .stat + .why {
+  margin-left: 0;
 }
 
 /* A row whose file will not be written reads as dimmed, not struck through:

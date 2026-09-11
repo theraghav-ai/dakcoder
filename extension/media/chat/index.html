@@ -54,7 +54,31 @@
       event goes to #announce instead, which is a sibling and therefore not an
       ancestor of anything the renderer appends here.
     -->
-    <main id="transcript" class="transcript" role="log" tabindex="-1"></main>
+    <!--
+      The find bar sits between the header band and the transcript rather than
+      floating over it, because a bar that covers the first row of results is a
+      bar that has to be dismissed to read what it found. Hidden until Ctrl+F.
+    -->
+    <div id="find" class="find" hidden>
+      <label class="sr-only" for="find-input" id="find-label"></label>
+      <input id="find-input" class="find-input" type="text" autocomplete="off" spellcheck="false" />
+      <span id="find-count" class="find-count" aria-live="polite"></span>
+      <button id="find-prev" class="icon" type="button"></button>
+      <button id="find-next" class="icon" type="button"></button>
+      <button id="find-close" class="icon" type="button"></button>
+    </div>
+
+    <div class="stage">
+      <main id="transcript" class="transcript" role="log" tabindex="-1"></main>
+
+      <!--
+        Shown only once the transcript has been scrolled away from the bottom.
+        A run that keeps appending while someone is reading turn 3 used to leave
+        no way back except a drag; the panel knew it was not at the bottom (it
+        already checks, to decide whether to stick) and simply never said so.
+      -->
+      <button id="jump" class="jump" type="button" hidden></button>
+    </div>
 
     <div id="announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 
@@ -105,6 +129,14 @@
       </div>
     </footer>
 
+    <!--
+      The highlighter is a separate classic script, loaded first, exposing
+      `dakHighlight` on the global. Kept out of chat.js so the renderer stays
+      readable and so its grammars can be tested on their own; kept vendored
+      because the CSP admits no CDN, and a highlighter fetched from one would be
+      the only thing in this panel that could talk to the network.
+    -->
+    <script nonce="{{nonce}}" src="{{highlight}}"></script>
     <script nonce="{{nonce}}" src="{{script}}"></script>
   </body>
 </html>

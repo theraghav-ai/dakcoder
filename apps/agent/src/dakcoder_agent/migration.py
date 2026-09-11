@@ -51,7 +51,8 @@ the last session got to has to be on disk.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
@@ -66,6 +67,7 @@ __all__ = [
     "Phase",
     "phases_from_meta",
     "plan_objection",
+    "steps_for_phase",
     "progress_document",
 ]
 
@@ -87,6 +89,11 @@ MIN_PHASES = 3
 #: under it is the eight-step plan this module exists to prevent, one
 #: indirection later.
 MIN_PARTS = 2
+
+#: How many log lines the plan document keeps. A migration is seven
+#: phases; a log that grew without bound would be the longest thing in a
+#: document whose value is being short enough to read.
+MAX_LOG = 40
 
 #: Lines above which one file is more than one step.
 #:
@@ -171,6 +178,9 @@ class MigrationState:
     #: checkpoint can say which one it is without two places recomputing it and
     #: disagreeing.
     closed: int = 0
+    #: What has happened, newest last. Appended by `close`, so the document
+    #: can say when each phase finished rather than only that it did.
+    log: tuple[str, ...] = ()
 
     # -- where it is ------------------------------------------------------
 
@@ -232,6 +242,12 @@ class MigrationState:
         )
         if self.phases != before:
             self.closed += 1
+            phase = self.phase_named(name)
+            self.log = (
+                *self.log,
+                f"{_now()} — phase {self.closed} of {len(self.phases)}, "
+                f"{phase.name if phase else name}, closed",
+            )[-MAX_LOG:]
             return True
         return False
 
@@ -311,6 +327,7 @@ class MigrationState:
         )
         if self.branch:
             lines.append(f"  Branch: {self.branch}" + (f" (cut from {self.base})" if self.base else ""))
+        lines.append(f"  Plan and progress: {PROGRESS_PATH} (written for you, kept current)")
         lines.append(
             "  The gate is deferred until the last phase closes: a half-converted "
             "service cannot build, so a failing gate now would say nothing. Close "
@@ -326,6 +343,7 @@ class MigrationState:
             "branch": self.branch,
             "base": self.base,
             "closed": self.closed,
+            "log": list(self.log),
             "phases": [p.as_dict() for p in self.phases],
         }
 
@@ -340,7 +358,14 @@ class MigrationState:
             branch=str(raw.get("branch") or ""),
             base=str(raw.get("base") or ""),
             closed=int(raw.get("closed") or 0),
+            log=tuple(str(x) for x in raw.get("log") or ()),
         )
+
+
+def _now() -> str:
+    """An ISO timestamp to the minute. Seconds would rewrite the document
+    on every turn for no information."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def phases_from_meta(meta: Mapping[str, Any]) -> tuple[Phase, ...]:
@@ -414,14 +439,8 @@ def plan_objection(
             + ", ".join(p.name for p in roadmap)
         )
 
+    # A plan that spans phases is *trimmed*, not refused. See `steps_for_phase`.
     spread = {str(s.phase).strip().lower() for s in steps}
-    if len(spread) > 1:
-        return (
-            f"this plan spans {len(spread)} phases at once. Plan one phase at a time: "
-            "the steps for the phase that is open now, and the roadmap for the rest. "
-            "A migration submitted as one plan is a migration nobody sees until it "
-            "is finished"
-        )
 
     # A file bigger than one reply is bigger than one step.
     #
@@ -472,13 +491,60 @@ def plan_objection(
     return ""
 
 
-#: Where the progress record lives, workspace-relative.
+#: Where the plan document lives, workspace-relative.
 #:
-#: In `.dakcoder` beside the session plans rather than at the repository root,
-#: because it is the agent's bookkeeping and not an artefact of the conversion
-#: -- a migration that left a `MIGRATION.md` in the diff would be asking a
-#: reviewer to review it.
-PROGRESS_PATH = ".dakcoder/migration.md"
+#: **This exact path is a contract with the extension.** `MIGRATION_PLAN_PATH`
+#: in `extension/src/wizard.ts` is the same string: the Migration view watches
+#: it, parses it, renders a row per unit, and its empty state tells the
+#: developer the plan will be written here. Nothing had ever written it. So the
+#: view was permanently empty, the welcome text pointed at a file that did not
+#: exist, and a developer whose migration was under way had -- exactly as
+#: reported -- nowhere to see the plan or track progress.
+#:
+#: Under `.dakcoder` rather than at the repository root because it is the
+#: agent's record, not an artefact of the conversion: a migration that left a
+#: `MIGRATION.md` in its own diff would be asking a reviewer to review it.
+PROGRESS_PATH = ".dakcoder/migration/plan.md"
+
+
+def steps_for_phase(phases: Sequence[Phase], steps: Sequence[Any]) -> tuple[list[Any], list[Any]]:
+    """Split a submitted plan into the open phase's steps and the rest.
+
+    Trimming rather than refusing, and the difference is a run that starts
+    against one that argues.
+
+    A model asked for a seven-phase roadmap and "the steps for the phase that is
+    open" sends the roadmap and the steps for the first two, because it has just
+    thought about both and the second is the interesting one. That is a good
+    plan submitted in the wrong shape, and a field session spent its whole
+    budget on it: the plan was refused, the model re-planned, the refusal fired
+    again, and between the two it fixated on a branch it could not cut. Nothing
+    was ever adopted, so the run never reached the phase that acts.
+
+    So the open phase's steps are adopted and the rest are handed back to the
+    caller to report. Nothing is lost that was not going to be re-planned
+    anyway: the later phase opens with its own `submit_plan`, against a
+    workspace this phase will have changed.
+
+    The open phase is the one the earliest step names, not the roadmap's first
+    pending one -- a developer whose branch already exists opens at phase two,
+    and taking the roadmap's answer would trim away everything they asked for.
+    """
+    ordered = list(steps)
+    first = next((str(s.phase).strip().lower() for s in ordered if str(s.phase).strip()), "")
+    if not first:
+        return ordered, []
+    # Whichever phase comes first in the *roadmap* among those the steps name,
+    # so a plan listing phase two before phase one is still trimmed to phase one.
+    named = {str(s.phase).strip().lower() for s in ordered if str(s.phase).strip()}
+    for phase in phases:
+        key = phase.name.strip().lower()
+        if key in named and phase.status != "done":
+            first = key
+            break
+    keep = [s for s in ordered if str(s.phase).strip().lower() == first]
+    rest = [s for s in ordered if str(s.phase).strip().lower() != first]
+    return keep, rest
 
 
 def progress_document(
@@ -487,82 +553,147 @@ def progress_document(
     touched: Sequence[str] = (),
     routes: int = 0,
 ) -> str:
-    """The migration's progress, as a document, from ground truth.
+    """The migration plan and where it has got to, as one document.
 
-    Written by the loop and never by the model, which is the whole of its value.
-    A field session wrote its own ``migration.md`` by hand, in prose, and then
-    read it back as evidence of work it had not done; this one is rendered from
-    the roadmap and the step statuses, both of which come from the change set.
+    Rendered from the roadmap and the step statuses -- both ground truth, both
+    derived from the change set -- and never from anything the model says about
+    its own progress. A field session wrote its own ``migration.md`` by hand, in
+    prose, and then read it back as evidence of work it had not done.
 
     It exists because a migration outlives a context window. Ten thousand lines
     across seven files is more than one session, so the question every later
-    session opens with is *where did the last one get to* -- and the honest
+    session opens with is *where did the last one get to*, and the honest
     answers available before this were the transcript, which compaction eats,
-    and the model's own summary, which is prose. One `read_file` on this answers
-    it in a few hundred tokens.
+    and the model's own summary, which is prose.
+
+    **The shape is a contract with the extension.** The Migration view parses
+    this file: it takes the first markdown table carrying a path-like column and
+    reads a unit from every row. Two consequences, and getting either wrong
+    empties the view:
+
+    * the Units table below is the only table here with a ``Unit`` column;
+    * nothing else in the document may be a ``- [ ]`` task line, because the
+      parser reads *every* one of those as a unit too. The phases are a numbered
+      list for that reason, not a checklist.
     """
-    out = ["# Migration progress", ""]
+    done = sum(1 for p in state.phases if p.status == "done")
+    out = [
+        "# Migration plan",
+        "",
+        "Generated by dakcoder. Edits are overwritten on the next turn — to change",
+        "the work, say so in the chat and the plan is rewritten from there.",
+        "",
+    ]
+
     out.append(
-        f"Branch: `{state.branch}`"
-        + (f", cut from `{state.base}`" if state.base else "")
+        f"- **Branch:** `{state.branch}`" + (f", cut from `{state.base}`" if state.base else "")
         if state.branch
-        else "Branch: not cut yet."
+        else "- **Branch:** not cut yet — nothing is written until it exists."
     )
     out.append(
-        f"Routes recorded before the migration: {routes}"
-        if routes
-        else "Routes recorded before the migration: none — the inventory was not taken, "
-        "so a lost route will not be caught automatically."
+        f"- **Phases:** {done} of {len(state.phases)} closed"
+        if state.phases
+        else "- **Phases:** not planned yet"
     )
+    out.append(
+        f"- **Routes recorded before the migration:** {routes} — a route lost in "
+        "conversion is caught when the last phase closes"
+        if routes
+        else "- **Routes recorded before the migration:** none. A route lost in "
+        "conversion will not be caught automatically."
+    )
+    out.append(f"- **Updated:** {_now()}")
     out.append("")
 
+    # -- the phases ------------------------------------------------------
+    #
+    # Numbered, never checkboxed: a `- [ ]` line is a unit to the view's parser,
+    # and a phase rendered that way would appear in the tree as a file that does
+    # not exist.
     if state.phases:
-        done = sum(1 for p in state.phases if p.status == "done")
-        out.append(f"## Phases — {done} of {len(state.phases)} closed")
-        out.append("")
-        for index, phase in enumerate(state.phases, 1):
-            mark = "x" if phase.status == "done" else " "
-            out.append(f"- [{mark}] **{index}. {phase.name}** — {phase.covers}")
-            if parts := phase.part_list:
-                out.append(f"      parts: {', '.join(parts)}")
-        out.append("")
-
-    if plan:
+        out += ["## Phases", ""]
         here = state.working(_plan_phase(plan))
-        out.append(
-            f"## Steps — phase {here[0]}, {here[1].name}" if here else "## Steps"
-        )
-        out.append("")
-        for index, step in enumerate(plan, 1):
-            mark = "x" if step.status in ("done", "skipped") else " "
-            where = f" *({step.part})*" if step.part else ""
-            out.append(
-                f"- [{mark}] {index}. `{step.file}`{where} — {step.action}"
-                + (f"  → **{step.status}**" if step.status not in ("done", "pending") else "")
-            )
-            if step.note:
-                out.append(f"      note: {step.note}")
+        for index, phase in enumerate(state.phases, 1):
+            covered = [
+                s
+                for s in plan
+                if str(getattr(s, "phase", "")).strip().lower() == phase.name.strip().lower()
+            ]
+            settled = sum(1 for s in covered if s.status in ("done", "skipped"))
+            if phase.status == "done":
+                mark = "**done**"
+            elif here is not None and here[0] == index:
+                mark = "**open**"
+            elif covered and settled == len(covered):
+                # Every step in it is settled and nothing has closed it yet.
+                # Saying "pending" there would have the document contradict the
+                # line under it, which is how a progress record stops being
+                # read.
+                mark = "ready to close"
+            else:
+                mark = "pending"
+            out.append(f"{index}. **{phase.name}** — {phase.covers or 'no summary'} · {mark}")
+            if parts := phase.part_list:
+                out.append(f"   - Parts: {', '.join(parts)}")
+            if covered:
+                out.append(f"   - Steps: {settled} of {len(covered)} settled")
         out.append("")
 
-    if remaining := [p.name for p in state.phases if p.status != "done"]:
-        out.append("## Still to do")
+    # -- the units, in the shape the view reads --------------------------
+    if plan:
+        out += [
+            "## Units",
+            "",
+            "| Unit | Kind | Classification | Status | Rules | Commit |",
+            "|---|---|---|---|---|---|",
+        ]
+        for step in plan:
+            kind = step.part or step.phase or ""
+            # SKIP is the view's word for "deliberately excluded", which is
+            # exactly what a skipped step is. Everything else is work.
+            classification = "SKIP" if step.status == "skipped" else "MIGRATE"
+            note = (step.note or step.action or "").replace("|", "/")
+            out.append(
+                f"| {step.file} | {kind} | {classification} | {step.status} | "
+                f"{note[:90]} | |"
+            )
         out.append("")
-        out.extend(f"- {name}" for name in remaining)
-        out.append("")
+
+    # -- what is left ----------------------------------------------------
+    remaining = [p for p in state.phases if p.status != "done"]
+    if remaining:
+        out += ["## Still to do", ""]
+        for phase in remaining:
+            out.append(f"- **{phase.name}** — {phase.covers or 'no summary'}")
+        out += [
+            "",
+            "Each phase is planned when it opens, against the workspace the phase",
+            "before it left. Say when to start the next one.",
+            "",
+        ]
+    elif state.phases:
+        out += [
+            "## Still to do",
+            "",
+            "Nothing — every phase has closed. The verification gate runs on the",
+            "whole conversion, including the route check against the inventory taken",
+            "before it started.",
+            "",
+        ]
 
     if touched:
-        out.append("## Files this session changed")
-        out.append("")
-        out.extend(f"- `{path}`" for path in touched[:60])
+        out += ["## Files changed this session", ""]
+        out += [f"- `{path}`" for path in touched[:60]]
         if len(touched) > 60:
             out.append(f"- ...and {len(touched) - 60} more")
         out.append("")
 
-    out.append(
-        "> Written by dakcoder from the plan and the change set. Edits here are "
-        "overwritten; change the plan instead."
-    )
-    return "\n".join(out) + "\n"
+    if state.log:
+        out += ["## Log", ""]
+        out += [f"- {entry}" for entry in state.log]
+        out.append("")
+
+    return "\n".join(out).rstrip() + "\n"
 
 
 def _plan_phase(plan: Sequence[Any]) -> str:

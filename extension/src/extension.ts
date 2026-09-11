@@ -26,6 +26,7 @@ import { API_VERSION, isResumable, type SessionSummary } from './protocol';
 import { Runtime, RuntimeError } from './runtime';
 import { RunState, readGateEvent } from './session-state';
 import { StatusBar } from './statusbar';
+import { capped, unified } from './textdiff';
 import * as trees from './trees';
 import * as wizard from './wizard';
 
@@ -340,6 +341,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // the Resume action -- the one next step out of an unverified run.
     state.onDidReceive((event) => {
       chatView.push(event, state.sessionId ?? '');
+      // The card goes up first and the diff catches up, so a blocked run says it
+      // is blocked immediately rather than after a file read.
+      if (event.type === 'tool_pending') void sendApprovalPreview(event);
       treeSet.sessions.applyEvent(event);
       treeSet.quota.applyEvent(event);
       treeSet.context.applyEvent(event);
@@ -374,6 +378,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       approvalService.present(approval, state.sessionId ?? undefined),
     ),
     state.onDidChange(() => {
+      /*
+       * "A run is in flight", as a context key.
+       *
+       * `dakcoder.session.running` already existed but is a tree item's
+       * `contextValue` — it answers "is *this row* a running session", which a
+       * keybinding cannot ask. Stop needs the window-wide fact, and a `when`
+       * clause naming a key nothing sets is a keybinding that never fires.
+       */
+      void vscode.commands.executeCommand('setContext', 'dakcoder.running', state.running);
       chatView.setRunState({
         phase: state.running ? 'running' : 'idle',
         mode: state.modeId as never,
@@ -389,6 +402,83 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       });
     }),
   );
+
+  /**
+   * The diff behind an approval, sent to the card that is already on screen.
+   *
+   * **Why the card needs one at all.** The approval is the one moment in a run
+   * where the developer is asked to decide something, and the card asked without
+   * showing the change: a tool name, a reason, a path, and a "Show diff" button
+   * that opened an editor tab. Deciding meant leaving the panel, and — because
+   * the panel is where the Accept button is — coming back. Every comparable
+   * agent shows the change in the card. This one now does too, and "Show diff"
+   * stays for the case a 900-line change genuinely needs a real diff editor.
+   *
+   * **Why it is best-effort.** `proposedText` throws a sentence a developer can
+   * act on when a change cannot be previewed — a patch whose anchor is missing,
+   * a template-driven tool that produces its files at run time. Those are real
+   * answers and the card shows them as the reason there is no diff. They are
+   * never a reason to fail the approval, which is why nothing here rethrows.
+   *
+   * Only the first path is previewed. A multi-file approval's card would become
+   * a scroll, and the changeset tree is the surface built for that.
+   */
+  const PREVIEW_LINES = 160;
+
+  async function sendApprovalPreview(event: { data?: Record<string, unknown> }): Promise<void> {
+    const data = event.data ?? {};
+    const id = typeof data['id'] === 'string' ? data['id'] : '';
+    const paths = Array.isArray(data['paths']) ? (data['paths'] as unknown[]) : [];
+    const path = typeof paths[0] === 'string' ? paths[0] : '';
+    if (!id || !path) return;
+
+    // The service holds the pending map, and `present()` is what fills it. Both
+    // run off the same event, so a miss here is a race rather than a fault.
+    const pending = approvalService.get(id);
+    if (!pending) return;
+
+    try {
+      const proposed = await approvalService.proposedText(pending, path);
+      const disk = await approvalService.diskText(path);
+      const diff = unified(disk, proposed, path);
+      if (diff.coarse) {
+        chatView.approvalPreview({
+          type: 'approval-preview',
+          id,
+          path,
+          diff: '',
+          added: diff.stat.added,
+          removed: diff.stat.removed,
+          cut: 0,
+          why: vscode.l10n.t('{0} is too large to diff in the panel. Show diff opens it in a real diff editor.', path),
+        });
+        return;
+      }
+      const cut = capped(diff, PREVIEW_LINES);
+      chatView.approvalPreview({
+        type: 'approval-preview',
+        id,
+        path,
+        diff: cut.text,
+        added: diff.stat.added,
+        removed: diff.stat.removed,
+        cut: cut.cut,
+      });
+    } catch (err) {
+      // The sentence `proposedText` threw is the honest reason, and it is
+      // already a translated, developer-facing one.
+      chatView.approvalPreview({
+        type: 'approval-preview',
+        id,
+        path,
+        diff: '',
+        added: 0,
+        removed: 0,
+        cut: 0,
+        why: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   /**
    * Mention completions.
@@ -716,8 +806,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           '',
           'Read @skill:legacy-migration first, then run legacy_audit to see the scope.',
           'Plan the whole conversion as phases and send the steps for the first phase',
-          'only. Confirm the branch to cut, and from which branch, before writing',
-          'anything.',
+          'only.',
+          '',
+          // Ordered explicitly, because the obvious wording is a trap. "Confirm
+          // the branch before writing anything" reads to a planner as "cut it
+          // now" — and `git_ops` is an acting tool, so it cannot. A field run
+          // spent its whole budget there: five refused `git_ops` calls and the
+          // same question asked of the developer four times, with no plan ever
+          // adopted.
+          'Cutting the branch is the first step of the first phase, and the acting',
+          'phase does it. While planning, settle only which branch to cut it from —',
+          'ask if the developer has not said. Do not try to cut it from the planner.',
         ].join('\n');
 
     try {

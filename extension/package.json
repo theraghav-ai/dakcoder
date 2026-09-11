@@ -2,7 +2,7 @@
   "name": "dakcoder-go",
   "displayName": "dakcoder",
   "description": "The India Post IT 2.0 backend coding agent for Go services on the n-api-template contract.",
-  "version": "0.3.11",
+  "version": "0.4.0",
   "publisher": "dop",
   "license": "UNLICENSED",
   "private": true,
@@ -29,8 +29,8 @@
     "compile": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build:test": "tsc --outDir dist-test --module CommonJS --moduleResolution Node --target ES2022 --lib ES2022,DOM --skipLibCheck --rootDir src --esModuleInterop --types node,vscode src/test/protocol.test.ts src/test/state.test.ts",
-    "test": "npm run build:test && node --test dist-test/test/protocol.test.js dist-test/test/state.test.js src/test/renderer.test.mjs",
+    "build:test": "tsc --outDir dist-test --module CommonJS --moduleResolution Node --target ES2022 --lib ES2022,DOM --skipLibCheck --rootDir src --esModuleInterop --types node,vscode src/test/protocol.test.ts src/test/state.test.ts src/test/migration-plan.test.ts src/test/textdiff.test.ts",
+    "test": "npm run build:test && node --test dist-test/test/protocol.test.js dist-test/test/state.test.js dist-test/test/migration-plan.test.js dist-test/test/textdiff.test.js src/test/renderer.test.mjs",
     "verify": "npm run typecheck && npm run test && npm run compile && npm run check:credentials && npm run check:commands && npm run check:l10n && npm run check:gotools",
     "package": "npm run verify && npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository",
     "check:credentials": "node scripts/check-no-credentials.mjs",
@@ -203,6 +203,33 @@
           "type": "boolean",
           "default": false,
           "description": "Re-run template compliance on the file you just saved. Local, offline, and costs no quota; off by default because it re-analyses the whole module on every save."
+        },
+        "dakcoder.chat.expandOutput": {
+          "type": "string",
+          "enum": [
+            "failures",
+            "always",
+            "never"
+          ],
+          "enumDescriptions": [
+            "Open the output of anything that failed, and of any call that wrote files. Everything else stays collapsed.",
+            "Open every tool result. Honest, and a long run becomes a long scroll.",
+            "Keep every tool result collapsed, including failures."
+          ],
+          "default": "failures",
+          "description": "Which tool results open themselves in the panel. A failure is the one row anyone needs to read, so it opens by default."
+        },
+        "dakcoder.chat.previewLines": {
+          "type": "number",
+          "default": 20,
+          "minimum": 4,
+          "maximum": 200,
+          "description": "How tall a block of output is before it scrolls, in lines. The whole text is always there and always scrollable; this only sets how much of it is on screen before you ask for the rest."
+        },
+        "dakcoder.chat.syntaxHighlighting": {
+          "type": "boolean",
+          "default": true,
+          "description": "Colour Go, SQL, YAML, JSON and diffs in the panel. Turn it off for a monochrome transcript."
         }
       }
     },
@@ -929,6 +956,17 @@
     },
     "keybindings": [
       {
+        "command": "dakcoder.focusComposer",
+        "key": "ctrl+alt+d",
+        "mac": "cmd+alt+d"
+      },
+      {
+        "command": "dakcoder.stopTask",
+        "key": "ctrl+alt+escape",
+        "mac": "cmd+alt+escape",
+        "when": "dakcoder.running"
+      },
+      {
         "key": "1",
         "command": "dakcoder.approval.accept",
         "when": "dakcoder.approvalPending && (resourceScheme == dakcoder-proposed || focusedView == dakcoder.changeset)"
@@ -960,6 +998,10 @@
       }
     ],
     "viewsWelcome": [
+      {
+        "view": "dakcoder.sessions",
+        "contents": "No conversations yet.\n\nEvery run is kept here with the files it changed, so you can reopen it, resume an unverified one, or revert what it wrote.\n[Start a task](command:dakcoder.newTask)\n[Open the chat](command:dakcoder.focusComposer)"
+      },
       {
         "view": "dakcoder.doctor",
         "contents": "Doctor checks the Go toolchain, private-module credentials, the local runtime and your sign-in — and offers a one-click fix for everything it finds.\n[Run Doctor](command:dakcoder.doctor)"

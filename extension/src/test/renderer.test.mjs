@@ -19,6 +19,16 @@ import vm from 'node:vm';
 
 const CHAT_JS = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'media', 'chat', 'chat.js');
 
+/*
+ * The elements `chat.js` reaches for by id.
+ *
+ * `find`, `find-*` and `jump` are deliberately absent. Both features need a real
+ * DOM - `createTreeWalker`, `splitText`, layout-aware scrolling - and the point
+ * of this stub is that a renderer reaching for a browser API it has not declared
+ * fails here by absence. The renderer guards both on the elements being present,
+ * so their absence is exactly the condition under test: the transcript must
+ * render identically in a host that has neither.
+ */
 const IDS = [
   'announce', 'composer', 'console', 'input', 'input-label', 'keys', 'meter',
   'mode-pill', 'offline', 'popup', 'queued', 'send', 'skip', 'stop',
@@ -118,6 +128,14 @@ class Node {
   setAttribute(name, value) {
     this.attributes[name] = String(value);
   }
+  /* Read back, because the renderer does: the approval card mints its own
+     `aria-labelledby` and then reads it to stamp the heading it points at.
+     Without this the card threw, and nothing in this file rendered one. */
+  getAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(this.attributes, name)
+      ? this.attributes[name]
+      : null;
+  }
   removeAttribute(name) {
     delete this.attributes[name];
   }
@@ -192,13 +210,29 @@ function panel() {
   return {
     send,
     posted,
+    /** The transcript element itself, for tests that inspect row internals. */
+    transcript: byId.get('transcript'),
     /** The rows on screen, in order. The renderer stamps each with its key. */
     rows: () =>
       byId
         .get('transcript')
         .children.filter((n) => n.dataset.key)
-        .map((n) => ({ key: n.dataset.key, text: n.textContent })),
+        .map((n) => ({ key: n.dataset.key, text: said(n) })),
   };
+}
+
+/**
+ * What a row *says*, with its hover toolbar left out.
+ *
+ * Messages carry a per-message action bar (copy, and on your own messages,
+ * edit). Those are controls rather than content, and folding their labels into
+ * the row's text would make every assertion about what the panel said also an
+ * assertion about which buttons it happened to offer.
+ */
+function said(node) {
+  if (node._classes && node._classes.has('msg-actions')) return '';
+  if (!node.children.length) return node.textContent;
+  return node.children.map(said).join('');
 }
 
 /** The host ships every string; the renderer has no fallbacks by design. */
@@ -545,5 +579,345 @@ describe('the transcript, after the panel is rebuilt', () => {
     const event = wire('s7', 1, 'assistant', { text: 'answer' });
     p.send(event, event);
     assert.equal(saying(p.rows(), 'answer').length, 1);
+  });
+});
+
+// -- what the panel shows without being asked --------------------------------
+
+/** Every node in a row, so a test can ask which of them exist. */
+function all(node, out = []) {
+  out.push(node);
+  node.children.forEach((c) => all(c, out));
+  return out;
+}
+
+const nodeOf = (p, part) =>
+  p.transcript.children.find((n) => n.dataset.key && n.dataset.key.indexOf(part) !== -1);
+
+describe('the transcript, and how much of it you can read', () => {
+  it('holds the whole of a tool result, not a clipped preview of it', () => {
+    // The reported complaint, reduced to its mechanism. The old renderer cut
+    // anything past three lines to a 3.3em box under `overflow: hidden` and put
+    // the rest behind "Open in editor", so a five-line vet failure - the single
+    // most common thing this panel prints - could not be read in the panel at
+    // all. Every character has to be in the DOM; how much of it is on screen at
+    // once is a scroll height, which is a different question.
+    const five = ['one', 'two', 'three', 'four', 'five'].join('\n');
+    const p = panel();
+    p.send(
+      wire('d1', 1, 'tool_call', { id: 't1', name: 'go_vet', arguments: { path: 'handler' } }),
+      wire('d1', 2, 'tool_result', { id: 't1', name: 'go_vet', ok: false, content: five }),
+    );
+
+    const row = p.rows().find((r) => r.key.indexOf('/tool:') !== -1);
+    assert.ok(row, 'the tool row is missing');
+    for (const line of ['one', 'two', 'three', 'four', 'five']) {
+      assert.ok(row.text.indexOf(line) !== -1, `"${line}" was clipped out of the row`);
+    }
+  });
+
+  it('opens a failure and leaves a success shut', () => {
+    // The panel's whole attention policy. Collapsing both meant the one row
+    // that explains why a run stopped looked exactly like the thirty that
+    // worked - and cost the same two clicks to read.
+    const p = panel();
+    p.send(
+      wire('d2', 1, 'tool_call', { id: 'a', name: 'read_file', arguments: { path: 'x.go' } }),
+      wire('d2', 2, 'tool_result', { id: 'a', name: 'read_file', ok: true, content: 'x\ny\nz\nw' }),
+      wire('d2', 3, 'tool_call', { id: 'b', name: 'go_build', arguments: {} }),
+      wire('d2', 4, 'tool_result', { id: 'b', name: 'go_build', ok: false, content: 'x\ny\nz\nw' }),
+    );
+
+    const bodies = (key) =>
+      all(nodeOf(p, key)).filter((n) => n._classes && n._classes.has('body'));
+    assert.equal(bodies('tool:a')[0].hidden, true, 'a successful read opened itself');
+    assert.equal(bodies('tool:b')[0].hidden, false, 'the failure stayed collapsed');
+  });
+
+  it('offers a way to read long output in place, not only in an editor', () => {
+    const long = Array.from({ length: 60 }, (_, i) => `line ${i}`).join('\n');
+    const p = panel();
+    p.send(
+      wire('d3', 1, 'tool_call', { id: 't', name: 'go_test', arguments: {} }),
+      wire('d3', 2, 'tool_result', { id: 't', name: 'go_test', ok: false, content: long }),
+    );
+
+    const nodes = all(nodeOf(p, 'tool:t'));
+    const scroll = nodes.find((n) => n._classes && n._classes.has('scroll'));
+    assert.ok(scroll, 'long output has no scrollable viewport');
+    assert.ok(scroll.style.maxHeight, 'the viewport has no height, so it cannot scroll');
+    assert.ok(
+      nodes.some((n) => n._classes && n._classes.has('dump-bar')),
+      'no controls for expanding, wrapping or copying it',
+    );
+    // And the text is all there regardless of what the viewport shows.
+    assert.ok(nodes.some((n) => n.textContent.indexOf('line 59') !== -1), 'the tail was dropped');
+  });
+
+  it('elides only what is too large to lay out, and says how much', () => {
+    // 40,000 lines in one `<pre>` is tens of megabytes of layout in a webview
+    // with a 60 MB budget. The head and tail stay; the middle is named.
+    const huge = Array.from({ length: 9000 }, (_, i) => `l${i}`).join('\n');
+    const p = panel();
+    p.send(
+      wire('d4', 1, 'tool_call', { id: 'h', name: 'go_test', arguments: {} }),
+      wire('d4', 2, 'tool_result', { id: 'h', name: 'go_test', ok: false, content: huge }),
+    );
+
+    const nodes = all(nodeOf(p, 'tool:h'));
+    assert.ok(
+      nodes.some((n) => n._classes && n._classes.has('elision')),
+      'a transcript-destroying payload was laid out whole',
+    );
+    assert.ok(nodes.some((n) => n.textContent.indexOf('l0\n') !== -1), 'the head is missing');
+    assert.ok(nodes.some((n) => n.textContent.indexOf('l8999') !== -1), 'the tail is missing');
+  });
+
+  it('renders a table, a numbered list and a link as themselves', () => {
+    // All three used to fall through to a paragraph: a table printed as pipes,
+    // a numbered list ran together on one line, and a link printed its own
+    // brackets and parentheses.
+    const p = panel();
+    p.send(
+      wire('d5', 1, 'assistant', {
+        text: [
+          '| rule | status |',
+          '| --- | --- |',
+          '| R-101 | fail |',
+          '',
+          '1. First step',
+          '2. Second step',
+          '',
+          'See [the contract](https://example.invalid/spec).',
+        ].join('\n'),
+      }),
+    );
+
+    const nodes = all(nodeOf(p, '/assistant:'));
+    const tags = nodes.map((n) => n.tagName);
+    assert.ok(tags.indexOf('TABLE') !== -1, 'the table rendered as pipes');
+    assert.ok(tags.indexOf('OL') !== -1, 'the numbered list rendered as a paragraph');
+    const anchor = nodes.find((n) => n.tagName === 'A');
+    assert.ok(anchor, 'the link rendered as markdown punctuation');
+    assert.equal(anchor.textContent, 'the contract');
+    assert.equal(anchor.href, 'https://example.invalid/spec');
+  });
+
+  it('never turns a non-http link into an anchor', () => {
+    // The renderer builds every node through textContent, so the only way a URL
+    // can become executable is by reaching an `href`. It must not.
+    const p = panel();
+    p.send(
+      wire('d6', 1, 'assistant', { text: 'Try [this](javascript:alert(1)) or [that](file:///etc).' }),
+    );
+    const anchors = all(nodeOf(p, '/assistant:')).filter((n) => n.tagName === 'A');
+    assert.equal(anchors.length, 0, `a non-http scheme became a link: ${anchors.map((a) => a.href)}`);
+  });
+
+  it('gives a code fence its filename, and the actions that use it', () => {
+    const p = panel();
+    p.send(
+      wire('d7', 1, 'assistant', {
+        text: '```go:handler/user.go\nfunc Handle() {}\n```',
+      }),
+    );
+    const nodes = all(nodeOf(p, '/assistant:'));
+    assert.ok(
+      nodes.some((n) => n._classes && n._classes.has('file') && n.textContent === 'handler/user.go'),
+      'the fence`s filename was thrown away',
+    );
+    assert.ok(nodes.some((n) => n.textContent === 'func Handle() {}'), 'the code is missing');
+  });
+});
+
+// -- the display settings ----------------------------------------------------
+
+/** A panel whose `init` carries `dakcoder.chat.*` other than the defaults. */
+function panelWith(display) {
+  const p = panel();
+  p.send({ type: 'init', strings: strings(), maxRows: 500, commands: [], mentions: [], display });
+  return p;
+}
+
+const bodies = (p, key) =>
+  all(nodeOf(p, key)).filter((n) => n._classes && n._classes.has('body'));
+
+const twoResults = (p, session) =>
+  p.send(
+    wire(session, 1, 'tool_call', { id: 'ok', name: 'read_file', arguments: { path: 'x.go' } }),
+    wire(session, 2, 'tool_result', { id: 'ok', name: 'read_file', ok: true, content: 'a\nb\nc\nd' }),
+    wire(session, 3, 'tool_call', { id: 'no', name: 'go_build', arguments: {} }),
+    wire(session, 4, 'tool_result', { id: 'no', name: 'go_build', ok: false, content: 'a\nb\nc\nd' }),
+  );
+
+describe('the transcript, under dakcoder.chat settings', () => {
+  it('opens everything when asked to', () => {
+    const p = panelWith({ expandOutput: 'always', previewLines: 20, syntaxHighlighting: true });
+    twoResults(p, 'g1');
+    assert.equal(bodies(p, 'tool:ok')[0].hidden, false, 'a success stayed shut under "always"');
+    assert.equal(bodies(p, 'tool:no')[0].hidden, false);
+  });
+
+  it('opens nothing when asked to, including failures', () => {
+    const p = panelWith({ expandOutput: 'never', previewLines: 20, syntaxHighlighting: true });
+    twoResults(p, 'g2');
+    assert.equal(bodies(p, 'tool:no')[0].hidden, true, 'a failure opened under "never"');
+    // And the text is still there to be read on one click - "never" is about
+    // attention, never about availability.
+    assert.ok(bodies(p, 'tool:no')[0].textContent.indexOf('d') !== -1);
+  });
+
+  it('takes the viewport height from the setting', () => {
+    const long = Array.from({ length: 80 }, (_, i) => `r${i}`).join('\n');
+    const tall = panelWith({ expandOutput: 'failures', previewLines: 50, syntaxHighlighting: true });
+    const short = panelWith({ expandOutput: 'failures', previewLines: 6, syntaxHighlighting: true });
+    for (const [p, session] of [[tall, 'g3'], [short, 'g4']]) {
+      p.send(
+        wire(session, 1, 'tool_call', { id: 'v', name: 'go_test', arguments: {} }),
+        wire(session, 2, 'tool_result', { id: 'v', name: 'go_test', ok: true, content: long }),
+      );
+    }
+    const heightOf = (p) =>
+      all(nodeOf(p, 'tool:v')).find((n) => n._classes && n._classes.has('scroll')).style.maxHeight;
+    assert.ok(heightOf(tall).indexOf('50') !== -1, `tall viewport: ${heightOf(tall)}`);
+    assert.ok(heightOf(short).indexOf('6') !== -1, `short viewport: ${heightOf(short)}`);
+  });
+
+  it('clamps a viewport height a hand-edited settings.json could set', () => {
+    const p = panelWith({ expandOutput: 'failures', previewLines: 99999, syntaxHighlighting: true });
+    p.send(
+      wire('g5', 1, 'tool_call', { id: 'v', name: 'go_test', arguments: {} }),
+      wire('g5', 2, 'tool_result', {
+        id: 'v',
+        name: 'go_test',
+        ok: true,
+        content: Array.from({ length: 400 }, (_, i) => `r${i}`).join('\n'),
+      }),
+    );
+    const height = all(nodeOf(p, 'tool:v')).find((n) => n._classes && n._classes.has('scroll'))
+      .style.maxHeight;
+    assert.ok(height.indexOf('99999') === -1, `an unclamped height reached layout: ${height}`);
+  });
+});
+
+// -- inline markdown ---------------------------------------------------------
+
+const md = (p, session, text) => {
+  p.send(wire(session, 1, 'assistant', { text }));
+  return all(nodeOf(p, '/assistant:'));
+};
+
+const tagged = (nodes, tag) => nodes.filter((n) => n.tagName === tag).map((n) => n.textContent);
+
+describe('the transcript, and inline markdown', () => {
+  it('bolds the whole span, not its first character', () => {
+    // The alternatives are joined into one regex, so a `\1` written inside the
+    // strong rule refers to the *first* group of the joined expression - the
+    // code span's backtick fence - and not to its own opening `**`. Written
+    // that way, `**fail**` rendered as a bold "f" followed by "ail" and a stray
+    // emphasised asterisk.
+    const nodes = md(panel(), 'm1', 'R-207 **fail** here');
+    assert.deepEqual(tagged(nodes, 'STRONG'), ['fail']);
+    assert.equal(tagged(nodes, 'EM').length, 0, 'the closing delimiter leaked out as emphasis');
+  });
+
+  it('parses emphasis inside strong rather than looping on it', () => {
+    // `inline` recurses, and a `/g` regex keeps `lastIndex` on the object. One
+    // shared instance meant the nested call rewound the cursor its own caller
+    // was still walking, so the outer loop re-matched what it had just consumed
+    // and allocated until the webview died.
+    const nodes = md(panel(), 'm2', 'the **gate *never* came clean** today');
+    assert.deepEqual(tagged(nodes, 'STRONG'), ['gate never came clean']);
+    assert.deepEqual(tagged(nodes, 'EM'), ['never']);
+  });
+
+  it('leaves snake_case identifiers alone', () => {
+    const nodes = md(panel(), 'm3', 'call fx_provide_handler before fx_invoke_run.');
+    assert.equal(tagged(nodes, 'EM').length, 0, 'an identifier was italicised');
+  });
+
+  it('does not let an unclosed delimiter swallow the rest of the message', () => {
+    const p = panel();
+    const nodes = md(p, 'm4', 'a ** b _ c ~~ d');
+    assert.equal(tagged(nodes, 'STRONG').length, 0);
+    assert.equal(tagged(nodes, 'S').length, 0);
+    // The text survives whole: an unmatched delimiter is punctuation, and a
+    // renderer that eats the sentence around it is worse than one that ignores
+    // the markup.
+    assert.equal(nodeOf(p, '/assistant:').textContent.indexOf('a ** b _ c ~~ d'), 0);
+  });
+
+  it('renders a checklist as checkboxes rather than as literal brackets', () => {
+    const nodes = md(panel(), 'm5', '- [x] scaffolded\n- [ ] registered');
+    const boxes = nodes.filter((n) => n.tagName === 'INPUT');
+    assert.equal(boxes.length, 2);
+    assert.equal(boxes[0].attributes.checked, 'true');
+    assert.equal(boxes[1].attributes.checked, undefined);
+  });
+});
+
+// -- the approval card -------------------------------------------------------
+
+describe('the approval card', () => {
+  it('shows the change it is asking about', () => {
+    // The card used to ask for a decision without showing the change: a tool, a
+    // reason, a path, and a button that opened an editor tab somewhere else.
+    const p = panel();
+    p.send(
+      wire('p1', 1, 'tool_pending', {
+        id: 'ap1',
+        tool: 'write_file',
+        reason: 'writes outside the scaffolded set',
+        paths: ['model/pension.go'],
+      }),
+      {
+        type: 'approval-preview',
+        id: 'ap1',
+        path: 'model/pension.go',
+        diff: '--- a/model/pension.go\n+++ b/model/pension.go\n@@ -1,2 +1,3 @@\n package model\n-type P struct{}\n+type P struct {\n+}',
+        added: 2,
+        removed: 1,
+        cut: 0,
+      },
+    );
+
+    const card = p.transcript.children.find((n) => n.dataset.key === 'ap:ap1');
+    assert.ok(card, 'no approval card');
+    const text = card.textContent;
+    assert.ok(text.indexOf('+type P struct {') !== -1, 'the diff is not in the card');
+    assert.ok(text.indexOf('-type P struct{}') !== -1, 'the removed line is not in the card');
+    assert.ok(text.indexOf('+2') !== -1 && text.indexOf('1') !== -1, 'no diff stat');
+  });
+
+  it('says why there is no diff rather than showing an empty box', () => {
+    const p = panel();
+    p.send(
+      wire('p2', 1, 'tool_pending', { id: 'ap2', tool: 'resource_scaffold', reason: 'r', paths: ['x.go'] }),
+      {
+        type: 'approval-preview',
+        id: 'ap2',
+        path: 'x.go',
+        diff: '',
+        added: 0,
+        removed: 0,
+        cut: 0,
+        why: 'resource_scaffold produces its files from templates when it runs.',
+      },
+    );
+    const card = p.transcript.children.find((n) => n.dataset.key === 'ap:ap2');
+    assert.ok(card.textContent.indexOf('from templates when it runs') !== -1);
+  });
+
+  it('does not attach a diff to an approval that has already been answered', () => {
+    // A decided card is a receipt. A diff of a change that already landed reads
+    // as an invitation to reconsider a decision nobody can now change.
+    const p = panel();
+    p.send(
+      wire('p3', 1, 'tool_pending', { id: 'ap3', tool: 'write_file', reason: 'r', paths: ['x.go'] }),
+      { type: 'approval-resolved', id: 'ap3', decision: 'accept' },
+      { type: 'approval-preview', id: 'ap3', path: 'x.go', diff: '+late', added: 1, removed: 0, cut: 0 },
+    );
+    const card = p.transcript.children.find((n) => n.dataset.key === 'ap:ap3');
+    assert.equal(card.textContent.indexOf('+late'), -1, 'a decided card grew a diff');
   });
 });

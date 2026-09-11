@@ -424,7 +424,22 @@ class Router:
             #
             # A mutating tool refused by mode has exactly one correct answer, and
             # it is not another tool.
+            #
+            # It is, however, a different answer in each mode, and saying only
+            # the general form left a Planner nowhere to go. A field session was
+            # refused `git_ops` five times while trying to cut a migration
+            # branch and read "a later step in the run will make it" each time
+            # without ever working out that the later step was on the far side
+            # of `submit_plan` -- so it asked the developer the same question
+            # four times instead. Naming the move costs nothing and is the whole
+            # difference between an explanation and an instruction.
             fix = "Describe the change you want; a later step in the run will make it."
+            if mode is Mode.PLANNER:
+                fix = (
+                    "Put it in the plan and call `submit_plan`. The acting phase holds "
+                    "the write tools and carries the plan out; this phase decides what "
+                    "it should say."
+                )
         elif spec.instead:
             fix = f"Instead, {spec.instead}."
         else:

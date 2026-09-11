@@ -40,6 +40,7 @@ from dakcoder_agent.migration import (
     phases_from_meta,
     plan_objection,
     progress_document,
+    steps_for_phase,
 )
 from dakcoder_agent.modes import Intent, Mode
 from dakcoder_agent.plan import PlanRecord
@@ -251,16 +252,62 @@ def test_every_phase_has_to_name_its_sub_categories() -> None:
     assert "branch" in objection and "no breakdown" in objection
 
 
-def test_a_plan_spanning_two_phases_at_once_is_sent_back() -> None:
-    """Requirement four, enforced where the work is committed to rather than asked for."""
+def test_a_plan_spanning_two_phases_is_trimmed_not_refused() -> None:
+    """Requirement four, enforced without arguing about it.
+
+    A model asked for a seven-phase roadmap and the steps for the open phase
+    sends the roadmap and the steps for the first two, because it has just
+    thought about both. That is a good plan in the wrong shape. Refusing it cost
+    a field session its whole budget: the plan bounced, the model re-planned,
+    the refusal fired again, and nothing was ever adopted — so the run never
+    reached the phase that can act.
+    """
     state = MigrationState(active=True)
     state.adopt(_phases())
     steps = [
         PlanStep("go.mod", "swap", "tidy", phase="deps"),
+        PlanStep("go.sum", "tidy", "tidy", phase="deps"),
         PlanStep("handler/user.go", "convert", "build", phase="handlers"),
     ]
-    objection = plan_objection(state, (), steps)
-    assert "spans 2 phases" in objection
+    assert plan_objection(state, (), steps) == "", "a spanning plan is not an objection"
+
+    kept, rest = steps_for_phase(state.phases, steps)
+    assert [s.file for s in kept] == ["go.mod", "go.sum"]
+    assert [s.file for s in rest] == ["handler/user.go"]
+
+
+def test_the_trim_follows_the_roadmap_order_not_the_submission_order() -> None:
+    state = MigrationState(active=True)
+    state.adopt(_phases())
+    steps = [
+        PlanStep("handler/user.go", "convert", "build", phase="handlers"),
+        PlanStep("go.mod", "swap", "tidy", phase="deps"),
+    ]
+    kept, rest = steps_for_phase(state.phases, steps)
+    assert [s.file for s in kept] == ["go.mod"], "the earlier phase is the open one"
+    assert [s.file for s in rest] == ["handler/user.go"]
+
+
+def test_a_closed_phase_is_never_the_one_trimmed_to() -> None:
+    state = MigrationState(active=True)
+    state.adopt(_phases())
+    state.close("branch")
+    steps = [
+        PlanStep("go.mod", "swap", "tidy", phase="deps"),
+        PlanStep("handler/user.go", "convert", "build", phase="handlers"),
+    ]
+    kept, _ = steps_for_phase(state.phases, steps)
+    assert [s.file for s in kept] == ["go.mod"]
+
+
+def test_an_untagged_plan_is_left_alone() -> None:
+    """Nothing to trim to, and dropping every step would be worse than adopting
+    a plan in the wrong shape."""
+    state = MigrationState(active=True)
+    state.adopt(_phases())
+    steps = [PlanStep("go.mod", "swap", "tidy")]
+    kept, rest = steps_for_phase(state.phases, steps)
+    assert kept == steps and rest == []
 
 
 def test_steps_must_name_a_phase_that_exists() -> None:
@@ -295,7 +342,12 @@ def test_a_phased_plan_is_accepted_and_travels_in_meta() -> None:
     assert result.ok
     assert [p.name for p in phases_from_meta(result.meta)] == ["branch", "deps", "handlers"]
     assert "3 phase(s)" in result.content
-    assert "is not work for this run" in result.content
+    assert "the rest of the roadmap is kept" in result.content
+    # The tool does not promise what the loop has not decided. It used to say
+    # "Work starts now — you hold the write tools from this turn on", on a call
+    # the loop reads afterwards and can refuse.
+    assert "Work starts now" not in result.content
+    assert "decided after this call" in result.content
     assert "[deps · go get]" in result.content
 
 
@@ -397,6 +449,75 @@ def _plan_result(*, steps, phases=()):
     return ToolResult.success(
         "plan", meta={"control": "plan", "summary": "s", "steps": steps, "phases": list(phases)}
     )
+
+
+# ── the planner is never told to make a call it cannot make ─────────────────
+#
+# From a field session that deadlocked across six developer messages: the state
+# block told the Planner to cut the branch with `git_ops`, `git_ops` is an
+# acting tool, and every attempt was refused by mode. The Planner asked the
+# developer which branch to cut from four times, was answered every time, and
+# never submitted a plan — so it never reached the phase that could have cut it.
+
+
+def test_the_planner_is_told_to_plan_the_branch_not_to_cut_it(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.state.mode = Mode.PLANNER
+    loop.state.migration = MigrationState(active=True)
+    loop.state.migration.adopt(_phases())
+
+    block = loop._state_block()
+    assert "no branch yet" in block
+    assert "submit_plan" in block
+    assert "cannot cut it here" in block
+    assert "git_ops` op=branch" not in block, (
+        "the planner was told to make a call its own request does not offer"
+    )
+
+
+def test_the_acting_phase_is_told_to_cut_it(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.state.mode = Mode.AGENT
+    loop.state.migration = MigrationState(active=True)
+    loop.state.migration.adopt(_phases())
+
+    block = loop._state_block()
+    assert "git_ops` op=branch" in block
+    assert "held until it exists" in block
+
+
+def test_a_planner_refused_a_write_tool_is_told_where_the_write_happens() -> None:
+    """`git_ops` refused by mode used to answer "a later step in the run will
+    make it", which names no move. The later step is on the far side of
+    `submit_plan`, and nothing said so."""
+    router = Router(Workspace(Path.cwd()))
+    outcome = router.dispatch("git_ops", {"op": "branch"}, mode=Mode.PLANNER)
+
+    assert isinstance(outcome, ToolResult) and not outcome.ok
+    assert outcome.meta.get("refused_by_mode")
+    assert "submit_plan" in outcome.fix
+    assert "acting phase" in outcome.fix
+
+
+def test_submit_plan_does_not_promise_what_the_loop_has_not_decided() -> None:
+    """The tool result reaches the model before the loop has read the plan.
+
+    Saying "work starts now, you hold the write tools from this turn on" on a
+    plan the loop then refuses is two contradictory statements about one call,
+    and the field session believed the wrong one: it went looking for write
+    tools it did not have.
+    """
+    result = submit_plan(
+        _call(
+            "submit_plan",
+            {"steps": [{"file": "a.go", "action": "x", "accepts": "y"}]},
+            Workspace(Path.cwd()),
+        )
+    )
+    assert result.ok
+    assert "Work starts now" not in result.content
+    assert "write tools" not in result.content
+    assert "decided after this call" in result.content
 
 
 # ── a file bigger than one reply is bigger than one step ────────────────────
@@ -772,7 +893,7 @@ def test_the_progress_record_says_whether_the_routes_were_recorded(tmp_path: Pat
     loop.state.plan = (PlanStep("go.mod", "swap", "tidy", phase="deps"),)
 
     with_routes = progress_document(loop.state.migration, loop.state.plan, (), 93)
-    assert "Routes recorded before the migration: 93" in with_routes
+    assert "**Routes recorded before the migration:** 93" in with_routes
 
     without = progress_document(loop.state.migration, loop.state.plan, (), 0)
     assert "will not be caught automatically" in without
@@ -781,31 +902,110 @@ def test_the_progress_record_says_whether_the_routes_were_recorded(tmp_path: Pat
 # ── progress survives the context window ────────────────────────────────────
 
 
-def test_the_progress_record_is_written_where_the_next_session_can_read_it(
+def test_the_plan_document_is_written_where_the_view_and_the_next_session_look(
     tmp_path: Path,
 ) -> None:
-    """A conversion outlives a context window; the transcript does not."""
+    """A conversion outlives a context window; the transcript does not.
+
+    And the path is the extension's, not one of our own choosing: the Migration
+    view watches `.dakcoder/migration/plan.md` and has since it shipped. Nothing
+    had ever written it, so the view was permanently empty and a developer
+    mid-migration had nowhere to look.
+    """
     loop = _migrating(tmp_path)
+    loop.state.routes_before = 93
     loop.state.plan = (
         PlanStep("go.mod", "swap the deps", "tidy", phase="deps", status="done"),
-        PlanStep(
-            "handler/paogen.go",
-            "convert methods 1-10",
-            "go build",
-            phase="handlers",
-            part="methods 1-10",
-        ),
+        PlanStep("main.go", "drop the routes invoke", "compiles", phase="deps"),
     )
     loop._save_progress()
 
-    written_doc = (tmp_path / PROGRESS_PATH).read_text(encoding="utf-8")
-    assert "Branch: `template-conversion`, cut from `development`" in written_doc
-    assert "[x] **1. branch**" in written_doc, "a closed phase is ticked"
-    assert "[ ] **3. handlers**" in written_doc
-    assert "1 of 3 closed" in written_doc
-    assert "[x] 1. `go.mod`" in written_doc
-    assert "*(methods 1-10)*" in written_doc
-    assert "## Still to do" in written_doc
+    assert PROGRESS_PATH == ".dakcoder/migration/plan.md", (
+        "the path is a contract with extension/src/wizard.ts"
+    )
+    doc = (tmp_path / PROGRESS_PATH).read_text(encoding="utf-8")
+
+    # The header a developer opens it for.
+    assert "**Branch:** `template-conversion`, cut from `development`" in doc
+    assert "**Phases:** 1 of 3 closed" in doc
+    assert "**Routes recorded before the migration:** 93" in doc
+
+    # Every phase, with its breakdown and where the work is.
+    assert "1. **branch** — cut the branch · **done**" in doc
+    assert "2. **deps** — swap api-* for n-api-* · **open**" in doc
+    assert "3. **handlers** — convert every handler · pending" in doc
+    assert "Parts: imports, Base, Routes" in doc
+    assert "Steps: 1 of 2 settled" in doc
+
+    # And the units, in the table the view parses.
+    assert "| Unit | Kind | Classification | Status | Rules | Commit |" in doc
+    assert "| go.mod | deps | MIGRATE | done |" in doc
+    assert "| main.go | deps | MIGRATE | pending |" in doc
+    assert "## Still to do" in doc
+
+
+def test_a_phase_whose_steps_are_all_settled_says_so(tmp_path: Path) -> None:
+    """Otherwise the document contradicts the line under it: "pending", above
+    "Steps: 4 of 4 settled"."""
+    loop = _migrating(tmp_path, phase="handlers")
+    loop.state.plan = (
+        PlanStep("go.mod", "swap", "tidy", phase="deps", status="done"),
+        PlanStep("handler/x.go", "convert", "build", phase="handlers"),
+    )
+    doc = progress_document(loop.state.migration, loop.state.plan, (), 0)
+    assert "**deps** — swap api-* for n-api-* · ready to close" in doc
+
+
+def test_the_document_never_renders_a_checkbox(tmp_path: Path) -> None:
+    """The view's parser reads *every* `- [ ]` line as a unit.
+
+    A phase rendered as a checklist — the obvious way to render one — would
+    appear in the Migration tree as a file that does not exist, above the files
+    that do. So the phases are a numbered list, and this is the assertion that
+    keeps them one.
+    """
+    loop = _migrating(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap", "tidy", phase="deps", status="done"),
+        PlanStep("main.go", "wire", "build", phase="deps", status="skipped", note="not needed"),
+    )
+    doc = progress_document(loop.state.migration, loop.state.plan, ("go.mod",), 93)
+    assert "- [ ]" not in doc and "- [x]" not in doc
+
+
+def test_a_skipped_step_is_excluded_in_the_views_own_vocabulary(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path)
+    loop.state.plan = (
+        PlanStep("routes/routes.go", "delete it", "gone", phase="deps", status="skipped"),
+    )
+    doc = progress_document(loop.state.migration, loop.state.plan, (), 0)
+    assert "| routes/routes.go | deps | SKIP | skipped |" in doc
+
+
+def test_closing_a_phase_is_logged_with_when(tmp_path: Path) -> None:
+    """"Where did the last session get to" wants a when as well as a what."""
+    loop = _migrating(tmp_path, phase="branch")
+    assert loop.state.migration.log == ()
+    loop.state.migration.close("branch")
+
+    assert len(loop.state.migration.log) == 1
+    entry = loop.state.migration.log[0]
+    assert "phase 1 of 3" in entry and "branch" in entry and "closed" in entry
+
+    doc = progress_document(loop.state.migration, (), (), 0)
+    assert "## Log" in doc and entry in doc
+
+
+def test_the_log_survives_a_restart(tmp_path: Path) -> None:
+    state = MigrationState(active=True)
+    state.adopt(_phases())
+    state.close("branch")
+    record = PlanRecord(session_id="s1")
+    record.migration = state
+    record.save(tmp_path)
+
+    back = PlanRecord.load(tmp_path, "s1")
+    assert back is not None and back.migration.log == state.log
 
 
 def test_nothing_is_written_for_an_ordinary_task(tmp_path: Path) -> None:
@@ -815,14 +1015,19 @@ def test_nothing_is_written_for_an_ordinary_task(tmp_path: Path) -> None:
     assert not (tmp_path / PROGRESS_PATH).exists()
 
 
-def test_the_progress_record_is_rendered_from_the_plan_not_from_prose(tmp_path: Path) -> None:
+def test_the_document_is_rendered_from_the_plan_not_from_prose(tmp_path: Path) -> None:
     """The field session wrote its own `migration.md` by hand and then read it
-    back as evidence of work it had not done. This one cannot say that."""
+    back as evidence of work it had not done. This one cannot say that.
+
+    The file is touched, and the step is still `pending`: what the change set
+    holds and what the plan claims are different facts, and only one of them is
+    the model's.
+    """
     loop = _migrating(tmp_path)
     loop.state.plan = (PlanStep("go.mod", "swap", "tidy", phase="deps"),)
     doc = progress_document(loop.state.migration, loop.state.plan, ("go.mod",))
-    assert "[ ] 1. `go.mod`" in doc, "a step nothing has written is not ticked"
-    assert "Edits here are overwritten" in doc
+    assert "| go.mod | deps | MIGRATE | pending |" in doc
+    assert "Edits are overwritten" in doc
 
 
 # ── 3. the branch ───────────────────────────────────────────────────────────
