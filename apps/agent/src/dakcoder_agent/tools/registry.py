@@ -538,7 +538,17 @@ _SPECS: tuple[ToolSpec, ...] = (
                         },
                         "accepts": {
                             "type": "string",
-                            "description": "How this step is checked once done.",
+                            # Named tools, because the field was being filled with
+                            # criteria the phase that has to satisfy them cannot
+                            # run: a migration plan wrote "legacy_audit reports no
+                            # findings" on all seven steps, and `legacy_audit`
+                            # belongs to ask and planner. Seven steps with no
+                            # check the acting phase could apply.
+                            "description": (
+                                "How this step is checked once done, with something "
+                                "the acting phase runs: go_build, go_vet, go_test, "
+                                "rules_lint, a read. Not legacy_audit or the audits."
+                            ),
                         },
                         "phase": {
                             "type": "string",
@@ -680,7 +690,10 @@ _SPECS: tuple[ToolSpec, ...] = (
                     "properties": {
                         "file": {"type": "string", "description": "Path this step changes."},
                         "action": {"type": "string", "description": "What changes in it."},
-                        "accepts": {"type": "string", "description": "How it is checked."},
+                        "accepts": {
+                            "type": "string",
+                            "description": "How it is checked, with a tool this phase has.",
+                        },
                         "phase": {"type": "string", "description": "Its phase, if any."},
                         "part": {"type": "string", "description": "Its part of that phase."},
                         "status": {

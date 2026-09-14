@@ -16,8 +16,8 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | Mode | Tools | Schema cost |
 |---|---|---|
 | **ask** | 15 | ~1,680 tokens |
-| **planner** | 17 | ~2,227 tokens |
-| **agent** | 25 | ~3,296 tokens |
+| **planner** | 17 | ~2,256 tokens |
+| **agent** | 25 | ~3,303 tokens |
 
 ## The catalogue
 

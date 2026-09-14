@@ -48,7 +48,17 @@ from dakcoder_shared.envelope import ToolResult
 
 from .router import Invocation
 
-__all__ = ["HANDLERS", "PlanStep", "steps_from_meta"]
+__all__ = ["HANDLERS", "MAX_STEP_PATHS", "PlanStep", "split_paths", "steps_from_meta"]
+
+#: How many paths one ``file`` field may name before it stops being a step.
+#:
+#: A field naming seven files is not a step with a wide scope, it is a manifest
+#: pasted into the wrong box, and splitting it would put seven pending items in
+#: front of a model whose whole problem is attempting everything it is shown.
+#: Past this it is left verbatim, which matches nothing -- and a plan that
+#: matches nothing is now a *stall* rather than a loop, because `_note_delete`
+#: catches the cycle. See `split_paths`.
+MAX_STEP_PATHS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +171,64 @@ class PlanStep:
         if root in ("", "."):
             return False
         return path.startswith(root + "/")
+
+
+def split_paths(file: str) -> tuple[str, ...]:
+    """The paths one ``file`` field names: one for a step, several for a list.
+
+    ``file`` is specified as a single path and the field is checked against the
+    change set by `PlanStep.covers`, which knows an exact path, a glob and a
+    directory. It does not know a *list*, and a list is what the field gets.
+
+    A migration run submitted ``"go.work, go.work.sum"``, ``"cover.html,
+    coverage, gin.log"`` and ``"docs/docs.go, docs/swagger.json"`` as three of
+    its seven steps -- because the artefacts genuinely go together and the step
+    cap is eight -- and each of those strings matched nothing. Not "matched
+    loosely": nothing. So `_step_wants_removal` could not see that the step
+    asked for the deletion it had just been given, the loop told the model it
+    had lost a file the plan never mentioned, `_mark_steps` could not close the
+    step on the write that followed, and `active_step` pinned the cursor there
+    for the rest of the run. The model deleted and restored ``go.work`` four
+    times in eight turns, obeying both instructions in turn.
+
+    Splitting rather than refusing, for the reason `steps_for_phase` trims
+    rather than refuses: that plan is a good plan in the wrong shape, and a
+    plan objection spends a round trip and a slot in `MAX_PLAN_OBJECTIONS` to
+    ask for a field the model already filled in correctly in substance. Split,
+    each path is its own step, each is closable on its own, and the run can say
+    which of the three artefacts it actually removed.
+
+    Comma is the separator. A comma in a real repository path is vanishingly
+    rare and a comma in this field is a list every time; the caller guards even
+    that case by leaving a field that names something on disk alone. Whitespace
+    splits only when *every* token looks like a path -- contains ``/`` or ``.``
+    -- because a directory step is one bare word and ``"my docs/readme.md"`` is
+    one path with a space in it, and splitting either would invent steps that
+    can never be satisfied. ``cover.html, coverage, gin.log`` is why the comma
+    form does not ask the same: ``coverage`` is a real file with no extension.
+
+    Returns the field unchanged, as a one-tuple, whenever it is not a list.
+    """
+    text = file.strip()
+    if not text:
+        return ()
+    if "," in text:
+        parts = [token.strip() for token in text.split(",")]
+    else:
+        parts = text.split()
+        if len(parts) > 1 and not all(_path_shaped(token) for token in parts):
+            return (text,)
+    parts = [token for token in parts if token]
+    if len(parts) < 2 or len(parts) > MAX_STEP_PATHS:
+        return (text,)
+    # Deduplicated, preserving order: two identical steps are two cursors on one
+    # file, and the second could never be closed by a write the first consumed.
+    return tuple(dict.fromkeys(parts))
+
+
+def _path_shaped(token: str) -> bool:
+    """Whether a whitespace-separated token could be a path on its own."""
+    return "/" in token or "." in token
 
 
 #: The statuses a step may carry, and the two the model may set itself.

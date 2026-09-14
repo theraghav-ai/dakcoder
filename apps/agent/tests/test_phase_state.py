@@ -23,7 +23,7 @@ from dakcoder_agent.gate import GateReport, StageResult
 from dakcoder_agent.loop import AgentLoop, _State
 from dakcoder_agent.modes import Intent, Mode
 from dakcoder_agent.plan import PlanRecord
-from dakcoder_agent.tools.control import PlanStep
+from dakcoder_agent.tools.control import MAX_STEP_PATHS, PlanStep, split_paths
 from dakcoder_agent.tools.router import Router
 from scripted import build, calls, patch, plan_call, say  # noqa: E402
 from scripted import gated, planning_router, written  # noqa: F401,E402
@@ -664,3 +664,109 @@ def test_the_finish_result_does_not_claim_delivery(planning_router: Router) -> N
     assert "has your reply" not in out.content
     assert "decided after this call" in out.content
     assert len(out.content) < 200, "echoing the answer put it in the transcript twice"
+
+
+# ── a `file` field naming several files ─────────────────────────────────────
+#
+# The third shape `covers` could not read, after the directory and the glob, and
+# the one that cost a whole first phase. A migration plan submitted
+# `"go.work, go.work.sum"`, `"cover.html, coverage, gin.log"` and
+# `"docs/docs.go, docs/swagger.json"` as three of its seven steps, and each of
+# those strings matched nothing at all: not the delete that carried the step
+# out, not the write that followed it, not the cursor's own "has anything landed
+# on this step" line. The run deleted `go.work`, was told the plan did not ask
+# for that and wrote it back, read its step saying to delete it, and deleted it
+# again -- four times in eight turns, every turn a real mutation.
+
+
+def test_a_comma_separated_field_is_a_list_of_paths() -> None:
+    assert split_paths("go.work, go.work.sum") == ("go.work", "go.work.sum")
+    assert split_paths("cover.html, coverage, gin.log") == (
+        "cover.html",
+        "coverage",
+        "gin.log",
+    )
+    assert split_paths("docs/docs.go, docs/swagger.json") == (
+        "docs/docs.go",
+        "docs/swagger.json",
+    )
+
+
+def test_the_comma_form_does_not_ask_the_tokens_to_look_like_paths() -> None:
+    """`coverage` is a real file with no extension, and it was in the field that
+    produced this bug. Requiring a dot or a slash of every token would refuse
+    exactly the case."""
+    assert split_paths("cover.html, coverage, gin.log")[1] == "coverage"
+
+
+def test_an_ordinary_step_is_left_alone() -> None:
+    for one in ("handler/paogen.go", "handler", "handler/response/*.go", "go.mod"):
+        assert split_paths(one) == (one,), one
+
+
+def test_whitespace_splits_only_when_every_token_is_path_shaped() -> None:
+    """A directory step is one bare word and `my docs/readme.md` is one path
+    with a space in it. Splitting either invents steps nothing can satisfy."""
+    assert split_paths("a.go b.go") == ("a.go", "b.go")
+    assert split_paths("my docs/readme.md") == ("my docs/readme.md",)
+    assert split_paths("the handler package") == ("the handler package",)
+
+
+def test_a_manifest_is_not_a_step() -> None:
+    """Past `MAX_STEP_PATHS` this is a file list pasted into the wrong box, and
+    splitting it would put a dozen pending items in front of a model whose whole
+    problem is attempting everything it is shown."""
+    many = ", ".join(f"f{i}.go" for i in range(MAX_STEP_PATHS + 1))
+    assert split_paths(many) == (many,)
+
+
+def test_a_blank_field_names_nothing() -> None:
+    assert split_paths("") == ()
+    assert split_paths("   ") == ()
+
+
+def test_the_plan_splits_a_multi_file_step_into_reachable_steps() -> None:
+    """Through `_normalise_plan`, which is where both `submit_plan` and
+    `revise_plan` pass. Each path becomes its own step, carrying the same
+    action, phase and acceptance -- so each is closable on its own and the run
+    can say which of the three artefacts it actually removed."""
+    loop = _loop()
+    steps = loop._normalise_plan(
+        (
+            PlanStep(
+                "go.work, go.work.sum",
+                "Delete go.work and go.work.sum",
+                "they are gone",
+                phase="deps",
+                part="artifacts",
+            ),
+        )
+    )
+
+    assert [s.file for s in steps] == ["go.work", "go.work.sum"]
+    assert all(s.phase == "deps" and s.part == "artifacts" for s in steps)
+    assert all(s.action == "Delete go.work and go.work.sum" for s in steps)
+    assert steps[0].covers("go.work") and steps[1].covers("go.work.sum")
+
+
+def test_a_split_step_is_marked_by_the_write_that_lands_on_it() -> None:
+    """The join that was broken. `_mark_steps` filters by `covers`, so nothing
+    the run did could ever change the status of the unsplit step."""
+    loop = _loop()
+    loop.state.plan = loop._normalise_plan(
+        (PlanStep("go.work, go.work.sum", "delete both", "gone", phase="deps"),)
+    )
+
+    loop._mark_steps("go.work", "written")
+
+    assert [s.status for s in loop.state.plan] == ["written", "pending"]
+
+
+def test_a_duplicate_path_in_the_field_becomes_one_step() -> None:
+    """Two steps on one file are two cursors on it, and the second could never
+    be closed by a write the first consumed."""
+    loop = _loop()
+    steps = loop._normalise_plan(
+        (PlanStep("go.work, go.work", "delete it", "gone"),)
+    )
+    assert [s.file for s in steps] == ["go.work"]

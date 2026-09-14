@@ -117,7 +117,7 @@ from .plan import PlanRecord
 from .undo import ensure_private
 from .prompts import mode_instruction, system_prompt
 from .tools import registry
-from .tools.control import PlanStep, steps_from_meta
+from .tools.control import PlanStep, split_paths, steps_from_meta
 from .tools.router import ApprovalRequest, Router
 
 log = logging.getLogger(__name__)
@@ -262,6 +262,9 @@ _OWNER: dict[str, str] = {
     "plan_forced": "task",
     "cursor": "task",
     "removed": "task",
+    "gone_once": "task",
+    "rewritten": "task",
+    "churn": "task",
     "routes_saved": "task",
     "routes_before": "task",
     "migration": "task",
@@ -771,6 +774,42 @@ def _is_degenerate(answer: str) -> bool:
 #: is believed, because this reads paths out of the plan and is not the
 #: arbiter of whether a step was still needed.
 MAX_FINISH_REFUSALS = 1
+
+#: A tool name as it appears inside a sentence. Tool names are lower_snake_case
+#: by the registry's own rule, so this needs no vocabulary of its own.
+_IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
+
+#: Control tools, which an ``accepts`` criterion would never legitimately name.
+#:
+#: Excluded from the check below so that a step checked by "submit_plan" -- which
+#: no plan has ever said and none should -- is not reported as an unrunnable
+#: criterion in a message about verification.
+_CONTROL_TOOLS = frozenset({"submit_plan", "revise_plan", "ask_developer", "finish"})
+
+
+def _unrunnable_checks() -> frozenset[str]:
+    """Tools an ``accepts`` may cite that the acting phase cannot call.
+
+    Derived from the registry rather than listed, so a tool moved between modes
+    does not leave a stale name here. Gate tools are excluded: the model never
+    calls `gofmt` or `swagger_check` and does not need to -- the gate runs them
+    on a schedule, so "swagger_check passes" is a criterion the run does apply.
+
+    The failure this answers: a migration plan wrote "legacy_audit reports no
+    legacy-lib-generation findings" as the acceptance criterion of all seven of
+    its steps. `legacy_audit` is an ask/planner tool. The acting phase called it,
+    was refused, and spent the turn discovering that its own plan had given it
+    nothing it could check -- on a phase where the criterion was the only thing
+    that could have told it a step was finished.
+    """
+    acting = set(registry.names_for(Mode.AGENT))
+    gate = set(registry.gate_tools())
+    return frozenset(
+        spec.name
+        for spec in registry.all_specs()
+        if spec.name not in acting and spec.name not in gate and spec.name not in _CONTROL_TOOLS
+    )
+
 
 #: How many times a migration's plan is sent back for not being phased.
 #:
@@ -2155,12 +2194,21 @@ class AgentLoop:
         self.state.calls.world_changed(self.router.mutations)
 
         mutated = False
+        #: Whether anything this batch changed was a change the run had not
+        #: already made and undone. Distinct from ``mutated``, which is about
+        #: the disk: a turn that deletes a file it wrote back last turn has
+        #: mutated the workspace and moved the run nowhere. See ``churn``.
+        productive = False
         #: Dispatched calls that told the run something it did not already have.
         informed = 0
         #: Files this batch deleted that the plan did not ask to have removed.
         #: Reported after the batch, on the turn it happened. See the mutation
         #: handling below.
         removed_open: list[str] = []
+        #: Files this batch deleted for at least the second time, having written
+        #: them back in between. A different objection from ``removed_open`` and
+        #: it has to be, because ``removed_open``'s remedy is what produced it.
+        churned: list[str] = []
 
         # What in this batch will not be dispatched, and why. Three rules, all
         # about the batch rather than any one call: a call repeated verbatim in
@@ -2502,17 +2550,41 @@ class AgentLoop:
                     # `action` is a typed field the model filled in to say what
                     # the step does; reading it is not the same as reading prose
                     # out of a reply.
-                    self.state.removed.add(mutation.path)
+                    cycles = self._note_delete(mutation.path)
+                    if cycles:
+                        # Told about whatever the plan says, because a turn that
+                        # goes round stops counting as progress whatever the
+                        # plan says, and a stall counter ticking with nothing
+                        # explaining it is the state this run was already in.
+                        churned.append(mutation.path)
+                    else:
+                        productive = True
                     if self._step_wants_removal(mutation.path):
                         self._mark_steps(mutation.path, "written")
-                    else:
+                        continue
+                    # `removed` is the ledger of files *lost*, and it is written
+                    # here rather than above the branch for a reason a field run
+                    # paid for: a planned deletion used to enter it too, and
+                    # `_deleted_and_not_replaced` reads it against the disk and
+                    # nothing else. So a migration that removed `routes/routes.go`
+                    # exactly as its plan said had its first `finish` refused with
+                    # "you deleted routes/routes.go ... so that file is simply
+                    # gone", and only got past it because MAX_FINISH_REFUSALS is
+                    # 1. A deletion the plan asked for is not a loss.
+                    self.state.removed.add(mutation.path)
+                    self._mark_steps(
+                        mutation.path,
+                        "pending",
+                        "deleted; its replacement has not been written",
+                    )
+                    # One objection per path, and not this one while it cycles:
+                    # "write it back" is the instruction that produced the
+                    # second deletion, and repeating it is repeating the loop.
+                    if not cycles:
                         removed_open.append(mutation.path)
-                        self._mark_steps(
-                            mutation.path,
-                            "pending",
-                            "deleted; its replacement has not been written",
-                        )
                     continue
+                if not self._note_write(mutation.path):
+                    productive = True
                 self.state.removed.discard(mutation.path)
                 # A mutation on a plan step's file is that step *written* --
                 # from the change set, which cannot lie, rather than from the
@@ -2633,7 +2705,13 @@ class AgentLoop:
         # Turn-level progress, judged on the batch rather than on any one call.
         # A batch that dispatched nothing -- every call a verbatim repeat or a
         # known dead end -- moved the run nowhere, however many calls it held.
-        if informed > 0 or mutated:
+        #
+        # ``productive`` rather than ``mutated``, and the difference is one
+        # field session: a run that deletes a file, is told to write it back,
+        # writes it back and deletes it again has mutated the workspace four
+        # times and changed nothing. Every one of those turns reset this
+        # counter, so the six-stall bound never came near firing.
+        if informed > 0 or productive:
             self.state.stalled_turns = 0
         else:
             self.state.stalled_turns += 1
@@ -2659,6 +2737,35 @@ class AgentLoop:
             if self.state.stalled_turns >= MAX_STALLED_TURNS:
                 self.result = self._stalled()
                 return
+
+        if churned:
+            # First, because it is the objection that supersedes the other one.
+            # A path in here has already been through `removed_open`'s remedy --
+            # "write it back" -- and come out the far side deleted again, so
+            # repeating that remedy is repeating the loop.
+            #
+            # What it asks for instead is a decision, and it names the two
+            # things that can be true. Either the plan step really does remove
+            # the file, in which case its `file` or its `action` is written in a
+            # way `_step_wants_removal` cannot read and `revise_plan` fixes it in
+            # one call; or it does not, in which case the file stays. The model
+            # is the only party that knows which, and until now nothing asked it.
+            names = ", ".join(dict.fromkeys(churned))
+            them = "them" if len(churned) > 1 else "it"
+            self.context.append_user(
+                f"You have deleted {names} again, having written {them} back after "
+                "the last time. That is a cycle, and this is the second time round.\n\n"
+                "Nothing about the workspace differs between those two turns, so a "
+                "third delete lands exactly where this one did. Decide instead:\n\n"
+                f"- If your plan step removes {them}, leave {them} deleted and work "
+                "the next step. If the step is not closing on the delete, its `file` "
+                "names more than one path or its `action` does not say the file is "
+                "removed -- `revise_plan` with one step per file, `action` saying it "
+                "is deleted, fixes both.\n"
+                f"- If the step does not remove {them}, leave {them} on disk and work "
+                "the next step.\n\n"
+                "Going round again ends the run as stalled."
+            )
 
         if removed_open:
             # Said immediately, on the turn the file went, because that is the
@@ -3681,6 +3788,77 @@ class AgentLoop:
         self.state.removed.difference_update(back)
         return gone[:STATE_ITEMS]
 
+    def _cited_but_unrunnable(self) -> list[str]:
+        """Tools the plan's ``accepts`` criteria name that the acting phase lacks."""
+        pool = _unrunnable_checks()
+        found: list[str] = []
+        for step in self.state.plan:
+            for word in _IDENTIFIER.findall(step.accepts.lower()):
+                if word in pool and word not in found:
+                    found.append(word)
+        return found
+
+    def _note_unrunnable_criteria(self) -> None:
+        """Say so when the plan is checked by tools the phase that works it cannot call.
+
+        A note, not an objection. The plan is adopted either way, and that is the
+        point: `MAX_PLAN_OBJECTIONS` is two, the migration shape objections have
+        first claim on both, and spending one on the wording of a field would buy
+        a re-plan round trip to fix something the model can simply be told. The
+        steps themselves are fine -- it is the criterion that cannot be applied.
+
+        Sent once, at adoption, where the model is about to start work and can
+        still decide what "done" will look like for each step.
+        """
+        named = self._cited_but_unrunnable()
+        if not named:
+            return
+        which = ", ".join(f"`{name}`" for name in named[:STATE_ITEMS])
+        is_are = "is a tool" if len(named) == 1 else "are tools"
+        self.context.append_user(
+            f"One note on the plan before you start: {which} {is_are} the acting "
+            "phase does not have -- they belong to ask and planner -- and the steps "
+            "above are accepted on them. Calling one from here is refused, so those "
+            "steps would have no check you can actually apply.\n\n"
+            "Check them with what this phase runs: `go_build`, `go_vet`, `go_test`, "
+            "`rules_lint`, or a `read_file`/`search_repo` that shows the thing is "
+            "true -- \"go build succeeds\", \"no api-* import is left in go.mod\", "
+            "\"the file is gone\". The plan stands; this is about how you verify it."
+        )
+
+    def _note_delete(self, path: str) -> int:
+        """Record a deletion, and return how many cycles this path has been through.
+
+        A cycle is delete, write back, delete again. It is the shape of the loop
+        this counter exists to catch, and the reason nothing else caught it is
+        that every turn in it was a real mutation: `stalled_turns` resets on
+        ``mutated``, so a run oscillating on one file reset its own stall
+        counter on every turn of the oscillation and ran until the finish-refusal
+        budget happened to end it, eighteen turns later.
+
+        Zero on a first deletion, which is ordinary work -- replacing a file
+        means deleting it, and a migration removes files outright.
+        """
+        cycles = self.state.churn.get(path, 0)
+        if path in self.state.rewritten:
+            self.state.rewritten.discard(path)
+            cycles += 1
+            self.state.churn[path] = cycles
+        self.state.gone_once.add(path)
+        return cycles
+
+    def _note_write(self, path: str) -> int:
+        """Record a write, and return the path's cycle count.
+
+        A write to something this session deleted arms the next deletion of it
+        as a cycle. Any write does: `write_file`, an `append`, a `patch_file`
+        against the replacement. What closes the cycle is the *second delete*,
+        not the shape of the restoration.
+        """
+        if path in self.state.gone_once:
+            self.state.rewritten.add(path)
+        return self.state.churn.get(path, 0)
+
     def _step_wants_removal(self, path: str) -> bool:
         """Whether a plan step covering ``path`` asked for it to be deleted.
 
@@ -3979,6 +4157,13 @@ class AgentLoop:
         # Still true on the next message: a file deleted and not replaced is
         # deleted and not replaced whatever the developer types next.
         self.state.removed = set(previous.state.removed)
+        # And the churn ledger with it. The loop it catches spanned three
+        # developer messages in the field -- a counter that restarted at each
+        # one would have read "no cycles yet" on every turn the run was most
+        # stuck, which is the same mistake `cursor` above exists to avoid.
+        self.state.gone_once = set(previous.state.gone_once)
+        self.state.rewritten = set(previous.state.rewritten)
+        self.state.churn = dict(previous.state.churn)
         # And the route inventory, which is taken once per *migration*, not
         # once per message: retaking it on message four would record a
         # half-converted service as the thing to compare the finished one
@@ -4096,21 +4281,48 @@ class AgentLoop:
         A path that will not resolve is kept verbatim. It is the model's text and
         the developer should see what was planned; it simply will not match, which
         is the same outcome as before and is now the *only* case with that outcome.
+
+        **And a field naming several files becomes several steps.** ``file`` is
+        one path by specification and `PlanStep.covers` compares it as one; a
+        field holding ``"go.work, go.work.sum"`` matched nothing, which cost a
+        field run its whole first phase. `split_paths` has the case and the
+        rule. Splitting happens here, before `plan_objection` sees the plan, so
+        the big-file check measures each path rather than a string that names
+        three of them and resolves to none.
         """
         out: list[PlanStep] = []
         for step in steps:
             if not step.file:
                 out.append(step)
                 continue
-            try:
-                rel = self.router.workspace.relative(
-                    self.router.workspace.resolve(step.file)
-                )
-            except (PathEscape, ValueError):
-                out.append(step)
-                continue
-            out.append(step if rel == step.file else replace(step, file=rel))
+            for path in self._paths_named_by(step.file):
+                out.append(step if path == step.file else replace(step, file=path))
         return tuple(out)
+
+    def _paths_named_by(self, file: str) -> tuple[str, ...]:
+        """The normalised workspace-relative paths one ``file`` field names."""
+        candidates = split_paths(file)
+        if len(candidates) > 1 and self._on_disk(file):
+            # A file that is actually there is never a list, whatever is in its
+            # name. Checked against the disk rather than argued about, for the
+            # reason `_deleted_and_not_replaced` is: the workspace is the only
+            # thing that knows, and a repository holding `a, b.go` is allowed to
+            # have a plan step for it.
+            candidates = (file.strip(),)
+        return tuple(dict.fromkeys(self._relative(path) for path in candidates))
+
+    def _relative(self, path: str) -> str:
+        """``path`` as the change set spells it, or verbatim when it will not resolve."""
+        try:
+            return self.router.workspace.relative(self.router.workspace.resolve(path))
+        except (PathEscape, ValueError, OSError):
+            return path
+
+    def _on_disk(self, path: str) -> bool:
+        try:
+            return self.router.workspace.resolve(path).exists()
+        except (PathEscape, ValueError, OSError):
+            return False
 
     def _unwritten_targets(self) -> list[str]:
         """Plan steps whose file no change reached.
@@ -4868,6 +5080,7 @@ class AgentLoop:
         if self.state.plan_summary:
             rendered = f"{self.state.plan_summary}\n\n{rendered}"
         self.context.set_plan(rendered)
+        self._note_unrunnable_criteria()
         yield Event(
             EventType.PLAN,
             {

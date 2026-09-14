@@ -144,6 +144,25 @@ class TaskState:
     #: Checked against the disk when it is read, so a file the developer
     #: restored drops out of it by itself.
     removed: set[str] = field(default_factory=set)
+    #: Every path this session has deleted, whether or not it came back, and
+    #: every path that has been written again since it went. Together they are
+    #: how a *cycle* is recognised: a delete of something in ``rewritten`` is
+    #: the second delete of a file that was already deleted once and restored.
+    #:
+    #: Separate from ``removed`` because ``removed`` is about loss and empties
+    #: itself as files return -- it has to, or the objection outlives the thing
+    #: it is about. Churn is about history, and the history is the point.
+    gone_once: set[str] = field(default_factory=set)
+    rewritten: set[str] = field(default_factory=set)
+    #: Path -> how many delete/restore/delete cycles it has been through.
+    #:
+    #: A run deleted `go.work`, was told the plan did not ask for that and wrote
+    #: it back, read its plan step saying to delete it, and deleted it again --
+    #: four times in eight turns. Every one of those turns mutated the
+    #: workspace, so `stalled_turns` reset on each of them and no bound in the
+    #: loop could see it. A mutation on a path that is already cycling is not
+    #: progress, and this is the counter that says so.
+    churn: dict[str, int] = field(default_factory=dict)
     #: The intent of the run that stopped to ask the developer something, held
     #: until their answer arrives and then spent.
     #:

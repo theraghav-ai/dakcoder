@@ -445,7 +445,7 @@
                 },
                 "accepts": {
                   "type": "string",
-                  "description": "How this step is checked once done."
+                  "description": "How this step is checked once done, with something the acting phase runs: go_build, go_vet, go_test, rules_lint, a read. Not legacy_audit or the audits."
                 },
                 "phase": {
                   "type": "string",
@@ -594,7 +594,7 @@
                 },
                 "accepts": {
                   "type": "string",
-                  "description": "How it is checked."
+                  "description": "How it is checked, with a tool this phase has."
                 },
                 "phase": {
                   "type": "string",

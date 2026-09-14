@@ -1279,3 +1279,303 @@ def test_re_submitting_the_roadmap_does_not_reopen_closed_phases() -> None:
     state.close("branch")
     state.adopt(_phases())
     assert state.current[1].name == "deps", "re-planning sent the run back to phase one"
+
+
+# ── a deletion the plan asked for is not a loss ─────────────────────────────
+#
+# `removed` is the ledger of files *gone*, and every deletion used to enter it,
+# including the ones the plan exists to carry out. `_deleted_and_not_replaced`
+# reads it against the disk and nothing else, so a migration that removed
+# `routes/routes.go` exactly as its step said had its first `finish` refused
+# with "you deleted routes/routes.go ... so that file is simply gone" -- and
+# only got past it because `MAX_FINISH_REFUSALS` happens to be 1.
+
+
+def test_a_deletion_the_step_asked_for_does_not_refuse_the_finish(planning_router) -> None:
+    workspace_root = planning_router.workspace.root
+    (workspace_root / "routes").mkdir(parents=True, exist_ok=True)
+    (workspace_root / "routes" / "routes.go").write_text("package routes\n", encoding="utf-8")
+
+    loop, _ = build(
+        planning_router,
+        [
+            calls(
+                (
+                    "delete_file",
+                    json.dumps({"path": "routes/routes.go", "reason": "retired by the template"}),
+                )
+            ),
+            calls(("finish", json.dumps({"answer": "the routes file is gone."}))),
+        ],
+        migration=True,
+    )
+    loop.state.migration.branch = "template-conversion"
+    loop.state.plan = (
+        PlanStep("routes/routes.go", "delete the retired routes file", "it is gone", phase="deps"),
+    )
+    list(loop.run("remove the routes file", intent=Intent.AGENT, continued=True))
+
+    assert not (workspace_root / "routes" / "routes.go").exists()
+    assert loop.state.removed == set(), "a planned deletion is not an outstanding loss"
+    assert loop._why_not_done() == ""
+    assert loop.state.plan[0].status in ("written", "done")
+    told = [
+        m.content
+        for m in loop.context.build()
+        if m.role.value == "user" and "You deleted" in (m.content or "")
+    ]
+    assert not told, "the run was told it had lost a file its plan removed on purpose"
+
+
+def test_an_unplanned_deletion_still_counts_as_a_loss(tmp_path: Path) -> None:
+    """The guard this narrows, unchanged. A file deleted with no step asking for
+    it and no replacement written is still four handlers gone."""
+    loop = _migrating(tmp_path, phase="handlers")
+    loop.state.plan = (
+        PlanStep("handler/paogen.go", "convert it", "go build", phase="handlers", status="done"),
+    )
+    loop.state.removed = {"handler/paogen.go"}
+
+    assert "you deleted handler/paogen.go" in loop._why_not_done()
+
+
+# ── delete, restore, delete ─────────────────────────────────────────────────
+#
+# Every turn of that cycle mutates the workspace, so `stalled_turns` -- which
+# resets on any mutation -- reset on every turn of it. The run oscillated on
+# `go.work` for eighteen turns and was ended by the finish-refusal budget rather
+# than by any bound that knew what was happening.
+
+
+def test_a_first_deletion_is_ordinary_work(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path)
+    assert loop._note_delete("go.work") == 0
+    assert loop.state.churn == {}
+
+
+def test_a_delete_after_a_restore_is_a_cycle(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path)
+    loop._note_delete("go.work")
+    loop._note_write("go.work")
+
+    assert loop._note_delete("go.work") == 1
+    assert loop.state.churn["go.work"] == 1
+
+    loop._note_write("go.work")
+    assert loop._note_delete("go.work") == 2
+
+
+def test_writing_a_file_this_run_never_deleted_arms_nothing(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path)
+    loop._note_write("handler/user.go")
+    assert loop._note_delete("handler/user.go") == 0, "a first deletion is not a cycle"
+
+
+def test_rewriting_the_replacement_does_not_make_a_cycle(tmp_path: Path) -> None:
+    """Delete, write, append, patch is one replacement, however many writes it
+    takes. What closes a cycle is the *second delete*."""
+    loop = _migrating(tmp_path)
+    loop._note_delete("handler/paogen.go")
+    for _ in range(3):
+        assert loop._note_write("handler/paogen.go") == 0
+    assert loop.state.churn == {}
+
+
+def test_the_cycle_survives_a_developer_message(tmp_path: Path) -> None:
+    """`carry_from`, because the loop it catches spanned three messages in the
+    field -- a counter restarting at each one would read "no cycles yet" on
+    every turn the run was most stuck."""
+    first = _migrating(tmp_path)
+    first._note_delete("go.work")
+    first._note_write("go.work")
+    first._note_delete("go.work")
+
+    second = _migrating(tmp_path)
+    second.carry_from(first)
+
+    assert second.state.churn == {"go.work": 1}
+    assert second._note_delete("go.work") == 1, "the ledger came with it"
+
+
+def _cycling(planning_router, turns, **kw):
+    """A run whose plan step covers nothing, on a workspace holding `go.work`.
+
+    The unsplit shape, forced past `_normalise_plan`, so these pin the *guard*
+    rather than the repair: a step that covers nothing is still possible
+    whenever a path will not resolve.
+    """
+    (planning_router.workspace.root / "go.work").write_text("go 1.25.0\n", encoding="utf-8")
+    loop, _ = build(planning_router, turns, migration=True, **kw)
+    loop.state.migration.branch = "template-conversion"
+    loop.state.plan = (
+        PlanStep("go.work, go.work.sum", "Delete go.work and go.work.sum", "gone", phase="deps"),
+    )
+    return loop
+
+
+def _delete(path: str = "go.work"):
+    return calls(("delete_file", json.dumps({"path": path, "reason": "the plan says so"})))
+
+
+def _rewrite(path: str = "go.work"):
+    return calls(("write_file", json.dumps({"path": path, "content": "go 1.25.0\n"})))
+
+
+def test_the_second_delete_is_told_about_as_a_cycle_not_as_a_loss(planning_router) -> None:
+    """The two objections cannot both be sent: `removed_open`'s remedy -- write
+    it back -- is what produced the second deletion."""
+    loop = _cycling(
+        planning_router,
+        [_delete(), _rewrite(), _delete(), _rewrite(), _delete()],
+        max_turns=6,
+    )
+    list(loop.run("clean up the workspace files", intent=Intent.AGENT, continued=True))
+
+    said = [m.content or "" for m in loop.context.build() if m.role.value == "user"]
+    cycle = [m for m in said if "That is a cycle" in m]
+    assert cycle, "the run was never told it was going round"
+    assert "revise_plan" in cycle[0]
+    assert "ends the run as stalled" in cycle[0]
+    assert loop.state.churn.get("go.work", 0) >= 1
+
+
+def test_a_cycle_is_told_about_even_when_the_step_asked_for_the_removal(
+    planning_router,
+) -> None:
+    """A turn that goes round stops counting as progress whatever the plan says,
+    so it has to be explained whatever the plan says. A stall counter ticking
+    with nothing saying why is the state this whole fix is about."""
+    (planning_router.workspace.root / "go.work").write_text("go 1.25.0\n", encoding="utf-8")
+    loop, _ = build(
+        planning_router,
+        [_delete(), _rewrite(), _delete()],
+        migration=True,
+        max_turns=5,
+    )
+    loop.state.migration.branch = "template-conversion"
+    loop.state.plan = (
+        PlanStep("go.work", "delete the workspace file", "it is gone", phase="deps"),
+    )
+    list(loop.run("drop the workspace file", intent=Intent.AGENT, continued=True))
+
+    said = [m.content or "" for m in loop.context.build() if m.role.value == "user"]
+    assert [m for m in said if "That is a cycle" in m], "the cycle went unexplained"
+    assert loop.state.churn.get("go.work", 0) >= 1
+
+
+def test_a_turn_that_only_re_deletes_is_not_progress(planning_router) -> None:
+    """The bound that could not see the loop. Every turn of it mutated the
+    workspace, so the six-stall ending never came near firing."""
+    loop = _cycling(
+        planning_router,
+        [_delete(), _rewrite(), _delete(), _rewrite(), _delete(), _rewrite()],
+        max_turns=8,
+    )
+    list(loop.run("clean up the workspace files", intent=Intent.AGENT, continued=True))
+
+    assert loop.state.stalled_turns >= 1, "the cycle still reset the stall counter"
+    assert loop.state.must_answer or loop.result is not None, "nothing ended the cycle"
+
+
+def test_the_split_plan_closes_the_step_and_never_cycles(planning_router) -> None:
+    """The repair and the guard together, on the plan that produced the bug.
+    Split, the deletion satisfies the step it was asked for, so nothing tells
+    the model to write the file back and there is no cycle to catch."""
+    workspace_root = planning_router.workspace.root
+    (workspace_root / "go.work").write_text("go 1.25.0\n", encoding="utf-8")
+    (workspace_root / "go.work.sum").write_text("h1:x\n", encoding="utf-8")
+
+    loop, _ = build(
+        planning_router,
+        [
+            _delete("go.work"),
+            _delete("go.work.sum"),
+            calls(("finish", json.dumps({"answer": "both workspace files are gone."}))),
+        ],
+        migration=True,
+        max_turns=6,
+    )
+    loop.state.migration.branch = "template-conversion"
+    loop.state.plan = loop._normalise_plan(
+        (
+            PlanStep(
+                "go.work, go.work.sum",
+                "Delete go.work and go.work.sum, which are local workspace artefacts",
+                "both files are gone",
+                phase="deps",
+            ),
+        )
+    )
+    list(loop.run("drop the go workspace files", intent=Intent.AGENT, continued=True))
+
+    assert not (workspace_root / "go.work").exists()
+    assert not (workspace_root / "go.work.sum").exists()
+    assert all(s.status in ("written", "done") for s in loop.state.plan), (
+        "each path was closed by the deletion that carried it out"
+    )
+    assert loop.state.churn == {}, "nothing went round"
+    assert loop.state.removed == set()
+    said = [m.content or "" for m in loop.context.build() if m.role.value == "user"]
+    assert not [m for m in said if "You deleted" in m]
+
+
+# ── an acceptance criterion the acting phase can run ────────────────────────
+#
+# The same plan accepted all seven of its steps on "legacy_audit reports no
+# findings". `legacy_audit` is an ask/planner tool: the acting phase called it,
+# was refused, and spent the turn learning that its own plan had given it
+# nothing it could check.
+
+
+def test_a_criterion_naming_a_tool_this_phase_lacks_is_found(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap the deps", "legacy_audit reports no findings", phase="deps"),
+        PlanStep("main.go", "rewire it", "go build succeeds", phase="deps"),
+    )
+    assert loop._cited_but_unrunnable() == ["legacy_audit"]
+
+
+def test_a_criterion_the_phase_can_run_is_not_commented_on(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap the deps", "go build and go_vet are clean", phase="deps"),
+        PlanStep("main.go", "rewire", "rules_lint finds nothing; read_file shows it", phase="deps"),
+    )
+    assert loop._cited_but_unrunnable() == []
+
+
+def test_a_gate_tool_is_a_criterion_the_run_does_apply(tmp_path: Path) -> None:
+    """The model never calls `gofmt` or `swagger_check` and does not need to --
+    the gate runs them on a schedule, so accepting a step on one is fine."""
+    loop = _migrating(tmp_path)
+    loop.state.plan = (
+        PlanStep("main.go", "rewire it", "gofmt is clean and swagger_check passes", phase="deps"),
+    )
+    assert loop._cited_but_unrunnable() == []
+
+
+def test_the_plan_is_adopted_and_the_criterion_is_pointed_out(tmp_path: Path) -> None:
+    """A note, not an objection: `MAX_PLAN_OBJECTIONS` is two and the migration
+    shape objections have first claim on both."""
+    loop = _migrating(tmp_path)
+    steps = (
+        PlanStep("go.mod", "swap the deps", "legacy_audit reports no findings", phase="deps"),
+    )
+    list(loop._adopt_plan(steps, "migrate"))
+
+    assert loop.state.plan == steps, "the plan stands"
+    said = [m.content or "" for m in loop.context.build() if m.role.value == "user"]
+    note = [m for m in said if "legacy_audit" in m]
+    assert note, "nothing said the criterion could not be applied"
+    assert "does not have" in note[0]
+    assert "go_build" in note[0]
+
+
+def test_a_clean_plan_gets_no_note(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path)
+    list(loop._adopt_plan(
+        (PlanStep("go.mod", "swap the deps", "go build succeeds", phase="deps"),), "migrate"
+    ))
+    said = [m.content or "" for m in loop.context.build() if m.role.value == "user"]
+    assert not [m for m in said if "the acting phase does not have" in m]

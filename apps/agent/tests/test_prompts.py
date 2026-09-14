@@ -211,7 +211,15 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 #: So 110 tokens a turn against ~103,000 per turn removed: the rules pay for
 #: themselves nine hundred times over on the first turn they save, and there
 #: were sixty spare. See `test_batching_cost.py`.
-PREFIX_CEILING = {Mode.ASK: 2_800, Mode.PLANNER: 3_350, Mode.AGENT: 4_420}
+#: `planner` moved again, by twenty tokens, for the `accepts` field naming the
+#: tools that can satisfy it. It is the cheapest line in this table to justify.
+#: A migration plan wrote "legacy_audit reports no findings" as the acceptance
+#: criterion of all seven of its steps; `legacy_audit` is an ask/planner tool,
+#: so the acting phase had seven steps and no check it could apply to any of
+#: them -- it called the tool, was refused, and spent the turn learning that its
+#: own plan had given it nothing to verify against. Twenty tokens, on planning
+#: turns only, against a turn thrown away on every phase of every migration.
+PREFIX_CEILING = {Mode.ASK: 2_800, Mode.PLANNER: 3_380, Mode.AGENT: 4_420}
 
 
 @pytest.mark.parametrize("mode", list(Mode))
