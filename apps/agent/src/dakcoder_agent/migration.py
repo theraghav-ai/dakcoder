@@ -232,6 +232,37 @@ class MigrationState:
             for p in phases
         )
 
+    def evidenced(self, name: str) -> bool:
+        """Whether this phase is complete on evidence the loop holds independently.
+
+        One phase has that property and it is the one that kept hanging. The
+        branch phase is finished when a branch exists that is not a shared one,
+        and `branch` records exactly that -- set from what ``git_ops`` reported
+        it had checked out, which is the only statement about the repository
+        that cannot be wrong. Everything else about phase completion is inferred
+        from whether *file-level* steps have settled, and a branch cut writes no
+        file.
+
+        That inference is what failed. A one-step branch plan, skipped because
+        the branch already existed, is a file-level accident deciding a
+        phase-level question; a branch phase whose step stays open for any
+        reason hangs the whole roadmap on bookkeeping while the fact it is
+        about sits in this object, true and unread.
+
+        Read off the phase's own typed ``name`` and ``covers`` -- fields the
+        model filled in to say what the phase is -- which is the same licence
+        ``_step_wants_removal`` takes with ``action``. Narrow on purpose: it
+        answers only for a phase that says it is about cutting the branch, and
+        every other phase closes the way it always did.
+        """
+        phase = self.phase_named(name)
+        if phase is None:
+            return False
+        said = f"{phase.name} {phase.covers}".lower()
+        if "branch" not in said:
+            return False
+        return bool(self.branch) and self.branch.strip().lower() not in PROTECTED
+
     def close(self, name: str) -> bool:
         """Mark one phase done. ``True`` if that changed anything."""
         key = name.strip().lower()
@@ -375,6 +406,48 @@ def phases_from_meta(meta: Mapping[str, Any]) -> tuple[Phase, ...]:
     )
 
 
+#: What a step says it does, when what it does is bounded by the edit rather
+#: than by the file.
+#:
+#: The size rule below refuses a single step on a file over ``BIG_FILE`` lines,
+#: and every word of its reasoning is about *conversion*: the acting phase has
+#: 16,384 output tokens, a conversion has to read the original as well, so a
+#: 4,000-line handler is nine steps rather than one. That is right, and it is
+#: right about conversion only.
+#:
+#: A dependency phase is not conversion. "Replace the api-log import with
+#: n-api-log" in a 4,064-line repository file is one `patch_file` with a
+#: one-line anchor, and the file's length has nothing to do with whether it
+#: fits in a reply. A field session was refused on exactly that, answered
+#: correctly -- "phase 2 is about dependencies, not handler conversion; the
+#: repo files only need import swaps" -- resubmitted the identical plan, and was
+#: refused again, spending both of `MAX_PLAN_OBJECTIONS` and fifty seconds on an
+#: objection it could not satisfy and should not have had to.
+_BOUNDED_EDITS = (
+    "import",
+    "dependenc",
+    "module path",
+    "go.mod",
+    "go.sum",
+)
+
+
+def _is_bounded_edit(action: str) -> bool:
+    """Whether this step's own description says it is an edit, not a rewrite.
+
+    Read off ``action`` -- a typed field the model filled in to say what the
+    step does -- which is the licence ``_step_wants_removal`` takes for the same
+    reason. It is not asking what the reply said; it is asking what this step
+    claims to be.
+
+    Deliberately narrow. Only the vocabulary of a dependency swap qualifies; a
+    step that says it "updates" or "fixes" a 4,000-line file is still a step
+    that has to be split, because nothing in those words bounds it.
+    """
+    said = action.lower()
+    return any(marker in said for marker in _BOUNDED_EDITS)
+
+
 def plan_objection(
     state: "MigrationState",
     phases: Sequence[Phase],
@@ -452,16 +525,24 @@ def plan_objection(
     # file. Split at plan time and each piece is a reply, a checkpoint and a
     # line in the progress record that says it is done.
     if lines is not None:
-        counted = {}
+        counted: dict[str, int] = {}
+        bounded: dict[str, bool] = {}
         for step in steps:
             path = str(getattr(step, "file", "") or "")
             if path:
                 counted.setdefault(path, 0)
                 counted[path] += 1
+                # A file is exempt only if *every* step on it is a bounded edit.
+                # One conversion step among three import swaps is still a
+                # conversion step, and it is the one that cannot finish.
+                was = bounded.get(path, True)
+                bounded[path] = was and _is_bounded_edit(str(getattr(step, "action", "") or ""))
         big = [
             (path, n)
             for path in counted
-            if counted[path] == 1 and (n := lines(path)) > BIG_FILE
+            if counted[path] == 1
+            and not bounded.get(path, False)
+            and (n := lines(path)) > BIG_FILE
         ]
         if big:
             worst = max(big, key=lambda item: item[1])

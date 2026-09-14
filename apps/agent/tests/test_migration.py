@@ -30,7 +30,7 @@ from dakcoder_shared.paths import Workspace
 
 from dakcoder_agent.context import ContextManager
 from dakcoder_agent.gate import ROUTES_BEFORE, GateReport, StageResult
-from dakcoder_agent.loop import MAX_PLAN_OBJECTIONS, AgentLoop, _State
+from dakcoder_agent.loop import STUCK_TURNS, MAX_PLAN_OBJECTIONS, AgentLoop, _State
 from dakcoder_agent.migration import (
     BIG_FILE,
     MIN_PHASES,
@@ -45,7 +45,7 @@ from dakcoder_agent.migration import (
 from dakcoder_agent.modes import Intent, Mode
 from dakcoder_agent.plan import PlanRecord
 from dakcoder_agent.tools import commands, fs
-from dakcoder_agent.tools.control import PlanStep, submit_plan
+from dakcoder_agent.tools.control import MODEL_STATUSES, PlanStep, submit_plan
 from dakcoder_agent.tools.router import Invocation, Router
 from dakcoder_agent.tools import registry
 from scripted import build, calls, patch, say  # noqa: E402
@@ -1579,3 +1579,586 @@ def test_a_clean_plan_gets_no_note(tmp_path: Path) -> None:
     ))
     said = [m.content or "" for m in loop.context.build() if m.role.value == "user"]
     assert not [m for m in said if "the acting phase does not have" in m]
+
+
+# ── a failed `go get` says which failure it was ─────────────────────────────
+#
+# One hint used to be attached to every `go get` failure, whatever the toolchain
+# said: "if this is a private module, GOPRIVATE and a git credential must be
+# configured". A field run hit `unknown revision` on six modules, was handed the
+# private-module hint, and reported to the developer that their GitLab
+# credentials were missing. They were not — `go list -m -versions` on the same
+# machine answered in full. The run ended blocked on a diagnosis the tool had
+# supplied and the evidence contradicted.
+
+
+def test_a_version_that_does_not_exist_says_so_and_names_the_move() -> None:
+    fix, dead_end = commands._why_get_failed(
+        "go: gitlab.cept.gov.in/it-2.0-common/n-api-db@v1.0.32: invalid version: "
+        "unknown revision v1.0.32",
+        "gitlab.cept.gov.in/it-2.0-common/n-api-db",
+        "v1.0.32",
+    )
+    assert "not a published version" in fix
+    assert "`version` omitted" in fix
+    assert "Do not guess" in fix
+    assert dead_end, "the same call fails the same way every time it is asked"
+
+
+def test_the_version_miss_never_blames_the_credentials() -> None:
+    """The whole point. GOPRIVATE was correct; saying otherwise cost the run."""
+    fix, _ = commands._why_get_failed(
+        "go: unknown revision v1.1.5", "gitlab.cept.gov.in/it-2.0-common/n-api-log", "v1.1.5"
+    )
+    assert "GOPRIVATE" not in fix
+    assert "credential" not in fix
+
+
+def test_an_unreachable_host_still_gets_the_private_module_hint() -> None:
+    for said in (
+        "fatal: could not read Username for 'https://gitlab.cept.gov.in': "
+        "terminal prompts disabled",
+        "dial tcp 10.0.0.1:443: i/o timeout",
+        "x509: certificate signed by unknown authority",
+    ):
+        fix, dead_end = commands._why_get_failed(said, "gitlab.cept.gov.in/it-2.0-common/n-api-db", "")
+        assert "GOPRIVATE" in fix, said
+        assert not dead_end, "a host that is down now may be up next turn"
+
+
+def test_reachability_is_read_before_the_version(tmp_path: Path) -> None:
+    """A credential failure mentioning a version must not be called a bad tag."""
+    fix, _ = commands._why_get_failed(
+        "go: n-api-db@v0.0.1: unknown revision v0.0.1\n"
+        "\tfatal: could not read Username for 'https://gitlab.cept.gov.in'",
+        "gitlab.cept.gov.in/it-2.0-common/n-api-db",
+        "v0.0.1",
+    )
+    assert "GOPRIVATE" in fix
+
+
+def test_an_unrecognised_failure_points_at_the_output(tmp_path: Path) -> None:
+    fix, dead_end = commands._why_get_failed("go: some new thing went wrong", "x/y", "v1")
+    assert "output above" in fix
+    assert not dead_end, "an unclassified failure is not known to be permanent"
+
+
+def test_the_dead_end_reaches_the_tool_result(workspace) -> None:
+    """Through `_result`, so the loop's ledger can answer the repeat."""
+    done = commands.Completed(
+        argv=["go", "get", "x@v9"],
+        code=1,
+        output="go: x@v9: invalid version: unknown revision v9",
+        seconds=0.1,
+    )
+    fix, dead_end = commands._why_get_failed(done.output, "x", "v9")
+    out = commands._result(done, what="go get x@v9", fix_on_fail=fix, meta={"dead_end": dead_end})
+    assert not out.ok
+    assert out.meta.get("dead_end")
+    assert "GOPRIVATE" not in out.for_model()
+
+
+def test_a_timeout_keeps_the_private_module_hint(workspace) -> None:
+    """That one is right where it is: a first fetch from gitlab is what hangs."""
+    done = commands.Completed(argv=["go", "get", "x"], code=1, output="", seconds=180, timed_out=True)
+    out = commands._result(done, what="go get x", fix_on_fail="ignored when it timed out")
+    assert "GOPRIVATE" in out.for_model()
+
+
+# ── the version tool reaches the phase that changes versions ────────────────
+
+
+def test_lib_version_check_is_offered_mid_migration_and_withheld_otherwise(
+    tmp_path: Path, planning_router
+) -> None:
+    """Its whole subject is the first phase of a conversion, and the phase that
+    works that conversion could not call it. Offering it outside one is what the
+    original restriction was right about: a library bump in the middle of
+    unrelated work turns a review into a regression hunt."""
+    loop = _migrating(tmp_path)
+    loop.router = planning_router
+    loop.state.mode = Mode.AGENT
+    assert "lib_version_check" in [t["function"]["name"] for t in loop._tools()]
+
+    ordinary = _loop(tmp_path)
+    ordinary.router = planning_router
+    ordinary.state.mode = Mode.AGENT
+    assert "lib_version_check" not in [t["function"]["name"] for t in ordinary._tools()]
+    # Withheld from the schema, not from the router, like `ask_developer`.
+    assert Mode.AGENT in registry.get("lib_version_check").modes
+
+
+def test_the_surveys_still_hold_it(tmp_path: Path) -> None:
+    spec = registry.get("lib_version_check")
+    assert {Mode.ASK, Mode.PLANNER} <= spec.modes
+
+
+def test_withholding_does_not_touch_the_other_acting_tools(
+    tmp_path: Path, planning_router
+) -> None:
+    """A set was introduced where there had been one name; the risk is that it
+    quietly takes something else with it."""
+    ordinary = _loop(tmp_path)
+    ordinary.router = planning_router
+    ordinary.state.mode = Mode.AGENT
+    offered = {t["function"]["name"] for t in ordinary._tools()}
+    assert {"write_file", "patch_file", "go_build", "go_mod", "finish"} <= offered
+
+
+# ── a question that was answered is not asked again ─────────────────────────
+#
+# `ask_developer` is exempt from all three intercept ledgers, because a repeated
+# *terminal* call is a signal rather than a question — a model trying to stop,
+# which `_phase_ended`'s bounded refusals answer. That is right for `finish`, and
+# it left `ask_developer` as the one call in the system that could repeat
+# verbatim forever with nothing counting it.
+#
+# A field run asked "which n-api-* versions should I use?", was told "use latest
+# versions", and asked the identical question twice more. Each answer ended one
+# run and started another that re-derived the same question from the same
+# unchanged cursor; nothing anywhere recorded that it had been settled.
+
+
+def _ask(*questions: str) -> ToolResult:
+    return ToolResult.success(
+        "\n".join(questions), meta={"control": "ask", "questions": list(questions)}
+    )
+
+
+def test_the_first_asking_goes_through(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path)
+    list(loop._phase_ended("ask_developer", _ask("which versions?")))
+
+    assert loop.result is not None, "the run ends with the question on screen"
+    assert loop.state.asked, "the question was not recorded"
+    assert loop.state.reasks == 0
+
+
+def test_the_same_question_after_an_answer_is_sent_back(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path)
+    list(loop._phase_ended("ask_developer", _ask("which versions?")))
+    loop.state.answered = "use latest versions"
+    loop.result = None
+
+    list(loop._phase_ended("ask_developer", _ask("which versions?")))
+
+    assert loop.result is None, "the run was ended on a question already answered"
+    said = [m.content or "" for m in loop.context.build() if m.role.value == "user"]
+    back = [m for m in said if "already asked that" in m]
+    assert back, "the model was not told it had been answered"
+    assert "use latest versions" in back[0], "the answer was not handed back"
+    assert "blocked" in back[0], "the exit from an unanswerable step is not named"
+
+
+def test_the_repeat_is_recognised_through_rewording(tmp_path: Path) -> None:
+    """A model re-asking rarely reproduces its own formatting."""
+    loop = _migrating(tmp_path)
+    list(loop._phase_ended("ask_developer", _ask("Which versions?", "And the branch?")))
+    loop.state.answered = "latest, and cut from main"
+    loop.result = None
+
+    list(loop._phase_ended("ask_developer", _ask("and   the BRANCH?", "which versions?")))
+
+    assert loop.result is None, "order and case are not what makes a question different"
+
+
+def test_a_different_question_is_put_to_the_developer(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path)
+    list(loop._phase_ended("ask_developer", _ask("which versions?")))
+    loop.state.answered = "use latest versions"
+    loop.result = None
+
+    list(loop._phase_ended("ask_developer", _ask("which branch should I cut from?")))
+
+    assert loop.result is not None, "a genuinely new question must reach the developer"
+
+
+def test_the_second_asking_is_believed(tmp_path: Path) -> None:
+    """Bounded at one, like every other refusal here: the model may be asking
+    something the answer genuinely did not cover."""
+    loop = _migrating(tmp_path)
+    list(loop._phase_ended("ask_developer", _ask("which versions?")))
+    loop.state.answered = "use latest versions"
+
+    loop.result = None
+    list(loop._phase_ended("ask_developer", _ask("which versions?")))
+    assert loop.result is None, "the first repeat is sent back"
+
+    loop.result = None
+    list(loop._phase_ended("ask_developer", _ask("which versions?")))
+    assert loop.result is not None, "the second repeat is put to the developer"
+
+
+def test_asking_something_new_clears_the_previous_answer(tmp_path: Path) -> None:
+    """What is outstanding is *this* question, and the old answer is not a reply
+    to it."""
+    loop = _migrating(tmp_path)
+    loop.state.answered = "use latest versions"
+    list(loop._phase_ended("ask_developer", _ask("which branch?")))
+    assert loop.state.answered == ""
+
+
+def test_the_ledger_survives_a_developer_message(tmp_path: Path) -> None:
+    """A question settled on message two is settled on message five."""
+    first = _migrating(tmp_path)
+    list(first._phase_ended("ask_developer", _ask("which versions?")))
+    first.state.answered = "use latest versions"
+
+    second = _migrating(tmp_path)
+    second.carry_from(first)
+
+    assert second.state.asked == first.state.asked
+    assert second.state.answered == "use latest versions"
+
+
+# ── a step that cannot be done ──────────────────────────────────────────────
+#
+# The status the plan did not have. A step whose premise is false stayed
+# `pending`, `active_step` returned it every turn for the rest of the run, and
+# `_plan_block` re-rendered it into the recency slot as an instruction the model
+# could not carry out. Three field loops have exactly that shape. `skipped` was
+# the only word the model could reach for and it means "unnecessary", which a
+# blocked step is not.
+
+
+def test_a_blocked_step_lets_the_cursor_move(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap the deps", "go build", status="blocked", note="versions unknown"),
+        PlanStep("main.go", "rewire it", "go build"),
+    )
+    index, step = loop.active_step
+    assert (index, step.file) == (2, "main.go"), "the cursor stayed on a step nothing can finish"
+
+
+def test_a_blocked_step_is_not_open_and_not_done(tmp_path: Path) -> None:
+    step = PlanStep("go.mod", "swap", "go build", status="blocked", note="why")
+    assert not step.open, "an open blocked step keeps the cursor frozen"
+    assert step.status != "done", "blocked must not read as finished"
+
+
+def test_a_blocked_step_does_not_refuse_the_finish(tmp_path: Path) -> None:
+    """Refusing over it would rebuild the permanently-unsatisfiable condition
+    the status exists to remove."""
+    loop = _loop(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap", "go build", status="blocked", note="versions unknown"),
+    )
+    assert loop._why_not_done() == ""
+
+
+def test_a_blocked_step_is_reported_with_its_reason(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap", "go build", status="blocked", note="versions unknown"),
+    )
+    said = loop._unfinished()
+    assert "go.mod" in said and "versions unknown" in said
+    assert "Blocked" in said
+
+
+def test_a_blocked_step_is_not_also_reported_as_never_written(tmp_path: Path) -> None:
+    """Two objections about one step read as two problems."""
+    loop = _loop(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap", "go build", status="blocked", note="why"),
+    )
+    assert loop._unwritten_targets() == []
+
+
+def test_a_blocked_step_closes_its_phase(tmp_path: Path) -> None:
+    """Otherwise one unreachable step holds the whole migration open, which is
+    the failure this status exists to end."""
+    loop = _migrating(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap", "go build", phase="deps", status="blocked", note="why"),
+    )
+    assert loop._close_phase() == "deps"
+
+
+def test_the_model_may_set_blocked_but_not_done() -> None:
+    assert "blocked" in MODEL_STATUSES
+    assert "done" not in MODEL_STATUSES
+    assert "written" not in MODEL_STATUSES
+
+
+def test_a_replan_that_renames_a_blocked_step_retries_it(tmp_path: Path) -> None:
+    """Re-stating the step *is* the retry."""
+    loop = _loop(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap", "go build", status="blocked", note="versions unknown"),
+    )
+    list(loop._adopt_plan((PlanStep("go.mod", "swap, with go get", "go build"),), ""))
+
+    assert [s.status for s in loop.state.plan] == ["pending"]
+
+
+def test_a_replan_that_omits_a_blocked_step_keeps_it(tmp_path: Path) -> None:
+    """Not a retraction — and the reason is what the developer needs."""
+    loop = _loop(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap", "go build", status="blocked", note="versions unknown"),
+    )
+    list(loop._adopt_plan((PlanStep("main.go", "rewire", "go build"),), ""))
+
+    by_file = {s.file: s for s in loop.state.plan}
+    assert by_file["go.mod"].status == "blocked"
+    assert by_file["go.mod"].note == "versions unknown"
+
+
+def test_the_block_shows_what_the_cursor_moved_past(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "swap", "go build", status="blocked", note="why"),
+        PlanStep("main.go", "rewire", "go build"),
+    )
+    assert any("Blocked: 1 go.mod" in line for line in loop._plan_block())
+
+
+# ── the cursor names the exit before the budget runs out ────────────────────
+
+
+def test_a_stuck_cursor_eventually_names_the_exit(tmp_path: Path) -> None:
+    """Everything else the block says is a restatement of an order the model has
+    already failed to carry out, and a restated order is what it loops on."""
+    loop = _loop(tmp_path)
+    step = PlanStep("go.mod", "swap the deps", "go build")
+    loop.state.plan = (step,)
+
+    loop.context._turn = 1
+    loop._cursor_age(step)
+    loop.context._turn = 1 + STUCK_TURNS
+    line = loop._cursor_age(step)
+
+    assert "revise_plan" in line
+    assert "`blocked`" in line
+    assert "not giving up" in line
+
+
+def test_an_ordinary_step_never_sees_that_line(tmp_path: Path) -> None:
+    """Read the file, plan the edit, make it — three turns, and nothing is wrong."""
+    loop = _loop(tmp_path)
+    step = PlanStep("go.mod", "swap the deps", "go build")
+    loop.state.plan = (step,)
+
+    loop.context._turn = 1
+    loop._cursor_age(step)
+    loop.context._turn = 3
+    assert "revise_plan" not in loop._cursor_age(step)
+
+
+# ── a phase that writes nothing is still a phase ────────────────────────────
+#
+# The migration's first phase cuts a branch. `git_ops` does that, and cutting a
+# branch touches no file, so `router.mutations` stays 0 — and `_verify` returned
+# on "nothing was changed, so there was nothing to verify" *before* reaching
+# `_phase_checkpoint`, which is the only caller of `_close_phase`.
+#
+# So the branch phase could never close, from any mode. A field session ran to
+# turn 30 with `Phase(name='branch', status='pending')` while the branch existed
+# and two `finish` calls had said the phase was complete; the state block told
+# the model "Migration: phase 1 of 7 — branch" in the recency slot on every
+# turn, and it re-derived "the branch phase is done" in prose each time — twice
+# byte-identically, at twenty-five seconds a turn.
+
+
+def _branching(tmp_path: Path) -> AgentLoop:
+    """A migration on its branch phase, with the branch already cut."""
+    loop = _migrating(tmp_path, phase="branch")
+    loop.state.migration.branch = "migrate-to-n-api-template"
+    loop.state.migration.base = "main"
+    loop._relay = lambda event: None
+    return loop
+
+
+def test_a_phase_that_wrote_nothing_still_reaches_the_checkpoint(tmp_path: Path) -> None:
+    loop = _branching(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "Cut the migration branch from main.", "the branch exists",
+                 phase="branch", status="skipped"),
+    )
+    assert loop.router.mutations == 0, "the premise: a branch cut writes no file"
+
+    list(loop._verify())
+
+    assert loop.state.migration.phase_named("branch").status == "done"
+
+
+def test_the_zero_mutation_report_is_unchanged_outside_a_migration(tmp_path: Path) -> None:
+    """The check moved above that one; it must not have replaced it."""
+    loop = _loop(tmp_path)
+    loop._relay = lambda event: None
+    list(loop._verify())
+
+    assert loop.result is not None
+    assert "nothing was changed" in loop.result.summary
+
+
+def test_a_finish_from_the_planner_closes_the_phase(tmp_path: Path) -> None:
+    """A migration phase can finish in PLANNER — a branch cut needs no write, so
+    its plan settles without the run ever entering AGENT. That `finish` used to
+    end the run DONE while touching no phase state at all."""
+    loop = _branching(tmp_path)
+    loop.state.mode = Mode.PLANNER
+    loop.state.plan = (
+        PlanStep("go.mod", "Cut the migration branch.", "it exists",
+                 phase="branch", status="skipped"),
+    )
+
+    list(loop._phase_ended("finish", ToolResult.success(
+        "done", meta={"answer": "Phase 1 (branch) is complete.", "blocked": ""}
+    )))
+
+    assert loop.state.migration.phase_named("branch").status == "done"
+
+
+def test_a_finish_from_ask_closes_nothing(tmp_path: Path) -> None:
+    """A question asked mid-migration is still a question."""
+    loop = _branching(tmp_path)
+    loop.state.mode = Mode.ASK
+    loop.state.plan = (
+        PlanStep("go.mod", "Cut the branch.", "it exists", phase="branch", status="skipped"),
+    )
+
+    list(loop._phase_ended("finish", ToolResult.success(
+        "answered", meta={"answer": "the branch is migrate-to-n-api-template", "blocked": ""}
+    )))
+
+    assert loop.state.migration.phase_named("branch").status == "pending"
+
+
+# ── a phase closes on its own evidence ─────────────────────────────────────
+
+
+def test_the_branch_phase_is_evidenced_by_the_branch(tmp_path: Path) -> None:
+    state = MigrationState(active=True)
+    state.adopt(_phases())
+    assert not state.evidenced("branch"), "no branch cut yet"
+
+    state.branch = "migrate-to-n-api-template"
+    assert state.evidenced("branch")
+
+
+def test_a_shared_branch_is_not_evidence(tmp_path: Path) -> None:
+    """Standing on `main` is not having cut a migration branch."""
+    state = MigrationState(active=True)
+    state.adopt(_phases())
+    for shared in ("main", "development", "Master"):
+        state.branch = shared
+        assert not state.evidenced("branch"), shared
+
+
+def test_no_other_phase_is_evidenced_by_a_branch(tmp_path: Path) -> None:
+    state = MigrationState(active=True)
+    state.adopt(_phases())
+    state.branch = "migrate-to-n-api-template"
+    assert not state.evidenced("deps")
+    assert not state.evidenced("handlers")
+
+
+def test_an_open_step_does_not_hold_the_branch_phase_once_it_is_cut(tmp_path: Path) -> None:
+    """The steps are the weakest possible signal here: a branch cut writes no
+    file for a step to land on."""
+    loop = _branching(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "Cut the branch.", "it exists", phase="branch"),
+    )
+    assert loop._close_phase() == "branch"
+
+
+def test_an_open_step_still_holds_a_phase_with_no_evidence(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path, phase="deps")
+    loop.state.migration.branch = "migrate-to-n-api-template"
+    loop.state.plan = (PlanStep("go.mod", "swap the deps", "go build", phase="deps"),)
+    assert loop._close_phase() == ""
+
+
+# ── an import swap is not a conversion ─────────────────────────────────────
+#
+# The size rule refuses one step on a file over BIG_FILE lines, and every word
+# of its reasoning is about conversion. A dependency phase is not conversion:
+# "replace the api-log import with n-api-log" in a 4,064-line repository file is
+# one patch_file with a one-line anchor. A field session was refused on exactly
+# that, answered correctly — "phase 2 is about dependencies, not handler
+# conversion" — resubmitted the identical plan, and was refused again, spending
+# both of MAX_PLAN_OBJECTIONS on an objection it could not satisfy.
+
+
+def _sized(**sizes: int):
+    return lambda path: sizes.get(path, 0)
+
+
+def test_an_import_swap_on_a_big_file_is_allowed() -> None:
+    steps = (
+        PlanStep("repo/postgres/paogen.go", "Replace api-log imports with n-api-log",
+                 "go build", phase="deps"),
+    )
+    said = plan_objection(
+        MigrationState(active=True, phases=_phases()), _phases(), steps,
+        lines=_sized(**{"repo/postgres/paogen.go": 4065}),
+    )
+    assert said == "", said
+
+
+def test_a_conversion_step_on_a_big_file_is_still_refused() -> None:
+    steps = (
+        PlanStep("repo/postgres/paogen.go", "Convert every method to dblib.Psql",
+                 "go build", phase="deps"),
+    )
+    said = plan_objection(
+        MigrationState(active=True, phases=_phases()), _phases(), steps,
+        lines=_sized(**{"repo/postgres/paogen.go": 4065}),
+    )
+    assert "4,065 lines" in said and "Split it" in said
+
+
+def test_one_conversion_step_among_import_swaps_is_still_refused() -> None:
+    """A file is exempt only if every step on it is a bounded edit."""
+    steps = (
+        PlanStep("repo/postgres/paogen.go", "Replace api-log imports with n-api-log",
+                 "go build", phase="deps"),
+        PlanStep("handler/paogen.go", "Rewrite the handlers for serverRoute.Context",
+                 "go build", phase="deps"),
+    )
+    said = plan_objection(
+        MigrationState(active=True, phases=_phases()), _phases(), steps,
+        lines=_sized(**{"repo/postgres/paogen.go": 4065, "handler/paogen.go": 6572}),
+    )
+    assert "handler/paogen.go" in said
+    assert "repo/postgres/paogen.go" not in said
+
+
+def test_a_small_file_is_unaffected_either_way() -> None:
+    steps = (PlanStep("main.go", "Rewrite the bootstrap", "go build", phase="deps"),)
+    said = plan_objection(
+        MigrationState(active=True, phases=_phases()), _phases(), steps,
+        lines=_sized(**{"main.go": 53}),
+    )
+    assert said == ""
+
+
+def test_the_next_message_plans_the_next_phase_not_the_closed_one(tmp_path: Path) -> None:
+    """Why no separate fix was needed for "open in AGENT when the phase settles".
+
+    That was on the fix list, and closing the phase subsumes it. Once the branch
+    phase is `done` the plan belongs to a *finished* phase, so PLANNER is the
+    correct mode for the follow-up — it has the next phase to plan — and the
+    state block names that phase rather than the one the developer already
+    watched complete. Routing to AGENT here would hand the acting phase a plan
+    with nothing open in it.
+    """
+    loop = _branching(tmp_path)
+    loop.state.plan = (
+        PlanStep("go.mod", "Cut the branch.", "it exists", phase="branch", status="skipped"),
+    )
+    list(loop._verify())
+    assert loop.state.migration.phase_named("branch").status == "done"
+
+    # The follow-up. No open steps, so `_work_in_flight` is False and the run
+    # opens in PLANNER — which is right, because the next phase needs a plan.
+    assert not loop._work_in_flight()
+    assert loop._opening_mode(Intent.AGENT, continued=True) is Mode.PLANNER
+    # And the roadmap has moved, which is the whole of the fix: the model is no
+    # longer told it is on a phase it has twice reported finishing.
+    assert loop.state.migration.current[1].name == "deps"
+    assert any("deps" in line for line in loop.state.migration.block(""))

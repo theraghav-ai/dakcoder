@@ -269,6 +269,8 @@ _OWNER: dict[str, str] = {
     "routes_before": "task",
     "migration": "task",
     "awaiting": "task",
+    "asked": "task",
+    "answered": "task",
     # What has been asked and answered. Invalidated as a unit.
     "seen_calls": "calls",
     "mutations_seen": "calls",
@@ -304,6 +306,7 @@ _OWNER: dict[str, str] = {
     "finish_refused": "progress",
     "preamble_refused": "progress",
     "plan_objections": "progress",
+    "reasks": "progress",
     "degenerate_refused": "progress",
     "replans": "progress",
     "revisions": "progress",
@@ -779,6 +782,35 @@ MAX_FINISH_REFUSALS = 1
 #: by the registry's own rule, so this needs no vocabulary of its own.
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
 
+#: How many times a question already answered is sent back before it is simply
+#: put to the developer again.
+#:
+#: One, like the other refusals here, and for their reason: the model may be
+#: asking something the previous answer genuinely did not cover, and it is
+#: entitled to say so and be believed. What it is not entitled to is asking the
+#: *same* question, word for word, at a developer who has already answered it --
+#: which a field run did three times across five turns.
+MAX_REASKS = 1
+
+#: Turns on one plan step, with nothing written to it, before the cursor block
+#: names ``blocked`` as the likely answer.
+#:
+#: Four. Long enough that an ordinary step -- read the file, plan the edit, make
+#: it -- never sees the line, and short enough to arrive while there is budget
+#: left to act on it. The loops this is for ran twenty turns and more.
+STUCK_TURNS = 4
+
+
+def _asked_fingerprint(questions: Sequence[Any]) -> str:
+    """A stable key for a set of questions, so a repeat is recognisable.
+
+    Order-insensitive and whitespace-insensitive, because neither changes what
+    is being asked, and a model re-asking rarely reproduces its own formatting.
+    """
+    cleaned = sorted(" ".join(str(q).lower().split()) for q in questions if str(q).strip())
+    return hashlib.sha256("\n".join(cleaned).encode("utf-8")).hexdigest()[:16]
+
+
 #: Control tools, which an ``accepts`` criterion would never legitimately name.
 #:
 #: Excluded from the check below so that a step checked by "submit_plan" -- which
@@ -1052,6 +1084,12 @@ class AgentLoop:
         if decided is Intent.AUTO and start is not None:
             decided, source = Intent.coerce(start), "start"
         awaiting, self.state.awaiting = self.state.awaiting, Intent.AUTO
+        if continued and awaiting is not Intent.AUTO:
+            # This message answers the question the previous run stopped on, and
+            # that is a fact rather than a guess -- `awaiting` is set only by
+            # `ask_developer`. Held so the *next* asking of the same question
+            # can be answered from here instead of from the developer.
+            self.state.answered = task
         if decided is Intent.AUTO and continued and awaiting is not Intent.AUTO:
             decided, source = awaiting, "answer"
         if decided is Intent.AUTO and continued and self._work_in_flight():
@@ -1885,8 +1923,17 @@ class AgentLoop:
         # what it may run. Making this conditional on the schema side keeps
         # ordinary acting turns exactly as they were, while a replayed stale
         # schema list still dispatches correctly instead of being refused.
+        #
+        # `lib_version_check` is withheld on the same condition and for the
+        # mirror of the same reason. Outside a conversion, a version tool in the
+        # phase that edits invites a library bump in the middle of unrelated
+        # work; inside one, the first phase *is* the bump, and a run that cannot
+        # ask what version a library is at guesses — a field run carried the
+        # superseded module's version across the rename and lost thirty-eight
+        # turns to six revisions that had never existed.
         if self.state.mode is Mode.AGENT and not self.state.migration.active:
-            tools = [t for t in tools if t["function"]["name"] != "ask_developer"]
+            withheld = {"ask_developer", "lib_version_check"}
+            tools = [t for t in tools if t["function"]["name"] not in withheld]
         return tools
 
     def _migration_guard(self, call: ToolCall) -> ToolResult | None:
@@ -3201,11 +3248,55 @@ class AgentLoop:
         prose used to mean there and is the thing this model can reliably say.
         """
         if tool == "ask_developer":
+            fingerprint = _asked_fingerprint(outcome.meta.get("questions") or ())
+            if (
+                fingerprint in self.state.asked
+                and self.state.answered
+                and self.state.reasks < MAX_REASKS
+            ):
+                # Sent back with the answer, rather than put to the developer a
+                # second time.
+                #
+                # `ask_developer` is exempt from all three intercept ledgers --
+                # a repeated terminal call is a model trying to stop, and the
+                # bounded refusals here are what answer it -- so this was the
+                # one call in the system that could repeat verbatim forever with
+                # nothing counting it. A field run asked which n-api-* versions
+                # to use, was told "use latest versions", and asked the
+                # identical question twice more, each answer ending one run and
+                # starting another that re-derived the same question from the
+                # same unchanged cursor.
+                #
+                # Bounded at one, like every other refusal here: the model may
+                # be asking something the answer genuinely did not cover, and
+                # the second asking is believed.
+                self.state.reasks += 1
+                self.context.append_user(
+                    "You have already asked that, and it was answered:\n\n"
+                    f"    {self.state.answered.strip()}\n\n"
+                    "Act on that answer. Asking again puts the same question to "
+                    "the developer a second time and moves nothing.\n\n"
+                    "If it genuinely does not settle the step, say which part of "
+                    "it does not and what you will do instead -- and if the step "
+                    "cannot be done at all, `revise_plan` it to `blocked` with "
+                    "the reason, which moves the plan past it rather than "
+                    "stopping the run."
+                )
+                return
+
             # Held for the answer. This is the only follow-up whose intent the
             # loop knows rather than guesses, and it is the one the classifier
             # was measured getting wrong: a Planner's four questions about a
             # migration came back answered and were read as "asking for
             # validation, not code changes".
+            #
+            # Recorded before the run ends, so the next one can tell a fresh
+            # question from a repeat. The answer is cleared with it: what is
+            # outstanding now is *this* question, and the previous answer is not
+            # a reply to it.
+            self.state.asked.append(fingerprint)
+            del self.state.asked[:-STATE_ITEMS]
+            self.state.answered = ""
             self.state.awaiting = self.state.intent
             self.result = RunResult(
                 Outcome.DONE,
@@ -3326,9 +3417,24 @@ class AgentLoop:
             # inside a tool result would be an answer nobody was shown.
             if answer:
                 yield Event(EventType.ASSISTANT, {"text": answer})
-            if self.state.mode is Mode.AGENT:
+            if self.state.mode is Mode.AGENT or (
+                self.state.mode is Mode.PLANNER and self.state.migration.active
+            ):
                 # The acting mode saying it is done is the gate's cue, exactly as
                 # a tool-free turn was. The gate still cannot be skipped.
+                #
+                # And the *planner* saying it during a migration is the same cue,
+                # because a migration phase can finish there. A phase whose work
+                # is a branch cut writes nothing, so its plan settles without the
+                # run ever entering AGENT -- and a `finish` from PLANNER used to
+                # end the run `DONE` while touching no phase state at all. A
+                # field session called it twice, both times with the answer
+                # "Phase 1 (branch) is complete", and the roadmap said `branch:
+                # pending` afterwards both times. The run reported success and
+                # the machine did not move.
+                #
+                # PLANNER and not ASK: a question asked mid-migration is still a
+                # question, and ending it should not close anybody's phase.
                 yield from self._verify()
                 return
             # Answered -- and, if the session had committed work it did not
@@ -3566,6 +3672,27 @@ class AgentLoop:
         cannot produce a different verdict -- it can only spend another build,
         vet and swagger_check arriving at the report already in context.
         """
+        # A migration reports at its phase boundary whether or not anything was
+        # written, and this check is **above** the zero-mutation one for a
+        # reason that cost a field session its whole first phase.
+        #
+        # The migration's first phase cuts a branch. `git_ops` does that, and
+        # cutting a branch touches no file, so `router.mutations` is 0 -- which
+        # sent every branch phase down the "nothing was changed, so there was
+        # nothing to verify" path below and returned before `_phase_checkpoint`
+        # could run. `_close_phase` is reachable from nowhere else, so the
+        # phase could never close: the roadmap stayed at "phase 1 of 7 —
+        # branch" for the rest of the session, the state block said so in the
+        # recency slot on every turn, and the model re-derived "the branch
+        # phase is done" in prose each time, twice byte-identically, at
+        # twenty-five seconds a turn.
+        #
+        # A phase that legitimately writes nothing is not an unstarted run. It
+        # is a finished phase, and `_phase_checkpoint` is the thing that says so.
+        if self.state.migration.defers_gate:
+            yield from self._phase_checkpoint()
+            return
+
         if self.router.mutations == 0:
             # A run that wrote nothing cannot fail the gate -- but "nothing was
             # changed" and "nothing needed changing" are different claims, and
@@ -3609,9 +3736,11 @@ class AgentLoop:
         # what is next, and the run stops there. The gate runs when the last
         # phase closes, and `defers_gate` is false from that moment -- a
         # deferral that outlived the migration would be an exemption.
-        if self.state.migration.defers_gate:
-            yield from self._phase_checkpoint()
-            return
+        #
+        # The check itself is now made at the top of this method, before the
+        # zero-mutation return, because a phase that writes nothing is still a
+        # phase. What is left here is the reasoning, which belongs with the
+        # gate it is about.
 
         key = (self.router.model_mutations, tuple(self.router.touched))
         if self.state.last_gate is not None and key == self.state.gate_key:
@@ -3759,7 +3888,11 @@ class AgentLoop:
         key = phase.name.strip().lower()
         scoped = [s for s in self.state.plan if s.phase.strip().lower() == key]
         steps = scoped or list(self.state.plan)
-        if any(step.open for step in steps):
+        # Evidence first, because it is the stronger witness. A branch phase is
+        # finished when the branch exists, whatever its steps say -- and its
+        # steps are the weakest possible signal, since cutting a branch writes
+        # no file for a step to land on. See `MigrationState.evidenced`.
+        if any(step.open for step in steps) and not migration.evidenced(phase.name):
             return ""
         if not migration.close(phase.name):
             return ""
@@ -4148,6 +4281,12 @@ class AgentLoop:
         # built per message: without this it is set and thrown away in the same
         # breath, and the answer to `ask_developer` is classified from scratch.
         self.state.awaiting = previous.state.awaiting
+        # And what has already been asked and answered. A question settled on
+        # message two is settled on message five, and a ledger rebuilt per
+        # message cannot tell a second asking from a first -- which is how the
+        # same question reached the developer three times.
+        self.state.asked = list(previous.state.asked)
+        self.state.answered = previous.state.answered
         # Carried with the plan it is about. A forced plan that survived into a
         # follow-up message is still a forced plan, and the follow-up is where
         # it does the most damage: `finish_refused` starts at 0 in a fresh
@@ -4264,8 +4403,30 @@ class AgentLoop:
         version matched path-shaped tokens in numbered paragraphs, which reported
         a neighbour named as an example as an unwritten target.
         """
-        missing = self._unwritten_targets()
-        return ". The plan named files this run never wrote: " + ", ".join(missing) if missing else ""
+        parts: list[str] = []
+        if missing := self._unwritten_targets():
+            parts.append("The plan named files this run never wrote: " + ", ".join(missing))
+        # Blocked steps are named separately, and they are not the same finding.
+        # "Never written" is a gap; "blocked" is a decision the model made and
+        # gave a reason for, and the developer needs the reason -- it is usually
+        # the thing they have to resolve before the next run can get further.
+        if stuck := self._blocked_steps():
+            parts.append(
+                "Blocked, with the reason given: "
+                + "; ".join(f"{s.file} ({s.note or 'no reason given'})" for s in stuck)
+            )
+        return ". " + ". ".join(parts) if parts else ""
+
+    def _blocked_steps(self) -> list[PlanStep]:
+        """Steps the model declared it cannot do, newest plan first.
+
+        Not an objection. `_why_not_done` deliberately does not read this: a
+        blocked step is the model exercising the exit this plan was missing, and
+        refusing a `finish` over it would rebuild the permanently-unsatisfiable
+        condition the whole status exists to remove. It is reported, not argued
+        with.
+        """
+        return [s for s in self.state.plan if s.status == "blocked"][:STATE_ITEMS]
 
     def _normalise_plan(self, steps: Sequence[PlanStep]) -> tuple[PlanStep, ...]:
         """Put every plan path into the form the change set is recorded in.
@@ -4604,6 +4765,11 @@ class AgentLoop:
             for i, s in enumerate(plan, 1)
             if s.status in ("done", "skipped")
         ]
+        # Named rather than folded into "done", because the cursor has moved
+        # past them and the model has to be able to tell why. A blocked step
+        # that read as finished would invite the run to report the work as
+        # complete; one that read as pending would put the cursor back on it.
+        stuck = [f"{i} {s.file}" for i, s in enumerate(plan, 1) if s.status == "blocked"]
         active = self.active_step
 
         lines: list[str] = []
@@ -4628,6 +4794,8 @@ class AgentLoop:
                 lines.append(f"Plan: all {len(plan)} step(s) settled.")
             if settled:
                 lines.append("  Done: " + ", ".join(settled[-STATE_ITEMS:]))
+            if stuck:
+                lines.append("  Blocked: " + ", ".join(stuck[-STATE_ITEMS:]))
             blocked = [f"{i} {s.file}" for i, s in enumerate(plan, 1) if s.status == "failed"]
             if blocked:
                 lines.append("  Failed: " + ", ".join(blocked[-STATE_ITEMS:]))
@@ -4649,6 +4817,8 @@ class AgentLoop:
             lines.append(f"  {elapsed}")
         if settled:
             lines.append("  Done: " + ", ".join(settled[-STATE_ITEMS:]))
+        if stuck:
+            lines.append("  Blocked: " + ", ".join(stuck[-STATE_ITEMS:]))
         nxt = next(
             (
                 f"step {i} — {s.file}"
@@ -4691,16 +4861,37 @@ class AgentLoop:
         if turns < 1:
             return ""
         landed = any(step.covers(path) for path in self.router.touched)
-        return (
-            f"On this step since turn {since} — {turns} turn(s) so far, and "
-            + (
+        if landed:
+            return (
+                f"On this step since turn {since} — {turns} turn(s) so far, and "
                 f"{step.file} has been written. What is outstanding is its "
                 "verification, not more of the work."
-                if landed
-                else f"nothing has been written to {step.file} yet. "
-                "Reading more is not what closes it."
             )
+        line = (
+            f"On this step since turn {since} — {turns} turn(s) so far, and "
+            f"nothing has been written to {step.file} yet. "
+            "Reading more is not what closes it."
         )
+        if turns >= STUCK_TURNS:
+            # The exit, named, at the point it becomes the likely answer.
+            #
+            # Everything else this block says is a restatement of the order the
+            # model has already failed to carry out, and a restated order is
+            # what it has been looping on. Three field loops ran to the turn cap
+            # with a cursor frozen on one step; in all three the step's premise
+            # was false and the model had no word for that. `skipped` was the
+            # only status it could set and it means "unnecessary", which this is
+            # not -- so it kept trying, and every guard in the loop could only
+            # tell it "not that".
+            line += (
+                f" {turns} turns on one step usually means the step cannot be done "
+                "as written. If that is what has happened, call `revise_plan` and "
+                "set this step's status to `blocked` with the reason in `note` — "
+                "the plan moves past it, the run carries on, and the developer is "
+                "told what stopped it. That is not giving up; it is the difference "
+                "between a run that reports a blocker and one that runs out of turns."
+            )
+        return line
 
     def _settle_written(self) -> None:
         """A clean full gate settles every step still sitting at ``written``.
@@ -5055,7 +5246,14 @@ class AgentLoop:
         are history, and dropping them would make the same claim the old rule
         made: that nothing happened.
         """
+        # Two sets, because ``blocked`` belongs to one of them and not the
+        # other. A re-plan that *names* a blocked step is the model deciding to
+        # try it again -- re-stating it is the retry -- so its status must not
+        # be carried onto the new step. A re-plan that does not mention it is
+        # not a retraction, and dropping it would lose the reason the developer
+        # needs.
         settled = {"done", "written", "skipped"}
+        history = settled | {"blocked"}
         incoming = {s.file for s in steps if s.file}
         prior = {s.file: s for s in self.state.plan if s.file and s.status in settled}
         merged = tuple(
@@ -5065,7 +5263,7 @@ class AgentLoop:
             for step in steps
         )
         kept = tuple(
-            s for s in self.state.plan if s.status in settled and s.file not in incoming
+            s for s in self.state.plan if s.status in history and s.file not in incoming
         )
         self.state.plan = kept + merged
         if summary:

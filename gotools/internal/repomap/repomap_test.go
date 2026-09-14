@@ -499,3 +499,91 @@ func stripDuration(s string) string {
 		s = s[:i] + s[j:]
 	}
 }
+
+// The planner is refused on a number, so the map has to report it.
+//
+// A migration plan is rejected when one step names a file over LargeFileLines,
+// and nothing the planner could cheaply call said how long a file was: this map
+// carried a file *count* per package, `read_file` reports "of 4,064" only after
+// you have paid for the read, and `git_blame` does not report it at all. A field
+// session spent a whole turn on `search_repo` plus three `git_blame` calls
+// against line 1 of three files, learned nothing, and resubmitted the same plan.
+func TestLargeListsTheFilesAPlanMustSplit(t *testing.T) {
+	root := mkws(t, map[string]string{
+		"handler/big.go":   "package handler\n" + strings.Repeat("// x\n", LargeFileLines+10),
+		"handler/small.go": "package handler\n\nfunc F() {}\n",
+	})
+	m := Build(load(t, root), Options{MaxTokens: -1})
+
+	if len(m.Large) != 1 {
+		t.Fatalf("Large = %v, want only the big file", m.Large)
+	}
+	if m.Large[0].Path != "handler/big.go" {
+		t.Fatalf("Large[0].Path = %q", m.Large[0].Path)
+	}
+	if m.Large[0].Lines <= LargeFileLines {
+		t.Fatalf("Large[0].Lines = %d, want > %d", m.Large[0].Lines, LargeFileLines)
+	}
+}
+
+func TestLargeIsEmptyWhenNothingNeedsSplitting(t *testing.T) {
+	root := mkws(t, map[string]string{"handler/user.go": "package handler\n\nfunc F() {}\n"})
+	if m := Build(load(t, root), Options{MaxTokens: -1}); len(m.Large) != 0 {
+		t.Fatalf("Large = %v, want none", m.Large)
+	}
+}
+
+// Longest first: the plan has to split the worst one.
+func TestLargeIsOrderedLongestFirst(t *testing.T) {
+	root := mkws(t, map[string]string{
+		"a/one.go": "package a\n" + strings.Repeat("// x\n", LargeFileLines+5),
+		"b/two.go": "package b\n" + strings.Repeat("// x\n", LargeFileLines+500),
+	})
+	m := Build(load(t, root), Options{MaxTokens: -1})
+
+	if len(m.Large) != 2 || m.Large[0].Path != "b/two.go" {
+		t.Fatalf("Large = %v, want b/two.go first", m.Large)
+	}
+}
+
+// Tests are excluded: the phase this informs does not convert them, and one
+// long table-driven test would crowd out the handlers that matter.
+func TestLargeSkipsTestFiles(t *testing.T) {
+	root := mkws(t, map[string]string{
+		"handler/user_test.go": "package handler\n" + strings.Repeat("// x\n", LargeFileLines+10),
+	})
+	if m := Build(load(t, root), Options{MaxTokens: -1}); len(m.Large) != 0 {
+		t.Fatalf("Large = %v, want tests excluded", m.Large)
+	}
+}
+
+// Scoped like buildPackages, so `repo_map package=handler` answers about that
+// directory rather than about the service.
+func TestLargeIsScopedByPackage(t *testing.T) {
+	root := mkws(t, map[string]string{
+		"handler/big.go": "package handler\n" + strings.Repeat("// x\n", LargeFileLines+10),
+		"repo/big.go":    "package repo\n" + strings.Repeat("// x\n", LargeFileLines+10),
+	})
+	m := Build(load(t, root), Options{Package: "handler", MaxTokens: -1})
+
+	if len(m.Large) != 1 || m.Large[0].Path != "handler/big.go" {
+		t.Fatalf("Large = %v, want only handler/big.go", m.Large)
+	}
+}
+
+// The number the field run could not find, on the corpus it could not find it in.
+func TestLargeFindsTheLegacyCorpusHandlers(t *testing.T) {
+	root := corpus(t, "pao-back-end-development")
+	m := Build(load(t, root), Options{MaxTokens: -1})
+
+	byPath := map[string]int{}
+	for _, f := range m.Large {
+		byPath[f.Path] = f.Lines
+	}
+	if n := byPath["repo/postgres/paogen.go"]; n < 4000 {
+		t.Fatalf("repo/postgres/paogen.go reported %d lines, want ~4,065", n)
+	}
+	if n := byPath["handler/paogen.go"]; n < 6000 {
+		t.Fatalf("handler/paogen.go reported %d lines, want ~6,572", n)
+	}
+}

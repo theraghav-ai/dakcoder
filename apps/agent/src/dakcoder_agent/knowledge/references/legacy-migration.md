@@ -172,6 +172,8 @@ go mod tidy
 
 `grpc-server` is only needed by services that expose gRPC or Connect-RPC; the rest of the list is unconditional.
 
+**Run those commands; do not hand-edit the versions into `go.mod`.** This step is `go_mod op=get` once per module with `version` omitted — not one `patch_file` over the require block. The two generations are separate release lines and their numbers have nothing to do with each other: `api-db` is at `v1.0.32` while `n-api-db` has never published past `v0.0.x`. A textual rename that keeps the version therefore writes six revisions that do not exist, and every `go get` and `go mod tidy` after it fails with `unknown revision` for all six at once — which reads exactly like a credentials problem and is not one. `lib_version_check` reports each replacement's current version if you want to see them before starting.
+
 **Critical dependency rules.** Use `n-api-bootstrapper`, never the legacy `api-bootstrapper`: the legacy one injects the old `*api-db.DB` type into Uber FX, which mismatches every repository expecting `*n-api-db.DB`. And pin `github.com/bufbuild/protovalidate-go` to `@v0.9.2` — other versions break interface compatibility with the generated protobuf validators.
 
 **The protobuf replace directive.** A service with generated protobufs that fails to compile on `undefined: File_buf_validate_expression_proto` or `undefined: File_buf_validate_validate_proto` is seeing a breaking change in the upstream generated-protobuf module, not a mistake in its own code. Pin it at the bottom of `go.mod` and re-tidy:

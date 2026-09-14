@@ -185,27 +185,70 @@ func libVersionHandler(defaultRoot string) mcp.ToolHandlerFor[AuditInput, LibVer
 		if err != nil {
 			return nil, LibVersionOutput{}, err
 		}
-		// One short budget for the whole report, not per module.
+		// One budget for the whole report, and a shorter one per module.
 		//
 		// The lookup shells out to `go list -m -versions`, which reaches the
-		// GitLab over the network. On a machine that cannot see it, each module
-		// burns its own timeout in turn — six modules at thirty seconds is three
-		// minutes of an agent turn spent on a tool whose answer is "reports
-		// only". Five seconds total is enough when the registry is reachable and
-		// short enough not to matter when it is not: the supersession half of
-		// the report needs no network and is still produced.
-		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		// GitLab over the network. The per-module timeout is what stops a
+		// machine that cannot see the host burning thirty seconds per module;
+		// the overall one bounds the report.
+		//
+		// The overall budget was 5s, the same as the per-lookup one, which meant
+		// the ceiling was reached by the *number* of modules rather than by any
+		// of them being slow. A service with nine CEPT requires needs nine
+		// lookups plus one per superseded replacement — fourteen in the field
+		// run that exposed this — and a measured 6.4s of work against a 5s
+		// ceiling left the rest cancelled and rendered as blank columns, with
+		// nothing in the output saying so. Twenty seconds is the cost of the
+		// tool answering completely, once per migration, against a turn spent on
+		// a report that was quietly missing most of its answer.
+		//
+		// The supersession half needs no network and is produced either way.
+		ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
 
 		res := libversion.Check(ctx, ws, libversion.GoListLister{Dir: ws.Root, Timeout: 5 * time.Second})
-		note := "Report only. Do not edit go.mod — tell the user what is available and let " +
-			"them decide. A library bump mid-review turns a review into a regression hunt."
-		if !res.Reachable {
-			note = "The package registry was not reachable, so only supersession is reported " +
-				"— the 'behind by N' half is missing. " + note
-		}
-		return nil, LibVersionOutput{Result: res, Summary: res.Summary(), Note: note}, nil
+		return nil, LibVersionOutput{Result: res, Summary: res.Summary(), Note: versionNote(res)}, nil
 	}
+}
+
+// versionNote says what this report is for and what it could not answer.
+//
+// Two things it has to get right, both learned from one field run.
+//
+// **What the reader may do with it.** The first sentence used to be "tell the
+// user what is available and let them decide", which is correct for a review
+// and reads as "stop" to the one caller that is supposed to act on it: the
+// acting phase of a migration, whose entire job that turn is to change these
+// versions. The review-time rule is kept and qualified rather than dropped.
+//
+// **Whether the report is complete.** The incompleteness warning was gated on
+// `!Reachable` — "did anything answer" — so one successful lookup withheld it
+// from a report that was thirteen lookups short. Four blank version columns
+// were rendered with nothing saying why, the caller read the blanks as "no
+// releases published", asked the developer which versions to use, was told "the
+// latest", and asked the identical question twice more.
+func versionNote(res *libversion.Result) string {
+	note := "Reports only; it does not edit go.mod. To act on it, run `go_mod " +
+		"op=get` per module with `version` omitted — the toolchain resolves " +
+		"the latest and writes go.mod itself. Never copy a version from the " +
+		"CURRENT column onto a superseded module: the two generations are " +
+		"separate release lines. Outside a migration, report the drift and " +
+		"let the developer decide — a library bump mid-review turns a review " +
+		"into a regression hunt."
+	switch {
+	case !res.Reachable:
+		return "The package registry was not reachable, so only supersession is " +
+			"reported — every version column is missing, not empty. " + note
+	case len(res.Unresolved) > 0:
+		return fmt.Sprintf(
+			"%d lookup(s) did not answer (%s), so their version columns are "+
+				"missing rather than empty — nothing here says those modules "+
+				"have no releases. You do not need the numbers: fetch with no "+
+				"version and the toolchain resolves them. ",
+			len(res.Unresolved), strings.Join(shortNames(res.Unresolved), ", "),
+		) + note
+	}
+	return note
 }
 
 // plural renders "3 things" / "1 thing" / "no things".
@@ -218,4 +261,14 @@ func plural(n int, noun string) string {
 	default:
 		return strconv.Itoa(n) + " " + noun + "s"
 	}
+}
+
+// shortNames trims the shared namespace off module paths so a warning naming
+// four of them still reads as one sentence.
+func shortNames(modules []string) []string {
+	out := make([]string, 0, len(modules))
+	for _, m := range modules {
+		out = append(out, strings.TrimPrefix(m, libversion.ModulePrefix))
+	}
+	return out
 }

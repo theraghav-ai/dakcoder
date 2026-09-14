@@ -13,7 +13,8 @@ import shutil
 import pytest
 
 from dakcoder_agent.modes import Mode
-from dakcoder_agent.tools.router import Router
+from dakcoder_agent.tools import fs, registry
+from dakcoder_agent.tools.router import Invocation, Router
 from dakcoder_shared.paths import Workspace
 
 #: The gofmt tests assert what the real formatter does to real bytes; without the
@@ -381,3 +382,141 @@ def test_an_append_records_a_modification_not_a_creation(
 
     fresh = run(router, "write_file", path="created.md", content="new\n", append=True)
     assert [m.kind for m in fresh.mutations] == [MutationKind.CREATE]
+
+
+def patch(workspace: Workspace, **args):
+    """`patch_file` without the router.
+
+    `go.mod` is an approval-gated path, so `router.dispatch` answers with an
+    `ApprovalRequest` rather than a result — and what these tests are about is
+    the handler's own refusal, which sits behind that.
+    """
+    return fs.patch_file(Invocation(registry.get("patch_file"), args, workspace))
+
+
+# ── go.mod: a version cannot ride across a rename ───────────────────────────
+#
+# A migration's first step is "replace the api-* dependencies with their n-api-*
+# equivalents", and the obvious way to carry it out is one `patch_file` over the
+# require block. That produces a patch with the same line count and the same
+# version strings, and the two library generations are entirely separate release
+# lines: `api-db` is at v1.0.32, `n-api-db`'s tags stop at v0.0.1. So the patch
+# applies cleanly, go.mod asserts six revisions that have never existed, and
+# every `go get` and `go mod tidy` after it fails with `unknown revision` for all
+# six at once. A field run spent thirty-eight turns there and reported the cause
+# to the developer as missing GitLab credentials.
+
+_GO_MOD = (
+    "module pisapi\r\n"
+    "\r\n"
+    "go 1.25.0\r\n"
+    "\r\n"
+    "require (\r\n"
+    "\tgitlab.cept.gov.in/it-2.0-common/api-db v1.0.32\r\n"
+    "\tgitlab.cept.gov.in/it-2.0-common/api-log v1.1.5\r\n"
+    "\tgithub.com/gin-gonic/gin v1.10.0\r\n"
+    ")\r\n"
+)
+
+
+def _with_go_mod(workspace: Workspace) -> None:
+    (workspace.root / "go.mod").write_text(_GO_MOD, encoding="utf-8", newline="")
+
+
+def test_a_rename_that_keeps_the_version_is_refused(workspace: Workspace) -> None:
+    _with_go_mod(workspace)
+    out = patch(
+        workspace,
+        path="go.mod",
+        old="gitlab.cept.gov.in/it-2.0-common/api-db v1.0.32",
+        new="gitlab.cept.gov.in/it-2.0-common/n-api-db v1.0.32",
+    )
+
+    assert not out.ok
+    assert "api-db" in out.content and "n-api-db" in out.content
+    assert "v1.0.32" in out.content
+    said = out.for_model()
+    assert "go_mod op=get" in said
+    assert "version` omitted" in said
+
+
+def test_the_refusal_leaves_go_mod_exactly_as_it_was(workspace: Workspace) -> None:
+    """A refused patch must not half-apply: the next tool reads this file."""
+    _with_go_mod(workspace)
+    patch(
+        workspace,
+        path="go.mod",
+        old="gitlab.cept.gov.in/it-2.0-common/api-db v1.0.32",
+        new="gitlab.cept.gov.in/it-2.0-common/n-api-db v1.0.32",
+    )
+    assert (workspace.root / "go.mod").read_bytes() == _GO_MOD.encode("utf-8")
+
+
+def test_the_refusal_is_a_dead_end_so_the_repeat_is_not_dispatched(workspace: Workspace) -> None:
+    """Deterministic: the same patch fails the same way every time it is asked."""
+    _with_go_mod(workspace)
+    out = patch(
+        workspace,
+        path="go.mod",
+        old="gitlab.cept.gov.in/it-2.0-common/api-log v1.1.5",
+        new="gitlab.cept.gov.in/it-2.0-common/n-api-log v1.1.5",
+    )
+    assert "dead_end" in out.meta
+
+
+def test_a_rename_with_the_replacement_version_is_allowed(workspace: Workspace) -> None:
+    """The correct move is not blocked. Only carrying the version is."""
+    _with_go_mod(workspace)
+    out = patch(
+        workspace,
+        path="go.mod",
+        old="gitlab.cept.gov.in/it-2.0-common/api-db v1.0.32",
+        new="gitlab.cept.gov.in/it-2.0-common/n-api-db v0.0.1",
+    )
+    assert out.ok, out.content
+    assert "n-api-db v0.0.1" in (workspace.root / "go.mod").read_text(encoding="utf-8")
+
+
+def test_an_ordinary_version_bump_is_allowed(workspace: Workspace) -> None:
+    _with_go_mod(workspace)
+    out = patch(
+        workspace,
+        path="go.mod",
+        old="api-log v1.1.5",
+        new="api-log v1.1.6",
+    )
+    assert out.ok, out.content
+
+
+def test_the_guard_is_go_mod_only(workspace: Workspace) -> None:
+    """Every other file may say whatever it likes about versions."""
+    (workspace.root / "notes.md").write_text(
+        "gitlab.cept.gov.in/it-2.0-common/api-db v1.0.32\n", encoding="utf-8"
+    )
+    out = patch(
+        workspace,
+        path="notes.md",
+        old="gitlab.cept.gov.in/it-2.0-common/api-db v1.0.32",
+        new="gitlab.cept.gov.in/it-2.0-common/n-api-db v1.0.32",
+    )
+    assert out.ok, out.content
+
+
+def test_every_carried_version_in_one_patch_is_counted(workspace: Workspace) -> None:
+    """The real patch swapped six at once; the refusal says so rather than
+    naming one and letting the model fix it six times."""
+    _with_go_mod(workspace)
+    out = patch(
+        workspace,
+        path="go.mod",
+        old=(
+            "\tgitlab.cept.gov.in/it-2.0-common/api-db v1.0.32\n"
+            "\tgitlab.cept.gov.in/it-2.0-common/api-log v1.1.5"
+        ),
+        new=(
+            "\tgitlab.cept.gov.in/it-2.0-common/n-api-db v1.0.32\n"
+            "\tgitlab.cept.gov.in/it-2.0-common/n-api-log v1.1.5"
+        ),
+    )
+    assert not out.ok
+    assert "1 more like it" in out.content

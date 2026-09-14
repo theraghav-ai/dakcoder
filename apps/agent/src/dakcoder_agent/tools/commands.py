@@ -294,7 +294,93 @@ def _join(*streams: str | bytes | None) -> str:
     return joined
 
 
-def _result(done: Completed, *, what: str, fix_on_fail: str = "") -> ToolResult:
+#: What a `go get` failure is, read off the toolchain's own words.
+#:
+#: One hint used to be attached to every failure -- "if this is a private
+#: module, GOPRIVATE and a git credential must be configured" -- whatever the
+#: toolchain actually said. A field run hit `unknown revision` on six modules,
+#: was handed the private-module hint, and reported to the developer that their
+#: GitLab credentials were missing. They were not: `go list -m -versions` on the
+#: same machine answered in full. The run ended blocked on a diagnosis the tool
+#: had supplied and the evidence contradicted.
+#:
+#: So the hint is read off the output. The two failures need opposite moves --
+#: one is "that version does not exist, drop it", the other is "this machine
+#: cannot reach the host" -- and handing the model the wrong one costs the task.
+_VERSION_MISS = (
+    "unknown revision",
+    "invalid version",
+    "no matching versions",
+    "unknown import path",
+    "does not contain package",
+)
+_CANNOT_REACH = (
+    "terminal prompts disabled",
+    "could not read username",
+    "could not read password",
+    "authentication required",
+    "dial tcp",
+    "i/o timeout",
+    "connection refused",
+    "no such host",
+    "certificate",
+    "x509",
+    "410 gone",
+    "proxy.golang.org",
+    "tls handshake",
+)
+
+
+def _why_get_failed(output: str, pkg: str, version: str) -> tuple[str, str]:
+    """The fix line for a failed ``go get``, and a dead-end reason if it is one.
+
+    The dead end is the half that saves turns. ``go get pkg@v1.0.32`` against a
+    module whose tags stop at ``v0.0.23`` fails identically every time it is
+    asked, so the loop's ledger can answer the repeat instead of the network --
+    and the model is told, in the same breath, the one move that does work.
+    """
+    said = (output or "").lower()
+    if any(marker in said for marker in _CANNOT_REACH):
+        return (
+            "This machine cannot reach the module host. Check `go env GOPRIVATE` "
+            "covers gitlab.cept.gov.in and that a git credential exists for it "
+            "-- `run_terminal [\"go\",\"env\",\"GOPRIVATE\"]` answers the first "
+            "half. This is an environment problem: report it rather than working "
+            "around it.",
+            "",
+        )
+    if any(marker in said for marker in _VERSION_MISS):
+        if version:
+            return (
+                f"{version} is not a published version of {pkg}. Do not guess "
+                "another one -- call go_mod again with `version` omitted and the "
+                "toolchain resolves the latest for you. The n-api-* libraries are "
+                "a different release line from the api-* ones they replace, so a "
+                "version carried across from the old module never exists.",
+                f"{pkg}@{version} is not a published version; ask without a version",
+            )
+        return (
+            f"The toolchain could not resolve {pkg} at all. Check the module path "
+            "is spelled exactly as the library publishes it; if it is, this is a "
+            "reachability problem rather than a version one.",
+            "",
+        )
+    return (
+        "Read the toolchain's output above -- it names what it could not do. If "
+        "go.mod already requires this module at a version that does not exist, "
+        "fix that line first: go_mod get with `version` omitted rewrites it to "
+        "the latest.",
+        "",
+    )
+
+
+def _result(
+    done: Completed,
+    *,
+    what: str,
+    fix_on_fail: str = "",
+    meta: dict[str, Any] | None = None,
+) -> ToolResult:
     if done.timed_out:
         return ToolResult.failure(
             f"{what} did not finish within {int(done.seconds)}s and was stopped.",
@@ -308,7 +394,12 @@ def _result(done: Completed, *, what: str, fix_on_fail: str = "") -> ToolResult:
     return ToolResult.failure(
         body,
         fix=fix_on_fail,
-        meta={"argv": done.argv, "code": done.code, "seconds": round(done.seconds, 2)},
+        meta={
+            "argv": done.argv,
+            "code": done.code,
+            "seconds": round(done.seconds, 2),
+            **(meta or {}),
+        },
     )
 
 
@@ -530,14 +621,16 @@ def go_mod(inv: Invocation) -> ToolResult:
     pkg = inv.arg("pkg")
     if not pkg:
         return ToolResult.failure("go_mod get needs pkg.", fix="Pass the module path to add.")
-    target = f"{pkg}@{inv.arg('version')}" if inv.arg("version") else pkg
+    version = str(inv.arg("version") or "").strip()
+    target = f"{pkg}@{version}" if version else pkg
     done = run(["go", "get", target], root, timeout=GATE_TIMEOUT)
     if not done.ok:
+        fix, dead_end = _why_get_failed(done.output, pkg, version)
         return _result(
             done,
             what=f"go get {target}",
-            fix_on_fail="If this is a private module, GOPRIVATE and a git credential must "
-            "be configured for gitlab.cept.gov.in.",
+            fix_on_fail=fix,
+            meta={"dead_end": dead_end} if dead_end else None,
         )
     return ToolResult.success(
         done.output or f"added {target}",

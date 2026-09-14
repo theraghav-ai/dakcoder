@@ -174,6 +174,25 @@ class TaskState:
     #: read-only. Thirteen turns later the run had no write tools, no
     #: `submit_plan`, and a migration plan it could only emit as prose.
     awaiting: Intent = Intent.AUTO
+    #: The question sets already put to the developer, as fingerprints, and the
+    #: answer the last one came back with.
+    #:
+    #: `ask_developer` is exempt from all three intercept ledgers, because a
+    #: repeated *terminal* call is a signal rather than a question -- a model
+    #: trying to stop, which `_phase_ended`'s bounded refusals answer. That is
+    #: right for `finish` and it left `ask_developer` as the one call in the
+    #: system that can repeat verbatim forever with nothing counting it.
+    #:
+    #: A field run asked "which n-api-* versions should I use?", was answered
+    #: "use latest versions", and asked the identical question twice more. Each
+    #: answer ended a run and started another; nothing anywhere recorded that
+    #: the question had been settled, so neither the loop nor the model could
+    #: tell the second asking from the first.
+    #:
+    #: Carried between messages, because the whole point of an answer is that it
+    #: is read by the run after the one that asked.
+    asked: list[str] = field(default_factory=list)
+    answered: str = ""
 
 
 @dataclass
@@ -372,6 +391,8 @@ class Progress:
     #: adopted, because a push-back that never stops asking spends the whole
     #: budget on the shape of the work instead of the work.
     plan_objections: int = 0
+    #: Questions sent back because they had already been asked and answered.
+    reasks: int = 0
     #: Loop-initiated returns to the Planner this run. See ``_replan``.
     replans: int = 0
     #: Model-initiated ``revise_plan`` calls this run.

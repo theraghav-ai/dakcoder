@@ -219,7 +219,19 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 #: them -- it called the tool, was refused, and spent the turn learning that its
 #: own plan had given it nothing to verify against. Twenty tokens, on planning
 #: turns only, against a turn thrown away on every phase of every migration.
-PREFIX_CEILING = {Mode.ASK: 2_800, Mode.PLANNER: 3_380, Mode.AGENT: 4_420}
+#: `agent` moved by 77 tokens for `lib_version_check`, and this number measures
+#: the *migration* case rather than an ordinary acting turn — `schemas_for` does
+#: not know which kind of run it is in, and `AgentLoop._tools` withholds the tool
+#: on every acting turn that is not a conversion, exactly as it does
+#: `ask_developer`. So an ordinary agent turn still pays the old prefix.
+#:
+#: What the 77 buys on the turns that do pay it: the acting phase can ask what
+#: version a library is at during the one phase whose whole job is to change
+#: library versions. Without it a field run guessed — it carried the superseded
+#: module's version across the rename into a separate release line, put six
+#: revisions that had never existed into go.mod, and spent thirty-eight turns
+#: blocked on the result while reporting the cause as missing credentials.
+PREFIX_CEILING = {Mode.ASK: 2_800, Mode.PLANNER: 3_380, Mode.AGENT: 4_500}
 
 
 @pytest.mark.parametrize("mode", list(Mode))

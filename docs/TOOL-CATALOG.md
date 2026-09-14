@@ -17,7 +17,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 |---|---|---|
 | **ask** | 15 | ~1,680 tokens |
 | **planner** | 17 | ~2,256 tokens |
-| **agent** | 25 | ~3,303 tokens |
+| **agent** | 26 | ~3,384 tokens |
 
 ## The catalogue
 
@@ -34,7 +34,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `db_roundtrip_audit` | AP |  |  | gotools | Profile every repository method: database calls, any inside a loop, batched, in a transaction, with a verdict. Worst first. Use before optimising by eye. |
 | `validation_audit` | AP |  |  | gotools | List every request field, its validate tag, and what the tag leaves unbounded. `required` alone means only 'not empty', so a 10MB string passes. |
 | `temporal_audit` | AP |  |  | gotools | List inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only — it makes no recommendation. |
-| `lib_version_check` | AP |  |  | gotools | Report CEPT library drift: which are behind, which are superseded by n-api-*. Reports only — never edit go.mod on it, tell the user. |
+| `lib_version_check` | AAP |  |  | gotools | Report CEPT library drift: which are behind, which are superseded by n-api-*. Reports only — never edit go.mod on it, tell the user. |
 | `route_inventory` | gate |  |  | gotools | Every route the service registers, gin or template, prefixes resolved. save= records them before a migration; against= reports which a finished one no longer serves. |
 | `playbook` | AAP |  |  | agent | Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before. |
 | `submit_plan` | P |  |  | agent | Submit the plan and start the work. Each step names one file, what changes in it, and how it is checked. A whole-service migration also sends phases, with steps for the first phase only. |

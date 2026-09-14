@@ -60,18 +60,47 @@ type Report struct {
 	Behind       int    `json:"behind,omitempty"`
 	Status       Status `json:"status"`
 	SupersededBy string `json:"superseded_by,omitempty"`
-	Note         string `json:"note,omitempty"`
+	// SupersededByLatest is the newest published version of the *replacement*,
+	// which is the only version anybody migrating actually needs.
+	//
+	// Without it this report answered a question next to the one being asked.
+	// It said "api-db v1.0.32 is superseded by n-api-db" and resolved versions
+	// for api-db alone, so a run converting a service was told the name of the
+	// module to move to and nothing about which version to move to. A field run
+	// filled that gap the only way left to it: it carried v1.0.32 across the
+	// rename. The two libraries are separate release lines -- api-db is at
+	// v1.0.32, n-api-db's tags stop at v0.0.1 -- so go.mod ended up asserting
+	// six revisions that had never existed, and every fetch after it failed.
+	SupersededByLatest string `json:"superseded_by_latest,omitempty"`
+	Note               string `json:"note,omitempty"`
 }
 
 // Result is the whole report.
 type Result struct {
 	Module  string   `json:"module"`
 	Reports []Report `json:"reports"`
-	// Reachable records whether the registry answered. When it did not, every
-	// Latest is empty and the report still lists what is superseded — which is
-	// static knowledge and needs no network.
+	// Reachable records whether the registry answered *at all*. When it did
+	// not, every Latest is empty and the report still lists what is superseded
+	// — which is static knowledge and needs no network.
+	//
+	// It is not the same question as "is this report complete", and reading it
+	// as though it were is what made a partial report indistinguishable from a
+	// finished one: one lookup succeeding set this true, the caller's "registry
+	// not reachable" warning was therefore withheld, and thirteen lookups that
+	// had been cancelled were rendered as blank columns with nothing saying so.
+	// Use Unresolved for completeness.
 	Reachable bool   `json:"registry_reachable"`
 	Error     string `json:"registry_error,omitempty"`
+	// Unresolved lists every module whose version could not be determined,
+	// incumbent or replacement, in the order they were tried.
+	//
+	// The distinction it carries is the one a reader cannot make from a blank
+	// column: an empty version means "not known", never "none published". A
+	// field run read four blank replacement versions as a complete answer that
+	// happened to omit them, asked the developer which versions to use, was
+	// told "the latest", and asked again twice — because nothing in the report
+	// said the lookups had been cut short.
+	Unresolved []string `json:"unresolved,omitempty"`
 }
 
 // Lister resolves the published versions of a module, newest last.
@@ -119,6 +148,20 @@ func (l GoListLister) Versions(ctx context.Context, module string) ([]string, er
 	return fields[1:], nil
 }
 
+// note records a module whose version could not be determined, once.
+//
+// Deduplicated because a replacement named by several requires is looked up
+// once and must be reported once; ordered because the first failure is usually
+// the one that explains the rest.
+func (r *Result) note(module string) {
+	for _, seen := range r.Unresolved {
+		if seen == module {
+			return
+		}
+	}
+	r.Unresolved = append(r.Unresolved, module)
+}
+
 // Check builds the report for a loaded workspace.
 //
 // A lookup failure for one module is recorded against that module rather than
@@ -126,6 +169,9 @@ func (l GoListLister) Versions(ctx context.Context, module string) ([]string, er
 // superseded column does not need the network at all.
 func Check(ctx context.Context, ws *workspace.Workspace, l Lister) *Result {
 	res := &Result{Module: ws.ModulePath}
+	// Replacements resolve once each. Several modules can name the same one,
+	// and a lookup is a process launch against a remote VCS.
+	latestOf := map[string]string{}
 	for _, req := range ws.Requires {
 		if !strings.HasPrefix(req.Path, ModulePrefix) {
 			continue
@@ -136,6 +182,38 @@ func Check(ctx context.Context, ws *workspace.Workspace, l Lister) *Result {
 			r.Status = StatusSuperseded
 			r.SupersededBy = replacement
 			r.Note = "migrating is a one-line import change; the API is identical"
+			newest, seen := latestOf[replacement]
+			if !seen {
+				// Failure is recorded against the report, not the run: the
+				// replacement's name is static knowledge and worth having on
+				// its own, which is the same reason the whole superseded column
+				// survives an unreachable registry.
+				if versions, err := l.Versions(ctx, replacement); err == nil && len(versions) > 0 {
+					newest = versions[len(versions)-1]
+					res.Reachable = true
+				} else {
+					if err != nil && res.Error == "" {
+						res.Error = err.Error()
+					}
+					res.note(replacement)
+				}
+				latestOf[replacement] = newest
+			}
+			r.SupersededByLatest = newest
+			if newest != "" {
+				r.Note = "migrating is a one-line import change; the API is identical. " +
+					"Its version line is separate from this module's — fetch " +
+					newest + " rather than carrying " + req.Version + " across."
+			} else {
+				// Says which of the two it is. A blank version column reads as
+				// "nothing published" to anybody who has not been told the
+				// lookup was cut short, and the correct move does not need the
+				// number either way.
+				r.Note = "migrating is a one-line import change; the API is identical. " +
+					"Its latest version could not be looked up — fetch it with " +
+					"`go get " + replacement + "` and no version rather than " +
+					"carrying " + req.Version + " across."
+			}
 		}
 
 		versions, err := l.Versions(ctx, req.Path)
@@ -144,6 +222,7 @@ func Check(ctx context.Context, ws *workspace.Workspace, l Lister) *Result {
 			if res.Error == "" {
 				res.Error = err.Error()
 			}
+			res.note(req.Path)
 			if r.Status != StatusSuperseded {
 				r.Status = StatusUnknown
 			}

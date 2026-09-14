@@ -378,6 +378,9 @@
                     },
                     "superseded_by": {
                       "type": "string"
+                    },
+                    "superseded_by_latest": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -386,6 +389,15 @@
                     "status"
                   ],
                   "type": "object"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "unresolved": {
+                "items": {
+                  "type": "string"
                 },
                 "type": [
                   "null",
@@ -808,6 +820,28 @@
           "go_version": {
             "type": "string"
           },
+          "large": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "lines": {
+                  "type": "integer"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "lines"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
           "module": {
             "type": "string"
           },
@@ -1074,6 +1108,157 @@
           "ok",
           "written",
           "files"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "route_inventory",
+      "description": "Every HTTP route the service registers, gin or template, prefixes resolved. `save` records them before a migration; `against` reports which a finished one no longer serves.",
+      "mutates": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "against": {
+            "description": "compare the current routes against a saved inventory and report what is missing",
+            "type": "string"
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          },
+          "save": {
+            "description": "write the inventory to this path, for comparing against later",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "before": {
+            "type": "integer"
+          },
+          "compared": {
+            "type": "boolean"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "legacy": {
+            "type": "integer"
+          },
+          "missing": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "file": {
+                  "type": "string"
+                },
+                "handler": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "method": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "style": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "path",
+                "handler",
+                "style",
+                "file",
+                "line"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "routes": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "file": {
+                  "type": "string"
+                },
+                "handler": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "method": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "style": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "path",
+                "handler",
+                "style",
+                "file",
+                "line"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "saved": {
+            "type": "string"
+          },
+          "template": {
+            "type": "integer"
+          },
+          "unresolved": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "routes",
+          "files",
+          "legacy",
+          "template",
+          "compared"
         ],
         "type": "object"
       }

@@ -236,6 +236,12 @@ func cmdLibVersionCheck(args []string, stdout, stderr io.Writer) int {
 		switch {
 		case r.SupersededBy != "":
 			status = "SUPERSEDED -> " + shortModule(r.SupersededBy)
+			// The replacement's own version, not this module's. It is the one
+			// fact a migration needs from this table, and printing the name
+			// without it is what left a field run guessing.
+			if r.SupersededByLatest != "" {
+				status += "@" + r.SupersededByLatest
+			}
 			if r.Behind > 0 {
 				status += fmt.Sprintf(" (also %d behind)", r.Behind)
 			}

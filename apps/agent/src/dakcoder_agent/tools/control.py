@@ -111,6 +111,17 @@ class PlanStep:
         ``written`` is deliberately not open. The file was written; what is
         outstanding is the verification, and "you planned to write this and did
         not" is the wrong objection to raise about it.
+
+        ``blocked`` is not open either, and that is the whole point of it. A
+        step nothing can finish used to have no status that let the cursor move:
+        it stayed ``pending``, `active_step` returned it every turn for the rest
+        of the run, and `_plan_block` re-rendered it into the recency slot as an
+        instruction the model could not carry out. Three field loops have that
+        shape -- a step whose premise was false, a cursor that only advances on
+        a write, and a model re-issued the same order until the turn budget ran
+        out. ``blocked`` is the exit: it does not claim the work was done, it
+        carries the reason in ``note``, `_why_not_done` reports it and the run
+        summary names it -- but the plan moves on.
         """
         return self.status in ("pending", "failed")
 
@@ -237,8 +248,14 @@ def _path_shaped(token: str) -> bool:
 #: node the plan did not have: a mutation on the step's file sets it, and only
 #: a clean inner gate over that file promotes it to ``done``. Before it,
 #: ``done`` meant "a write happened" and a file written wrongly was finished.
-STEP_STATUSES = ("pending", "written", "done", "failed", "skipped")
-MODEL_STATUSES = ("pending", "skipped")
+#:
+#: ``blocked`` is the model's other word, and it means something ``skipped``
+#: cannot: *this step cannot be done right now, and here is why*. Skipping
+#: claims the work was unnecessary; blocking says it is necessary and
+#: unreachable. The distinction matters at the end of the run, where one is a
+#: decision and the other is a handover.
+STEP_STATUSES = ("pending", "written", "done", "failed", "skipped", "blocked")
+MODEL_STATUSES = ("pending", "skipped", "blocked")
 
 #: How much of a `finish` answer reaches the developer.
 #:

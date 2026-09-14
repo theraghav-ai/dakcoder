@@ -20,6 +20,7 @@ C1 limits: at most **6 parameters** per tool, description at most **200 characte
 | [`project_scaffold`](#project_scaffold) | ✓ | 4 | Create a new n-api-template service in an empty directory, seeded with one working resource. Greenfield only; to add to an existing service use resource_scaffold. |
 | [`repo_map`](#repo_map) |  | 3 | Module path, library generation, package tree with exported symbols, and the FX composition root. Call once to orient; pass `package` for one package in full. |
 | [`resource_scaffold`](#resource_scaffold) | ✓ | 3 | Write a whole CRUD resource — domain, DDL, repository, DTOs, handler, FX registration — from a field spec. Use this instead of writing the files yourself. |
+| [`route_inventory`](#route_inventory) |  | 3 | Every HTTP route the service registers, gin or template, prefixes resolved. `save` records them before a migration; `against` reports which a finished one no longer serves. |
 | [`rules_lint`](#rules_lint) |  | 3 | Check Go against the n-api-template contract: layer boundaries, handler signature, repository contract, DTO envelopes, FX wiring. Run after each edit batch, passing `paths` with the files you changed. |
 | [`temporal_audit`](#temporal_audit) |  | 1 | Inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only, no recommendation. Call when asked about async or Temporal. |
 | [`validation_audit`](#validation_audit) |  | 1 | Every request field, its validate tag, and what the tag leaves unbounded. Call when writing or reviewing request DTOs: `required` alone means only 'not empty', so a 10MB string passes. |
@@ -484,6 +485,9 @@ CEPT library drift: which are behind, which are superseded by the n-api-* genera
               },
               "superseded_by": {
                 "type": "string"
+              },
+              "superseded_by_latest": {
+                "type": "string"
               }
             },
             "required": [
@@ -492,6 +496,15 @@ CEPT library drift: which are behind, which are superseded by the n-api-* genera
               "status"
             ],
             "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "unresolved": {
+          "items": {
+            "type": "string"
           },
           "type": [
             "null",
@@ -978,6 +991,28 @@ Module path, library generation, package tree with exported symbols, and the FX 
     "go_version": {
       "type": "string"
     },
+    "large": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "lines": {
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "lines"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
     "module": {
       "type": "string"
     },
@@ -1267,6 +1302,178 @@ Write a whole CRUD resource — domain, DDL, repository, DTOs, handler, FX regis
     "ok",
     "written",
     "files"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+---
+
+## route_inventory
+
+Every HTTP route the service registers, gin or template, prefixes resolved. `save` records them before a migration; `against` reports which a finished one no longer serves.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `against` | string |  | compare the current routes against a saved inventory and report what is missing |
+| `root` | string |  | workspace root; omit to use the server's default |
+| `save` | string |  | write the inventory to this path, for comparing against later |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "against": {
+      "description": "compare the current routes against a saved inventory and report what is missing",
+      "type": "string"
+    },
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    },
+    "save": {
+      "description": "write the inventory to this path, for comparing against later",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "before": {
+      "type": "integer"
+    },
+    "compared": {
+      "type": "boolean"
+    },
+    "files": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "legacy": {
+      "type": "integer"
+    },
+    "missing": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "handler": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "method": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "style": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "method",
+          "path",
+          "handler",
+          "style",
+          "file",
+          "line"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "routes": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "handler": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "method": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "style": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "method",
+          "path",
+          "handler",
+          "style",
+          "file",
+          "line"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "saved": {
+      "type": "string"
+    },
+    "template": {
+      "type": "integer"
+    },
+    "unresolved": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    }
+  },
+  "required": [
+    "routes",
+    "files",
+    "legacy",
+    "template",
+    "compared"
   ],
   "type": "object"
 }

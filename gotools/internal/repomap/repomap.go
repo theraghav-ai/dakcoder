@@ -29,6 +29,7 @@
 package repomap
 
 import (
+	"bytes"
 	"encoding/json"
 	"go/ast"
 	"go/token"
@@ -65,10 +66,39 @@ type Map struct {
 	Packages []Package `json:"packages"`
 	FX       *FX       `json:"fx,omitempty"`
 
-	Files      int      `json:"files"`
-	Elided     *Elision `json:"elided,omitempty"`
-	EstTokens  int      `json:"est_tokens"`
-	DurationMS int64    `json:"duration_ms"`
+	Files int `json:"files"`
+	// Large lists the files too big for one plan step, longest first.
+	//
+	// **This exists because a rule is enforced on a number nothing reported.**
+	// A migration plan is refused when a single step names a file over
+	// `LargeFileLines`, on the correct reasoning that one reply cannot convert
+	// it. The planner had no way to find that number out: this map carried a
+	// file *count* per package and nothing about size, and `read_file` reports
+	// "lines 1-800 of 4,064" only once you have paid for the read. A field
+	// session spent a whole turn on `search_repo` and three `git_blame` calls
+	// against line 1 of three files, trying to learn their length -- which
+	// `git_blame` does not report -- and then resubmitted the same plan.
+	//
+	// Bounded by construction: only files past the threshold appear, which on
+	// the legacy corpus is a handful and on a template service is none.
+	Large      []LargeFile `json:"large,omitempty"`
+	Elided     *Elision    `json:"elided,omitempty"`
+	EstTokens  int         `json:"est_tokens"`
+	DurationMS int64       `json:"duration_ms"`
+}
+
+// LargeFileLines is the length past which one step cannot convert a file.
+//
+// **It has to agree with `BIG_FILE` in `apps/agent/.../migration.py`**, which is
+// the side that refuses the plan. This side only reports; a reporter that
+// disagreed with the enforcer would tell the planner a file is fine and then
+// refuse the plan that believed it.
+const LargeFileLines = 800
+
+// LargeFile is one file the plan has to split.
+type LargeFile struct {
+	Path  string `json:"path"`
+	Lines int    `json:"lines"`
 }
 
 // Package is one directory of Go source.
@@ -143,6 +173,7 @@ func Build(ws *workspace.Workspace, opts Options) *Map {
 	sort.Strings(m.Requires)
 
 	m.Packages = buildPackages(ws, opts.Package)
+	m.Large = largeFiles(ws, opts.Package)
 
 	if opts.Package == "" {
 		if fx := buildFX(ws); fx != nil {
@@ -160,6 +191,44 @@ func Build(ws *workspace.Workspace, opts Options) *Map {
 	m.EstTokens = estimateTokens(m)
 	m.DurationMS = time.Since(start).Milliseconds()
 	return m
+}
+
+// largeFiles lists the source files a single plan step cannot convert.
+//
+// Counted from the bytes the workspace already holds, so this does no I/O —
+// the same rule the rest of Build follows. Tests are excluded: a plan does not
+// convert them in the phase this informs, and a 3,000-line table-driven test
+// would crowd out the handlers that matter.
+//
+// Scoped by `only` exactly as `buildPackages` is, so `repo_map package=handler`
+// answers about that directory rather than about the service.
+func largeFiles(ws *workspace.Workspace, only string) []LargeFile {
+	only = strings.TrimSuffix(strings.TrimPrefix(strings.ReplaceAll(only, "\\", "/"), "./"), "/")
+	var out []LargeFile
+	for _, f := range ws.Files {
+		if f.Layer == workspace.LayerTest {
+			continue
+		}
+		dir := path.Dir(f.Rel)
+		if dir == "." {
+			dir = ""
+		}
+		if only != "" && dir != only {
+			continue
+		}
+		if n := bytes.Count(f.Src, []byte{'\n'}) + 1; n > LargeFileLines {
+			out = append(out, LargeFile{Path: f.Rel, Lines: n})
+		}
+	}
+	// Longest first: the plan has to split the worst one, and a reader scanning
+	// three entries wants the 4,000-line file before the 900-line one.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Lines != out[j].Lines {
+			return out[i].Lines > out[j].Lines
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out
 }
 
 // buildPackages groups files by directory and extracts exported symbols.

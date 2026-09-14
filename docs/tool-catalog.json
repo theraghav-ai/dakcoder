@@ -49,6 +49,7 @@
       "search_repo",
       "search_docs",
       "rules_lint",
+      "lib_version_check",
       "playbook",
       "ask_developer",
       "finish",
@@ -365,6 +366,7 @@
         "additionalProperties": false
       },
       "modes": [
+        "agent",
         "ask",
         "planner"
       ],
@@ -594,7 +596,7 @@
                 },
                 "accepts": {
                   "type": "string",
-                  "description": "How it is checked, with a tool this phase has."
+                  "description": "How it is checked."
                 },
                 "phase": {
                   "type": "string",
@@ -608,13 +610,14 @@
                   "type": "string",
                   "enum": [
                     "pending",
-                    "skipped"
+                    "skipped",
+                    "blocked"
                   ],
-                  "description": "skipped drops the step; say why in note."
+                  "description": "skipped = unnecessary; blocked = cannot be done now."
                 },
                 "note": {
                   "type": "string",
-                  "description": "Why it is skipped."
+                  "description": "Why it is skipped or blocked."
                 }
               },
               "required": [

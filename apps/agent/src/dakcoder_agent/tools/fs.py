@@ -443,6 +443,20 @@ def patch_file(inv: Invocation) -> ToolResult:
         )
 
     patched = text.replace(old, new, 1)
+
+    if carried := _versions_carried_across_a_rename(rel, text, patched):
+        was, now, version = carried[0]
+        more = f" ({len(carried) - 1} more like it)" if len(carried) > 1 else ""
+        return ToolResult.failure(
+            f"that patch renames {was} to {now} and keeps {version}{more}. "
+            f"{version} is {was}'s version, not {now}'s.",
+            fix="Do not write module versions by hand. Change the imports, then "
+            "`go_mod op=get pkg=" + now + "` with `version` omitted — the "
+            "toolchain resolves the latest and writes go.mod itself. Repeat per "
+            "module, then `go_mod op=tidy`.",
+            meta={"dead_end": f"go.mod cannot carry {version} from {was} to {now}"},
+        )
+
     _write_text(path, _apply_eol(patched, eol))
 
     delta = len(new.split("\n")) - len(old.split("\n"))
@@ -451,6 +465,58 @@ def patch_file(inv: Invocation) -> ToolResult:
         f"patched {rel} ({change})",
         mutations=[Mutation(rel, MutationKind.MODIFY)],
     )
+
+
+#: A `require` line: the module path, then its version.
+_REQUIRE = re.compile(r"^\s*(?:require\s+)?([a-z0-9.\-]+\.[a-z]{2,}/\S+)\s+(v\S+)", re.M)
+
+
+def _requires(text: str) -> dict[str, str]:
+    """Every module ``text`` requires, and at what version."""
+    return {module: version for module, version in _REQUIRE.findall(text)}
+
+
+def _versions_carried_across_a_rename(
+    rel: str, before: str, after: str
+) -> list[tuple[str, str, str]]:
+    """Renames in a ``go.mod`` patch that kept the old module's version.
+
+    Returns ``(was, now, version)`` per offence, empty when the patch is fine.
+
+    **The failure this exists for.** A migration's first step is "replace the
+    api-* dependencies with their n-api-* equivalents", and the obvious way to
+    carry it out is a `patch_file` over the require block. That produces a patch
+    with the same line count and the same version strings -- `api-db v1.0.32`
+    becomes `n-api-db v1.0.32` -- and the two library generations are entirely
+    separate release lines: api-db is at v1.0.32 and n-api-db's tags stop at
+    v0.0.1. So the patch applies cleanly, go.mod now asserts six revisions that
+    have never existed, and every `go get` and `go mod tidy` after it fails with
+    `unknown revision` for all six at once. A field run spent thirty-eight turns
+    on that and reported it to the developer as missing GitLab credentials.
+
+    Refused here rather than diagnosed later because the evidence is *in the
+    patch*: nothing downstream can tell "this version was carried across a
+    rename" from "this version was always wrong", and by the time the toolchain
+    objects the model is reading an error about a file it no longer remembers
+    editing.
+
+    Matched on the version rather than on the names, so it holds for any rename
+    -- there is no list of api-* to n-api- pairs here to fall out of date. Two
+    genuinely different modules published at the same version would trip it; the
+    refusal names the move that is correct for them too, which is to let the
+    toolchain write the line.
+    """
+    if Path(rel).name != "go.mod":
+        return []
+    was_required, now_required = _requires(before), _requires(after)
+    gone = {m: v for m, v in was_required.items() if m not in now_required}
+    added = {m: v for m, v in now_required.items() if m not in was_required}
+    offences: list[tuple[str, str, str]] = []
+    for module, version in added.items():
+        source = next((old for old, v in gone.items() if v == version), "")
+        if source:
+            offences.append((source, module, version))
+    return offences
 
 
 def _why_no_match(text: str, old: str, rel: str) -> str:

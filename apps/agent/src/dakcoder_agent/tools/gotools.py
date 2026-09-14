@@ -612,10 +612,35 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
                 status = str(r.get("status", ""))
                 if r.get("superseded_by"):
                     status = "SUPERSEDED -> " + str(r["superseded_by"]).rsplit("/", 1)[-1]
+                    # The replacement's own version, which is the one fact a
+                    # conversion needs from this row. Without it the row named
+                    # the module to move to and nothing about which version, and
+                    # a field run filled the gap by carrying this module's
+                    # version across the rename -- into a separate release line
+                    # where it had never existed.
+                    if latest := r.get("superseded_by_latest"):
+                        status += f"@{latest}"
                 if r.get("behind"):
                     status += f" (behind {r['behind']})"
                 out.append(f"  {module:24s} {r.get('current','?'):10s} {status}")
             out.extend(_elided(_MAX_ROWS, len(rows), "all are CEPT modules"))
+            # What the report could not answer, before what it says to do about
+            # it. The CLI has printed `registry_error` since this tool existed
+            # and this path never did, so a run reading the report through the
+            # agent saw blank version columns and no reason for them -- and read
+            # a blank as "nothing published" rather than "not looked up". It
+            # then asked the developer which versions to use, was answered, and
+            # asked again twice.
+            if unresolved := list(result.get("unresolved") or []):
+                short = [str(m).rsplit("/", 1)[-1] for m in unresolved[:_MAX_ROWS]]
+                more = "" if len(unresolved) <= _MAX_ROWS else f", +{len(unresolved) - _MAX_ROWS} more"
+                out.extend([
+                    "",
+                    f"  not looked up: {', '.join(short)}{more} — their version is "
+                    "missing from this report, not missing upstream.",
+                ])
+            if error := str(result.get("registry_error") or "").strip():
+                out.append(f"  first lookup error: {error}")
             if note := str(payload.get("note") or "").strip():
                 out.extend(["", note])
             return "\n".join(line for line in out if line is not None)

@@ -444,10 +444,20 @@ _SPECS: tuple[ToolSpec, ...] = (
             "n-api-*. Reports only — never edit go.mod on it, tell the user."
         ),
         parameters=_obj(),
-        # Planner alone, and for a reason beyond cost: offering this to Coder or
-        # Verifier invites a library bump in the middle of unrelated work, which
-        # turns a review into a regression hunt.
-        modes=_SURVEY,
+        # The surveys, plus the acting phase *during a migration only* --
+        # withheld there otherwise by `AgentLoop._tools`, the same asymmetric
+        # lock `ask_developer` uses.
+        #
+        # The original rule was the surveys alone, because offering a version
+        # tool to a phase that edits invites a library bump in the middle of
+        # unrelated work, which turns a review into a regression hunt. That
+        # still holds for every task that is not a conversion. A migration is
+        # the exception that swallows the rule: its entire first phase *is* a
+        # dependency bump, and denying the acting phase the one tool that knows
+        # what version a library is at left it guessing. A field run guessed the
+        # superseded module's version, carried it across the rename, and spent
+        # thirty-eight turns blocked on six revisions that had never existed.
+        modes=frozenset({_ASK, _PLAN, _AGENT}),
         provider=Provider.GOTOOLS,
     ),
     # The migration's before-and-after. `save` takes the inventory while the
@@ -690,18 +700,20 @@ _SPECS: tuple[ToolSpec, ...] = (
                     "properties": {
                         "file": {"type": "string", "description": "Path this step changes."},
                         "action": {"type": "string", "description": "What changes in it."},
-                        "accepts": {
-                            "type": "string",
-                            "description": "How it is checked, with a tool this phase has.",
-                        },
+                        "accepts": {"type": "string", "description": "How it is checked."},
                         "phase": {"type": "string", "description": "Its phase, if any."},
                         "part": {"type": "string", "description": "Its part of that phase."},
                         "status": {
                             "type": "string",
-                            "enum": ["pending", "skipped"],
-                            "description": "skipped drops the step; say why in note.",
+                            # `blocked` is the exit a step with a false premise
+                            # had none of. Without it the only statuses the
+                            # model could set were "do it" and "it was not
+                            # needed", so a step it could not do stayed pending
+                            # and the cursor never moved off it.
+                            "enum": ["pending", "skipped", "blocked"],
+                            "description": "skipped = unnecessary; blocked = cannot be done now.",
                         },
-                        "note": {"type": "string", "description": "Why it is skipped."},
+                        "note": {"type": "string", "description": "Why it is skipped or blocked."},
                     },
                     "required": ["file", "action", "accepts"],
                     "additionalProperties": False,

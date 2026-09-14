@@ -27,14 +27,14 @@ Claude Code is not the same kind of thing Cline is.
 
 A comparison that does not state this first is misleading in both directions.
 
-| | Claude Code | dakcoder |
-|---|---|---|
-| Model | Frontier (Opus/Sonnet 4.5-4.6), plus Haiku for classification | Qwen3.8-27B on self-hosted vLLM via LiteLLM |
-| Scope | Any language, any repo, any task | Go services on one template (`n-api-template`) |
-| Users | Public, millions, adversarial and untrusted | One government org, one template, known users |
-| Size | ~512,000 lines TS, 1,902 files | ~50,000 lines Python + a Go sidecar |
-| Distribution | npm CLI + IDE bridges + SDK + cloud | VS Code extension + local daemon + central gateway |
-| Trust boundary | Runs arbitrary shell on a user's machine | Runs 9 allow-listed binaries, no shell |
+|                | Claude Code                                                   | dakcoder                                           |
+| -------------- | ------------------------------------------------------------- | -------------------------------------------------- |
+| Model          | Frontier (Opus/Sonnet 4.5-4.6), plus Haiku for classification | Qwen3.8-27B on self-hosted vLLM via LiteLLM        |
+| Scope          | Any language, any repo, any task                              | Go services on one template (`n-api-template`)     |
+| Users          | Public, millions, adversarial and untrusted                   | One government org, one template, known users      |
+| Size           | ~512,000 lines TS, 1,902 files                                | ~50,000 lines Python + a Go sidecar                |
+| Distribution   | npm CLI + IDE bridges + SDK + cloud                           | VS Code extension + local daemon + central gateway |
+| Trust boundary | Runs arbitrary shell on a user's machine                      | Runs 9 allow-listed binaries, no shell             |
 
 **The model is the axis everything else rotates around.** A large part of what
 looks like over-engineering in `loop.py` — forced `tool_choice`, the intercept
@@ -59,19 +59,19 @@ first principles. Neither of you believes the agent is the prompt.
 
 ## 1. Sources
 
-| Source | What it is good for | Caution |
-|---|---|---|
-| [kubesimplify: what the source actually teaches](https://blog.kubesimplify.com/claude-code-leak-what-the-source-actually-teaches) | `ToolSearch`/`defer_loading`, the five compaction strategies, `promptCacheBreakDetection.ts`, `denialTracking.ts` | Says `query.ts` is 1,729 lines; others say the query engine is 46,000 |
-| [tanbiralam/claude-code](https://github.com/tanbiralam/claude-code) | Directory layout: ~50 commands, ~40 tools, ~140 components, `src/bridge/` | A mirror of allegedly-leaked source; claims unverified |
-| [karanprasad: reverse-engineering 512K lines](https://karanprasad.com/blog/how-claude-code-actually-works-reverse-engineering-512k-lines) | The most concrete: compaction thresholds, 7-stage permission pipeline, bash parser limits, 5-tier model fallback, terminal renderer | Most numbers appear only here; treat single-sourced figures as indicative |
-| [VILA-Lab: Dive into Claude Code](https://github.com/VILA-Lab/Dive-into-Claude-Code) | The best *design* source — seven layers, six design decisions, the assemble/model/execute extension contract | Analytical rather than forensic; a snapshot, explicitly |
-| [claudefa.st: everything found](https://claudefa.st/blog/guide/mechanics/claude-code-source-leak) | Subagent execution models, autoDream, feature flags, KAIROS | Feature-inventory framing; unreleased ≠ shipped |
-| [sabrina.dev: comprehensive analysis](https://www.sabrina.dev/p/claude-code-source-leak-analysis) | The bash-parser CR/LF disagreement, the compaction-failure BigQuery numbers | Security-incident framing |
-| [wavespeed: architecture deep dive](https://wavespeed.ai/blog/posts/claude-code-architecture-leaked-source-deep-dive/) | Three-layer compression, mailbox pattern, telemetry | Short; overlaps the above |
-| [Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts) | Prompt assembly: 500+ conditional strings, ~150 system sections, ~70 agent prompts | Extracted, versioned per release |
-| [hqman/claude-code-source-code-deobfuscation](https://github.com/hqman/claude-code-source-code-deobfuscation) | Cleanroom deobfuscation of the npm package | README documents method, not findings |
-| [shareAI-lab analysis, v1.0.33](https://github.com/shareAI-lab/learn-claude-code) (via [Medium summary](https://medium.com/@sampan090611/claude-code-feels-like-a-senior-dev-heres-what-actually-makes-it-different-and-what-the-49c02b456d9c), [DeepWiki](https://deepwiki.com/myopicOracle/analysis_claude_code_in_English/2.2-message-queue-and-real-time-steering)) | The named internals: `nO` master loop, `h2A` dual-buffer queue, `wU2` compressor | A year older than the leak; names are from obfuscated symbols |
-| [layer5](https://layer5.io/blog/engineering/the-claude-code-source-leak-512000-lines-a-missing-npmignore-and-the-fastest-growing-repo-in-github-history/), [zscaler](https://www.zscaler.com/blogs/security-research/anthropic-claude-code-leak) | The leak itself: missing `.npmignore`, 59.8 MB source map, 2026-03-31 | Incident reporting, not architecture |
+| Source                                                                                                                                                                                                                                                                                                                                                                  | What it is good for                                                                                                                 | Caution                                                                   |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| [kubesimplify: what the source actually teaches](https://blog.kubesimplify.com/claude-code-leak-what-the-source-actually-teaches)                                                                                                                                                                                                                                       | `ToolSearch`/`defer_loading`, the five compaction strategies, `promptCacheBreakDetection.ts`, `denialTracking.ts`                   | Says `query.ts` is 1,729 lines; others say the query engine is 46,000     |
+| [tanbiralam/claude-code](https://github.com/tanbiralam/claude-code)                                                                                                                                                                                                                                                                                                     | Directory layout: ~50 commands, ~40 tools, ~140 components, `src/bridge/`                                                           | A mirror of allegedly-leaked source; claims unverified                    |
+| [karanprasad: reverse-engineering 512K lines](https://karanprasad.com/blog/how-claude-code-actually-works-reverse-engineering-512k-lines)                                                                                                                                                                                                                               | The most concrete: compaction thresholds, 7-stage permission pipeline, bash parser limits, 5-tier model fallback, terminal renderer | Most numbers appear only here; treat single-sourced figures as indicative |
+| [VILA-Lab: Dive into Claude Code](https://github.com/VILA-Lab/Dive-into-Claude-Code)                                                                                                                                                                                                                                                                                    | The best _design_ source — seven layers, six design decisions, the assemble/model/execute extension contract                        | Analytical rather than forensic; a snapshot, explicitly                   |
+| [claudefa.st: everything found](https://claudefa.st/blog/guide/mechanics/claude-code-source-leak)                                                                                                                                                                                                                                                                       | Subagent execution models, autoDream, feature flags, KAIROS                                                                         | Feature-inventory framing; unreleased ≠ shipped                           |
+| [sabrina.dev: comprehensive analysis](https://www.sabrina.dev/p/claude-code-source-leak-analysis)                                                                                                                                                                                                                                                                       | The bash-parser CR/LF disagreement, the compaction-failure BigQuery numbers                                                         | Security-incident framing                                                 |
+| [wavespeed: architecture deep dive](https://wavespeed.ai/blog/posts/claude-code-architecture-leaked-source-deep-dive/)                                                                                                                                                                                                                                                  | Three-layer compression, mailbox pattern, telemetry                                                                                 | Short; overlaps the above                                                 |
+| [Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts)                                                                                                                                                                                                                                                                       | Prompt assembly: 500+ conditional strings, ~150 system sections, ~70 agent prompts                                                  | Extracted, versioned per release                                          |
+| [hqman/claude-code-source-code-deobfuscation](https://github.com/hqman/claude-code-source-code-deobfuscation)                                                                                                                                                                                                                                                           | Cleanroom deobfuscation of the npm package                                                                                          | README documents method, not findings                                     |
+| [shareAI-lab analysis, v1.0.33](https://github.com/shareAI-lab/learn-claude-code) (via [Medium summary](https://medium.com/@sampan090611/claude-code-feels-like-a-senior-dev-heres-what-actually-makes-it-different-and-what-the-49c02b456d9c), [DeepWiki](https://deepwiki.com/myopicOracle/analysis_claude_code_in_English/2.2-message-queue-and-real-time-steering)) | The named internals: `nO` master loop, `h2A` dual-buffer queue, `wU2` compressor                                                    | A year older than the leak; names are from obfuscated symbols             |
+| [layer5](https://layer5.io/blog/engineering/the-claude-code-source-leak-512000-lines-a-missing-npmignore-and-the-fastest-growing-repo-in-github-history/), [zscaler](https://www.zscaler.com/blogs/security-research/anthropic-claude-code-leak)                                                                                                                        | The leak itself: missing `.npmignore`, 59.8 MB source map, 2026-03-31                                                               | Incident reporting, not architecture                                      |
 
 **Where sources conflict**, this report says so inline. The three biggest:
 query-engine size (1,729 vs 46,000 lines), tool count (40 vs 54), and bash
@@ -82,32 +82,32 @@ of the recommendations below depend on which is right.
 
 ## 2. Summary
 
-| # | Dimension | dakcoder | Claude Code | Edge |
-|---|---|---|---|---|
-| 1 | Loop shape | Python generator; `run` → `_run` → `_turn` → `_tool_calls`, events teed through one funnel | Async generator `queryLoop` with 7 named continue sites; serialisable mid-turn | Claude Code |
-| 2 | Reasoning distribution | Harness decides; model chooses within it | Same, measured at 1.6% / 98.4% | Even — same philosophy |
-| 3 | Modes / permission | 3 tool allow-lists (ASK/PLANNER/AGENT) | 6-7 permission modes × 7-stage decision pipeline | Claude Code |
-| 4 | Tool catalogue | 38 specs, 25 in AGENT, typed contract C1, published catalogue, CI drift test | ~40-54 tools, per-tool `isReadOnly`/`isDestructive` | dakcoder on contract rigour |
-| 5 | Schema delivery | Full per-mode schema list every turn (2.8k-4.4k token prefix, ceilinged in CI) | `defer_loading` + `ToolSearch` meta-tool; fuzzy-matched injection | **Claude Code** |
-| 6 | Parallel execution | Opt-in `ToolSpec.parallel`, 7 tools, 4 threads, batch ≤ 6 | Parallel dispatch with a scheduler; read/write separation | Even |
-| 7 | Command safety | 9-binary allow-list, no shell, argv only | Full bash AST parser, 15 rejected node classes, 35+ blocked builtins, 50 ms/50k-node budget | Different problems; dakcoder's is safer *and* narrower |
-| 8 | Approval | `Approval` enum (none/conditional/always), per-tool `needs_approval`, protected paths, HTTP round trip | 7-stage cascade, rule engine, hooks, LLM classifier, 1 h cache, denial tracking | Claude Code |
-| 9 | Canonical vs projected context | Append-only `Transcript` + `CompactionState` sidecar + `Projector`; prefix-hash safety catch | Append-only JSONL + chain patching at read time | **Even — you landed the same idea** |
-| 10 | Compaction | 2 strategies (`agentic`, `basic`), 35% retain, thrash detector (3 in 8 turns), one overflow recovery | 5-6 graduated strategies: snip, microcompact, context collapse, autocompact, reactive | **Claude Code** |
-| 11 | Compaction triggers | Threshold on budget; reactive on a classified 400 | `effectiveContextWindow − 13,000`; warning at −20,000; circuit breaker after 3 failures | Claude Code |
-| 12 | Prompt caching | Prefix-stable by construction; one system prompt for all modes; budgets asserted in tests | 14 tracked cache-break vectors, sticky-on flag latches, deliberate MCP cache boundary | Claude Code |
-| 13 | Verification | **Deterministic 11-stage gate**, baselined, scoped, fail-fast, plus a sub-second inner loop after every edit | No built-in gate; verification is hooks + a verification sub-agent prompt | **dakcoder, decisively** |
-| 14 | Plan state | Typed `PlanStep` with status from ground truth, `revise_plan`, loop-initiated replan, phased migration state machine | Plan mode, TodoWrite, UltraPlan (unshipped); no typed plan the harness verifies against | **dakcoder** |
-| 15 | Sub-agents | **None** | Task tool + 3 execution models (Fork/Teammate/Worktree), isolated context, sidechain transcripts, mailbox IPC | **Claude Code** |
-| 16 | Steering | `steer()` drained at turn start; pinned as a directive | `h2A` async dual-buffer queue; mid-stream injection, pause/resume | Claude Code |
-| 17 | Loop guards | 24 named bounds, 3 intercept ledgers, dead-end ledger, overlap detection, churn ledger | Denial tracking (3/20), compaction circuit breaker, stall events | **dakcoder** |
-| 18 | Memory / knowledge | Generated `SKILL.md` always resident + 17 on-demand references + 10 diagnostic playbooks | 4-level CLAUDE.md hierarchy, auto-memory (<200 lines/25 KB), autoDream consolidation | Claude Code on breadth, dakcoder on drift-proofing |
-| 19 | Extensibility | `beforeTool`/`afterTool` hooks only | Hooks (27 events/5 categories), Skills, Plugins (10 component types), MCP client | **Claude Code** |
-| 20 | Persistence & resume | Transcript + compaction sidecar + `events.jsonl` + journal + `plan.md` + undo manifest; `rehydrate` | Append-only JSONL, sidechains, global prompt history, chain patching | Even |
-| 21 | Undo | Per-path pre-image snapshot, correct on a dirty tree and untracked files | Not documented in these sources | **dakcoder** |
-| 22 | Model routing | Role → model at the gateway; one model in practice | Dual-model (Opus reason + Haiku classify), 5-tier fallback chain, 4 providers | Claude Code |
-| 23 | Observability | `metrics.py`, OTel, central ledger, `debug.jsonl` prefix-delta recording | 600+ `tengu_` flags, frustration/continue-counter telemetry | Even |
-| 24 | UI | VS Code webview + SSE with `since_id` resume | React Fiber reconciler for terminals, Int32Array frame diffing, 10 FPS | Not comparable |
+| #   | Dimension                      | dakcoder                                                                                                             | Claude Code                                                                                                   | Edge                                                   |
+| --- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| 1   | Loop shape                     | Python generator; `run` → `_run` → `_turn` → `_tool_calls`, events teed through one funnel                           | Async generator `queryLoop` with 7 named continue sites; serialisable mid-turn                                | Claude Code                                            |
+| 2   | Reasoning distribution         | Harness decides; model chooses within it                                                                             | Same, measured at 1.6% / 98.4%                                                                                | Even — same philosophy                                 |
+| 3   | Modes / permission             | 3 tool allow-lists (ASK/PLANNER/AGENT)                                                                               | 6-7 permission modes × 7-stage decision pipeline                                                              | Claude Code                                            |
+| 4   | Tool catalogue                 | 38 specs, 25 in AGENT, typed contract C1, published catalogue, CI drift test                                         | ~40-54 tools, per-tool `isReadOnly`/`isDestructive`                                                           | dakcoder on contract rigour                            |
+| 5   | Schema delivery                | Full per-mode schema list every turn (2.8k-4.4k token prefix, ceilinged in CI)                                       | `defer_loading` + `ToolSearch` meta-tool; fuzzy-matched injection                                             | **Claude Code**                                        |
+| 6   | Parallel execution             | Opt-in `ToolSpec.parallel`, 7 tools, 4 threads, batch ≤ 6                                                            | Parallel dispatch with a scheduler; read/write separation                                                     | Even                                                   |
+| 7   | Command safety                 | 9-binary allow-list, no shell, argv only                                                                             | Full bash AST parser, 15 rejected node classes, 35+ blocked builtins, 50 ms/50k-node budget                   | Different problems; dakcoder's is safer _and_ narrower |
+| 8   | Approval                       | `Approval` enum (none/conditional/always), per-tool `needs_approval`, protected paths, HTTP round trip               | 7-stage cascade, rule engine, hooks, LLM classifier, 1 h cache, denial tracking                               | Claude Code                                            |
+| 9   | Canonical vs projected context | Append-only `Transcript` + `CompactionState` sidecar + `Projector`; prefix-hash safety catch                         | Append-only JSONL + chain patching at read time                                                               | **Even — you landed the same idea**                    |
+| 10  | Compaction                     | 2 strategies (`agentic`, `basic`), 35% retain, thrash detector (3 in 8 turns), one overflow recovery                 | 5-6 graduated strategies: snip, microcompact, context collapse, autocompact, reactive                         | **Claude Code**                                        |
+| 11  | Compaction triggers            | Threshold on budget; reactive on a classified 400                                                                    | `effectiveContextWindow − 13,000`; warning at −20,000; circuit breaker after 3 failures                       | Claude Code                                            |
+| 12  | Prompt caching                 | Prefix-stable by construction; one system prompt for all modes; budgets asserted in tests                            | 14 tracked cache-break vectors, sticky-on flag latches, deliberate MCP cache boundary                         | Claude Code                                            |
+| 13  | Verification                   | **Deterministic 11-stage gate**, baselined, scoped, fail-fast, plus a sub-second inner loop after every edit         | No built-in gate; verification is hooks + a verification sub-agent prompt                                     | **dakcoder, decisively**                               |
+| 14  | Plan state                     | Typed `PlanStep` with status from ground truth, `revise_plan`, loop-initiated replan, phased migration state machine | Plan mode, TodoWrite, UltraPlan (unshipped); no typed plan the harness verifies against                       | **dakcoder**                                           |
+| 15  | Sub-agents                     | **None**                                                                                                             | Task tool + 3 execution models (Fork/Teammate/Worktree), isolated context, sidechain transcripts, mailbox IPC | **Claude Code**                                        |
+| 16  | Steering                       | `steer()` drained at turn start; pinned as a directive                                                               | `h2A` async dual-buffer queue; mid-stream injection, pause/resume                                             | Claude Code                                            |
+| 17  | Loop guards                    | 24 named bounds, 3 intercept ledgers, dead-end ledger, overlap detection, churn ledger                               | Denial tracking (3/20), compaction circuit breaker, stall events                                              | **dakcoder**                                           |
+| 18  | Memory / knowledge             | Generated `SKILL.md` always resident + 17 on-demand references + 10 diagnostic playbooks                             | 4-level CLAUDE.md hierarchy, auto-memory (<200 lines/25 KB), autoDream consolidation                          | Claude Code on breadth, dakcoder on drift-proofing     |
+| 19  | Extensibility                  | `beforeTool`/`afterTool` hooks only                                                                                  | Hooks (27 events/5 categories), Skills, Plugins (10 component types), MCP client                              | **Claude Code**                                        |
+| 20  | Persistence & resume           | Transcript + compaction sidecar + `events.jsonl` + journal + `plan.md` + undo manifest; `rehydrate`                  | Append-only JSONL, sidechains, global prompt history, chain patching                                          | Even                                                   |
+| 21  | Undo                           | Per-path pre-image snapshot, correct on a dirty tree and untracked files                                             | Not documented in these sources                                                                               | **dakcoder**                                           |
+| 22  | Model routing                  | Role → model at the gateway; one model in practice                                                                   | Dual-model (Opus reason + Haiku classify), 5-tier fallback chain, 4 providers                                 | Claude Code                                            |
+| 23  | Observability                  | `metrics.py`, OTel, central ledger, `debug.jsonl` prefix-delta recording                                             | 600+ `tengu_` flags, frustration/continue-counter telemetry                                                   | Even                                                   |
+| 24  | UI                             | VS Code webview + SSE with `since_id` resume                                                                         | React Fiber reconciler for terminals, Int32Array frame diffing, 10 FPS                                        | Not comparable                                         |
 
 Rough shape: **you lead on verification, plan state, loop discipline and undo.
 Claude Code leads on context management, extensibility, delegation, and
@@ -131,7 +131,7 @@ Yours is also a generator chain — `run` tees every event through one funnel in
 metrics and the debug recorder, `_run` drives, `_turn` builds and dispatches,
 `_tool_calls` handles the batch — and the funnel discipline is better than
 anything the sources describe on Claude Code's side. What you do not have is
-*resumable mid-turn state*: an exception inside `_tool_calls` loses the turn,
+_resumable mid-turn state_: an exception inside `_tool_calls` loses the turn,
 and resume rebuilds from the transcript rather than from a serialised loop
 position. `rehydrate.py` is close, but it restores the conversation, not the
 loop.
@@ -153,7 +153,7 @@ raised by 20 tokens on 2026-09-14 to add one sentence to a field description.
 That test is doing exactly its job, and the pressure it is registering is real:
 25 tools in AGENT is already 4.4k tokens of every prompt, and the surveys
 (`db_roundtrip_audit`, `validation_audit`, `temporal_audit`,
-`lib_version_check`) are in ASK and PLANNER *only because* the prompt cost was
+`lib_version_check`) are in ASK and PLANNER _only because_ the prompt cost was
 judged not worth it in AGENT — the comment in `registry.py` says so outright.
 
 Deferred loading dissolves that trade. The surveys could be visible everywhere
@@ -176,15 +176,15 @@ edits", is the same instinct without the stated guard.
 fire under different pressure:
 
 1. **Snip** — fast lossy pruning of old messages
-2. **Microcompact** — targets *tool outputs only*, persists large reads to disk with a model-visible summary, no API call
+2. **Microcompact** — targets _tool outputs only_, persists large reads to disk with a model-visible summary, no API call
 3. **Context collapse** — progressive compression of older segments
 4. **Autocompact** — full summarisation at a computed threshold
 5. **Reactive** — emergency, on an actual `prompt_too_long`/413
 
 You have `agentic` and `basic`, plus one overflow recovery at `retain_pct=0.15`.
 Your projection already does caps, slice supersession and repeat collapse, which
-covers some of what snip and microcompact do — but it does it *every turn on
-everything*, not as a graduated response to pressure, and it never persists a
+covers some of what snip and microcompact do — but it does it _every turn on
+everything_, not as a graduated response to pressure, and it never persists a
 large read to disk in exchange for a summary.
 
 **Microcompact is the one to steal.** Your single largest context consumer is
@@ -192,8 +192,8 @@ tool output — a `read_file` of a 6,571-line handler, a `repo_map`, a
 `legacy_audit`. Claude Code writes those to disk and leaves a model-visible
 pointer. You already have every piece: `router.workspace`, the
 `.dakcoder/sessions/<id>/` directory, `CACHED_RESULT_CHARS`, and a projection
-layer that is the right place to apply it. What you do not have is the *step
-between* "cap it at insertion" and "compact the whole conversation".
+layer that is the right place to apply it. What you do not have is the _step
+between_ "cap it at insertion" and "compact the whole conversation".
 
 Their thresholds, for calibration ([karanprasad](https://karanprasad.com/blog/how-claude-code-actually-works-reverse-engineering-512k-lines)):
 
@@ -208,14 +208,14 @@ For a 200k model: compact at ~167k, warn at ~160k. Yours is 235,520 prompt +
 named differently. Your circuit breaker is `_thrashing` (3 compactions in 8
 turns); theirs halts compaction entirely after 3 consecutive failures. Theirs is
 the one that matters — sabrina.dev reports an internal BigQuery query finding
-1,279 sessions with *up to 3,272 consecutive compaction failures*, burning
+1,279 sessions with _up to 3,272 consecutive compaction failures_, burning
 ~250,000 API calls a day. Your `_summariser_failed` path should have the same
 hard stop, and on a metered shared GPU budget the argument is stronger.
 
 ### 3.4 Verification: your decisive lead (row 13)
 
 None of the ten sources describes anything in Claude Code equivalent to
-`gate.py`. What they describe instead is: hooks that *can* run a linter, a
+`gate.py`. What they describe instead is: hooks that _can_ run a linter, a
 "Verification Agent" prompt that tells a sub-agent "the implementer is an LLM,
 verify independently", and the model's own judgement about whether it is done.
 
@@ -229,8 +229,8 @@ the run. Plus an inner loop after every mutating batch, sub-second, that
 promotes a step from `written` to `done` only when the formatter and contract
 linter come back clean over what was written.
 
-`registry.py` states the principle Claude Code's design does not: *"a model that
-chooses whether to run `go vet` is one that sometimes does not."* That is the
+`registry.py` states the principle Claude Code's design does not: _"a model that
+chooses whether to run `go vet` is one that sometimes does not."_ That is the
 right call and it is the single thing in this codebase most worth not losing.
 The cost is generality — the gate only exists because the target is one template
 in one language.
@@ -243,7 +243,7 @@ model writes and the harness does not verify), and UltraPlan (unshipped: Opus
 plan the harness checks work against.
 
 Yours is. `PlanStep` carries `file`, `action`, `accepts`, `phase`, `part` and a
-`status` the *loop* sets from the change set — `written` when a mutation lands,
+`status` the _loop_ sets from the change set — `written` when a mutation lands,
 `done` only when the inner gate is clean over it, `failed` when a gate failure
 names the file. `_why_not_done()` is a single completion guard. `migration.py`
 adds a phase state machine on top, with `plan_objection` refusing a migration
@@ -253,7 +253,7 @@ The 2026-09-14 `/migrate` bug is the counter-argument worth recording honestly:
 the whole mechanism hangs on `PlanStep.covers`, and one malformed `file` field
 (`"go.work, go.work.sum"`) made four independent checks fail at once and put the
 run in an infinite delete/restore loop. Ground-truth status tracking is a
-stronger design than TodoWrite *and* it has a single point of failure TodoWrite
+stronger design than TodoWrite _and_ it has a single point of failure TodoWrite
 does not have. The fix landed; the lesson is that a join this load-bearing needs
 its inputs validated at the boundary, which is now what `split_paths` does.
 
@@ -305,7 +305,7 @@ as of 2026-09-14 a delete/restore churn ledger. `loopstate.py` groups all of it
 into five owners with an invalidation rule per group.
 
 This is genuinely better engineering than what the sources attribute to Claude
-Code, and it is better *because* the model is worse. Do not let a future refactor
+Code, and it is better _because_ the model is worse. Do not let a future refactor
 cargo-cult it away on the grounds that "Claude Code doesn't need this".
 
 ### 3.9 Extensibility (row 19)
@@ -314,8 +314,8 @@ Claude Code: hooks at 27 events across 5 categories; Skills (`SKILL.md` with
 YAML frontmatter, progressive disclosure); Plugins with 10 component types; MCP
 as a client for third-party servers. VILA-Lab abstracts the contract to three
 stages — `assemble()` (what enters context), `model()` (what can be requested),
-`execute()` (permission gates and pre/post hooks) — and the rule *"load an
-extension's instructions and schemas when they become relevant"*.
+`execute()` (permission gates and pre/post hooks) — and the rule _"load an
+extension's instructions and schemas when they become relevant"_.
 
 You have `hooks.py` with `beforeTool`/`afterTool` and two good safety rules (a
 hook cannot silently succeed; a hook cannot impersonate a tool by emitting
@@ -335,22 +335,22 @@ or a second service family ever appears, the generalisation is small.
 Claude Code assembles its system prompt from 500+ discrete conditional strings —
 ~150 system sections, ~70 agent prompts, ~90 data templates — into a reported
 32,000+ lines, split into 7 static sections (cached globally) and 13 dynamic
-ones, with a deliberate cache-busting boundary placed *after* MCP instructions so
+ones, with a deliberate cache-busting boundary placed _after_ MCP instructions so
 that adding an MCP server does not invalidate the static prefix.
 
 You have one `system.md` under a 1,200-token budget asserted in tests, one mode
-overlay under 250 tokens appended as a *user* message, and a state block built
+overlay under 250 tokens appended as a _user_ message, and a state block built
 from ground truth at the end of every prompt. Your `prompts/__init__.py`
 docstring records why: three separate system prompts cost the previous
 implementation three cold prefills per task.
 
 Your approach is better for your situation and it is not a coincidence — a 27B
 model given 32,000 lines of conditional instruction would not follow them.
-What is worth taking is the *mechanism*, not the volume:
+What is worth taking is the _mechanism_, not the volume:
 `promptCacheBreakDetection.ts` tracks 14 fields that invalidate the cache
 (system prompt hash, tool schema hashes, model, beta headers, effort) and uses
 sticky-on latches to stop a feature flag flipping mid-session and breaking the
-prefix. You assert prefix stability in tests; you do not *detect* a break at
+prefix. You assert prefix stability in tests; you do not _detect_ a break at
 runtime. On a metered shared endpoint, a cache break you cannot see is money you
 cannot attribute.
 
@@ -366,7 +366,7 @@ cannot attribute.
    Immediate effects: AGENT's 4,420-token prefix drops; the four surveys can be
    visible in AGENT without cost (which would have saved the `/migrate` run a
    turn); `test_prompts.py`'s ceiling stops being a tax on documentation.
-   *Watch:* a 27B model may not reach for a meta-tool reliably — gate it behind a
+   _Watch:_ a 27B model may not reach for a meta-tool reliably — gate it behind a
    measurement, and keep the 6-8 tools it uses every turn undeferred.
 
 2. **A hard stop on repeated compaction failure.** `_summariser_failed` should
@@ -428,7 +428,7 @@ cannot attribute.
   parsing, 22-23 validators and a tree-sitter WASM grammar because it runs
   arbitrary shell for untrusted users — and sabrina.dev documents a live bypass
   where two parsers disagree on `\r` tokenisation. Your 9-binary argv allow-list
-  with no shell is *more* secure and two orders of magnitude smaller. Keep it.
+  with no shell is _more_ secure and two orders of magnitude smaller. Keep it.
 - **An LLM permission classifier.** The YOLO classifier is a two-stage model call
   (64 tokens fast / 4,096 tokens full) with a 1-hour cache and 60-80% hit rate.
   On your endpoint that is latency and quota spent to avoid a dialog a known user
@@ -479,9 +479,9 @@ cannot attribute.
 
 ## 7. The honest summary
 
-dakcoder is a *narrower, more verified, more tightly bounded* agent than Claude
+dakcoder is a _narrower, more verified, more tightly bounded_ agent than Claude
 Code, and that is the correct design for a 27B model pointed at one template.
-Claude Code is a *broader, more extensible, better-contextualised* agent, and
+Claude Code is a _broader, more extensible, better-contextualised_ agent, and
 that is correct for a frontier model pointed at every repository on earth.
 
 The three gaps that are real regardless of scope:
@@ -505,47 +505,47 @@ running untrusted work at scale, or something you have already built.
 
 ### dakcoder
 
-| Concern | File |
-|---|---|
-| Agent loop, bounds, state | `apps/agent/src/dakcoder_agent/loop.py` |
-| Loop state groups | `apps/agent/src/dakcoder_agent/loopstate.py` |
-| Modes, budgets, reasoning | `apps/agent/src/dakcoder_agent/modes.py` |
-| Canonical transcript | `apps/agent/src/dakcoder_agent/transcript.py` |
-| Compaction sidecar | `apps/agent/src/dakcoder_agent/compaction.py` |
-| Projection | `apps/agent/src/dakcoder_agent/projection.py` |
-| Context assembly, layers, budget | `apps/agent/src/dakcoder_agent/context.py` |
-| Verification gate | `apps/agent/src/dakcoder_agent/gate.py` |
-| Plan and agenda | `apps/agent/src/dakcoder_agent/plan.py`, `tools/control.py` |
-| Migration phase machine | `apps/agent/src/dakcoder_agent/migration.py` |
-| Tool contract C1 | `apps/agent/src/dakcoder_agent/tools/registry.py` |
-| Tool router, six checks | `apps/agent/src/dakcoder_agent/tools/router.py` |
-| Hook seam, parallel rule | `apps/agent/src/dakcoder_agent/hooks.py` |
-| Undo snapshots | `apps/agent/src/dakcoder_agent/undo.py` |
-| Local HTTP + SSE | `apps/agent/src/dakcoder_agent/loopback.py` |
-| Prompt assembly | `apps/agent/src/dakcoder_agent/prompts/` |
-| Knowledge / the one Skill | `packages/knowledge/SKILL.md`, `references/` |
-| Diagnostic playbooks | `apps/agent/src/dakcoder_agent/playbooks/` |
-| Go analysis sidecar | `gotools/` |
-| Auth, quota, model proxy | `apps/gateway/src/dakcoder_gateway/` |
+| Concern                          | File                                                        |
+| -------------------------------- | ----------------------------------------------------------- |
+| Agent loop, bounds, state        | `apps/agent/src/dakcoder_agent/loop.py`                     |
+| Loop state groups                | `apps/agent/src/dakcoder_agent/loopstate.py`                |
+| Modes, budgets, reasoning        | `apps/agent/src/dakcoder_agent/modes.py`                    |
+| Canonical transcript             | `apps/agent/src/dakcoder_agent/transcript.py`               |
+| Compaction sidecar               | `apps/agent/src/dakcoder_agent/compaction.py`               |
+| Projection                       | `apps/agent/src/dakcoder_agent/projection.py`               |
+| Context assembly, layers, budget | `apps/agent/src/dakcoder_agent/context.py`                  |
+| Verification gate                | `apps/agent/src/dakcoder_agent/gate.py`                     |
+| Plan and agenda                  | `apps/agent/src/dakcoder_agent/plan.py`, `tools/control.py` |
+| Migration phase machine          | `apps/agent/src/dakcoder_agent/migration.py`                |
+| Tool contract C1                 | `apps/agent/src/dakcoder_agent/tools/registry.py`           |
+| Tool router, six checks          | `apps/agent/src/dakcoder_agent/tools/router.py`             |
+| Hook seam, parallel rule         | `apps/agent/src/dakcoder_agent/hooks.py`                    |
+| Undo snapshots                   | `apps/agent/src/dakcoder_agent/undo.py`                     |
+| Local HTTP + SSE                 | `apps/agent/src/dakcoder_agent/loopback.py`                 |
+| Prompt assembly                  | `apps/agent/src/dakcoder_agent/prompts/`                    |
+| Knowledge / the one Skill        | `packages/knowledge/SKILL.md`, `references/`                |
+| Diagnostic playbooks             | `apps/agent/src/dakcoder_agent/playbooks/`                  |
+| Go analysis sidecar              | `gotools/`                                                  |
+| Auth, quota, model proxy         | `apps/gateway/src/dakcoder_gateway/`                        |
 
 ### Claude Code (as named by the sources; not verified against source)
 
-| Concern | File / symbol |
-|---|---|
-| Agent loop | `query.ts` → `queryLoop`; `nO` in v1.0.33 |
-| Message queue / steering | `h2A` dual-buffer queue |
-| Context compression | `microCompact.ts`, `apiMicrocompact.ts`; `wU2` in v1.0.33 |
-| Cache-break detection | `promptCacheBreakDetection.ts` (14 fields) |
-| Tool base contract | `Tool.ts` (`isReadOnly`, `isDestructive`) |
-| Deferred loading | `TOOL_SEARCH_TOOL_NAME = 'ToolSearch'` |
-| Denial tracking | `denialTracking.ts` (46 lines, 3/20) |
-| Bash security | `bashSecurity.ts` (22-23 numbered checks) |
-| Tools / commands / UI | `src/tools/`, `src/commands/`, `src/components/` |
-| IDE bridge | `src/bridge/` |
-| Sub-agent IPC | `~/.claude/work/ipc/` |
+| Concern                  | File / symbol                                             |
+| ------------------------ | --------------------------------------------------------- |
+| Agent loop               | `query.ts` → `queryLoop`; `nO` in v1.0.33                 |
+| Message queue / steering | `h2A` dual-buffer queue                                   |
+| Context compression      | `microCompact.ts`, `apiMicrocompact.ts`; `wU2` in v1.0.33 |
+| Cache-break detection    | `promptCacheBreakDetection.ts` (14 fields)                |
+| Tool base contract       | `Tool.ts` (`isReadOnly`, `isDestructive`)                 |
+| Deferred loading         | `TOOL_SEARCH_TOOL_NAME = 'ToolSearch'`                    |
+| Denial tracking          | `denialTracking.ts` (46 lines, 3/20)                      |
+| Bash security            | `bashSecurity.ts` (22-23 numbered checks)                 |
+| Tools / commands / UI    | `src/tools/`, `src/commands/`, `src/components/`          |
+| IDE bridge               | `src/bridge/`                                             |
+| Sub-agent IPC            | `~/.claude/work/ipc/`                                     |
 
 ---
 
-*Written for the dakcoder maintainers. Claude Code figures are second-hand from
+_Written for the dakcoder maintainers. Claude Code figures are second-hand from
 the sources in §1 and should be treated as indicative; the recommendations in §4
-do not depend on any single disputed number.*
+do not depend on any single disputed number._
