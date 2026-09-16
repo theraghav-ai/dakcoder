@@ -243,11 +243,12 @@ OUTPUT_RESERVE = 10_240
 #: how the Planner came to have a different one that nobody noticed.
 #:
 #: ``CONTEXT_WINDOW - AGENT's max_tokens - OUTPUT_RESERVE``, exactly:
-#: 262,144 - 16,384 - 10,240 = 235,520. It was 245,760 when the largest
-#: completion budget was 6,144; raising that to 16,384 bought the output room
-#: out of here rather than out of the reserve, which is the trade the arithmetic
-#: above makes explicit. The cost is 4.2% of the prompt ceiling and a compaction
-#: threshold 7,168 tokens earlier, measured in ``test_budget_regression.py``.
+#: 262,144 - 32,768 - 10,240 = 219,136. It was 245,760 when the largest
+#: completion budget was 6,144, and 235,520 when it was 16,384; every raise has
+#: bought its output room out of here rather than out of the reserve, which is
+#: the trade the arithmetic above makes explicit. The cumulative cost is 10.8%
+#: of the original prompt ceiling and a compaction threshold 18,637 tokens
+#: earlier, measured in ``test_budget_regression.py``.
 #:
 #: The history is worth keeping, because both of the old numbers were
 #: load-bearing. It was 24,000 for the Planner once, and that killed a
@@ -260,7 +261,7 @@ OUTPUT_RESERVE = 10_240
 #:
 #: The budget is a ceiling, not an allocation: short runs are unchanged, and
 #: prefix caching absorbs most of what a long one accumulates.
-PROMPT_BUDGET = 235_520
+PROMPT_BUDGET = 219_136
 
 #: Output budgets.
 #:
@@ -278,8 +279,22 @@ PROMPT_BUDGET = 235_520
 #: could create in one call was about 24 KB, and a run asked for a report longer
 #: than that could not write it at all (BUG FS-1). ``append`` removed the hard
 #: floor -- anything can now be written in chunks -- but each chunk is a turn,
-#: and a turn is a full prefill. 16,384 makes the common case one call instead
+#: and a turn is a full prefill. 16,384 made the common case one call instead
 #: of three.
+#:
+#: **Raised again 2026-09-15**, to 32,768 for both of the modes whose output is
+#: one large structured argument rather than prose. ``AGENT`` doubles because
+#: 16,384 is roughly 64 KB of ``content`` and a whole-file conversion has to fit
+#: the prose, the tool name and the file itself into one reply. ``PLANNER``
+#: comes up from 8,192 to the same number for the same shape of reason: a plan
+#: is a single ``submit_plan`` whose arguments carry every step, ``MAX_STEPS``
+#: is twelve, and a nine-step breakdown of one 6,571-line handler is an ordinary
+#: submission rather than a pathological one. A plan cut off mid-argument is not
+#: a shorter plan; it is a turn spent for nothing and a phase that cannot start.
+#:
+#: ``ASK`` stays at 8,192 deliberately. It holds no write tool and no structured
+#: emitter, so its ceiling is only ever about prose, and an answer that wants
+#: 32,768 tokens is an answer that should have been a plan.
 #:
 #: The room came from ``PROMPT_BUDGET``, not from ``OUTPUT_RESERVE``. See both.
 MODES: dict[Mode, ModeConfig] = {
@@ -289,12 +304,12 @@ MODES: dict[Mode, ModeConfig] = {
     # Emits a plan through ``submit_plan``, which is structured output, and the
     # spike found no quality gain from thinking on structured output. A plan is
     # one call whose arguments hold every step, so it has the same shape of
-    # limit as a write and the same reason to have room.
-    Mode.PLANNER: ModeConfig(Mode.PLANNER, PROMPT_BUDGET, 8192, False, 0.1, role="planner"),
-    # Every tool, including ``write_file``. The largest budget, because this is
-    # the only mode that ever has to emit a whole file, and the one the window
-    # arithmetic above is sized against.
-    Mode.AGENT: ModeConfig(Mode.AGENT, PROMPT_BUDGET, 16384, False, 0.1, role="coder"),
+    # limit as a write -- and now the same budget, for the same reason.
+    Mode.PLANNER: ModeConfig(Mode.PLANNER, PROMPT_BUDGET, 32768, False, 0.1, role="planner"),
+    # Every tool, including ``write_file``. Shares the largest budget with the
+    # Planner, because this is the only mode that ever has to emit a whole file,
+    # and it is the one the window arithmetic above is sized against.
+    Mode.AGENT: ModeConfig(Mode.AGENT, PROMPT_BUDGET, 32768, False, 0.1, role="coder"),
 }
 
 

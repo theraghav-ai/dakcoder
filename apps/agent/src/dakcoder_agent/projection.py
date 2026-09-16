@@ -90,7 +90,7 @@ class ToolCap:
 #:
 #: At 32,768 a 6,000-token ``read_file`` cap was 18% of the budget and the
 #: elision marker's advice — "re-read the file with a narrower line range" —
-#: was survival. At 245,760 the same cap is 2.4%, and that advice *instructed*
+#: was survival. At 219,136 the same cap is 2.7%, and that advice *instructed*
 #: the sliced re-reading loop two field transcripts died of. The caps below
 #: still exist (an unbounded tool result is how one call eats a context), but
 #: they are sized so an ordinary artefact — a whole Go file, a whole build log,

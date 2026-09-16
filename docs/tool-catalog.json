@@ -433,7 +433,7 @@
         "properties": {
           "steps": {
             "type": "array",
-            "description": "The steps, in order. At most eight.",
+            "description": "The steps, in order, at most twelve. One file at a time when they are big.",
             "items": {
               "type": "object",
               "properties": {
@@ -465,7 +465,7 @@
               ],
               "additionalProperties": false
             },
-            "maxItems": 8
+            "maxItems": 12
           },
           "phases": {
             "type": "array",
@@ -582,7 +582,7 @@
         "properties": {
           "steps": {
             "type": "array",
-            "description": "The remaining steps, in order. At most eight.",
+            "description": "The remaining steps, in order. At most twelve.",
             "items": {
               "type": "object",
               "properties": {
@@ -627,7 +627,7 @@
               ],
               "additionalProperties": false
             },
-            "maxItems": 8
+            "maxItems": 12
           },
           "reason": {
             "type": "string",

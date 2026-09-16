@@ -30,7 +30,13 @@ from dakcoder_shared.paths import Workspace
 
 from dakcoder_agent.context import ContextManager
 from dakcoder_agent.gate import ROUTES_BEFORE, GateReport, StageResult
-from dakcoder_agent.loop import STUCK_TURNS, MAX_PLAN_OBJECTIONS, AgentLoop, _State
+from dakcoder_agent.loop import (
+    MAX_PLAN_OBJECTIONS,
+    STUCK_TURNS,
+    AgentLoop,
+    _State,
+    _TOOLCHAIN_CHECKS,
+)
 from dakcoder_agent.migration import (
     BIG_FILE,
     MIN_PHASES,
@@ -544,7 +550,11 @@ def test_a_file_too_big_for_one_reply_may_not_have_one_step(tmp_path: Path) -> N
     )
     assert "6,571 lines" in objection
     assert "one step" in objection
-    assert "can never be finished" in objection
+    # The arithmetic, not just "more than one". Nine steps at 800 lines each is
+    # what one reply can carry; the check used to accept any split at all while
+    # its own message said "roughly one step per 800 lines", and a plan that
+    # followed the message was accepted at three (~2,190 lines a step).
+    assert "at least 9" in objection
     assert "line range" in objection
 
 
@@ -562,8 +572,9 @@ def test_splitting_that_file_across_steps_is_accepted(tmp_path: Path) -> None:
             phase="handlers",
             part=f"methods {n}-{n + 9}",
         )
-        for n in (1, 11, 21)
+        for n in range(1, 90, 10)
     ]
+    assert len(steps) == 9, "6,571 lines is nine steps at 800 lines each"
     assert (
         plan_objection(MigrationState(active=True), _phases(), steps, lines=loop._line_count)
         == ""
@@ -1439,12 +1450,20 @@ def test_the_second_delete_is_told_about_as_a_cycle_not_as_a_loss(planning_route
     assert loop.state.churn.get("go.work", 0) >= 1
 
 
-def test_a_cycle_is_told_about_even_when_the_step_asked_for_the_removal(
-    planning_router,
-) -> None:
-    """A turn that goes round stops counting as progress whatever the plan says,
-    so it has to be explained whatever the plan says. A stall counter ticking
-    with nothing saying why is the state this whole fix is about."""
+def test_a_planned_deletion_cannot_be_undone_by_a_write(planning_router) -> None:
+    """The cycle this used to assert can no longer form, which is better.
+
+    It asserted that a delete/restore/delete on a path whose *step asked for the
+    removal* was explained as a cycle. The restoration in the middle is now
+    refused outright -- a write that puts back a file the plan deleted on
+    purpose undoes a finished step -- so there is no second delete and nothing
+    to explain. The stronger guarantee is asserted instead.
+
+    The field run this comes from deleted `routes/routes.go` and
+    `handler/response.go` exactly as its migration said, hit a mid-conversion
+    build failure whose first line named the package it had just removed, and
+    wrote both files back with the gin helpers in them.
+    """
     (planning_router.workspace.root / "go.work").write_text("go 1.25.0\n", encoding="utf-8")
     loop, _ = build(
         planning_router,
@@ -1458,9 +1477,16 @@ def test_a_cycle_is_told_about_even_when_the_step_asked_for_the_removal(
     )
     list(loop.run("drop the workspace file", intent=Intent.AGENT, continued=True))
 
-    said = [m.content or "" for m in loop.context.build() if m.role.value == "user"]
-    assert [m for m in said if "That is a cycle" in m], "the cycle went unexplained"
-    assert loop.state.churn.get("go.work", 0) >= 1
+    assert "go.work" in loop.state.retired, "the planned deletion was not recorded"
+    assert not (planning_router.workspace.root / "go.work").exists(), "the file came back"
+    refused = [
+        m.content or ""
+        for m in loop.context.build()
+        if m.role.value == "tool" and "deleted by this migration on purpose" in (m.content or "")
+    ]
+    assert refused, "the resurrection was not refused"
+    assert "revise_plan" in refused[0], "no way out was named"
+    assert loop.state.churn == {}, "no cycle can form once the write is refused"
 
 
 def test_a_turn_that_only_re_deletes_is_not_progress(planning_router) -> None:
@@ -2162,3 +2188,81 @@ def test_the_next_message_plans_the_next_phase_not_the_closed_one(tmp_path: Path
     # longer told it is on a phase it has twice reported finishing.
     assert loop.state.migration.current[1].name == "deps"
     assert any("deps" in line for line in loop.state.migration.block(""))
+
+
+# ── a mid-conversion build failure is expected, and says so ─────────────────
+#
+# The gate is deferred during a conversion because "every build between those
+# two points fails, correctly, on code the plan has not reached yet" — and then
+# the acting phase was left holding `go_build`, whose own fix line says "fix the
+# first error listed". A field run followed it: the first error named a package
+# the plan had correctly deleted, so it recreated the file.
+
+
+def test_a_failing_build_mid_migration_is_framed(planning_router) -> None:
+    loop, _ = build(
+        planning_router,
+        [calls(("go_build", "{}")), calls(("finish", json.dumps({"answer": "stopped"})))],
+        migration=True,
+        max_turns=4,
+    )
+    loop.state.migration = MigrationState(active=True)
+    loop.state.migration.adopt(_phases())
+    loop.state.migration.branch = "template-conversion"
+    loop.router.handlers["go_build"] = lambda _inv: ToolResult.failure(
+        "main.go:6:2: package gotemplate/routes is not in std",
+        fix="Fix the first error listed; later ones are often consequences of it.",
+    )
+    list(loop.run("convert the handlers", intent=Intent.AGENT, continued=True))
+
+    said = [m.content or "" for m in loop.context.build() if m.role.value == "user"]
+    framed = [m for m in said if "mid-conversion" in m]
+    assert framed, "the run was left to read a mid-conversion build as its own failure"
+    assert "do not work down that error list" in framed[0].lower()
+    assert "Restoring the file" in framed[0], "the resurrection is not warned against"
+
+
+def test_a_failing_build_outside_a_migration_is_not_framed(planning_router) -> None:
+    """An ordinary run's build failure is entirely its own problem."""
+    loop, _ = build(
+        planning_router,
+        [calls(("go_build", "{}")), calls(("finish", json.dumps({"answer": "stopped"})))],
+        max_turns=4,
+    )
+    loop.router.handlers["go_build"] = lambda _inv: ToolResult.failure("undefined: X")
+    list(loop.run("fix the build", intent=Intent.AGENT))
+
+    said = [m.content or "" for m in loop.context.build() if m.role.value == "user"]
+    assert not [m for m in said if "mid-conversion" in m]
+
+
+def test_rules_lint_is_not_excused_mid_migration(tmp_path: Path) -> None:
+    """It is scoped to what this run touched, so its findings *are* this phase's."""
+    assert "rules_lint" not in _TOOLCHAIN_CHECKS
+    assert _TOOLCHAIN_CHECKS == {"go_build", "go_vet", "go_test"}
+
+
+# ── a step of several on one file reads only its own range ─────────────────
+
+
+def test_a_split_step_says_to_read_only_its_range(tmp_path: Path) -> None:
+    """A run read "convert paogen.go, lines 1-2000", reasoned it had to read all
+    6,571 lines first, and reported the phase blocked. It was right about the
+    arithmetic it did and wrong about the one it needed."""
+    loop = _loop(tmp_path)
+    loop.state.plan = tuple(
+        PlanStep("handler/paogen.go", f"convert lines {n}-{n + 799}", "go build",
+                 phase="handlers", part=f"lines {n}-{n + 799}")
+        for n in (1, 801, 1601)
+    )
+    block = "\n".join(loop._plan_block())
+
+    assert "one of 3 steps on handler/paogen.go" in block
+    assert "`start` and `end`" in block
+    assert "Do not read or rewrite the whole file" in block
+
+
+def test_a_lone_step_says_nothing_about_ranges(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.state.plan = (PlanStep("main.go", "rewire it", "go build", phase="deps"),)
+    assert "read only" not in "\n".join(loop._plan_block()).lower()

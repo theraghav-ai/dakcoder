@@ -329,8 +329,9 @@ def write_file(inv: Invocation) -> ToolResult:
 
     **Why append exists** (BUG FS-1). A model's whole reply — prose, tool name
     and the entire ``content`` argument, JSON-escaped — has to fit one
-    ``max_tokens`` budget, which is 6,144 for the acting mode. That caps a
-    single ``write_file`` at roughly 24 KB of text, and there was no second way
+    ``max_tokens`` budget, which was 6,144 for the acting mode when this was
+    found and is 32,768 now. That capped a single ``write_file`` at roughly
+    24 KB of text, and there was no second way
     to get bytes into a file: ``write_file`` refused to overwrite and
     ``patch_file`` needs a unique anchor *in a file that already has one*, which
     the first chunk of a new document does not have. So a document larger than

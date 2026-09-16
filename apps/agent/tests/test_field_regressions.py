@@ -495,7 +495,29 @@ def test_a_search_that_returns_nothing_new_says_so_and_is_eventually_withdrawn(r
     ]
     assert told, "the run was never told it was getting the same sections back"
     assert any("does not cover" in t for t in told), "the corpus was never declared exhausted"
-    assert False in client.offered, "search_docs was never withdrawn"
+
+    # **Refused, not withdrawn**, and the tool list never moves.
+    #
+    # This used to assert the opposite -- that `search_docs` disappeared from
+    # the schema list once the cap was reached. It did, and it was the most
+    # expensive line in `_tools`: the schemas are serialised into the prompt
+    # ahead of the system message, so dropping one mid-run changes the token
+    # stream at position zero and costs a full prefix re-prefill for the rest of
+    # the run -- ~15,000 tokens at turn 20, ~76,000 at turn 100 -- to hide one
+    # schema of about forty.
+    #
+    # The stop is unchanged and is the thing that was measured. What changed is
+    # where it is applied: the call is refused in the batch pre-check with the
+    # same wording, so the model gets a harder answer than a missing tool ever
+    # gave it and the request it is judged against stays byte-stable.
+    assert all(client.offered), "the tool list moved; the prefix cache cannot survive that"
+    refused = [
+        m.content
+        for m in context.build()
+        if str(m.role) == "tool" and "was not run" in (m.content or "")
+    ]
+    assert refused, "the search was never actually refused"
+    assert any("does not cover" in r for r in refused), refused[0]
 
 
 # ── a compound request is work, and a conjoined noun phrase is not ──────────

@@ -186,7 +186,7 @@ def test_small_results_pass_through_untouched():
 
 # ── the file-slice ledger ───────────────────────────────────────────────────
 #
-# `ContextManager.SUPERSEDE_SLICES` says why this is still on at a 245,760-token
+# `ContextManager.SUPERSEDE_SLICES` says why this is still on at a 219,136-token
 # budget, against the failure report's advice: measured, turning it off puts
 # `test_budget_regression`'s P95 at 166,801 tokens against a 128,000 target.
 # What the report is right about is the bug, and the containment rule below is

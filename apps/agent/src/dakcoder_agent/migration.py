@@ -15,8 +15,8 @@ which is worse. So the gate is **deferred** until the last phase closes, and
 then it runs *without* a baseline, because a converted service that does not
 build has not been converted.
 
-**It is too big for one plan.** ``submit_plan`` caps at eight steps; a service
-has forty handlers. A plan that tries to hold the whole conversion is a plan
+**It is too big for one plan.** ``submit_plan`` caps at ``MAX_STEPS`` steps; a
+service has forty handlers. A plan that tries to hold the whole conversion is a plan
 whose cursor never advances and whose steps are directories. So the roadmap --
 the phases, in order -- is held separately from the steps, and the step list is
 only ever *the phase that is open*.
@@ -54,6 +54,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
+
+from .tools.registry import MAX_STEPS
 
 __all__ = [
     "BASE_BRANCH",
@@ -105,11 +107,18 @@ MAX_LOG = 40
 #: each of those files.
 #:
 #: A step is a unit of work that has to fit in one reply. The acting phase gets
-#: 16,384 output tokens, which is roughly 1,200 lines of Go written from
+#: 32,768 output tokens, which is roughly 2,400 lines of Go written from
 #: scratch, and a conversion also has to *read* the original. 800 lines is the
 #: point past which a whole-file step is a step that cannot be finished --
 #: `paogen.go` becomes nine steps, each of which is a reply and a checkpoint,
 #: and the plan can say which of the nine are done.
+#:
+#: **The threshold did not move when the budget doubled**, and that is on
+#: purpose. It was never 16,384 divided by a line length: the reply also carries
+#: the prose and the tool name, the model has to have read the original in an
+#: earlier turn and hold it, and a step is a *checkpoint* as well as a unit of
+#: output -- nine resumable pieces beat four that each lose more when one fails.
+#: What the extra room buys is headroom inside a step, not bigger steps.
 BIG_FILE = 800
 
 
@@ -411,8 +420,8 @@ def phases_from_meta(meta: Mapping[str, Any]) -> tuple[Phase, ...]:
 #:
 #: The size rule below refuses a single step on a file over ``BIG_FILE`` lines,
 #: and every word of its reasoning is about *conversion*: the acting phase has
-#: 16,384 output tokens, a conversion has to read the original as well, so a
-#: 4,000-line handler is nine steps rather than one. That is right, and it is
+#: 32,768 output tokens, a conversion has to read the original as well, so a
+#: 4,000-line handler is five steps rather than one. That is right, and it is
 #: right about conversion only.
 #:
 #: A dependency phase is not conversion. "Replace the api-log import with
@@ -537,27 +546,93 @@ def plan_objection(
                 # conversion step, and it is the one that cannot finish.
                 was = bounded.get(path, True)
                 bounded[path] = was and _is_bounded_edit(str(getattr(step, "action", "") or ""))
-        big = [
-            (path, n)
-            for path in counted
-            if counted[path] == 1
-            and not bounded.get(path, False)
-            and (n := lines(path)) > BIG_FILE
-        ]
-        if big:
-            worst = max(big, key=lambda item: item[1])
+        # **Enough steps, not merely more than one.**
+        #
+        # This asked `counted[path] == 1`, so any split at all satisfied it
+        # however much each step carried -- while the message it printed said
+        # "roughly one step per 800 lines". The check and its own advice
+        # disagreed, and the plan that followed the advice was accepted at three
+        # steps for a 6,571-line handler: ~2,190 lines each, against an acting
+        # phase that can emit about 1,200. The run discovered that thirty turns
+        # later and reported the whole phase blocked, correctly.
+        #
+        # The point of an objection at plan time is that the cost is paid here.
+        # An objection that accepts an unworkable plan is worse than none: it
+        # spends the round trip and certifies the result.
+        short = []
+        for path, given in counted.items():
+            if bounded.get(path, False):
+                continue
+            n = lines(path)
+            if n <= BIG_FILE:
+                continue
+            needed = -(-n // BIG_FILE)  # ceil, without importing math for it
+            if given < needed:
+                short.append((path, n, given, needed))
+        # **The demand has to fit in a submission.**
+        #
+        # `paogen.go` at 6,571 lines needs nine steps by the arithmetic above,
+        # and `submit_plan` carries eight. Asking for nine would be a condition
+        # no plan could satisfy -- and this file's whole history is the cost of
+        # building one of those by accident. So when the phase's big files need
+        # more steps than one plan can hold, the objection asks for a *narrower*
+        # plan instead of a longer one: one file, finished, then the next.
+        #
+        # It is also the answer the run reached on its own and could not act on:
+        # "I need to start with the smallest file to make progress, but the plan
+        # does not include it as the first step."
+        total = sum(needed for _, _, _, needed in short)
+        if short and total > MAX_STEPS:
+            # The smallest file in the *plan*, not the smallest oversized one.
+            #
+            # A file under the threshold is not in `short` at all, and it is
+            # exactly the one to start with: `publicacct.go` at 695 lines is one
+            # step and finishes in a turn, which is what turns a blocked phase
+            # into a moving one. Naming the smallest *large* file instead would
+            # have sent the run at a 3,966-line handler while a 695-line one sat
+            # there -- and "start with the smallest" was the run's own
+            # conclusion, which it could not act on.
+            sizes = {
+                path: lines(path)
+                for path in counted
+                if path and not bounded.get(path, False)
+            }
+            path = min(sizes, key=lambda p: (sizes[p], p))
+            n = sizes[path]
+            needed = max(1, -(-n // BIG_FILE))
             return (
-                f"{worst[0]} is {worst[1]:,} lines and the plan gives it one step. "
-                "One reply cannot convert it, so that step can never be finished. "
-                "Split it: several steps naming the same file, each saying in "
-                "`action` which methods or which line range it converts, and put "
-                "the group in `part`. "
+                "this phase is bigger than one plan can hold: its large files need "
+                f"{total} steps between them and a plan carries {MAX_STEPS}. Plan "
+                "one file at a time. Send the steps for "
+                f"{path} ({n:,} lines, {needed} step{'' if needed == 1 else 's'}) and nothing "
+                "else -- it is the "
+                "smallest, so it finishes first and the next plan is written against "
+                "a service that is already part-converted. Each step names its own "
+                "line range in `action`, reads only that range (`read_file` takes "
+                "`start` and `end`) and writes it back"
+            )
+        if short:
+            worst = max(short, key=lambda item: item[1])
+            path, n, given, needed = worst
+            had = "one step" if given == 1 else f"{given} steps"
+            return (
+                f"{path} is {n:,} lines and the plan gives it {had}. One reply "
+                f"writes about {BIG_FILE:,} lines, so those steps cannot be "
+                f"finished; it needs at least {needed}. Split it that far: "
+                "several steps naming the same file, each saying in `action` "
+                "which methods or which line range it converts, and put the "
+                "group in `part`. Each step then reads only its own range "
+                "(`read_file` takes `start` and `end`) and writes that range "
+                "back -- the whole file is never read or written at once."
                 + (
-                    ", ".join(f"{p} ({n:,} lines)" for p, n in big[:3])
-                    + " all need this."
-                    if len(big) > 1
-                    else "Roughly one step per "
-                    + f"{BIG_FILE:,} lines."
+                    "\n\nAlso short: "
+                    + ", ".join(
+                        f"{p} ({ln:,} lines, {g} of {nd})"
+                        for p, ln, g, nd in short
+                        if p != path
+                    )
+                    if len(short) > 1
+                    else ""
                 )
             )
 

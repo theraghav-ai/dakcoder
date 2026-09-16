@@ -33,6 +33,7 @@ from ..modes import Mode
 __all__ = [
     "MAX_DESCRIPTION",
     "MAX_PARAMS",
+    "MAX_STEPS",
     "Approval",
     "Provider",
     "REGISTRY",
@@ -46,6 +47,29 @@ __all__ = [
 #: C1's hard limits.
 MAX_PARAMS = 6
 MAX_DESCRIPTION = 200
+
+#: How many steps one ``submit_plan`` may carry.
+#:
+#: Named rather than written into the two schemas below, because
+#: ``plan_objection`` has to know it. That check demands a file be split into
+#: ``ceil(lines / BIG_FILE)`` steps, and a demand larger than one submission can
+#: hold is a condition no plan can satisfy -- the failure this codebase keeps
+#: rebuilding by accident. The two numbers have to be one number.
+#:
+#: **Eight until the arithmetic was enforced; twelve now.** Eight came from a
+#: field session that died with three replies cut off mid-tool-call, having
+#: written two files out of eight steps: a model handed eight pending items
+#: attempts all eight, and back then the output budget was 16,384. The mitigation for that is
+#: no longer the cap -- ``_plan_block`` stopped rendering the checklist and
+#: renders one step with a cursor, which is what that docstring is about -- and
+#: the cap became the binding constraint on something else. ``handler/paogen.go``
+#: is 6,571 lines, which is nine steps at 800 lines each, and at a cap of eight
+#: the largest handler in the corpus could not be planned at all.
+#:
+#: Twelve covers the worst real conversion with headroom. It is not licence for
+#: twelve-step plans of small files: `plan_objection` still asks for a plan of
+#: one file at a time when the phase's files need more than this between them.
+MAX_STEPS = 12
 
 _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -531,7 +555,7 @@ _SPECS: tuple[ToolSpec, ...] = (
         ),
         parameters=_obj(
             steps=_array(
-                "The steps, in order. At most eight.",
+                "The steps, in order, at most twelve. One file at a time when they are big.",
                 {
                     "type": "object",
                     "properties": {
@@ -572,7 +596,7 @@ _SPECS: tuple[ToolSpec, ...] = (
                     "required": ["file", "action", "accepts"],
                     "additionalProperties": False,
                 },
-                maxItems=8,
+                maxItems=MAX_STEPS,
             ),
             # The roadmap, and the reason it is a second field rather than a
             # longer `steps`: a migration is forty files and `steps` caps at
@@ -694,7 +718,7 @@ _SPECS: tuple[ToolSpec, ...] = (
         ),
         parameters=_obj(
             steps=_array(
-                "The remaining steps, in order. At most eight.",
+                "The remaining steps, in order. At most twelve.",
                 {
                     "type": "object",
                     "properties": {
@@ -718,7 +742,7 @@ _SPECS: tuple[ToolSpec, ...] = (
                     "required": ["file", "action", "accepts"],
                     "additionalProperties": False,
                 },
-                maxItems=8,
+                maxItems=MAX_STEPS,
             ),
             reason=_str("What was tried and why it did not work."),
         ),

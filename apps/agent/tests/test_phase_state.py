@@ -20,7 +20,7 @@ from dakcoder_shared.paths import Workspace
 
 from dakcoder_agent.context import ContextManager
 from dakcoder_agent.gate import GateReport, StageResult
-from dakcoder_agent.loop import AgentLoop, _State
+from dakcoder_agent.loop import MAX_RETRIEVAL_REPEATS, AgentLoop, _FORCE_FINISH, _State
 from dakcoder_agent.modes import Intent, Mode
 from dakcoder_agent.plan import PlanRecord
 from dakcoder_agent.tools.control import MAX_STEP_PATHS, PlanStep, split_paths
@@ -350,9 +350,10 @@ def _block(loop) -> str:
 
 
 def test_the_block_names_one_active_step_not_a_checklist() -> None:
-    """A model handed eight pending items and a 16,384-token output budget
-    attempts all eight. The field session died with three replies in a row cut
-    off mid-tool-call, having written two files out of eight steps."""
+    """A model handed eight pending items attempts all eight. The field session
+    died with three replies in a row cut off mid-tool-call against the
+    16,384-token output budget of the time, having written two files out of
+    eight steps."""
     loop = _loop()
     list(loop._adopt_plan(FIELD_PLAN, "migrate"))
 
@@ -770,3 +771,145 @@ def test_a_duplicate_path_in_the_field_becomes_one_step() -> None:
         (PlanStep("go.work, go.work", "delete it", "gone"),)
     )
     assert [s.file for s in steps] == ["go.work"]
+
+
+# ── the cacheable head of the request ───────────────────────────────────────
+#
+# The server reuses the KV state of a *prefix*, so the saving turns entirely on
+# the head of the request being byte-identical between turns. The message layers
+# are ordered for that and measured (`ContextManager.build`). The head in front
+# of them was not: the chat template serialises the tool schemas ahead of the
+# system message, so the tools array is position zero — and two rules rewrote it
+# mid-run, each costing a full re-prefill that nothing reported.
+#
+# On this manager's own `novel_tokens`, a break at turn 20 re-prefills ~15,000
+# tokens and at turn 100 ~76,000.
+
+
+def _headed() -> AgentLoop:
+    loop = _loop()
+    loop.state.mode = Mode.AGENT
+    return loop
+
+
+def _tools_named(*names: str) -> list[dict]:
+    return [{"type": "function", "function": {"name": n, "parameters": {}}} for n in names]
+
+
+def test_the_first_turn_writes_the_cache_rather_than_breaking_it() -> None:
+    loop = _headed()
+    assert loop._note_prefix(_tools_named("read_file", "write_file")) == ""
+    assert loop.state.prefix_break == ""
+
+
+def test_an_unchanged_head_is_not_a_break() -> None:
+    loop = _headed()
+    tools = _tools_named("read_file", "write_file")
+    loop._note_prefix(tools)
+    assert loop._note_prefix(list(tools)) == ""
+
+
+def test_dropping_a_tool_is_reported_as_a_break() -> None:
+    """The `search_docs` withdrawal that used to happen at a repeat cap."""
+    loop = _headed()
+    loop._note_prefix(_tools_named("read_file", "search_docs", "write_file"))
+
+    assert loop._note_prefix(_tools_named("read_file", "write_file")) == "tools"
+    assert loop.state.prefix_break == "tools"
+
+
+def test_narrowing_to_the_terminals_is_reported_as_a_break() -> None:
+    """The other one: a forced-answer turn used to send a one-tool list."""
+    loop = _headed()
+    loop._note_prefix(_tools_named("read_file", "write_file", "finish"))
+    assert loop._note_prefix(_tools_named("finish")) == "tools"
+
+
+def test_reordering_the_tools_is_a_break() -> None:
+    """Order is part of the token stream, so it is part of the prefix."""
+    loop = _headed()
+    loop._note_prefix(_tools_named("read_file", "write_file"))
+    assert loop._note_prefix(_tools_named("write_file", "read_file")) == "tools"
+
+
+def test_a_mode_switch_is_reported() -> None:
+    """Unavoidable and correct — different modes need different tools — but it
+    is still a cold prefill, and a number nobody sees is a number nobody
+    budgets for."""
+    loop = _headed()
+    tools = _tools_named("read_file")
+    loop._note_prefix(tools)
+    loop.state.mode = Mode.PLANNER
+    assert loop._note_prefix(tools) == "mode"
+
+
+def test_the_first_part_to_move_is_the_one_reported() -> None:
+    """A change in the tools invalidates the system message after it whether or
+    not that also changed; naming all three would be three findings about one
+    event."""
+    loop = _headed()
+    loop._note_prefix(_tools_named("read_file"))
+    loop.state.mode = Mode.PLANNER
+    assert loop._note_prefix(_tools_named("write_file")) == "tools"
+
+
+# ── and the two rules that were breaking it ─────────────────────────────────
+
+
+def test_search_docs_stays_in_the_schema_past_the_repeat_cap(planning_router) -> None:
+    """It used to be withdrawn here, which moved position zero of the prompt."""
+    loop = _loop()
+    loop.router = planning_router
+    loop.state.mode = Mode.ASK
+
+    before = [t["function"]["name"] for t in loop._tools()]
+    assert "search_docs" in before, "the fixture does not offer the tool under test"
+
+    loop.state.retrieval_repeats = MAX_RETRIEVAL_REPEATS + 1
+    assert [t["function"]["name"] for t in loop._tools()] == before, (
+        "the tool list moved to enforce a repeat cap, which re-prefills the prompt"
+    )
+
+
+def test_a_single_terminal_mode_names_the_tool_instead_of_narrowing(planning_router) -> None:
+    """`required` over one tool and a named choice over all of them are the same
+    constraint; only one of them moves the prompt."""
+    loop = _loop()
+    loop.router = planning_router
+    loop.state.mode = Mode.AGENT
+    tools = loop._tools()
+
+    offered, choice = loop._terminal_request(tools, "required")
+
+    assert offered == tools, "the list was narrowed, which re-prefills the whole prompt"
+    assert choice == {"type": "function", "function": {"name": "finish"}}
+
+
+def test_the_planner_still_narrows_because_it_has_three_answers(planning_router) -> None:
+    """Its terminals are three different answers to "what was this task?", and
+    naming one of them is the mistake that wrote an unrequested migration
+    (BUG L-28). One re-prefill is the price of not making that choice."""
+    loop = _loop()
+    loop.router = planning_router
+    loop.state.mode = Mode.PLANNER
+    tools = loop._tools()
+
+    offered, choice = loop._terminal_request(tools, "required")
+
+    names = {t["function"]["name"] for t in offered}
+    assert names <= {"submit_plan", "ask_developer", "finish"}
+    assert len(names) > 1, "the planner must keep its choice"
+    assert choice == "required"
+
+
+def test_a_named_force_is_left_alone(planning_router) -> None:
+    """The second force already names `finish`; it needs no list at all."""
+    loop = _loop()
+    loop.router = planning_router
+    loop.state.mode = Mode.AGENT
+    tools = loop._tools()
+
+    offered, choice = loop._terminal_request(tools, _FORCE_FINISH)
+
+    assert offered == tools
+    assert choice == _FORCE_FINISH

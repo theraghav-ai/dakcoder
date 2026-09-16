@@ -16,8 +16,8 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | Mode | Tools | Schema cost |
 |---|---|---|
 | **ask** | 15 | ~1,680 tokens |
-| **planner** | 17 | ~2,256 tokens |
-| **agent** | 26 | ~3,384 tokens |
+| **planner** | 17 | ~2,266 tokens |
+| **agent** | 26 | ~3,385 tokens |
 
 ## The catalogue
 
@@ -184,7 +184,7 @@ Submit the plan and start the work. Each step names one file, what changes in it
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `steps` | array | yes | The steps, in order. At most eight. |
+| `steps` | array | yes | The steps, in order, at most twelve. One file at a time when they are big. |
 | `phases` | array |  | Migrations only: the phases in order, at least three. Omit for ordinary tasks. |
 | `summary` | string |  | One sentence on what the whole plan achieves. |
 
@@ -212,7 +212,7 @@ Replace the remaining plan steps after an approach failed. Say what was tried an
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `steps` | array | yes | The remaining steps, in order. At most eight. |
+| `steps` | array | yes | The remaining steps, in order. At most twelve. |
 | `reason` | string | yes | What was tried and why it did not work. |
 
 ### `write_file`

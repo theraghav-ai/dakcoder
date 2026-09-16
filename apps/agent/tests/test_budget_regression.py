@@ -37,6 +37,20 @@ one, and a 4.2% cut to a number nothing reaches costs nothing.
     novel total  846,666   (+445 tokens)
     compactions        0   (unchanged — the cut did not bring compaction back)
 
+**Re-measured 2026-09-15 for PROMPT_BUDGET = 219,136**, after `planner` and
+`agent` both went to 32,768 output tokens and the further 16,384 came out of the
+prompt ceiling again. Every figure below is *identical* to the 235,520 run, to
+the token, and that is the point: the simulation's working set peaks at ~115k
+and the compaction threshold moved from 164,864 to 153,395, so the run is still
+nowhere near it. The budget cut is only visible to a task whose working set is
+larger than anything this gate models — which is the honest limit of this file,
+and the reason `test_compaction_is_rare_because_each_one_invalidates_a_prefix`
+is bounded tightly rather than loosely.
+
+    P95 prompt   114,811   (unchanged)
+    novel total  846,666   (unchanged)
+    compactions        0   (unchanged)
+
 The prefill target needs reading carefully. §5.3 writes it as
 "<= 180k (cap + compaction + **prefix reuse**)", and the row beneath it marks
 the >=80% cache-hit rate as *contingent on plan.md §9 Q1* — which is unresolved,
@@ -282,8 +296,9 @@ def test_compaction_is_rare_because_each_one_invalidates_a_prefix():
     read_file results already exceed the threshold it had just compacted below.
     """
     _, _, snapshot = _run_managed()
-    # Zero at the 245,760 budget — this task's working set peaks around 115k
-    # against a ~172k threshold. Bounded at two rather than zero because a
+    # Zero at every ceiling this file has been baselined against — this task's
+    # working set peaks around 115k, and the threshold has only come down from
+    # ~172k to ~153k. Bounded at two rather than zero because a
     # knife-edge assertion flaps on every content change and gets relaxed by
     # whoever it flaps on; but compaction *returning* here is the loudest
     # available signal that the budget shrank back toward the ceiling that was
@@ -314,7 +329,8 @@ def test_the_managed_run_is_dramatically_cheaper_than_the_unmanaged_one():
         f"\n  compactions={snapshot['compactions']}  stale_slices={snapshot['stale_slices']}"
     )
 
-    # 2.2x raw at the 245,760 budget, down from ~14x at 32,768 — deliberately.
+    # 2.2x raw at a model-window-sized budget, down from ~14x at 32,768 —
+    # deliberately.
     # Most of the old saving was truncation: capped tool results are cheap to
     # re-send and expensive to act on, and the sliced re-reading they caused is
     # what killed runs. What remains is the saving the design still promises —
@@ -341,8 +357,8 @@ def test_growth_is_bounded_rather_than_linear():
     managed, _, _ = _run_managed()
     unmanaged = _run_unmanaged()
 
-    # At 245,760 the plateau moved: a 25-turn task no longer brushes the
-    # ceiling, so within the run the managed curve still climbs — what bounds
+    # At a model-window-sized budget the plateau moved: a 25-turn task no longer
+    # brushes the ceiling, so within the run the managed curve still climbs — what bounds
     # it now is the working set. The property worth pinning is that the whole
     # task completes *under the compaction threshold* on content the unmanaged
     # baseline pushes far past it: the managed cost is set by the distinct

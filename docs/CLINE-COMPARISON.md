@@ -67,7 +67,7 @@ loop.
 | 7 | Completion state | `finish` tool, plan-abandonment refusal, deterministic gate with baseline | `submit_and_exit` with `completesRun`, `requireCompletionTool`, `completionGuard`, exactly-once `task.completed` | Yours |
 | 8 | Plan state | Typed `PlanStep` with status, `revise_plan`, loop-initiated replan | Plan/Act/YOLO as tool presets plus a command guard; no in-loop plan object; agenda tasks are a cross-session backlog | Yours |
 | 9 | File/change state | `touched`/`mutations` counters, per-path pre-image snapshot, whole-session revert, mtime check on follow-up | Per-run git checkpoint in private refs with untracked files; restore files, task, or both; compare diff | Cline |
-| 10 | Context budget | Window arithmetic: 235,520 prompt + 16,384 output + 10,240 reserve; EMA calibration against real `prompt_tokens` | Trigger at 0.9 of max input, target 0.7, preserve 20k recent; 3 chars/token flat | Yours |
+| 10 | Context budget | Window arithmetic: 219,136 prompt + 32,768 output + 10,240 reserve; EMA calibration against real `prompt_tokens` | Trigger at 0.9 of max input, target 0.7, preserve 20k recent; 3 chars/token flat | Yours |
 | 11 | Compaction | Retain 35% by tokens, structured `Recap`, chunked summariser, ledger invalidation, thrash detector | Agentic or basic strategy, overflow recovery, sidecar keyed by prefix hash, manual `/compact`, imported-history fold | Even, different strengths |
 | 12 | Message projection | `wire()` for the model; the event stream is the display | Three projections: provider, display wrapper type, `ClineMessage` with `seq`/`epoch` | Cline |
 | 13 | Persistence | Best-effort journal, `session.json`, undo manifest; loop ledgers not persisted | `sessions.db` + manifest + messages file + compaction sidecar + checkpoint metadata, atomic writes | Cline |
@@ -329,8 +329,8 @@ checkpoint boundary.
 ### 2.10 Context budget
 
 **Yours.** `ModeConfig` refuses to construct if
-`prompt_budget + max_tokens + OUTPUT_RESERVE > CONTEXT_WINDOW` (262,144 = 235,520
-+ 16,384 + 10,240). Compaction fires at 70% of the prompt budget. Tool schema
+`prompt_budget + max_tokens + OUTPUT_RESERVE > CONTEXT_WINDOW` (262,144 = 219,136
++ 32,768 + 10,240). Compaction fires at 70% of the prompt budget. Tool schema
 tokens are observed per turn. `Calibration` is an EMA (0.2) of chars-per-token
 against the endpoint's `prompt_tokens`, and `estimate_error` is emitted on every
 usage event.

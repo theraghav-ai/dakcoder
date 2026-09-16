@@ -131,12 +131,22 @@ def terminal_forces(client: "ScriptedClient") -> list[list[str]]:
 
     What every fence test actually asserts is "this turn could not do anything
     but stop", so that is what this answers.
+
+    **It returns what the turn could produce, not what it was offered**, and
+    those stopped being the same thing when the loop stopped narrowing the tool
+    list for a single-terminal mode. The schemas are serialised into the prompt
+    ahead of the system message, so a narrowed list is a different prefix from
+    position zero and costs two full re-prefills for one turn; naming the tool
+    constrains the reply exactly as hard and leaves the request alone. Both
+    shapes reach here, and under both the answer to "what could this turn do"
+    is the same -- which is the only thing a fence test is about.
     """
     out: list[list[str]] = []
     for choice, offered in zip(client.tool_choices, client.seen_tools):
         if isinstance(choice, dict):
-            if choice.get("function", {}).get("name", "") in TERMINALS:
-                out.append(list(offered))
+            named = choice.get("function", {}).get("name", "")
+            if named in TERMINALS:
+                out.append([named])
         elif choice == "required" and offered and set(offered) <= TERMINALS:
             out.append(list(offered))
     return out

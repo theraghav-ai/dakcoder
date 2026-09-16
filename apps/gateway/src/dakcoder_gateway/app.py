@@ -348,7 +348,7 @@ async def _with_error_events(first: bytes, rest) -> Any:
 #: A reservation is a claim against the developer's hourly budget, so a client
 #: that asks for an absurd one is refused rather than believed. The ceiling is
 #: well above any single turn the agent can assemble (the largest prompt budget
-#: is 245,760 tokens) and well below anything that could exhaust a window in one
+#: is 219,136 tokens) and well below anything that could exhaust a window in one
 #: request.
 MAX_ESTIMATED_TOKENS = 1_000_000
 
@@ -358,7 +358,7 @@ MAX_ESTIMATED_TOKENS = 1_000_000
 #: There was no limit: the whole body was read into memory before anything looked
 #: at it, so an authenticated client could hand the gateway as much as it cared
 #: to send (BUG GW-6). Sixteen megabytes is far above the largest prompt the
-#: agent can assemble — 245,760 tokens is roughly 1 MB of JSON — and far below
+#: agent can assemble — 219,136 tokens is roughly 900 KB of JSON — and far below
 #: anything that threatens a worker.
 MAX_BODY_BYTES = 16 * 1024 * 1024
 

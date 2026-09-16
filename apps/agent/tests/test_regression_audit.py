@@ -2148,7 +2148,7 @@ def test_the_window_arithmetic_is_checked_not_documented() -> None:
     from dakcoder_agent.modes import CONTEXT_WINDOW, Mode, ModeConfig
 
     with pytest.raises(ValueError, match="share it"):
-        ModeConfig(Mode.AGENT, CONTEXT_WINDOW - 1_000, 16_384, False, 0.1)
+        ModeConfig(Mode.AGENT, CONTEXT_WINDOW - 1_000, 32_768, False, 0.1)
 
 
 def test_the_agent_window_is_sized_against_the_largest_output_budget() -> None:
@@ -2299,11 +2299,11 @@ def test_truncation_is_countable_without_reading_prose(
     acc.feed({"type": "tool_result", "data": {
         "id": "c1", "name": "write_file", "ok": False,
         "content": "output limit reached mid-call; write_file was not dispatched",
-        "truncated_by_output_limit": True, "output_limit": 16_384}})
+        "truncated_by_output_limit": True, "output_limit": 32_768}})
     m = acc.finish()
 
     assert m.truncations == 1
-    assert m.output_limit == 16_384
+    assert m.output_limit == 32_768
     assert m.pressed_the_ceiling is True
 
 
@@ -2322,7 +2322,7 @@ def test_the_report_reads_a_journal_and_separates_pressure_from_loss(tmp_path) -
 
     quiet = [
         {"id": 1, "type": "user", "data": {"text": "add a handler"}},
-        {"id": 2, "type": "usage", "data": {"prompt_tokens": 20_000, "budget": 235_520}},
+        {"id": 2, "type": "usage", "data": {"prompt_tokens": 20_000, "budget": 219_136}},
         {"id": 3, "type": "finish", "data": {"outcome": "done", "turns": 3}},
         {"id": 4, "type": "metrics", "data": {"context_window": 262_144}},
     ]
@@ -2338,7 +2338,7 @@ def test_the_report_reads_a_journal_and_separates_pressure_from_loss(tmp_path) -
                                                 "arguments": {"path": "a.go"}, "turn": 9}},
         {"id": 6, "type": "tool_result", "data": {"id": "c2", "name": "read_file", "ok": True,
                                                   "turn": 9, "meta": {"bytes": 90_000}}},
-        {"id": 7, "type": "usage", "data": {"prompt_tokens": 230_000, "budget": 235_520}},
+        {"id": 7, "type": "usage", "data": {"prompt_tokens": 214_000, "budget": 219_136}},
         {"id": 8, "type": "finish", "data": {"outcome": "unverified", "turns": 9}},
         {"id": 9, "type": "metrics", "data": {"context_window": 262_144}},
     ]
@@ -2364,4 +2364,4 @@ def test_the_report_reads_a_journal_and_separates_pressure_from_loss(tmp_path) -
     assert hard["lost_work"] is True, "and the run needed what it threw away"
     assert hard["evicted_paths_reread"] == ["a.go"]
     assert hard["bytes_read"] == 180_000, "the true size, not the 64k event cap"
-    assert hard["peak_prompt_tokens"] == 230_000
+    assert hard["peak_prompt_tokens"] == 214_000

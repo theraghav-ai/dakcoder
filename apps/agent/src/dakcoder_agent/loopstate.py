@@ -163,6 +163,17 @@ class TaskState:
     #: loop could see it. A mutation on a path that is already cycling is not
     #: progress, and this is the counter that says so.
     churn: dict[str, int] = field(default_factory=dict)
+    #: Paths this run deleted *because a plan step asked it to*.
+    #:
+    #: The mirror of `_step_wants_removal`, which was one-directional: it could
+    #: say "this deletion was planned" and nothing could say "this file coming
+    #: back undoes that plan". A field run deleted `routes/routes.go` and
+    #: `handler/response.go` exactly as its migration said, then hit a build
+    #: failure whose first line named the package it had just removed -- because
+    #: `main.go` still imported it -- and put both files back, gin helpers and
+    #: all. Every guard passed: the step was `written`, `removed` correctly did
+    #: not hold them, and churn counts a *second delete*, not a resurrection.
+    retired: set[str] = field(default_factory=set)
     #: The intent of the run that stopped to ask the developer something, held
     #: until their answer arrives and then spent.
     #:
@@ -393,6 +404,23 @@ class Progress:
     plan_objections: int = 0
     #: Questions sent back because they had already been asked and answered.
     reasks: int = 0
+    #: What the cacheable head of the request hashed to last turn, and what
+    #: changed if it moved: ``(tools, system, mode)``.
+    #:
+    #: The server's prefix cache is a *prefix* cache -- one changed token at
+    #: position n costs a re-prefill of everything from n on -- and the head is
+    #: the part nobody watches. The message layers were ordered for this on
+    #: purpose and are measured (`ContextManager.build`); the tool schemas sit
+    #: *ahead* of the system message in the assembled prompt and were being
+    #: mutated mid-run by two separate rules, each costing a full re-prefill
+    #: that nothing reported and no test could see.
+    #:
+    #: Three parts rather than one hash, because they invalidate in order --
+    #: tools, then system, then mode -- and knowing which moved is the
+    #: difference between a number and a thing to fix.
+    prefix_key: tuple[str, str, str] = ("", "", "")
+    #: Why the prefix moved this turn, or ``""``. Reported on the usage event.
+    prefix_break: str = ""
     #: Loop-initiated returns to the Planner this run. See ``_replan``.
     replans: int = 0
     #: Model-initiated ``revise_plan`` calls this run.

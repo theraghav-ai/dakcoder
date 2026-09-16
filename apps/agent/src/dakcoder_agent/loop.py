@@ -265,6 +265,7 @@ _OWNER: dict[str, str] = {
     "gone_once": "task",
     "rewritten": "task",
     "churn": "task",
+    "retired": "task",
     "routes_saved": "task",
     "routes_before": "task",
     "migration": "task",
@@ -307,6 +308,8 @@ _OWNER: dict[str, str] = {
     "preamble_refused": "progress",
     "plan_objections": "progress",
     "reasks": "progress",
+    "prefix_key": "progress",
+    "prefix_break": "progress",
     "degenerate_refused": "progress",
     "replans": "progress",
     "revisions": "progress",
@@ -790,6 +793,14 @@ _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
 #: entitled to say so and be believed. What it is not entitled to is asking the
 #: *same* question, word for word, at a developer who has already answered it --
 #: which a field run did three times across five turns.
+#: The checks whose failure is expected while a conversion is open.
+#:
+#: Not every tool -- `rules_lint` is scoped to what the run touched and its
+#: findings are about this phase's own edits, which is exactly what a
+#: mid-conversion run should act on. These three compile or run the *whole*
+#: module, so mid-conversion they report the plan not being finished yet.
+_TOOLCHAIN_CHECKS = frozenset({"go_build", "go_vet", "go_test"})
+
 MAX_REASKS = 1
 
 #: Turns on one plan step, with nothing written to it, before the cursor block
@@ -1631,7 +1642,17 @@ class AgentLoop:
         if answering:
             tool_choice = forced_choice or self._terminal_choice()
             if forced_choice is None:
-                offered = self._terminal_tools()
+                offered, tool_choice = self._terminal_request(tools, tool_choice)
+
+        # Measured on what is actually sent, not on what `_tools` returned: the
+        # narrowing above is a prefix break, and hashing the unnarrowed list
+        # would hide the one case most worth seeing.
+        if moved := self._note_prefix(offered):
+            log.info(
+                "turn %d: prompt prefix broken at %s — the server re-prefills this turn",
+                self.context.turn,
+                moved,
+            )
         # Recorded before the call, read after it by `_phase_ended`: a plan that
         # arrives on a turn like this one was not volunteered.
         self.state.terminal_forced = answering and forced_choice is None
@@ -1898,6 +1919,20 @@ class AgentLoop:
         decided the answer is in the knowledge base keeps rewording the
         question.
 
+        **That one is no longer done here.** It was, and it was the most
+        expensive line in this method: the tool schemas are serialised into the
+        prompt by the chat template *ahead of the system message*, so dropping
+        one mid-run changes the token stream at position zero and invalidates
+        the server's prefix cache for the whole rest of the run. Measured on
+        this manager's own `novel_tokens`, a break at turn 20 re-prefills about
+        15,000 tokens and at turn 100 about 76,000 -- to withhold one schema of
+        roughly forty.
+        ``_tool_calls`` refuses the call instead, in the same batch pre-check
+        that answers a repeat: same hard stop, same wording, and the request the
+        model is judged against does not move. The refusal is stronger than the
+        withdrawal was, not weaker -- a removed tool is silent, and a refusal
+        names what to do instead.
+
         Nothing else is ever withdrawn. The old loop took the read tools away
         from a Planner at turn 16 and the lookup tools away from a Coder at
         turn 16, in both cases to force a decision the mode had no other way to
@@ -1905,8 +1940,6 @@ class AgentLoop:
         model about what exists.
         """
         tools = self.router.schemas_for(self.state.mode)
-        if self.state.retrieval_repeats >= MAX_RETRIEVAL_REPEATS:
-            tools = [s for s in tools if s["function"]["name"] != "search_docs"]
         # And one withheld, which is the same mechanism pointed the other way.
         #
         # `ask_developer` is dispatchable in the acting phase -- the registry
@@ -2175,6 +2208,14 @@ class AgentLoop:
             "budget_used_pct": round(usage.used_pct, 1),
             "reasoning_tokens": result.chat.usage.reasoning_tokens,
             "estimate_error": result.estimate_error,
+            # Which part of the cacheable head moved this turn, or "".
+            #
+            # It belongs on the usage event because it *is* a usage fact: a
+            # broken prefix is the difference between the server reading this
+            # prompt and recomputing it, and on a shared GPU that is the
+            # largest single number in the row it sits next to. `cached_tokens`
+            # says what the cache gave; this says why it gave less.
+            "prefix_break": self.state.prefix_break,
         }
         # One line per call, which is the thing an in-progress run makes
         # visible and the end-of-run summary cannot: a run that is climbing
@@ -2256,6 +2297,9 @@ class AgentLoop:
         #: them back in between. A different objection from ``removed_open`` and
         #: it has to be, because ``removed_open``'s remedy is what produced it.
         churned: list[str] = []
+        #: Toolchain checks that failed while a conversion is still open. Their
+        #: failure is expected and their own fix line is wrong there.
+        mid_migration_failures: set[str] = set()
 
         # What in this batch will not be dispatched, and why. Three rules, all
         # about the batch rather than any one call: a call repeated verbatim in
@@ -2276,6 +2320,28 @@ class AgentLoop:
                 )
                 continue
             seen_in_batch.add(fingerprint)
+            if (
+                call.name == "search_docs"
+                and self.state.retrieval_repeats >= MAX_RETRIEVAL_REPEATS
+            ):
+                # Refused here rather than withheld from the schema list.
+                #
+                # `_tools` used to drop `search_docs` on this condition, and the
+                # tool schemas sit ahead of the system message in the assembled
+                # prompt -- so the withdrawal changed the token stream at
+                # position zero and cost a full prefix re-prefill for the rest
+                # of the run, tens of thousands of tokens, to hide one schema.
+                #
+                # The stop itself is unchanged and is what was measured: the
+                # corpus does not acquire new sections mid-run, so nothing that
+                # follows could change the answer, and a model that has decided
+                # the answer is in the knowledge base keeps rewording the
+                # question. A refusal says so; a missing tool says nothing.
+                skipped[call.id] = self._retrieval_exhausted()
+                continue
+            if reason := self._resurrects_a_retired_file(call):
+                skipped[call.id] = reason
+                continue
             if call.name == "finish" and others:
                 skipped[call.id] = (
                     "it was sent in the same reply as other calls. Read their "
@@ -2534,6 +2600,12 @@ class AgentLoop:
             if not refused_by_mode and novel and not _empty_finding(outcome):
                 informed += 1
             mutated = mutated or bool(outcome.mutations)
+            if (
+                not outcome.ok
+                and call.name in _TOOLCHAIN_CHECKS
+                and self.state.migration.defers_gate
+            ):
+                mid_migration_failures.add(call.name)
             if call.name == "go_mod":
                 self.state.dependencies_changed = True
             # Where the migration's branch rule is satisfied, and it is read off
@@ -2608,6 +2680,9 @@ class AgentLoop:
                         productive = True
                     if self._step_wants_removal(mutation.path):
                         self._mark_steps(mutation.path, "written")
+                        # Recorded so a later write can be recognised as undoing
+                        # it. See `TaskState.retired`.
+                        self.state.retired.add(mutation.path)
                         continue
                     # `removed` is the ledger of files *lost*, and it is written
                     # here rather than above the branch for a reason a field run
@@ -2784,6 +2859,33 @@ class AgentLoop:
             if self.state.stalled_turns >= MAX_STALLED_TURNS:
                 self.result = self._stalled()
                 return
+
+        if broke := sorted(mid_migration_failures):
+            # The gate is deferred mid-conversion for a reason this file states
+            # at length -- "every build between those two points fails,
+            # correctly, on code the plan has not reached yet" -- and then
+            # leaves the model the same button. `go_build` is in the acting
+            # phase's tool list, `commands.py` has never heard of a migration,
+            # and its fix line says "fix the first error listed".
+            #
+            # A field run followed that instruction exactly. The first error was
+            # `package gotemplate/routes is not in std`, because `main.go` still
+            # imported a package the plan had correctly deleted, so it recreated
+            # `routes/routes.go`. Then `handler/response.go`, gin helpers and
+            # all. The tool told it to, and nothing told it otherwise.
+            self.context.append_user(
+                f"{', '.join(broke)} failed, and this service is mid-conversion. "
+                "Errors in code the plan has not reached yet are expected here: "
+                "half the service imports the old libraries and half imports the "
+                "new ones, and it does not build again until the last phase "
+                "closes. The gate knows that and is deferred until then.\n\n"
+                "So do not work down that error list. Fix only what *this phase's "
+                "steps* are about, and read the rest as the conversion being "
+                "half done.\n\n"
+                "In particular: if an error names a file the plan deleted, the "
+                "fix is in whatever still refers to it. Restoring the file puts "
+                "back the thing this migration exists to remove."
+            )
 
         if churned:
             # First, because it is the objection that supersedes the other one.
@@ -3219,6 +3321,91 @@ class AgentLoop:
         if self.state.forced_terminal:
             return _FORCE_FINISH
         return "required"
+
+    def _note_prefix(self, tools: Sequence[dict[str, Any]]) -> str:
+        """Record what the cacheable head of this request hashes to; say if it moved.
+
+        The server reuses the KV state of a *prefix*, so the whole saving turns
+        on the head of the request being byte-identical from one turn to the
+        next. The message layers are ordered for that and the ordering is
+        measured (`ContextManager.build`). The head in front of them is not:
+        the chat template serialises the tool schemas ahead of the system
+        message, so the tools array is position zero, and two rules were
+        rewriting it mid-run -- one dropping `search_docs` at a repeat cap, one
+        narrowing to the terminals on a forced answer. Each cost a full
+        re-prefill, roughly 15,000 tokens at turn 20 and 76,000 at turn 100, and
+        nothing anywhere reported it. Both are fixed; this is what would have
+        found them, and what will find the next one.
+
+        Hashed in prompt order and reported by the *first* part that moved,
+        because a change in the tools invalidates the system message after it
+        whether or not the system message also changed. Naming all three would
+        be three findings about one event.
+
+        Free when nothing changes: three hashes of small strings, once a turn.
+        """
+        key = (
+            hashlib.sha256(
+                json.dumps(list(tools), sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:16],
+            hashlib.sha256(system_prompt().encode("utf-8")).hexdigest()[:16],
+            hashlib.sha256(
+                mode_instruction(self.state.mode).encode("utf-8")
+            ).hexdigest()[:16],
+        )
+        was, self.state.prefix_key = self.state.prefix_key, key
+        if was == ("", "", ""):
+            # The first turn of a run writes the cache rather than breaking it.
+            self.state.prefix_break = ""
+            return ""
+        for part, before, now in zip(("tools", "system", "mode"), was, key):
+            if before != now:
+                self.state.prefix_break = part
+                return part
+        self.state.prefix_break = ""
+        return ""
+
+    def _terminal_request(
+        self, tools: list[dict[str, Any]], choice: str | dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], str | dict[str, Any]]:
+        """The tools and the choice for a turn that has to end the phase.
+
+        Two ways to constrain such a turn, and they cost very differently.
+
+        Narrowing the tool list to the terminals is what makes ``"required"``
+        safe -- with the full list, ``required`` only guarantees *a* call, and
+        the model carries on researching. But the schemas are serialised into
+        the prompt ahead of the system message, so a narrowed list is a
+        different token stream from position zero: the server's prefix cache
+        misses on the way in and misses again on the way out, two full
+        re-prefills for one turn. On a context of the size a migration reaches
+        that is ~15,000 tokens at turn 20 and ~76,000 at turn 100, each way.
+
+        **Naming the tool costs nothing.** ``tool_choice: {name: X}`` constrains
+        the turn exactly as hard as a one-tool list and leaves the request
+        byte-identical up to the last message. So when the mode has a single
+        terminal -- ASK and AGENT, where it is ``finish`` -- the list stays
+        whole and the choice names it.
+
+        PLANNER keeps the narrowed list, and that is deliberate rather than an
+        oversight. Its three terminals are three different answers to "what was
+        this task?", naming one of them is exactly the mistake that wrote an
+        unrequested migration (BUG L-28, see `_terminal_choice`), and there is
+        no way to say "one of these three" other than by sending those three.
+        One re-prefill is the price of not making that choice for the model.
+        """
+        if isinstance(choice, dict):
+            # Already named -- the second force, which says `finish`. Narrowing
+            # on top of a named choice buys nothing and costs a re-prefill: the
+            # endpoint is constrained to one tool either way.
+            return tools, choice
+        terminals = self._terminal_tools()
+        names = [t["function"]["name"] for t in terminals]
+        if len(names) == 1:
+            # `required` over one tool and a named choice over all of them are
+            # the same constraint; only one of them moves the prompt.
+            return tools, {"type": "function", "function": {"name": names[0]}}
+        return terminals, choice
 
     def _terminal_tools(self) -> list[dict[str, Any]]:
         """Every way this mode can end its phase, and nothing else.
@@ -3959,6 +4146,62 @@ class AgentLoop:
             "\"the file is gone\". The plan stands; this is about how you verify it."
         )
 
+    def _resurrects_a_retired_file(self, call: ToolCall) -> str:
+        """Why this write undoes a deletion the plan asked for, or ``""``.
+
+        The mirror of `_step_wants_removal`, and it was missing. That predicate
+        could say "this deletion was planned"; nothing could say "this file
+        coming back undoes the plan". So a field run deleted `routes/routes.go`
+        and `handler/response.go` exactly as its migration said, ran `go_build`
+        mid-conversion, read `package gotemplate/routes is not in std` as the
+        first error -- true, and caused by `main.go` still importing what the
+        plan had removed -- and wrote both files back, gin helpers included.
+        Every existing guard passed it: the step was `written`, `removed`
+        correctly did not hold them, and churn counts a second *delete*.
+
+        Refused rather than reported, because by the time anything reports it
+        the legacy file is on disk and the next `go_build` is green -- which
+        reads as the problem being solved. The run then converts around a file
+        the conversion exists to delete.
+
+        The escape is `revise_plan`. If the file genuinely has to come back, the
+        step that removed it was wrong, and saying so is a plan revision rather
+        than a silent write.
+        """
+        if not self.state.retired:
+            return ""
+        spec = registry.get(call.name)
+        if spec is None or not spec.mutates:
+            return ""
+        try:
+            path = str((call.parsed() or {}).get("path", "") or "")
+        except ValueError:
+            return ""
+        if not path:
+            return ""
+        try:
+            rel = self.router.workspace.relative(self.router.workspace.resolve(path))
+        except (PathEscape, ValueError, OSError):
+            rel = path
+        if rel not in self.state.retired:
+            return ""
+        step = next(
+            (s for s in self.state.plan if s.covers(rel) and self._step_wants_removal(rel)),
+            None,
+        )
+        said = f' — "{step.action}"' if step is not None else ""
+        return (
+            f"{rel} was deleted by this migration on purpose{said}, and writing it "
+            "again undoes that step.\n\n"
+            "If a build error named it, the error is in whatever still refers to "
+            f"it, not in {rel} being absent — fix the import or the registration "
+            "that points at it. A service mid-conversion does not build, and "
+            "restoring the file it is converting away from is how a conversion "
+            "ends up shipping the thing it was meant to remove.\n\n"
+            "If the file genuinely has to come back, the step that removed it was "
+            "wrong: call `revise_plan` and say so."
+        )
+
     def _note_delete(self, path: str) -> int:
         """Record a deletion, and return how many cycles this path has been through.
 
@@ -4303,6 +4546,10 @@ class AgentLoop:
         self.state.gone_once = set(previous.state.gone_once)
         self.state.rewritten = set(previous.state.rewritten)
         self.state.churn = dict(previous.state.churn)
+        # A file the plan retired stays retired across a developer message:
+        # the step that removed it is still done, and the build error that
+        # tempts the model to put it back is still there.
+        self.state.retired = set(previous.state.retired)
         # And the route inventory, which is taken once per *migration*, not
         # once per message: retaking it on message four would record a
         # half-converted service as the thing to compare the finished one
@@ -4603,6 +4850,17 @@ class AgentLoop:
                 "Rewording the question will not reach different sections. Ask about "
                 "something else, or work from what is already above."
             )
+        return self._retrieval_exhausted()
+
+    def _retrieval_exhausted(self) -> str:
+        """What the corpus has left to say once the repeat cap is reached.
+
+        One wording, two callers: the overlap check says it on the search that
+        reaches the cap, and `_tool_calls` says it to every search after --
+        which is what replaced withholding the schema. Sharing the text is the
+        point. A model told one thing by the result and another by the refusal
+        is a model given a reason to try a third phrasing.
+        """
         return (
             f"That is {self.state.retrieval_repeats} searches in a row returning "
             "sections you already have. The knowledge base does not cover this "
@@ -4728,10 +4986,12 @@ class AgentLoop:
 
         This is the ACTIVE PHASE node, and it is a rendering decision with a
         measured cause. The block used to list every step and its status on
-        every turn. A model handed eight pending items and a 16,384-token output
-        budget attempts all eight: a field session died with three replies in a
-        row cut off mid-tool-call, having written two files out of eight steps,
-        and its own prose was an essay about the remaining six.
+        every turn. A model handed eight pending items attempts all eight: a
+        field session died with three replies in a row cut off mid-tool-call
+        against the 16,384-token output budget of the time, having written two
+        files out of eight steps, and its own prose was an essay about the
+        remaining six. The budget is 32,768 now and the shape does not change --
+        a checklist is an invitation to spend the whole of whatever it is.
 
         One step, named, with the criterion it is measured against. What is
         finished is summarised by number rather than re-listed, because the
@@ -4809,6 +5069,22 @@ class AgentLoop:
         )
         if step.part:
             lines.append(f"  Part: {step.part}")
+        if same := [i for i, s in enumerate(plan, 1) if s.file == step.file and i != index]:
+            # One of several steps on one file, and the workflow is not obvious.
+            #
+            # A run read "convert handler/paogen.go, lines 1-2000", reasoned that
+            # it had to read 6,571 lines before it could write any of them,
+            # concluded the context budget would not survive it, and reported the
+            # phase blocked. It was right about the arithmetic it did and wrong
+            # about the arithmetic it needed: a step reads *its own range* and
+            # writes that range back, which fits a reply with room to spare.
+            # Nothing had ever said so.
+            lines.append(
+                f"  This is one of {len(same) + 1} steps on {step.file}. Read only "
+                "the range this step names -- `read_file` takes `start` and `end` "
+                "-- and write that range back. Do not read or rewrite the whole "
+                "file; the other steps have the rest."
+            )
         if step.accepts:
             lines.append(f"  Accepts: {step.accepts}")
         if step.note:
@@ -5015,7 +5291,7 @@ class AgentLoop:
         file convertible at all.
 
         A 6,571-line handler cannot be converted in one reply -- the acting
-        phase has 16,384 output tokens and has to read the original as well --
+        phase has 32,768 output tokens and has to read the original as well --
         so its step is really nine steps over the same path, each naming the
         methods it converts. Marking *every* covering step on the first write
         made those nine a single step wearing nine hats: one `patch_file` and

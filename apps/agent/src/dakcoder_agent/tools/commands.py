@@ -25,6 +25,7 @@ for a new developer, and without a timeout it presents as the agent being broken
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -330,6 +331,34 @@ _CANNOT_REACH = (
     "tls handshake",
 )
 
+#: A module that has moved, and where it moved to.
+#:
+#: `go get` says this when the path you asked for resolves to a repository whose
+#: own go.mod declares a different module path. No version of the old path can
+#: satisfy it, so "drop the version and take the latest" -- the advice for a
+#: version miss -- is exactly wrong here and sends the run round again. A field
+#: run asked for `github.com/bufbuild/protovalidate-go` and was told the module
+#: now declares itself `buf.build/go/protovalidate`; the hint it got back said
+#: to retry without a version.
+_RENAMED = re.compile(
+    r"module declares its path as:\s*(?P<now>\S+).*?but was required as:\s*(?P<was>\S+)",
+    re.S,
+)
+
+#: Modules the knowledge base pins, and what it pins them to.
+#:
+#: ``@latest`` is the right answer for the n-api-* libraries and the wrong one
+#: here: the reference migration says to pin `protovalidate-go` at v0.9.2
+#: because other versions break interface compatibility with the generated
+#: protobuf validators. Recommending the latest for one of these would be the
+#: tool contradicting the corpus the planner was told to follow.
+#:
+#: **Keep this in step with `references/legacy-migration.md`.** It is a short
+#: list on purpose; a long one belongs in the knowledge base rather than here.
+_PINNED: dict[str, str] = {
+    "github.com/bufbuild/protovalidate-go": "v0.9.2",
+}
+
 
 def _why_get_failed(output: str, pkg: str, version: str) -> tuple[str, str]:
     """The fix line for a failed ``go get``, and a dead-end reason if it is one.
@@ -340,6 +369,33 @@ def _why_get_failed(output: str, pkg: str, version: str) -> tuple[str, str]:
     and the model is told, in the same breath, the one move that does work.
     """
     said = (output or "").lower()
+    if moved := _RENAMED.search(output or ""):
+        now, was = moved.group("now"), moved.group("was")
+        return (
+            f"{was} has moved: the repository now declares itself {now}. No "
+            f"version of {was} can satisfy that, so asking again without a "
+            f"version will fail the same way. Change the import paths to {now} "
+            "and fetch that instead -- or, if this module is only reachable "
+            "through a dependency, leave it alone and fix the dependency that "
+            "requires the old path.",
+            f"{was} was renamed to {now}; the old path resolves to nothing",
+        )
+    if pinned := _PINNED.get(pkg):
+        if version and version != pinned:
+            return (
+                f"{pkg} is pinned to {pinned} by the migration reference, and "
+                f"you asked for {version}. Other versions break interface "
+                "compatibility with the generated protobuf validators. Ask for "
+                f"{pinned} exactly.",
+                f"{pkg} must be {pinned}, not {version}",
+            )
+        if not version:
+            return (
+                f"{pkg} is pinned to {pinned} by the migration reference -- this "
+                "is the one dependency not to take the latest of. Ask for "
+                f"{pinned} exactly. See @skill:legacy-migration.",
+                f"{pkg} must be asked for at {pinned}",
+            )
     if any(marker in said for marker in _CANNOT_REACH):
         return (
             "This machine cannot reach the module host. Check `go env GOPRIVATE` "

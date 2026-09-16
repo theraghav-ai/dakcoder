@@ -48,7 +48,13 @@ from dakcoder_shared.envelope import ToolResult
 
 from .router import Invocation
 
-__all__ = ["HANDLERS", "MAX_STEP_PATHS", "PlanStep", "split_paths", "steps_from_meta"]
+__all__ = [
+    "HANDLERS",
+    "MAX_STEP_PATHS",
+    "PlanStep",
+    "split_paths",
+    "steps_from_meta",
+]
 
 #: How many paths one ``file`` field may name before it stops being a step.
 #:
