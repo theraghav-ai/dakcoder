@@ -404,6 +404,25 @@ class Progress:
     plan_objections: int = 0
     #: Questions sent back because they had already been asked and answered.
     reasks: int = 0
+    #: What the last reply hashed to -- its prose and every call in it -- and
+    #: how many times it has now come back byte-identical.
+    #:
+    #: The one repetition nothing counted. There are ledgers for a repeated
+    #: tool call, a repeated search, a repeated question and a degenerate
+    #: `finish` answer, and every one of them watches an *argument*; none of
+    #: them watches the reply. Session 6d923ab574ae sent the same 128-token
+    #: reply -- same prose, same `read_file`, same 30-line range -- on 24 of its
+    #: last 41 turns, through three modes, three tool lists and six developer
+    #: messages, and the only thing that ever objected was `stalled_turns`,
+    #: which is per-run and restarted five times.
+    #:
+    #: Carried across developer messages by `carry_from`, and it is the only
+    #: counter here that carries in the *strict* direction -- the refusals
+    #: beside it carry leniently, towards stopping the push-back. A reply that
+    #: is still identical after the developer has typed something is the exact
+    #: failure, not the thing that clears it.
+    reply_key: str = ""
+    reply_repeats: int = 0
     #: What the cacheable head of the request hashed to last turn, and what
     #: changed if it moved: ``(tools, system, mode)``.
     #:

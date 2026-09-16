@@ -308,6 +308,8 @@ _OWNER: dict[str, str] = {
     "preamble_refused": "progress",
     "plan_objections": "progress",
     "reasks": "progress",
+    "reply_key": "progress",
+    "reply_repeats": "progress",
     "prefix_key": "progress",
     "prefix_break": "progress",
     "degenerate_refused": "progress",
@@ -810,6 +812,76 @@ MAX_REASKS = 1
 #: it -- never sees the line, and short enough to arrive while there is budget
 #: left to act on it. The loops this is for ran twenty turns and more.
 STUCK_TURNS = 4
+
+
+#: How many identical replies pass before the loop stops taking the prose.
+#:
+#: One. The second copy of a reply is the first evidence of a loop, its prose is
+#: already in the working set verbatim, and appending it again is the whole
+#: mechanism: session 6d923ab574ae carried 25 copies of one 110-token message
+#: into a 153,000-token prompt -- 7% of the context spent teaching the model to
+#: send it a 26th time. What replaces it names the repetition, which is the one
+#: thing the model cannot see from a transcript of its own confident narration.
+REPLY_PROSE_REPEATS = 1
+
+#: Identical replies before the turn after is made to answer.
+#:
+#: Two, matching `STALLS_BEFORE_ANSWER`, and reached sooner than it in practice:
+#: a stall needs every call in the batch to be a repeat, and this needs only the
+#: reply to be the same one. They are different questions -- "did this turn
+#: learn anything" and "is this turn a copy of the last one" -- and the second
+#: is the one a model in a loop answers wrong.
+REPLY_REPEATS_BEFORE_ANSWER = 2
+
+#: Identical replies before the run ends.
+#:
+#: Four. By then the escape at `REPLY_REPEATS_BEFORE_ANSWER` has fired twice and
+#: not taken, the prose has been stubbed twice, and every further turn is a full
+#: prefill of a context the size of a migration's for a reply already on file.
+#: The field run spent 41 turns and roughly 5.9 million prompt tokens past this
+#: point, and ended with the same `no_progress` it would have ended with here.
+MAX_REPLY_REPEATS = 4
+
+
+def _reply_fingerprint(content: str, calls: Sequence[ToolCall]) -> str:
+    """A stable key for a whole reply: its prose and every call in it.
+
+    Whitespace-folded, because a model that repeats itself does reproduce its
+    own formatting but nothing is gained by insisting on it, and keyed on both
+    halves because either alone is a legitimate repeat: two turns may honestly
+    open with the same sentence, and two `read_file` calls for different ranges
+    are different work. It is the pair coming back unchanged that means nothing
+    happened.
+    """
+    prose = " ".join((content or "").split())
+    fingerprints = "|".join(_fingerprint(call) for call in calls)
+    if not prose and not fingerprints:
+        return ""
+    return hashlib.sha256(
+        f"{prose}\x00{fingerprints}".encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _holds_a_phase_open(step: PlanStep) -> bool:
+    """Whether this step must be finished before its phase may close.
+
+    ``PlanStep.open`` answers a narrower question -- "does this step still ask
+    for a *write*" -- and ``written`` is deliberately outside it, because "you
+    planned to write this and did not" is the wrong objection to raise about a
+    file that exists. That reading is right everywhere it is used to decide what
+    to *ask the model for*, and wrong everywhere it is used to decide whether
+    the work is finished.
+
+    Session 6d923ab574ae is what the difference costs: three call sites read
+    ``open`` as "is there outstanding work" -- `_close_phase`, `_work_in_flight`
+    and the stall escape's `_open_targets` -- while `_why_not_done`, the one
+    predicate that decides whether a run may end, read ``written`` as
+    unfinished. The phase closed, the follow-up re-planned, the forced turn took
+    the write tools away, and the `finish` that all three pointed at was refused
+    by the fourth. Naming the question separately is what stops them drifting
+    apart again.
+    """
+    return step.open or step.status == "written"
 
 
 def _asked_fingerprint(questions: Sequence[Any]) -> str:
@@ -1540,25 +1612,17 @@ class AgentLoop:
             # and `required` over the whole list says exactly that, which is
             # already how the research fence answers the identical situation
             # twenty lines below.
-            outstanding = [] if because else self._open_targets()
+            outstanding = [] if because else self._outstanding()
             if outstanding:
                 forced_choice = "required"
-                self.context.append_user(
-                    "Stop searching. That call has already been answered and asking it "
-                    "again returns the same thing.\n\n"
-                    "Your plan set out to write " + ", ".join(outstanding) + ". "
-                    + ("Write them now" if len(outstanding) > 1 else "Write it now")
-                    + ", from what you already have. If a file genuinely cannot be "
-                    "written, say which and why in one line and call `finish`."
-                )
+                self.context.append_user(self._stall_notice() + self._outstanding_ask())
             else:
                 self.context.append_user(
                     because
                     or (
-                        "Stop searching. That call has already been answered and asking it "
-                        "again returns the same thing.\n\n"
-                        "Give the developer what you have established now, and say what you "
-                        "could not find out."
+                        self._stall_notice()
+                        + "Give the developer what you have established now, and say what "
+                        "you could not find out."
                     )
                 )
         elif self.state.research_turns >= MAX_RESEARCH_TURNS:
@@ -1573,7 +1637,7 @@ class AgentLoop:
             # `finish` -- and finished, honestly and uselessly, with "nothing
             # was changed". The bound had fired correctly and pointed at the
             # exit instead of at the work.
-            outstanding = self._open_targets()
+            outstanding = self._outstanding()
             answering = True
             if self._gate_wants_an_edit():
                 # A failing gate in the same context says "Make the edit, or say
@@ -1601,12 +1665,9 @@ class AgentLoop:
                 # and which one depends on whether the file exists yet.
                 forced_choice = "required"
                 self.context.append_user(
-                    f"You have spent {self.state.research_turns} turns reading and "
-                    "have written nothing. You have read enough.\n\n"
-                    "Your plan set out to write " + ", ".join(outstanding) + ". "
-                    + ("Write them now" if len(outstanding) > 1 else "Write it now")
-                    + ", from what you already have. If a file genuinely cannot be "
-                    "written, say which and why in one line and call `finish`."
+                    f"You have spent {self.state.research_turns} turns reading in "
+                    "this phase and have not closed it. You have read enough.\n\n"
+                    + self._outstanding_ask()
                 )
             else:
                 self.context.append_user(
@@ -1713,10 +1774,11 @@ class AgentLoop:
         # the wire declares -- malformed against a strict endpoint, and worse as
         # a prompt: the model's visible history of itself becomes paragraphs of
         # narration with results appearing beside them unexplained.
+        repeats = self._note_reply(result.chat.content or "", result.chat.tool_calls)
         assistant_msg: Message | None = None
         if result.chat.content or result.chat.tool_calls:
             assistant_msg = self.context.append_assistant(
-                result.chat.content or "",
+                self._reply_prose(result.chat.content or "", repeats, result.chat.tool_calls),
                 tool_calls=tuple(result.chat.tool_calls),
             )
 
@@ -1728,6 +1790,37 @@ class AgentLoop:
         # took, and the next overrun is a new run of bad luck rather than a
         # continuation of this one.
         self.state.truncated_turns = 0
+
+        if repeats >= MAX_REPLY_REPEATS:
+            # Every call in the reply still gets an answer. The assistant
+            # message declaring them is in the working set, and an orphaned
+            # `tool_call_id` poisons the resume as surely as it poisons the wire.
+            self._answer_unrun(
+                result.chat.tool_calls,
+                f"the run ended: this reply had been sent {repeats} times before, "
+                "unchanged.",
+            )
+            still_open = self._outstanding()
+            self.result = RunResult(
+                Outcome.NO_PROGRESS,
+                f"the model sent the same reply {repeats + 1} times running -- the same "
+                "text and the same call each time -- so nothing this phase did could "
+                "have changed anything"
+                + (". Still outstanding: " + ", ".join(still_open) if still_open else ""),
+                self.context.turn,
+                tuple(self.router.touched),
+                self.state.last_gate,
+            )
+            return
+        if repeats >= REPLY_REPEATS_BEFORE_ANSWER:
+            # `must_answer` and nothing else. Setting `answer_because` too would
+            # route the next turn down the branch that narrows the tool list --
+            # `because` is the refused-terminal path, where forcing a write
+            # would be wrong -- and that is the branch `_outstanding` exists to
+            # keep a stall out of. A repeated reply *is* a stall, with the
+            # strongest evidence there is, so it takes the stall's path and
+            # `_stall_notice` adds the one sentence that is new.
+            self.state.must_answer = True
 
         if result.chat.tool_calls:
             self.state.research_turns += 1
@@ -3384,8 +3477,23 @@ class AgentLoop:
         **Naming the tool costs nothing.** ``tool_choice: {name: X}`` constrains
         the turn exactly as hard as a one-tool list and leaves the request
         byte-identical up to the last message. So when the mode has a single
-        terminal -- ASK and AGENT, where it is ``finish`` -- the list stays
-        whole and the choice names it.
+        terminal the list stays whole and the choice names it.
+
+        That is ASK always, and AGENT only outside a migration. **Inside one,
+        AGENT holds ``ask_developer`` too** -- `registry` shows it there
+        deliberately, because a conversion meets its unknowns while converting
+        -- so the cheap path does not fire and every forced turn of a migration
+        pays the re-prefill twice. This said "ASK and AGENT, where it is
+        ``finish``" for as long as that has been false, which is the kind of
+        comment that costs a reader an afternoon: `prefix_break` reported
+        ``tools`` on every turn of session 6d923ab574ae from 109 on and the
+        docstring said it could not.
+
+        Not fixed by naming ``finish`` anyway. Two terminals are two different
+        answers to "what is this turn for", and choosing for the model is BUG
+        L-28 in the other mode. What removes the cost is not reaching here: a
+        stall with outstanding work now takes the `required`-over-the-whole-list
+        branch in `_run`, which is the case this was being paid for.
 
         PLANNER keeps the narrowed list, and that is deliberate rather than an
         oversight. Its three terminals are three different answers to "what was
@@ -4055,17 +4163,47 @@ class AgentLoop:
 
         From the plan, never from the model saying so -- the same rule
         `_mark_steps` follows, one level up. A step is settled when it is
-        ``done``, ``written`` or ``skipped``; ``written`` counts because the
-        inner loop is the only verification a migration gets before the end, and
-        holding a phase open on a formatter that could not run is the
-        permanently-unsatisfiable condition this file keeps rebuilding by
-        accident.
+        ``done``, ``skipped`` or ``blocked``.
 
-        **The fallback matters more than the rule.** When no step carries the
-        open phase's name -- the model submitted a roadmap and then plain steps,
-        which it will -- the whole plan settling closes the phase. Without that,
-        a roadmap with one untagged plan under it is a migration that can never
+        **``written`` is not settled, and that is the whole of session
+        6d923ab574ae.** It used to count, on the reasoning that the inner loop is
+        the only verification a migration gets before the end and that holding a
+        phase open on a formatter which could not run is the
+        permanently-unsatisfiable condition this file keeps rebuilding by
+        accident. The first half is true; the second does not follow.
+        `_verify_written` leaves a step at ``written`` *only* when a stage that
+        actually ran produced a finding naming that step's file, and promotes it
+        to ``done`` when none did -- a step nothing could check is already
+        ``done``, so the unsatisfiable case this was guarding against cannot
+        reach here.
+
+        What counting it cost, measured: the `handlers` phase closed with both
+        its steps at ``written`` and `rules_lint` dirty on each. `_why_not_done`
+        then refused every `finish` *because* those steps were written and
+        unclean, and `plan_objection` refused every plan that named them
+        *because* their phase had closed. The model was ordered to fix two files
+        and forbidden from planning to; it emitted one byte-identical 128-token
+        reply on 24 of the next 41 turns, across five developer messages, and
+        the session ended `no_progress` with the fix one edit away.
+
+        The exit from a step that genuinely cannot be cleaned is `revise_plan`
+        to ``blocked``, which is settled here -- and which `_cursor_age` already
+        names, in the state block, at precisely the point this used to hang.
+
+        **The fallback matters more than the rule.** When no step carries any
+        phase name -- the model submitted a roadmap and then plain steps, which
+        it will -- the whole plan settling closes the phase. Without that, a
+        roadmap with one untagged plan under it is a migration that can never
         reach its last phase and therefore never runs the gate at all.
+
+        A *tagged* plan gets no such fallback, and that is a second finding from
+        the same session. At turn 80 the plan's steps all carried `handlers`,
+        which was already closed, so `working` fell back to the roadmap's first
+        pending phase -- `branch` -- and the untagged fallback then closed it on
+        the strength of handler work. The developer was told "phase 3 of 7 —
+        branch — is complete" about a branch cut fifty-eight turns earlier. A
+        plan that names its phase has said which phase its settling is evidence
+        about, and it is not this one.
         """
         migration = self.state.migration
         here = migration.working(self._plan_phase())
@@ -4074,12 +4212,15 @@ class AgentLoop:
         _, phase = here
         key = phase.name.strip().lower()
         scoped = [s for s in self.state.plan if s.phase.strip().lower() == key]
-        steps = scoped or list(self.state.plan)
         # Evidence first, because it is the stronger witness. A branch phase is
         # finished when the branch exists, whatever its steps say -- and its
         # steps are the weakest possible signal, since cutting a branch writes
         # no file for a step to land on. See `MigrationState.evidenced`.
-        if any(step.open for step in steps) and not migration.evidenced(phase.name):
+        evidenced = migration.evidenced(phase.name)
+        if not scoped and any(s.phase.strip() for s in self.state.plan) and not evidenced:
+            return ""
+        steps = scoped or list(self.state.plan)
+        if any(_holds_a_phase_open(step) for step in steps) and not evidenced:
             return ""
         if not migration.close(phase.name):
             return ""
@@ -4430,8 +4571,17 @@ class AgentLoop:
         Once anything has been written the distinction lapses, exactly as it
         does in `_open_targets`: a run that has started acting on a plan is
         working to it, whatever produced it.
+
+        **A ``written`` step is work in flight.** It read ``open`` alone, so a
+        plan whose every step had been written and none verified looked finished
+        here and the follow-up opened in PLANNER -- which has no write tools, and
+        whose only forward move is to submit the plan it is already holding.
+        Session 6d923ab574ae did that on three separate developer messages
+        (turns 81-87, 91-97, 106-112): nineteen turns at ~140,000 prompt tokens
+        each, re-deriving a plan that was on disk, to reach an acting phase that
+        was one `patch_file` from done. See `_holds_a_phase_open`.
         """
-        if not any(step.open for step in self.state.plan):
+        if not any(_holds_a_phase_open(step) for step in self.state.plan):
             return False
         return not self.state.plan_forced or bool(self.router.touched)
 
@@ -4482,6 +4632,11 @@ class AgentLoop:
         transcript makes it look like the agent has no memory. It has memory and
         no *record*.
 
+        **And the counters that end a loop rather than inform one.** Everything
+        in ``_Progress`` used to be per message, which is right for a budget and
+        wrong for a bound: the loop being bounded is not always inside one
+        message. See the block below.
+
         Only what remains true between messages. ``last_results`` and
         ``dead_ends`` are deliberately **not** carried: the developer edits files
         between messages and nothing here watches for that, so a cached answer
@@ -4503,6 +4658,30 @@ class AgentLoop:
         the undo snapshots are the session's, not the message's.
         """
         self.router = previous.router
+        # The reply ledger, and it is the one thing here that *ends* a run
+        # rather than informing one. Every other bound in `_Progress` is built
+        # per message on purpose -- a developer who types again is entitled to a
+        # fresh push-back budget -- and session 6d923ab574ae is what that costs
+        # when the loop is not per message either: the same reply, five runs,
+        # six developer messages, `stalled_turns` restarting from zero at each
+        # one and reaching its bound of six five separate times. A reply that is
+        # still identical *after* the developer has typed something is not a new
+        # attempt at the work; it is the same attempt with a witness.
+        self.state.reply_key = previous.state.reply_key
+        self.state.reply_repeats = previous.state.reply_repeats
+        # And the refusals, which carry in the lenient direction: a run whose
+        # `finish` has already been sent back once is not sent back again, and a
+        # plan that has already been objected to twice is adopted as it stands.
+        # `plan_forced` below was carried for exactly this reason and only
+        # solved it for one of the four counters -- the other three went on
+        # spending a fresh budget of push-backs on every message, which is how
+        # one refused `finish` was refused three more times over four messages
+        # while the thing it was refused for never changed.
+        self.state.finish_refused = previous.state.finish_refused
+        self.state.plan_objections = previous.state.plan_objections
+        self.state.preamble_refused = previous.state.preamble_refused
+        self.state.degenerate_refused = previous.state.degenerate_refused
+        self.state.reasks = previous.state.reasks
         self.state.seen_calls = dict(previous.state.seen_calls)
         self.state.reads = dict(previous.state.reads)
         self.state.retrievals = list(previous.state.retrievals)
@@ -4803,6 +4982,148 @@ class AgentLoop:
             return []
         return self._unwritten_targets()
 
+    def _stall_notice(self) -> str:
+        """How a forced turn opens, and what it names as the evidence.
+
+        The first sentence is unchanged and load-bearing -- it is measured, and
+        `test_a_stalled_acting_turn_keeps_its_write_tools` reads it -- so the
+        repetition is added to it rather than swapped for it. Both facts are
+        true at once and they are different: the *call* has been answered
+        before, and the *reply* is a copy of the last one. A model that has lost
+        the thread argues with the first and cannot argue with the second.
+        """
+        notice = (
+            "Stop searching. That call has already been answered and asking it "
+            "again returns the same thing.\n\n"
+        )
+        if self.state.reply_repeats >= REPLY_REPEATS_BEFORE_ANSWER:
+            notice += (
+                f"You have now sent that same reply {self.state.reply_repeats + 1} "
+                "times -- the same text and the same call, word for word. Whatever "
+                "you are waiting to find out, this turn is not going to find it "
+                "out.\n\n"
+            )
+        return notice
+
+    def _note_reply(self, content: str, calls: Sequence[ToolCall]) -> int:
+        """Record this reply and answer how many times it has come back unchanged.
+
+        Zero for a reply that differs from the one before it, which is every
+        reply in a run that is working.
+        """
+        key = _reply_fingerprint(content, calls)
+        if not key:
+            return 0
+        if key != self.state.reply_key:
+            self.state.reply_key = key
+            self.state.reply_repeats = 0
+            return 0
+        self.state.reply_repeats += 1
+        return self.state.reply_repeats
+
+    def _reply_prose(self, content: str, repeats: int, calls: Sequence[ToolCall]) -> str:
+        """What of a reply's prose goes into the working set.
+
+        All of it, until the same reply has come back `REPLY_PROSE_REPEATS`
+        times; a marker after that. The calls always travel -- they carry the
+        ``tool_call_id`` every result that follows refers to -- and only the
+        prose is dropped, because only the prose is already in the context
+        verbatim and only the prose is long.
+
+        Not merely a saving. The duplicate is *read back* as the model's own
+        stated intent, on every turn after it, and a model reading ten copies of
+        "Let me first check the current state" has ten pieces of evidence that
+        checking the current state is what it does next. Replacing them with a
+        count is the only thing in this file that tells a model it is repeating
+        itself in the one place it will certainly look.
+
+        Prose-only replies keep their text. A repeated answer with no call is a
+        `finish`-shaped mistake and `_is_degenerate` is the check for it; a
+        stub there would delete the thing the developer is owed.
+        """
+        if repeats > REPLY_PROSE_REPEATS and content and calls:
+            return (
+                f"(the same reply and the same call as the previous {repeats} turns; "
+                "the text is above)"
+            )
+        return content
+
+    def _outstanding(self) -> list[str]:
+        """Every file this phase still owes work on: unwritten, or written and unclean.
+
+        `_open_targets` answers "what is this run in the wrong for not having
+        *written*", which is the right question for `_why_not_done`'s first
+        objection and the wrong one for a forced turn. A phase whose files have
+        all been written and none of them cleaned has outstanding work and no
+        open target -- so the stall escape took its `else` branch, cut the tool
+        list to the terminals and said "give the developer what you have
+        established now", and `_why_not_done` then refused the `finish` it had
+        just demanded, naming the written-but-unclean steps the same turn had
+        decided were not work.
+
+        Session 6d923ab574ae, turn 114: the one turn of that phase where
+        `patch_file` was the answer is the turn `patch_file` was removed from
+        the request. The two predicates now read the same status the same way;
+        see `_holds_a_phase_open`.
+
+        AGENT only, exactly like `_open_targets` and for its reason: naming
+        files to write at a mode that holds no write tool is an instruction it
+        cannot obey, and PLANNER's way out of a stall is `submit_plan`.
+        """
+        if self.state.mode is not Mode.AGENT:
+            return []
+        unclean = [s.file for s in self.state.plan if s.status == "written" and s.file]
+        return list(dict.fromkeys(self._open_targets() + unclean))
+
+    def _outstanding_ask(self) -> str:
+        """What to ask a forced turn for, when the phase still owes work.
+
+        Two sentences at most plus the exit, and which ones depend on what is
+        outstanding. "Write them now" is wrong about a file that already exists
+        and is merely unclean, and a model told to write a file it has written
+        writes it again -- which is how the churn ledger came to be needed.
+
+        The exit is named every time. A step that cannot be cleaned has one
+        (`revise_plan` to `blocked`) and it is the move the model does not find
+        on its own: three field loops ran to the turn cap with a cursor frozen
+        on a step whose premise was false, and in all three the only status the
+        model could reach was `skipped`, which means "unnecessary" and was not
+        true.
+        """
+        missing = self._open_targets()
+        unclean = [s for s in self.state.plan if s.status == "written" and s.file]
+        parts: list[str] = []
+        if missing:
+            parts.append(
+                "Your plan set out to write " + ", ".join(missing) + ". "
+                + ("Write them now" if len(missing) > 1 else "Write it now")
+                + ", from what you already have."
+            )
+        if unclean:
+            names = ", ".join(dict.fromkeys(s.file for s in unclean))
+            why = next((s.note for s in unclean if s.note), "")
+            plural = len(unclean) > 1
+            parts.append(
+                names
+                + (" have" if plural else " has")
+                + " been written and "
+                + ("are" if plural else "is")
+                + " not clean yet"
+                + (f" ({why})" if why else "")
+                + ". Edit "
+                + ("them" if plural else "it")
+                + " now -- patch the part the finding names. Reading "
+                + ("them" if plural else "it")
+                + " again returns the same bytes and does not move the finding."
+            )
+        parts.append(
+            "If a file genuinely cannot be finished, `revise_plan` that step to "
+            "`blocked` with the reason -- the plan moves past it and the run "
+            "carries on. If none of it can be done, say which and why in one line "
+            "and call `finish`."
+        )
+        return "\n\n".join(parts)
+
     def _retrieval_overlap(self, call: ToolCall, outcome: ToolResult) -> str:
         """What to tell a run that keeps asking the corpus the same thing.
 
@@ -4972,14 +5293,39 @@ class AgentLoop:
         that has not started -- and a run that jumped to polishing while three
         steps had never been attempted is the shape of a run that finishes
         nothing. Pending first.
+
+        **Never a step whose phase has closed.** `_adopt_plan` keeps settled
+        steps from earlier phases as history, and a phase closed on evidence
+        (`MigrationState.evidenced`) can leave one behind unsettled, so without
+        this the cursor can come to rest inside work the roadmap two lines above
+        it declares finished. It did, for 27 turns of session 6d923ab574ae: the
+        state block said "Migration: phase 4 of 7 — grpc-handlers" and, four
+        lines down, "Now: step 2 of 3 of phase handlers". The model was reading
+        one message that gave two answers, and it kept answering the second.
+
+        Returning ``None`` rather than falling back to that step is the point: a
+        plan whose only unsettled work belongs to a closed phase has nothing for
+        the cursor to sit on, and `_plan_block` renders that honestly.
         """
         for index, step in enumerate(self.state.plan, 1):
-            if step.open:
+            if step.open and not self._phase_closed(step):
                 return index, step
         for index, step in enumerate(self.state.plan, 1):
-            if step.status == "written":
+            if step.status == "written" and not self._phase_closed(step):
                 return index, step
         return None
+
+    def _phase_closed(self, step: PlanStep) -> bool:
+        """Whether this step belongs to a phase the migration has already closed.
+
+        Read straight off the roadmap rather than through `_plan_phase`, which
+        asks `active_step` and would make this a cycle. A step with no phase, or
+        a plan with no migration under it, belongs to whatever is open.
+        """
+        if not (self.state.migration.active and step.phase.strip()):
+            return False
+        phase = self.state.migration.phase_named(step.phase)
+        return phase is not None and phase.status == "done"
 
     def _plan_block(self) -> list[str]:
         """The plan as a cursor, not as a checklist.
@@ -5138,11 +5484,32 @@ class AgentLoop:
             return ""
         landed = any(step.covers(path) for path in self.router.touched)
         if landed:
-            return (
+            line = (
                 f"On this step since turn {since} — {turns} turn(s) so far, and "
                 f"{step.file} has been written. What is outstanding is its "
                 "verification, not more of the work."
             )
+            if step.status == "written" and step.note:
+                # "Verification" is the honest word for a step waiting on a gate
+                # it will reach, and the wrong one for a step a check has
+                # already objected to -- the objection is in `note`, and what it
+                # wants is an edit.
+                #
+                # Session 6d923ab574ae had both readings in one block, four
+                # lines apart: this line saying the outstanding thing was
+                # verification, and the migration line above saying "the gate is
+                # deferred until the last phase closes". Between them the
+                # recency slot -- the position the whole design gives to what to
+                # do next -- named a job that could not be done, for 27 turns.
+                line = (
+                    f"On this step since turn {since} — {turns} turn(s) so far. "
+                    f"{step.file} has been written and a check objected to it: "
+                    f"{step.note}. That is an edit, not a wait — no gate later on "
+                    "will clear it, and reading the file again returns the same "
+                    "bytes. Fix what the finding names, or `revise_plan` this step "
+                    "to `blocked` with the reason."
+                )
+            return line
         line = (
             f"On this step since turn {since} — {turns} turn(s) so far, and "
             f"nothing has been written to {step.file} yet. "

@@ -482,6 +482,14 @@ def test_a_run_that_will_not_answer_even_when_forced_still_stops(
     cannot call a tool -- but a proxy that drops the parameter, or a server that
     ignores it, would put the loop back where it was. `MAX_STALLED_TURNS` is what
     catches that, and it must still end the run rather than spin.
+
+    **Two calls, alternating**, so that this is a test of the stall bound and
+    nothing else. `MAX_REPLY_REPEATS` is tighter and would otherwise end the run
+    first -- a reply repeated verbatim is a stronger signal than a turn that
+    learned nothing, and it is checked in `test_written_deadlock.py`. It
+    compares each reply with the one before it, so alternating between two
+    already-answered searches stalls without ever repeating, which is the shape
+    this bound is the only thing left to catch.
     """
 
     class Defiant(ScriptedClient):
@@ -490,8 +498,9 @@ def test_a_run_that_will_not_answer_even_when_forced_still_stops(
         def chat(self, messages, *, tool_choice=None, **kwargs):
             return super().chat(messages, **kwargs)
 
-    repeat = calls(("search_repo", json.dumps({"pattern": "Routes"})))
-    client = Defiant([repeat] * 12, kind="question")
+    one = calls(("search_repo", json.dumps({"pattern": "Routes"})))
+    two = calls(("search_repo", json.dumps({"pattern": "Handler"})))
+    client = Defiant([one, two] * 8, kind="question")
     loop = AgentLoop(
         ContextManager(mode=Mode.ASK, system_prompt="s"),
         client,
