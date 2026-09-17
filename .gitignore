@@ -27,6 +27,8 @@ apps/*/build/
 apps/*/*.egg-info/
 error.txt
 
+/docs/
+
 # The deployment env holds the JWT secret and model key; only the example ships.
 deploy/dakcoder.env
 
@@ -37,3 +39,5 @@ deploy/dakcoder.env
 extension/*.vsix
 !extension/dakcoder-go-0.4.8.vsix
 # --- end packaged extensions ---
+
+
