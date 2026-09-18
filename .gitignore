@@ -27,6 +27,9 @@ apps/*/build/
 apps/*/*.egg-info/
 error.txt
 
+# Generated contract artifacts do not belong here. They live in api/, which is
+# tracked, because a drift check against an ignored file skips in every fresh
+# clone. That is how the C1 catalogue check stopped running.
 /docs/
 
 # The deployment env holds the JWT secret and model key; only the example ships.

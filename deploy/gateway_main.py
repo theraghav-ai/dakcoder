@@ -139,7 +139,7 @@ async def build_ledger():
 
 
 def tool_catalog() -> dict:
-    path = ROOT / "docs" / "tool-catalog.json"
+    path = ROOT / "api" / "tool-catalog.json"
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
     from dakcoder_agent.tools.catalog import as_json  # only if the agent is installed

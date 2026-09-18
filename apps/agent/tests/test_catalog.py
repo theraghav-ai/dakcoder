@@ -4,11 +4,17 @@ A hand-maintained contract document drifts from the code within weeks, and the
 drift is silent: nobody reads a table to check it is still true. Generating it
 and failing CI when the file disagrees is the only version of "the documentation
 is accurate" that survives.
+
+A missing file fails; it does not skip. The catalogue used to live under
+``docs/``, which was later ignored by git, and from then on this check skipped
+in every fresh clone, CI included. It stayed green because it never ran.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,7 +24,10 @@ from dakcoder_agent.tools import registry
 from dakcoder_agent.tools.catalog import as_json, as_markdown, conformance
 from dakcoder_agent.tools.gotools import handlers_for
 
-DOCS = Path(__file__).resolve().parents[3] / "docs"
+ROOT = Path(__file__).resolve().parents[3]
+API = ROOT / "api"
+PUBLISHED = ("TOOL-CATALOG.md", "tool-catalog.json")
+REGENERATE = "Run `make catalog` and commit the result."
 
 
 def test_the_registry_satisfies_c1() -> None:
@@ -32,20 +41,37 @@ def test_the_registry_satisfies_c1() -> None:
 
 
 def test_the_published_catalogue_is_current() -> None:
-    path = DOCS / "TOOL-CATALOG.md"
-    if not path.is_file():
-        pytest.skip("catalogue not generated yet; run `make tool-catalog`")
+    path = API / "TOOL-CATALOG.md"
+    assert path.is_file(), f"api/TOOL-CATALOG.md is missing. {REGENERATE}"
     assert path.read_text(encoding="utf-8") == as_markdown(), (
-        "docs/TOOL-CATALOG.md is stale. Run `make tool-catalog` and commit the result."
+        f"api/TOOL-CATALOG.md is stale. {REGENERATE}"
     )
 
 
 def test_the_published_schemas_are_current() -> None:
-    path = DOCS / "tool-catalog.json"
-    if not path.is_file():
-        pytest.skip("catalogue not generated yet; run `make tool-catalog`")
+    path = API / "tool-catalog.json"
+    assert path.is_file(), f"api/tool-catalog.json is missing. {REGENERATE}"
     assert path.read_text(encoding="utf-8") == as_json(), (
-        "docs/tool-catalog.json is stale. Run `make tool-catalog` and commit the result."
+        f"api/tool-catalog.json is stale. {REGENERATE}"
+    )
+
+
+@pytest.mark.parametrize("name", PUBLISHED)
+def test_the_published_catalogue_is_not_ignored_by_git(name: str) -> None:
+    """The failure the missing-file check cannot see on a developer's machine.
+
+    If the catalogue is written somewhere git ignores, the file still exists
+    locally and the check passes there. The breakage only shows up in the next
+    fresh clone. This catches it before the commit.
+    """
+    if shutil.which("git") is None or not (ROOT / ".git").exists():
+        pytest.skip("not a git checkout")
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", f"api/{name}"], cwd=ROOT, check=False
+    ).returncode == 0
+    assert not ignored, (
+        f"api/{name} is ignored by git, so the drift check above will not run in "
+        "a fresh clone. Generated contract artifacts must live in a tracked path."
     )
 
 

@@ -50,6 +50,8 @@ apps/
                       in the .vsix; see ARCHITECTURE D-36)
 
 packages/knowledge/ the agent's knowledge base — generated, do not edit
+api/                generated contracts — TOOL-CATALOG.md (C1, model-facing);
+                    `make catalog`, checked by `make catalog-check`
 docs/               ARCHITECTURE.md
 plan*.md            the programme plan: shared context, Part A, Part B
 
