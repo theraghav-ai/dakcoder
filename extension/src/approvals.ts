@@ -517,11 +517,23 @@ export class ApprovalService implements vscode.Disposable {
   async extend(pending: Pending): Promise<void> {
     try {
       const { seconds_left, extensions } = await this.deps.client.extendApproval(pending.approval.id);
+      pending.warned = false;
+      pending.extensions = extensions;
+      if (seconds_left === null) {
+        // The runtime has no approval timeout (the default), so there is no
+        // countdown. This used to set the deadline to now: `null * 1000` is 0,
+        // so the reviewer was told they had 0 more seconds.
+        pending.deadline = undefined;
+        this.deps.log.info(`approval ${pending.approval.id}: no time limit to extend`);
+        void vscode.window.setStatusBarMessage(
+          vscode.l10n.t('dakcoder: this approval has no time limit.'),
+          5_000,
+        );
+        return;
+      }
       // Re-anchor on the server's number: from here the countdown is measured,
       // not estimated.
       pending.deadline = Date.now() + seconds_left * 1000;
-      pending.warned = false;
-      pending.extensions = extensions;
       this.deps.log.info(`approval ${pending.approval.id} extended: ${seconds_left}s left, ${extensions} extension(s)`);
       void vscode.window.setStatusBarMessage(
         vscode.l10n.t('dakcoder: {0} more seconds to review.', Math.round(seconds_left)),

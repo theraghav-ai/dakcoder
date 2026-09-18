@@ -562,6 +562,7 @@
   "dakcoder.{0} is set in your settings. There is no such setting: a client-side model key or URL would bypass quota and audit. Remove it.": "dakcoder.{0} is set in your settings. There is no such setting: a client-side model key or URL would bypass quota and audit. Remove it.",
   "dakcoder: 1 preflight check is failing.": "dakcoder: 1 preflight check is failing.",
   "dakcoder: checking your toolchain…": "dakcoder: checking your toolchain…",
+  "dakcoder: this approval has no time limit.": "dakcoder: this approval has no time limit.",
   "dakcoder: {0} more seconds to review.": "dakcoder: {0} more seconds to review.",
   "dakcoder: {0} preflight checks are failing.": "dakcoder: {0} preflight checks are failing.",
   "dakcoderd": "dakcoderd",

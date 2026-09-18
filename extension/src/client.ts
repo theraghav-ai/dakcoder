@@ -261,8 +261,11 @@ export class RuntimeClient extends Rest {
     });
   }
 
-  /** Give the reviewer more time, so a slow review never becomes a rejection. */
-  extendApproval(id: string): Promise<{ seconds_left: number; extensions: number }> {
+  /**
+   * Give the reviewer more time, so a slow review never becomes a rejection.
+   * `seconds_left` is null when the runtime has no approval timeout.
+   */
+  extendApproval(id: string): Promise<{ seconds_left: number | null; extensions: number }> {
     return this.post(`/v1/approvals/${id}/extend`);
   }
 
