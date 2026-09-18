@@ -24,6 +24,12 @@ lives outside ``apps/`` so nothing here can end up inside a wheel.
                               the fact is stated on /v1/health rather than
                               hidden — an identity provider that trusts whatever
                               it is told must never be mistaken for the real one.
+    DAKCODER_RUNTIME_URL      a hosted runtime to front at /v1/runtime/*, e.g.
+                              http://127.0.0.1:8791. Needs DAKCODER_GATEWAY_TOKEN
+                              (the runtime's token) and a runtime started with
+                              DAKCODER_HOSTED=1. Unset: no such route.
+    DAKCODER_CORS_ORIGINS     browser origins allowed to call, comma-separated.
+                              Unset: no CORS. '*' is refused.
 
 ``--mint`` prints a signed access token instead of serving, which is how a
 runtime gets a JWT here without a browser and a GitLab OAuth application.
@@ -47,6 +53,7 @@ from dakcoder_gateway.probe import EndpointProbes
 from dakcoder_gateway.proxy import ModelProxy
 from dakcoder_gateway.quota import Limits, MemoryStore, QuotaPolicy, RedisStore
 from dakcoder_gateway.routing import RoleRouter
+from dakcoder_gateway.runtime import RuntimeProxy
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -138,6 +145,31 @@ async def build_ledger():
     return PostgresLedger(pool, on_error=complain), f"postgres {dsn.rsplit('@', 1)[-1]}"
 
 
+def build_runtime_proxy() -> tuple[RuntimeProxy | None, str]:
+    """The hosted runtime this gateway fronts at /v1/runtime/*, if one is set.
+
+    Off unless DAKCODER_RUNTIME_URL names it. The token is the runtime's own
+    loopback token (DAKCODER_GATEWAY_TOKEN, the name the runtime reads it by),
+    and the runtime must be started with DAKCODER_HOSTED=1 so that it answers
+    only requests this gateway forwards (host-plan §3).
+    """
+    url = os.environ.get("DAKCODER_RUNTIME_URL", "").strip()
+    if not url:
+        return None, "not fronted"
+    token = os.environ.get("DAKCODER_GATEWAY_TOKEN", "").strip()
+    if not token:
+        raise SystemExit("DAKCODER_RUNTIME_URL is set but DAKCODER_GATEWAY_TOKEN is not.")
+    return RuntimeProxy(url, token), f"fronted at /v1/runtime -> {url}"
+
+
+def cors_origins() -> tuple[str, ...]:
+    """Browser origins allowed to call this gateway: DAKCODER_CORS_ORIGINS,
+    comma-separated. Unset means no CORS, which is right for every client that
+    is not a web page."""
+    raw = os.environ.get("DAKCODER_CORS_ORIGINS", "")
+    return tuple(o.strip().rstrip("/") for o in raw.split(",") if o.strip())
+
+
 def tool_catalog() -> dict:
     path = ROOT / "api" / "tool-catalog.json"
     if path.exists():
@@ -208,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
         quota = QuotaPolicy(store, limits)
         proxy = ModelProxy.from_routes(router, quota, ledger=ledger)
 
+        runtime, runtime_name = build_runtime_proxy()
         gateway = Gateway(
             AuthService(identity, build_minter(), roles=RoleMap()),
             quota,
@@ -216,6 +249,8 @@ def main(argv: list[str] | None = None) -> int:
             probe=EndpointProbes(router),
             tool_catalog=tool_catalog(),
             version=os.environ.get("DAKCODER_VERSION", "local"),
+            runtime=runtime,
+            cors_origins=cors_origins(),
         )
         gateway.capabilities = {"status": "not probed", "identity": kind}
 
@@ -231,6 +266,8 @@ def main(argv: list[str] | None = None) -> int:
                     # from the bill.
                     "quota": "enforced" if limits.any_enforced else "UNMETERED (counting only)",
                     "ledger": ledger_name,
+                    "runtime": runtime_name,
+                    "cors": list(gateway.cors_origins) or "off",
                     "upstream": router.default.base_url,
                     # The whole table, not one model. "Which model is the
                     # planner on today?" is now an operator's question with an

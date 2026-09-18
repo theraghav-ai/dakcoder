@@ -1,6 +1,6 @@
 // Generated from api/contract.json and api/openapi.json by scripts/gen-contract.mjs.
 // Do not edit. Run `make contract` at the repository root and commit the result.
-// openapi.json digest: 9c08423b9631597e
+// openapi.json digest: 68d0f2f963cd7dcc
 
 /**
  * The runtime API this build speaks. A mismatch with `/v1/health` is refused

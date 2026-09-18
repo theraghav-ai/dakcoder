@@ -693,9 +693,9 @@ def create_app(runtime: Loopback, *, authenticate: Authenticator | None = None) 
     # without the filter is a cross-tenant leak (host-plan §8), and six routes
     # once arrived in a single release.
 
-    def caller(authorization: str | None = Header(default=None)) -> Caller:
+    def caller(request: Request) -> Caller:
         try:
-            return authenticate(authorization)
+            return authenticate(request.headers)
         except Unauthorised as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from None
 
@@ -722,7 +722,7 @@ def create_app(runtime: Loopback, *, authenticate: Authenticator | None = None) 
     # -- readiness ----------------------------------------------------------
 
     @app.get("/v1/health")
-    async def health(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    async def health(request: Request) -> dict[str, Any]:
         """No token required — for the liveness half.
 
         A health check that needs a credential cannot tell the extension whether
@@ -744,14 +744,17 @@ def create_app(runtime: Loopback, *, authenticate: Authenticator | None = None) 
             "version": runtime.version,
         }
         try:
-            who = authenticate(authorization)
+            who = authenticate(request.headers)
         except Unauthorised:
             return payload
         mine = runtime.sessions.list(owner=who.sub)
+        if who.local:
+            # Where the runtime's files are and which gateway it uses are facts
+            # about the developer's own machine, for the developer. A hosted
+            # caller is shown neither: they are paths on a shared server (§6).
+            payload.update({"workspace": str(runtime.workspace), "gateway": runtime.gateway_url})
         payload.update(
             {
-                "workspace": str(runtime.workspace),
-                "gateway": runtime.gateway_url,
                 "ready": runtime.ready,
                 "sessions": {
                     "total": len(mine),

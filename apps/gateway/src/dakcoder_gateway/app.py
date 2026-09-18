@@ -13,6 +13,7 @@ casually is one where the next thing to cross is something nobody decided about.
     GET  /v1/models          the role -> model routing in force
     GET  /v1/tools           the tool schemas                         (C1)
     POST /v1/llm/{path}      the model proxy                          (§15.4)
+    *    /v1/runtime/{path}  a hosted runtime, for the verified caller (host-plan §3)
 
 **Errors are translated in one place.** Each domain raises its own exception —
 ``AuthError``, ``QuotaExceeded``, ``ProxyError``, ``StoreUnavailable`` — and the
@@ -30,7 +31,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .auth import AuthError, AuthService, Claims
 from .ledger import Ledger, MemoryLedger
@@ -38,6 +40,7 @@ from .probe import CapabilityProbe, EndpointProbes
 from .proxy import ModelProxy, ProxyError
 from .quota import Lane, QuotaExceeded, QuotaPolicy, StoreUnavailable
 from .quota.store import Conflict
+from .runtime import RuntimeProxy, RuntimeRefused, RuntimeUnavailable
 
 __all__ = ["Gateway", "create_app"]
 
@@ -58,7 +61,17 @@ class Gateway:
         probe: CapabilityProbe | EndpointProbes | None = None,
         tool_catalog: dict[str, Any] | None = None,
         version: str = "dev",
+        #: A hosted runtime this gateway fronts at /v1/runtime/*. None: no route.
+        runtime: RuntimeProxy | None = None,
+        #: Browser origins allowed to call this gateway. Empty: no CORS at all,
+        #: which is what every non-browser client needs.
+        cors_origins: tuple[str, ...] = (),
     ) -> None:
+        if "*" in cors_origins:
+            # These are credentialed requests: an Authorization header on every
+            # one. A wildcard would let any page a signed-in developer visits
+            # spend their quota and read their sessions (host-plan §6.1).
+            raise ValueError("CORS origins must be listed; '*' is refused")
         self.auth = auth
         self.quota = quota
         self.proxy = proxy
@@ -66,6 +79,8 @@ class Gateway:
         self.probe = probe
         self.tool_catalog = tool_catalog or {}
         self.version = version
+        self.runtime = runtime
+        self.cors_origins = cors_origins
         #: Filled by the startup probe, so /v1/health answers instantly rather
         #: than making every caller wait on an upstream round trip.
         self.capabilities: dict[str, Any] = {"status": "not probed"}
@@ -96,9 +111,31 @@ def create_app(gateway: Gateway) -> FastAPI:
         aclose = getattr(getattr(gateway.auth, "identity", None), "aclose", None)
         if aclose is not None:
             await aclose()
+        if gateway.runtime is not None:
+            await gateway.runtime.aclose()
 
     app = FastAPI(title="dakcoder gateway", version=gateway.version, lifespan=lifespan)
     app.state.gateway = gateway
+    if gateway.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(gateway.cors_origins),
+            allow_methods=["GET", "POST", "DELETE"],
+            # What the extension and a portal send. Named, not "*", for the
+            # same reason as the origins.
+            allow_headers=[
+                "Authorization",
+                "Content-Type",
+                "Last-Event-ID",
+                "Idempotency-Key",
+                "X-Estimated-Tokens",
+                "X-Lane",
+            ],
+            # Bearer tokens, not cookies: nothing here needs the browser to
+            # attach credentials of its own.
+            allow_credentials=False,
+            max_age=600,
+        )
 
     # -- error translation --------------------------------------------------
 
@@ -136,6 +173,15 @@ def create_app(gateway: Gateway) -> FastAPI:
         return JSONResponse(
             status_code=exc.status, content={"error": "upstream", "reason": str(exc)}
         )
+
+    @app.exception_handler(RuntimeRefused)
+    async def _runtime_refused(_request: Request, exc: RuntimeRefused) -> JSONResponse:
+        # A 404 like any unknown path: the refusal is not something to explain.
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+
+    @app.exception_handler(RuntimeUnavailable)
+    async def _runtime_unavailable(_request: Request, exc: RuntimeUnavailable) -> JSONResponse:
+        return JSONResponse(status_code=502, content={"error": "runtime", "reason": str(exc)})
 
     # -- authentication -----------------------------------------------------
 
@@ -318,6 +364,32 @@ def create_app(gateway: Gateway) -> FastAPI:
                 # endpoint into a slow non-streaming one, silently.
                 "X-Accel-Buffering": "no",
             },
+        )
+
+    # -- a hosted runtime, fronted (host-plan §3) ----------------------------
+
+    @app.api_route("/v1/runtime/{path:path}", methods=["GET", "POST", "DELETE"])
+    async def runtime(path: str, request: Request, claims: Claims = Depends(caller)) -> Response:
+        """The runtime's API, for the verified caller. See ``runtime.py``.
+
+        Answered as the runtime answers: its status, its body, its stream. The
+        runtime scopes every session to the caller this names, so a caller
+        cannot reach another's sessions through here any more than directly.
+        """
+        if gateway.runtime is None:
+            raise RuntimeRefused(path)
+        upstream = await gateway.runtime.open(
+            request.method,
+            path,
+            query=request.url.query,
+            body=await request.body(),
+            headers=request.headers,
+            sub=claims.sub,
+        )
+        return StreamingResponse(
+            gateway.runtime.relay(upstream),
+            status_code=upstream.status_code,
+            headers=gateway.runtime.response_headers(upstream),
         )
 
     return app

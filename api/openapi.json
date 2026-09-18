@@ -72,16 +72,6 @@
               }
             }
           },
-          "422": {
-            "description": "A parameter could not be read.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ValidationFailure"
-                }
-              }
-            }
-          },
           "4XX": {
             "description": "Refused. The body says why.",
             "content": {
@@ -184,16 +174,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApprovalList"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "A parameter could not be read.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ValidationFailure"
                 }
               }
             }
@@ -396,16 +376,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Health"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "A parameter could not be read.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ValidationFailure"
                 }
               }
             }
@@ -1327,16 +1297,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ToolCatalog"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "A parameter could not be read.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ValidationFailure"
                 }
               }
             }

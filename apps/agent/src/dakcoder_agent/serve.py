@@ -42,6 +42,7 @@ from .loop import AgentLoop
 from .loopback import Loopback, create_app
 from .modes import Mode
 from . import toolchain
+from .callers import gateway_forwarded
 from .prompts import system_prompt
 from .tools import commands, control, fs, knowledge
 from .tools.catalog import as_json
@@ -253,6 +254,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--no-prewarm", action="store_true")
     parser.add_argument("--version-string", default=os.environ.get("DAKCODER_VERSION", "dev"))
+    parser.add_argument(
+        "--hosted",
+        action="store_true",
+        default=os.environ.get("DAKCODER_HOSTED", "").strip() == "1",
+        help="answer only requests the gateway forwards, each for the caller it names "
+        "(see callers.gateway_forwarded); also DAKCODER_HOSTED=1",
+    )
     args = parser.parse_args(argv)
 
     gateway_url = os.environ.get("DAKCODER_GATEWAY_URL", "")
@@ -314,7 +322,10 @@ def main(argv: list[str] | None = None) -> int:
         prewarm(runtime, local_config(gateway_url, jwt))
     toolchain.probe_in_background(runtime.set_toolchain)
 
-    app = create_app(runtime)
+    app = create_app(
+        runtime,
+        authenticate=gateway_forwarded(lambda: runtime.token) if args.hosted else None,
+    )
     # `Server.run(sockets=[...])` rather than `uvicorn.run(fd=...)`: passing a
     # file descriptor works on POSIX and silently fails on Windows, where socket
     # handles are not file descriptors. The primary platform here is Windows 11,

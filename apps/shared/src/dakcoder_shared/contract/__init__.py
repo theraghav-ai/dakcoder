@@ -28,7 +28,13 @@ from typing import Any
 from ..envelope import EventType
 from . import events, rest
 
-__all__ = ["API_VERSION", "as_json", "digest", "document"]
+__all__ = ["API_VERSION", "CALLER_HEADER", "as_json", "digest", "document"]
+
+#: Who the gateway says the caller is, on a request it forwards to a hosted
+#: runtime. Between the two services only: the gateway removes any copy a
+#: client sends before setting its own, and the runtime believes it only
+#: alongside its own token. Here so neither side can spell it differently.
+CALLER_HEADER = "X-Dakcoder-Caller"
 
 #: The contract version clients pin against. Bumped when a response shape
 #: changes in a way a client could not have anticipated — never for an additive

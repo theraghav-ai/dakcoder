@@ -18,7 +18,7 @@ import httpx
 import pytest
 from fastapi.routing import APIRoute
 
-from dakcoder_agent.callers import Caller, Unauthorised
+from dakcoder_agent.callers import CALLER_HEADER, Caller, Unauthorised, gateway_forwarded
 from dakcoder_agent.loopback import Loopback, PendingApproval, create_app
 from dakcoder_agent.session import SessionStore
 from dakcoder_agent.tools.router import ApprovalRequest
@@ -28,8 +28,9 @@ from wirecheck import CheckedTransport
 ALICE, BOB = "Bearer alice", "Bearer bob"
 
 
-def two_tenants(authorization: str | None) -> Caller:
+def two_tenants(headers) -> Caller:
     """A stand-in for a hosted authenticator: two callers, told apart by token."""
+    authorization = headers.get("authorization")
     if authorization in (ALICE, BOB):
         return Caller(sub=authorization.split()[1])
     raise Unauthorised("who are you")
@@ -207,3 +208,53 @@ def test_ownership_survives_a_restart(tmp_path: Path) -> None:
     restored = SessionStore(tmp_path)
     assert restored.get(session.id).owner == "alice"
     assert restored.get(local.id).owner == "", "a local session stays the local developer's"
+
+
+# ── a hosted runtime, behind the gateway ────────────────────────────────────
+
+RUNTIME_TOKEN = "runtime-token"
+
+
+@pytest.fixture
+def hosted(tmp_path: Path):
+    runtime = Loopback(tmp_path, lambda _s, _a: None, token=RUNTIME_TOKEN)
+    return create_app(runtime, authenticate=gateway_forwarded(lambda: runtime.token))
+
+
+def forwarded(app, sub: str | None, token: str = RUNTIME_TOKEN) -> httpx.AsyncClient:
+    headers = {"Authorization": f"Bearer {token}"}
+    if sub is not None:
+        headers[CALLER_HEADER] = sub
+    return httpx.AsyncClient(
+        transport=CheckedTransport(app), base_url="http://127.0.0.1", headers=headers
+    )
+
+
+async def test_a_hosted_runtime_needs_both_the_token_and_a_caller(hosted) -> None:
+    async with forwarded(hosted, "alice") as ok:
+        assert (await ok.get("/v1/sessions")).status_code == 200
+    async with forwarded(hosted, None) as no_caller:
+        assert (await no_caller.get("/v1/sessions")).status_code == 401, (
+            "the token alone is not the local developer: a hosted runtime has none"
+        )
+    async with forwarded(hosted, "alice", token="guessed") as no_token:
+        assert (await no_token.get("/v1/sessions")).status_code == 401, (
+            "a caller header is believed only from the gateway"
+        )
+
+
+async def test_a_hosted_caller_cannot_reach_sessions_from_before_hosting(hosted) -> None:
+    """Sessions written by the local developer, on a runtime later hosted, have
+    no owner. No hosted caller's `sub` is empty, so none of them reach them."""
+    runtime: Loopback = hosted.state.runtime
+    local = runtime.sessions.create("the developer's task")
+    async with forwarded(hosted, "alice") as alice:
+        assert (await alice.get("/v1/sessions")).json()["sessions"] == []
+        assert (await alice.get(f"/v1/sessions/{local.id}")).status_code == 404
+
+
+async def test_a_hosted_caller_is_not_shown_the_servers_paths(hosted) -> None:
+    async with forwarded(hosted, "alice") as alice:
+        health = (await alice.get("/v1/health")).json()
+    assert "workspace" not in health and "gateway" not in health
+    assert health["sessions"] == {"total": 0, "running": 0}
