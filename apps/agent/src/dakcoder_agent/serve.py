@@ -41,6 +41,7 @@ from .llm import make_client
 from .loop import AgentLoop
 from .loopback import Loopback, create_app
 from .modes import Mode
+from . import toolchain
 from .prompts import system_prompt
 from .tools import commands, control, fs, knowledge
 from .tools.catalog import as_json
@@ -311,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.no_prewarm:
         prewarm(runtime, local_config(gateway_url, jwt))
+    toolchain.probe_in_background(runtime.set_toolchain)
 
     app = create_app(runtime)
     # `Server.run(sockets=[...])` rather than `uvicorn.run(fd=...)`: passing a

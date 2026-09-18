@@ -2375,6 +2375,20 @@
           },
           "sessions": {
             "$ref": "#/components/schemas/SessionCounts"
+          },
+          "toolchain": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": "Tool → version, `installed` when it has no readable version, null when missing. Absent until probed, shortly after start.",
+            "type": "object"
           }
         },
         "required": [

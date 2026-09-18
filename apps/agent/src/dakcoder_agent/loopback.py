@@ -207,11 +207,17 @@ class Loopback:
         # of a session and were the half nothing ever released (BUG L-12).
         self.sessions.on_forget = self._forget
         self.ready: dict[str, Any] = {"prewarmed": False}
+        #: Tool → version, set once by ``toolchain.probe_in_background``. Empty
+        #: until then, and ``/v1/health`` leaves the field out while it is.
+        self.toolchain: dict[str, str | None] = {}
         #: The developer's gateway JWT, as the extension last refreshed it.
         #: Read per request by the LLM client rather than captured at spawn —
         #: see ``POST /v1/credential``. Empty means "whatever the process
         #: started with", which is what ``serve`` falls back to.
         self._credential: str = ""
+
+    def set_toolchain(self, versions: dict[str, str | None]) -> None:
+        self.toolchain = dict(versions)
 
     def set_credential(self, jwt: str) -> None:
         self._credential = jwt.strip()
@@ -730,6 +736,8 @@ def create_app(runtime: Loopback) -> FastAPI:
                 },
             }
         )
+        if runtime.toolchain:
+            payload["toolchain"] = runtime.toolchain
         return payload
 
     @app.get("/v1/tools")

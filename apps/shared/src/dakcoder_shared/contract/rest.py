@@ -169,6 +169,11 @@ class Health(Wire):
     gateway: Absent[str]
     ready: Absent[Readiness]
     sessions: Absent[SessionCounts]
+    toolchain: Absent[dict[str, str | None]] = Field(
+        default=None,
+        description="Tool → version, `installed` when it has no readable version, "
+        "null when missing. Absent until probed, shortly after start.",
+    )
 
 
 class Tool(Wire):

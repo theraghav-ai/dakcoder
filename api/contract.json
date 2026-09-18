@@ -65,5 +65,5 @@
     "POST /v1/sessions/{session_id}/wind-down",
     "POST /v1/tasks"
   ],
-  "hash": "396b81dbb16d78ae"
+  "hash": "29f78394ac48a49a"
 }

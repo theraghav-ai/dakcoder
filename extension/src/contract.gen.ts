@@ -1,6 +1,6 @@
 // Generated from api/contract.json and api/openapi.json by scripts/gen-contract.mjs.
 // Do not edit. Run `make contract` at the repository root and commit the result.
-// openapi.json digest: 8a1c1adbdb404cf7
+// openapi.json digest: 9c08423b9631597e
 
 /**
  * The runtime API this build speaks. A mismatch with `/v1/health` is refused
@@ -14,7 +14,7 @@ export const API_VERSION = '1.1';
  * with additions this build does not know about. That is legal under C2, so it
  * is logged, not refused.
  */
-export const CONTRACT_HASH = '396b81dbb16d78ae';
+export const CONTRACT_HASH = '29f78394ac48a49a';
 
 /**
  * Every event type the runtime can emit (C2). A lower bound: a newer runtime
@@ -339,6 +339,8 @@ export interface Health {
   gateway?: string;
   ready?: Readiness;
   sessions?: SessionCounts;
+  /** Tool → version, `installed` when it has no readable version, null when missing. Absent until probed, shortly after start. */
+  toolchain?: Record<string, string | null>;
 }
 
 /**
