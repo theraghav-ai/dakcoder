@@ -61,7 +61,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 
@@ -75,6 +75,7 @@ from .debug import DebugLog
 from .journal import Journal
 from .loop import AgentLoop, Outcome, RunResult
 from . import openapi
+from .callers import Authenticator, Caller, Unauthorised, loopback_token
 from .modes import Intent
 from .plan import AGENDA_STATES, AgendaStore, AgendaTask, PlanRecord
 from .rehydrate import rehydrate, restorable, restore_canonical
@@ -227,8 +228,10 @@ class Loopback:
 
     # -- running a task -----------------------------------------------------
 
-    def start(self, task: str, *, intent: Intent = Intent.AUTO, acceptance=()) -> Session:
-        session = self.sessions.create(task)
+    def start(
+        self, task: str, *, intent: Intent = Intent.AUTO, acceptance=(), owner: str = ""
+    ) -> Session:
+        session = self.sessions.create(task, owner=owner)
         # Recorded before the loop is spawned, so the developer's own words are
         # the first row of the transcript rather than something only the panel
         # that happened to be open at the time remembers.
@@ -671,31 +674,50 @@ class Loopback:
         return [p for p in self.approvals.values() if p.session_id == session_id]
 
 
-def create_app(runtime: Loopback) -> FastAPI:
+def create_app(runtime: Loopback, *, authenticate: Authenticator | None = None) -> FastAPI:
+    """The runtime's HTTP API.
+
+    ``authenticate`` decides who a request is from. The default is the loopback
+    token, which has one caller; a hosted runtime passes one that has many.
+    """
     app = FastAPI(title="dakcoderd", version=runtime.version)
     app.state.runtime = runtime
+    authenticate = authenticate or loopback_token(lambda: runtime.token)
 
-    def _missing() -> None:
-        raise HTTPException(status_code=404, detail="no such session")
+    # -- who is calling, and what is theirs ---------------------------------
+    #
+    # Every route but /v1/health takes its caller from `caller`; every route
+    # with a session or an approval in its path takes it from `owned` or
+    # `owned_approval`, never from the store directly. test_tenancy walks the
+    # route table and fails on any route that does not, because a route added
+    # without the filter is a cross-tenant leak (host-plan §8), and six routes
+    # once arrived in a single release.
 
-    def authorise(authorization: str | None) -> None:
-        """The loopback token.
+    def caller(authorization: str | None = Header(default=None)) -> Caller:
+        try:
+            return authenticate(authorization)
+        except Unauthorised as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from None
 
-        Bound to 127.0.0.1, so this is not defending against the network — it is
-        defending against *other processes on the same machine*, which on a
-        developer laptop includes every npm postinstall script and browser
-        extension that can reach localhost. `secrets.compare_digest` because a
-        timing side channel on a local socket is entirely practical.
+    def owned(session_id: str, who: Caller = Depends(caller)) -> Session:
+        """The caller's session, or 404.
+
+        Someone else's session is a 404 and not a 403. A 403 would confirm that
+        the id exists, which is already more than a stranger should learn.
         """
-        expected = f"Bearer {runtime.token}"
-        if not authorization or not secrets.compare_digest(authorization, expected):
-            raise HTTPException(status_code=401, detail="invalid loopback token")
-
-    def session_or_404(session_id: str) -> Session:
         session = runtime.sessions.get(session_id)
-        if session is None:
+        if session is None or not who.owns(session):
             raise HTTPException(status_code=404, detail=f"no session {session_id}")
         return session
+
+    def owned_approval(approval_id: str, who: Caller = Depends(caller)) -> PendingApproval:
+        """The caller's pending approval, or 410, the answer for one already
+        gone: someone else's must be indistinguishable from that."""
+        pending = runtime.approvals.get(approval_id)
+        session = runtime.sessions.get(pending.session_id) if pending else None
+        if pending is None or session is None or not who.owns(session):
+            raise HTTPException(status_code=410, detail="that approval is no longer pending")
+        return pending
 
     # -- readiness ----------------------------------------------------------
 
@@ -722,17 +744,18 @@ def create_app(runtime: Loopback) -> FastAPI:
             "version": runtime.version,
         }
         try:
-            authorise(authorization)
-        except HTTPException:
+            who = authenticate(authorization)
+        except Unauthorised:
             return payload
+        mine = runtime.sessions.list(owner=who.sub)
         payload.update(
             {
                 "workspace": str(runtime.workspace),
                 "gateway": runtime.gateway_url,
                 "ready": runtime.ready,
                 "sessions": {
-                    "total": len(runtime.sessions.list()),
-                    "running": sum(1 for s in runtime.sessions.list() if s.running),
+                    "total": len(mine),
+                    "running": sum(1 for s in mine if s.running),
                 },
             }
         )
@@ -740,17 +763,14 @@ def create_app(runtime: Loopback) -> FastAPI:
             payload["toolchain"] = runtime.toolchain
         return payload
 
-    @app.get("/v1/tools")
-    async def tools(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        authorise(authorization)
+    @app.get("/v1/tools", dependencies=[Depends(caller)])
+    async def tools() -> dict[str, Any]:
         return runtime.tool_catalog
 
     # -- the developer's credential -----------------------------------------
 
-    @app.post("/v1/credential")
-    async def credential(
-        body: dict[str, Any], authorization: str | None = Header(default=None)
-    ) -> dict[str, Any]:
+    @app.post("/v1/credential", dependencies=[Depends(caller)])
+    async def credential(body: dict[str, Any]) -> dict[str, Any]:
         """Replace the JWT the runtime authenticates to the gateway with.
 
         The daemon outlives the token it was spawned with. It used to be baked
@@ -763,7 +783,6 @@ def create_app(runtime: Loopback) -> FastAPI:
         Nothing is echoed back but a fingerprint. A token in a response body is
         a token in a log.
         """
-        authorise(authorization)
         jwt = str(body.get("jwt", "")).strip()
         if not jwt:
             raise HTTPException(status_code=400, detail="jwt is required")
@@ -773,10 +792,7 @@ def create_app(runtime: Loopback) -> FastAPI:
     # -- tasks --------------------------------------------------------------
 
     @app.post("/v1/tasks")
-    async def start_task(
-        body: dict[str, Any], authorization: str | None = Header(default=None)
-    ) -> dict[str, Any]:
-        authorise(authorization)
+    async def start_task(body: dict[str, Any], who: Caller = Depends(caller)) -> dict[str, Any]:
         task = str(body.get("task", "")).strip()
         if not task:
             raise HTTPException(status_code=400, detail="task is required")
@@ -792,6 +808,7 @@ def create_app(runtime: Loopback) -> FastAPI:
             task,
             intent=Intent.coerce(body.get("intent") or body.get("mode")),
             acceptance=tuple(body.get("acceptance") or ()),
+            owner=who.sub,
         )
         return session.as_dict()
 
@@ -799,11 +816,10 @@ def create_app(runtime: Loopback) -> FastAPI:
 
     @app.get("/v1/sessions/{session_id}/events")
     async def events(
-        session_id: str,
         request: Request,
         since_id: int = Query(default=0),
         last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
-        authorization: str | None = Header(default=None),
+        session: Session = Depends(owned),
     ) -> StreamingResponse:
         """Live events, resumable.
 
@@ -815,9 +831,6 @@ def create_app(runtime: Loopback) -> FastAPI:
         ``EventSource`` sends automatically on reconnect — a client that does
         nothing special still resumes correctly.
         """
-        authorise(authorization)
-        session = session_or_404(session_id)
-
         resume_from = since_id
         if last_event_id and last_event_id.isdigit():
             resume_from = max(resume_from, int(last_event_id))
@@ -832,63 +845,47 @@ def create_app(runtime: Loopback) -> FastAPI:
 
     @app.get("/v1/sessions")
     async def list_sessions(
-        status: str | None = None, authorization: str | None = Header(default=None)
+        status: str | None = None, who: Caller = Depends(caller)
     ) -> dict[str, Any]:
-        authorise(authorization)
-        return {"sessions": [s.as_dict() for s in runtime.sessions.list(status=status)]}
+        return {
+            "sessions": [
+                s.as_dict() for s in runtime.sessions.list(status=status, owner=who.sub)
+            ]
+        }
 
     @app.get("/v1/sessions/{session_id}")
     async def get_session(
-        session_id: str,
-        transcript: bool = False,
-        authorization: str | None = Header(default=None),
+        transcript: bool = False, session: Session = Depends(owned)
     ) -> dict[str, Any]:
-        authorise(authorization)
-        session = session_or_404(session_id)
         payload = session.as_dict(transcript=transcript)
         payload["pending_approvals"] = [
-            p.as_dict() for p in runtime.pending_for(session_id)
+            p.as_dict() for p in runtime.pending_for(session.id)
         ]
         return payload
 
     @app.delete("/v1/sessions/{session_id}")
-    async def delete_session(
-        session_id: str, authorization: str | None = Header(default=None)
-    ) -> dict[str, Any]:
-        authorise(authorization)
-        session = session_or_404(session_id)
+    async def delete_session(session: Session = Depends(owned)) -> dict[str, Any]:
         if session.running:
             raise HTTPException(status_code=409, detail="abort the session before deleting it")
-        runtime.sessions.delete(session_id)
-        return {"deleted": session_id}
+        runtime.sessions.delete(session.id)
+        return {"deleted": session.id}
 
     @app.post("/v1/sessions/{session_id}/abort")
-    async def abort(
-        session_id: str, authorization: str | None = Header(default=None)
-    ) -> dict[str, Any]:
-        authorise(authorization)
-        session = session_or_404(session_id)
+    async def abort(session: Session = Depends(owned)) -> dict[str, Any]:
         session.abort()
-        runtime._release(session_id)
-        return {"aborting": session_id, "status": str(session.status)}
+        runtime._release(session.id)
+        return {"aborting": session.id, "status": str(session.status)}
 
     # -- revert -------------------------------------------------------------
 
     @app.get("/v1/sessions/{session_id}/revert")
-    async def revert_plan(
-        session_id: str, authorization: str | None = Header(default=None)
-    ) -> dict[str, Any]:
+    async def revert_plan(session: Session = Depends(owned)) -> dict[str, Any]:
         """What a revert would do. §12 asks for the confirmation to list the
         exact paths, because "revert my last task" is easy to fire by accident."""
-        authorise(authorization)
-        return runtime.sessions.plan_revert(session_or_404(session_id)).as_dict()
+        return runtime.sessions.plan_revert(session).as_dict()
 
     @app.post("/v1/sessions/{session_id}/revert")
-    async def revert(
-        session_id: str, authorization: str | None = Header(default=None)
-    ) -> dict[str, Any]:
-        authorise(authorization)
-        session = session_or_404(session_id)
+    async def revert(session: Session = Depends(owned)) -> dict[str, Any]:
         if session.running:
             raise HTTPException(
                 status_code=409, detail="a running session cannot be reverted; abort it first"
@@ -898,17 +895,17 @@ def create_app(runtime: Loopback) -> FastAPI:
     # -- approvals ----------------------------------------------------------
 
     @app.get("/v1/approvals")
-    async def list_approvals(
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        authorise(authorization)
-        return {"approvals": [p.as_dict() for p in runtime.approvals.values()]}
+    async def list_approvals(who: Caller = Depends(caller)) -> dict[str, Any]:
+        mine = {s.id for s in runtime.sessions.list(owner=who.sub)}
+        return {
+            "approvals": [
+                p.as_dict() for p in runtime.approvals.values() if p.session_id in mine
+            ]
+        }
 
     @app.post("/v1/approvals/{approval_id}")
     async def decide(
-        approval_id: str,
-        body: dict[str, Any],
-        authorization: str | None = Header(default=None),
+        body: dict[str, Any], pending: PendingApproval = Depends(owned_approval)
     ) -> dict[str, Any]:
         """Accept, reject, or edit.
 
@@ -916,14 +913,11 @@ def create_app(runtime: Loopback) -> FastAPI:
         standout of ``postgen``'s approval card, and the reason is arithmetic:
         correcting a path costs nothing, while rejecting costs a turn and the
         model often makes the same mistake again.
-        """
-        authorise(authorization)
-        pending = runtime.approvals.get(approval_id)
-        if pending is None:
-            # Gone means answered, timed out, or the run ended. All three are
-            # "too late" rather than an error the client should retry.
-            raise HTTPException(status_code=410, detail="that approval is no longer pending")
 
+        A missing approval is a 410 (from ``owned_approval``): gone means
+        answered, timed out, or the run ended, and all three are "too late"
+        rather than an error the client should retry.
+        """
         decision = str(body.get("decision", "reject")).lower()
         if decision not in ("accept", "reject", "edit"):
             raise HTTPException(status_code=400, detail="decision must be accept, reject or edit")
@@ -945,13 +939,11 @@ def create_app(runtime: Loopback) -> FastAPI:
 
         pending.approved = decision in ("accept", "edit")
         pending.decided.set()
-        return {"id": approval_id, "decision": decision}
+        return {"id": pending.id, "decision": decision}
 
     @app.post("/v1/sessions/{session_id}/resume")
     async def resume_session(
-        session_id: str,
-        body: dict[str, Any] | None = None,
-        authorization: str | None = Header(default=None),
+        body: dict[str, Any] | None = None, session: Session = Depends(owned)
     ) -> dict[str, Any]:
         """Run a finished session again, on its own transcript.
 
@@ -959,8 +951,6 @@ def create_app(runtime: Loopback) -> FastAPI:
         *follow-up* instead: resuming a successful change would re-enter the gate
         loop on something that already passed.
         """
-        authorise(authorization)
-        session = runtime.sessions.get(session_id) or _missing()
         if session.running:
             raise HTTPException(status_code=409, detail="that session is still running")
         if not session.status.resumable:
@@ -973,9 +963,7 @@ def create_app(runtime: Loopback) -> FastAPI:
 
     @app.post("/v1/sessions/{session_id}/messages")
     async def message_session(
-        session_id: str,
-        body: dict[str, Any],
-        authorization: str | None = Header(default=None),
+        body: dict[str, Any], session: Session = Depends(owned)
     ) -> dict[str, Any]:
         """Send the session another message, whatever state it is in.
 
@@ -995,8 +983,6 @@ def create_app(runtime: Loopback) -> FastAPI:
         typed. Here the branch is taken under the same view of the session that
         acts on it.
         """
-        authorise(authorization)
-        session = runtime.sessions.get(session_id) or _missing()
         text = str(body.get("text", "")).strip()
         if not text:
             raise HTTPException(status_code=400, detail="text is required")
@@ -1027,24 +1013,18 @@ def create_app(runtime: Loopback) -> FastAPI:
         return session.as_dict()
 
     @app.post("/v1/sessions/{session_id}/wind-down")
-    async def wind_down(
-        session_id: str, authorization: str | None = Header(default=None)
-    ) -> dict[str, Any]:
+    async def wind_down(session: Session = Depends(owned)) -> dict[str, Any]:
         """Stop after the current turn, rather than mid-flight.
 
         Distinct from abort on purpose: a turn can be several minutes long and
         can be halfway through writing a file, and "let it finish and then stop"
         is a different request from "stop now".
         """
-        authorise(authorization)
-        session = runtime.sessions.get(session_id) or _missing()
         session.wind_down()
         return {"id": session.id, "winding_down": True}
 
     @app.get("/v1/sessions/{session_id}/context")
-    async def context_inspector(
-        session_id: str, authorization: str | None = Header(default=None)
-    ) -> dict[str, Any]:
+    async def context_inspector(session: Session = Depends(owned)) -> dict[str, Any]:
         """What the server currently holds, for the context inspector.
 
         Reported rather than reconstructed. Contract C5 makes the server
@@ -1052,9 +1032,7 @@ def create_app(runtime: Loopback) -> FastAPI:
         anyway: it never sees the message list, the per-mode budgets, or the
         token estimator.
         """
-        authorise(authorization)
-        runtime.sessions.get(session_id) or _missing()
-        context = runtime.contexts.get(session_id)
+        context = runtime.contexts.get(session.id)
         if context is None:
             raise HTTPException(
                 status_code=404, detail="no context is held for that session any more"
@@ -1063,10 +1041,9 @@ def create_app(runtime: Loopback) -> FastAPI:
 
     @app.get("/v1/sessions/{session_id}/transcript")
     async def session_transcript(
-        session_id: str,
         view: str = Query(default="model"),
         limit: int = Query(default=200),
-        authorization: str | None = Header(default=None),
+        session: Session = Depends(owned),
     ) -> dict[str, Any]:
         """What happened, or what the model saw. They are different, and both exist.
 
@@ -1085,8 +1062,7 @@ def create_app(runtime: Loopback) -> FastAPI:
         Reads from the live context when the daemon holds one and from disk when
         it does not, so it answers for a session this process has never run.
         """
-        authorise(authorization)
-        runtime.sessions.get(session_id) or _missing()
+        session_id = session.id
         limit = max(1, min(2_000, limit))
 
         context = runtime.contexts.get(session_id)
@@ -1148,10 +1124,9 @@ def create_app(runtime: Loopback) -> FastAPI:
 
     @app.post("/v1/sessions/{session_id}/compact")
     async def compact_now(
-        session_id: str,
         strategy: str = Query(default="basic"),
         retain: float = Query(default=0.35),
-        authorization: str | None = Header(default=None),
+        session: Session = Depends(owned),
     ) -> dict[str, Any]:
         """Compact this session's context on demand.
 
@@ -1166,8 +1141,7 @@ def create_app(runtime: Loopback) -> FastAPI:
         context that moved underneath it. There is no reason to allow it: the
         run compacts itself at the threshold.
         """
-        authorise(authorization)
-        session = runtime.sessions.get(session_id) or _missing()
+        session_id = session.id
         if session.status is Status.RUNNING:
             raise HTTPException(
                 status_code=409,
@@ -1198,51 +1172,44 @@ def create_app(runtime: Loopback) -> FastAPI:
         }
 
     @app.get("/v1/sessions/{session_id}/plan")
-    async def session_plan(
-        session_id: str, authorization: str | None = Header(default=None)
-    ) -> dict[str, Any]:
+    async def session_plan(session: Session = Depends(owned)) -> dict[str, Any]:
         """This session's plan, its step statuses and how it got here.
 
         From disk rather than from the live loop, so it answers after a restart
         and for a session this daemon has never run -- which is most of them,
         and all the interesting ones.
         """
-        authorise(authorization)
-        runtime.sessions.get(session_id) or _missing()
-        record = PlanRecord.load(runtime.workspace, session_id)
+        record = PlanRecord.load(runtime.workspace, session.id)
         if record is None:
             raise HTTPException(status_code=404, detail="that session has no plan")
         return record.as_dict()
 
-    @app.get("/v1/agenda")
-    async def list_agenda(
-        state: str = Query(default="open"),
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
+    # The agenda belongs to the workspace, not to a session or a caller, so its
+    # routes need a caller and nothing more. In a hosted deployment, who may
+    # read a workspace's agenda is who holds its lease (host-plan §9.2).
+
+    @app.get("/v1/agenda", dependencies=[Depends(caller)])
+    async def list_agenda(state: str = Query(default="open")) -> dict[str, Any]:
         """The repository's backlog: work proposed but not yet done.
 
         ``state=open`` is the default because that is the question anyone
         actually has. The others are there so a UI can show what was dropped
         without a second endpoint.
         """
-        authorise(authorization)
         store = AgendaStore(runtime.workspace)
         tasks = store.open_tasks() if state == "open" else [
             t for t in store.load() if state == "all" or t.state == state
         ]
         return {"tasks": [t.as_dict() for t in tasks], "state": state}
 
-    @app.post("/v1/agenda")
-    async def add_agenda_task(
-        request: Request, authorization: str | None = Header(default=None)
-    ) -> dict[str, Any]:
+    @app.post("/v1/agenda", dependencies=[Depends(caller)])
+    async def add_agenda_task(request: Request) -> dict[str, Any]:
         """Propose work for later.
 
         Deliberately open to the developer as well as to the agent. The agent is
         the one most likely to notice a fourth N+1 while fixing three; the
         developer is the one who will be reading this list on Monday.
         """
-        authorise(authorization)
         body = await request.json()
         if not isinstance(body, dict) or not str(body.get("title") or "").strip():
             raise HTTPException(status_code=400, detail="a task needs a title")
@@ -1261,19 +1228,14 @@ def create_app(runtime: Loopback) -> FastAPI:
             )
         return added.as_dict()
 
-    @app.post("/v1/agenda/{task_id}")
-    async def move_agenda_task(
-        task_id: str,
-        request: Request,
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
+    @app.post("/v1/agenda/{task_id}", dependencies=[Depends(caller)])
+    async def move_agenda_task(task_id: str, request: Request) -> dict[str, Any]:
         """Approve, drop or complete a proposal.
 
         The state is moved by a person, which is the whole point of the agenda
         existing separately from the plan: a plan step's status is derived from
         the change set and this one is a decision.
         """
-        authorise(authorization)
         body = await request.json()
         state = str((body or {}).get("state") or "")
         if state not in AGENDA_STATES:
@@ -1292,7 +1254,7 @@ def create_app(runtime: Loopback) -> FastAPI:
 
     @app.post("/v1/approvals/{approval_id}/extend")
     async def extend_approval(
-        approval_id: str, authorization: str | None = Header(default=None)
+        pending: PendingApproval = Depends(owned_approval),
     ) -> dict[str, Any]:
         """Give the reviewer more time.
 
@@ -1302,13 +1264,9 @@ def create_app(runtime: Loopback) -> FastAPI:
         minutes are the ones reviewing the seven-file changesets that matter
         most.
         """
-        authorise(authorization)
-        pending = runtime.approvals.get(approval_id)
-        if pending is None:
-            raise HTTPException(status_code=410, detail="that approval is no longer pending")
         pending.extensions += 1
         return {
-            "id": approval_id,
+            "id": pending.id,
             "extensions": pending.extensions,
             "seconds_left": round(pending.deadline_in(), 1),
         }

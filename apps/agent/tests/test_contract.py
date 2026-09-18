@@ -235,9 +235,10 @@ async def test_the_credential_route_matches_its_contract(app) -> None:
 
 async def test_the_extend_route_matches_its_contract(app, monkeypatch) -> None:
     runtime: Loopback = app.state.runtime
+    session = runtime.sessions.create("a task")
     request = ApprovalRequest(tool="write_file", arguments={"path": "a.go"}, reason="r")
     runtime.approvals[request.id] = PendingApproval(
-        id=request.id, session_id="s", request=request
+        id=request.id, session_id=session.id, request=request
     )
     async with http_for(app) as http:
         # With a timeout, and without one: `seconds_left` is null then.

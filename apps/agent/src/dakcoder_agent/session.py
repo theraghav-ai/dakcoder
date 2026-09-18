@@ -160,6 +160,10 @@ class Session:
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
     finished_at: datetime | None = None
     summary: str = ""
+    #: The ``sub`` of the caller that started it (host-plan §8). Empty for the
+    #: local developer, the only caller a loopback runtime has, so a local
+    #: runtime's sessions all share one owner and nothing about them changes.
+    owner: str = ""
     events: list[StoredEvent] = field(default_factory=list)
     #: Paths mutated, in order, for revert and for the gate's scoping.
     mutations: list[str] = field(default_factory=list)
@@ -286,6 +290,7 @@ class Session:
                 "finished_at": self.finished_at.isoformat() if self.finished_at else None,
                 "summary": self.summary,
                 "mutations": list(self.mutations),
+                "owner": self.owner,
             }
         )
 
@@ -451,6 +456,9 @@ class SessionStore:
                 finished_at=parse_time(meta.get("finished_at")),
                 summary=summary,
                 mutations=[str(m) for m in (meta.get("mutations") or [])],
+                # Written before ownership existed means written by the local
+                # developer: the only caller there was.
+                owner=str(meta.get("owner") or ""),
                 journal=Journal(self.workspace, session_id),
                 _events_pending=True,
                 _steer_closed=True,
@@ -459,12 +467,13 @@ class SessionStore:
         self._trim()
         return loaded
 
-    def create(self, task: str) -> Session:
+    def create(self, task: str, *, owner: str = "") -> Session:
         session_id = uuid.uuid4().hex[:12]
         session = Session(
             id=session_id,
             task=task,
             workspace=str(self.workspace),
+            owner=owner,
             journal=Journal(self.workspace, session_id) if self.persist else None,
         )
         session._write_meta()
@@ -475,8 +484,11 @@ class SessionStore:
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
-    def list(self, *, status: str | None = None) -> list[Session]:
+    def list(self, *, status: str | None = None, owner: str | None = None) -> list[Session]:
+        """Newest first. ``owner`` narrows to one caller's; None means everyone's."""
         sessions = sorted(self._sessions.values(), key=lambda s: s.created_at, reverse=True)
+        if owner is not None:
+            sessions = [s for s in sessions if s.owner == owner]
         if status:
             sessions = [s for s in sessions if str(s.status) == status]
         return sessions
