@@ -636,3 +636,32 @@ describe('RunState — raising an approval', () => {
     assert.deepEqual(raised, [], 'a decided approval must never come back as a live card');
   });
 });
+
+describe('RunState — gate announcements are not gate runs', () => {
+  // The `gate` event type carries the verification gate's reports and also the
+  // loop's announcements (`replan`, `phase`, `forced_tool_call`, `routes`, ...),
+  // which have no stages. The chat panel has ignored those since BUG EXT-8; the
+  // gate ladder did not, so an announcement became "the last gate": it wiped
+  // what the ladder said the run was blocked on, and added an empty column.
+  it('keeps the blocking stage when an announcement follows a failed gate', () => {
+    const { state } = stateWith([]);
+    feed(state, [
+      event(1, 'turn_start', { turn: 1, mode: 'agent', attempt: 1 }),
+      event(2, 'gate', {
+        kind: 'full',
+        ok: false,
+        seconds: 4.2,
+        stages: [{ name: 'go_build', ok: false, blocking: true, skipped: '', seconds: 4.2 }],
+        not_run: ['go_test'],
+        blocked_by: 'go_build',
+      }),
+      event(3, 'gate', { kind: 'replan', reason: 'the build keeps failing', tried: ['a.go'] }),
+      event(4, 'turn_start', { turn: 2, mode: 'planner', attempt: 2 }),
+      event(5, 'gate', { kind: 'phase', deferred: true, closed: 'deps', phase: 'handlers', index: 2, phases: 6 }),
+    ]);
+    const ladder = state.gateLadder;
+    assert.equal(ladder.blockedBy, 'go_build');
+    assert.deepEqual(ladder.notRun, ['go_test']);
+    assert.deepEqual(ladder.attempts, [1], 'an announcement is not an attempt');
+  });
+});

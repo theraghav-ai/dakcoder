@@ -952,6 +952,13 @@ export class RunState implements vscode.Disposable {
 
       case 'gate': {
         this.release();
+        // `gate` also carries the loop's announcements (`replan`, `phase`,
+        // `forced_tool_call`, ...: see `GatePayload`), which have no stages.
+        // Read as gate runs they became "the last gate", wiping what the ladder
+        // said the run was blocked on and adding an empty attempt column. The
+        // same test the chat panel uses (BUG EXT-8): a gate run always has
+        // stages, and a list of known kinds would break on the next one added.
+        if (d.kind !== 'compaction' && records(d.stages).length === 0) break;
         const run: GateRun = { turn: this._turn, attempt: this._attempt, at, event: readGate(d) };
         if (run.event.kind === 'compaction') {
           this.compactionRuns.push(run);
