@@ -77,6 +77,7 @@ from .loop import AgentLoop, Outcome, RunResult
 from . import openapi
 from .callers import Authenticator, Caller, Unauthorised, loopback_token
 from .modes import Intent
+from .policies import AUTO_SAFE, INTERACTIVE, POLICIES, auto_safe
 from .plan import AGENDA_STATES, AgendaStore, AgendaTask, PlanRecord
 from .rehydrate import rehydrate, restorable, restore_canonical
 from .session import Session, SessionStore, Status
@@ -229,9 +230,15 @@ class Loopback:
     # -- running a task -----------------------------------------------------
 
     def start(
-        self, task: str, *, intent: Intent = Intent.AUTO, acceptance=(), owner: str = ""
+        self,
+        task: str,
+        *,
+        intent: Intent = Intent.AUTO,
+        acceptance=(),
+        owner: str = "",
+        approval_policy: str = INTERACTIVE,
     ) -> Session:
-        session = self.sessions.create(task, owner=owner)
+        session = self.sessions.create(task, owner=owner, approval_policy=approval_policy)
         # Recorded before the loop is spawned, so the developer's own words are
         # the first row of the transcript rather than something only the panel
         # that happened to be open at the time remembers.
@@ -307,6 +314,25 @@ class Loopback:
         loop = asyncio.get_running_loop()
 
         def approve(request: ApprovalRequest) -> bool:
+            if session.approval_policy == AUTO_SAFE:
+                # Decided now, by rule, and written into the transcript: a run
+                # nobody watched can still be read (policies.py).
+                approved, reason = auto_safe(request)
+                self.approvals.pop(request.id, None)
+                emit(
+                    Event(
+                        EventType.GATE,
+                        {
+                            "kind": "auto_approval",
+                            "id": request.id,
+                            "tool": request.tool,
+                            "paths": list(request.paths),
+                            "approved": approved,
+                            "reason": reason,
+                        },
+                    )
+                )
+                return approved
             return self._await_decision(session, request)
 
         def register(request: ApprovalRequest) -> None:
@@ -807,11 +833,17 @@ def create_app(runtime: Loopback, *, authenticate: Authenticator | None = None) 
         # asked for the Planner" -- and the answer it picked, for every message,
         # was the phase that plans. `Intent.coerce` maps every retired name onto
         # what it actually asked for.
+        policy = str(body.get("approval_policy") or INTERACTIVE)
+        if policy not in POLICIES:
+            raise HTTPException(
+                status_code=400, detail=f"approval_policy must be one of {', '.join(POLICIES)}"
+            )
         session = runtime.start(
             task,
             intent=Intent.coerce(body.get("intent") or body.get("mode")),
             acceptance=tuple(body.get("acceptance") or ()),
             owner=who.sub,
+            approval_policy=policy,
         )
         return session.as_dict()
 

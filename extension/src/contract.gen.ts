@@ -1,6 +1,6 @@
 // Generated from api/contract.json and api/openapi.json by scripts/gen-contract.mjs.
 // Do not edit. Run `make contract` at the repository root and commit the result.
-// openapi.json digest: 68d0f2f963cd7dcc
+// openapi.json digest: 033f0e23044029cd
 
 /**
  * The runtime API this build speaks. A mismatch with `/v1/health` is refused
@@ -14,7 +14,7 @@ export const API_VERSION = '1.1';
  * with additions this build does not know about. That is legal under C2, so it
  * is logged, not refused.
  */
-export const CONTRACT_HASH = '29f78394ac48a49a';
+export const CONTRACT_HASH = 'c7951dfa23939e88';
 
 /**
  * Every event type the runtime can emit (C2). A lower bound: a newer runtime
@@ -242,6 +242,16 @@ export interface Extended {
   seconds_left: number | null;
 }
 
+/** An approval decided by the `auto_safe` policy, not by a person. */
+export interface GateAutoApproval {
+  kind: 'auto_approval';
+  id: string;
+  tool: string;
+  paths: string[];
+  approved: boolean;
+  reason: string;
+}
+
 export interface GateCompaction {
   kind: 'compaction';
   reason: string;
@@ -266,7 +276,7 @@ export interface GateOverflowRecovery {
 }
 
 /** One of several shapes, told apart by `kind`. */
-export type GatePayload = GateRun | GateForcedToolCall | GateToolChoiceUnsupported | GateOverflowRecovery | GatePhase | GateRoutes | GateReplan | GateCompaction;
+export type GatePayload = GateRun | GateForcedToolCall | GateToolChoiceUnsupported | GateOverflowRecovery | GatePhase | GateRoutes | GateReplan | GateCompaction | GateAutoApproval;
 
 /** A migration phase closed and the gate is deferred until the last one. */
 export interface GatePhase {
@@ -582,6 +592,8 @@ export interface TaskRequest {
    */
   mode?: string;
   acceptance?: string[];
+  /** `interactive` (the default): a person answers every approval. `auto_safe`: decided by rule, for a caller with nobody to ask; protected files, deletions and new dependencies are refused. */
+  approval_policy?: 'interactive' | 'auto_safe';
 }
 
 /** `assistant` (the whole reply) and `assistant_delta` (a streamed piece of it). */

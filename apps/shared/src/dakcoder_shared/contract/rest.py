@@ -99,6 +99,12 @@ class TaskRequest(Wire):
         default=None, deprecated=True, description="Read as `intent` by older clients."
     )
     acceptance: Absent[list[str]]
+    approval_policy: Absent[Literal["interactive", "auto_safe"]] = Field(
+        default=None,
+        description="`interactive` (the default): a person answers every approval. "
+        "`auto_safe`: decided by rule, for a caller with nobody to ask; protected files, "
+        "deletions and new dependencies are refused.",
+    )
 
 
 class DecisionRequest(Wire):

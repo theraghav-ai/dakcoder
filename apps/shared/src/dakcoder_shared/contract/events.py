@@ -193,6 +193,17 @@ class GateReplan(Wire):
     tried: list[str]
 
 
+class GateAutoApproval(Wire):
+    """An approval decided by the `auto_safe` policy, not by a person."""
+
+    kind: Literal["auto_approval"]
+    id: str
+    tool: str
+    paths: list[str]
+    approved: bool
+    reason: str
+
+
 class GateCompaction(Wire):
     kind: Literal["compaction"]
     reason: str
@@ -216,6 +227,7 @@ class GatePayload(
                 GateRoutes,
                 GateReplan,
                 GateCompaction,
+                GateAutoApproval,
             ],
             Field(discriminator="kind"),
         ]

@@ -1962,6 +1962,42 @@
         ],
         "type": "object"
       },
+      "GateAutoApproval": {
+        "description": "An approval decided by the `auto_safe` policy, not by a person.",
+        "properties": {
+          "kind": {
+            "const": "auto_approval",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "approved": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "id",
+          "tool",
+          "paths",
+          "approved",
+          "reason"
+        ],
+        "type": "object"
+      },
       "GateCompaction": {
         "properties": {
           "kind": {
@@ -2059,6 +2095,7 @@
         "description": "One of several shapes, told apart by `kind`.",
         "discriminator": {
           "mapping": {
+            "auto_approval": "#/components/schemas/GateAutoApproval",
             "compaction": "#/components/schemas/GateCompaction",
             "forced_tool_call": "#/components/schemas/GateForcedToolCall",
             "full": "#/components/schemas/GateRun",
@@ -2095,6 +2132,9 @@
           },
           {
             "$ref": "#/components/schemas/GateCompaction"
+          },
+          {
+            "$ref": "#/components/schemas/GateAutoApproval"
           }
         ]
       },
@@ -3291,6 +3331,14 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "approval_policy": {
+            "description": "`interactive` (the default): a person answers every approval. `auto_safe`: decided by rule, for a caller with nobody to ask; protected files, deletions and new dependencies are refused.",
+            "enum": [
+              "interactive",
+              "auto_safe"
+            ],
+            "type": "string"
           }
         },
         "required": [

@@ -164,6 +164,9 @@ class Session:
     #: local developer, the only caller a loopback runtime has, so a local
     #: runtime's sessions all share one owner and nothing about them changes.
     owner: str = ""
+    #: ``interactive`` (a person answers every approval) or ``auto_safe``
+    #: (decided by rule, for a caller with nobody to ask). See policies.py.
+    approval_policy: str = "interactive"
     events: list[StoredEvent] = field(default_factory=list)
     #: Paths mutated, in order, for revert and for the gate's scoping.
     mutations: list[str] = field(default_factory=list)
@@ -291,6 +294,7 @@ class Session:
                 "summary": self.summary,
                 "mutations": list(self.mutations),
                 "owner": self.owner,
+                "approval_policy": self.approval_policy,
             }
         )
 
@@ -459,6 +463,7 @@ class SessionStore:
                 # Written before ownership existed means written by the local
                 # developer: the only caller there was.
                 owner=str(meta.get("owner") or ""),
+                approval_policy=str(meta.get("approval_policy") or "interactive"),
                 journal=Journal(self.workspace, session_id),
                 _events_pending=True,
                 _steer_closed=True,
@@ -467,13 +472,16 @@ class SessionStore:
         self._trim()
         return loaded
 
-    def create(self, task: str, *, owner: str = "") -> Session:
+    def create(
+        self, task: str, *, owner: str = "", approval_policy: str = "interactive"
+    ) -> Session:
         session_id = uuid.uuid4().hex[:12]
         session = Session(
             id=session_id,
             task=task,
             workspace=str(self.workspace),
             owner=owner,
+            approval_policy=approval_policy,
             journal=Journal(self.workspace, session_id) if self.persist else None,
         )
         session._write_meta()
