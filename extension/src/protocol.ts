@@ -9,37 +9,22 @@
  * description, and no code may switch on an event type without a default arm.
  */
 
-/** Contract version this build pins against. Compared with `/v1/health`. */
 /**
- * The runtime contract this build speaks. A mismatch is refused at connect
- * time rather than discovered later in a way nobody attributes.
+ * `API_VERSION`, `CONTRACT_HASH` and `EventType` are generated from the
+ * runtime's own declaration (`api/contract.json`), not written here. The
+ * hand-written `EventType` that used to be here had drifted: it did not list
+ * `metrics`.
  *
- * **1.1** — the mode vocabulary changed: five modes became `ask`, `planner`
- * and `agent`. A 1.0 client is sent values its `Mode` union does not carry.
- * The extension and the runtime ship in the same `.vsix`, so this only ever
- * fires on a hand-mixed pair — which is exactly when it should.
+ * The extension and the runtime ship in the same `.vsix`, so a version
+ * mismatch only happens with a hand-mixed pair. That is exactly when refusing
+ * to connect is the right answer.
  */
-export const API_VERSION = '1.1';
+import type { EventType } from './contract.gen';
+
+export { API_VERSION, CONTRACT_HASH } from './contract.gen';
+export type { EventType } from './contract.gen';
 
 // ── events (C2) ─────────────────────────────────────────────────────────────
-
-export type EventType =
-  | 'turn_start'
-  | 'assistant'
-  | 'assistant_delta'
-  | 'user'
-  | 'tool_call'
-  | 'tool_pending'
-  | 'tool_result'
-  | 'plan'
-  | 'gate'
-  | 'usage'
-  | 'quota'
-  | 'steer'
-  | 'finish'
-  | 'error'
-  | 'heartbeat'
-  | 'end';
 
 export interface WireEvent {
   /** Monotonic, server-assigned. What `since_id` and `Last-Event-ID` resume from. */
@@ -274,6 +259,8 @@ export interface SessionSummary {
 export interface Health {
   ok: boolean;
   api_version: string;
+  /** Compared with `CONTRACT_HASH`. Absent from runtimes that predate it. */
+  contract_hash?: string;
   version: string;
   /**
    * Everything below describes the developer's machine — which directory is

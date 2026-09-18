@@ -22,6 +22,9 @@ unbypassable (Part A §15.4).
     GET  /v1/health                     version, toolchain, readiness
     GET  /v1/tools                      contract C1
 
+That list is a sample. The full table is in ``api/contract.json``, generated
+from this app's own routes and checked in CI.
+
 **The loop is synchronous and this is not.** Two bridges are needed and both are
 places where a naive version breaks quietly:
 
@@ -48,6 +51,7 @@ import logging
 import math
 import os
 import secrets
+import tempfile
 import threading
 import uuid
 from collections.abc import AsyncIterator
@@ -58,7 +62,10 @@ from typing import Any, Callable
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute
 
+from dakcoder_shared import contract
+from dakcoder_shared.contract import API_VERSION
 from dakcoder_shared.envelope import Event, EventType
 
 from .compaction import CompactionState
@@ -73,26 +80,9 @@ from .session import Session, SessionStore, Status
 from .transcript import Transcript
 from .tools.router import ApprovalRequest
 
-__all__ = ["API_VERSION", "Loopback", "PendingApproval", "create_app"]
+__all__ = ["API_VERSION", "Loopback", "PendingApproval", "create_app", "published_contract", "route_table"]
 
 log = logging.getLogger(__name__)
-
-#: The contract version the extension pins against. Bumped when a response shape
-#: changes in a way a client could not have anticipated — never for an additive
-#: field, because C2's rule is that unknown types and fields are ignored.
-#:
-#: **1.1** — the mode vocabulary changed. Five modes (`planner`, `scaffolder`,
-#: `coder`, `verifier`, `debugger`) became three (`ask`, `planner`, `agent`), so
-#: a 1.0 client's `Mode` union does not contain the values it will now be sent.
-#: It degrades rather than crashes — an unknown mode is displayed raw — but the
-#: guard exists precisely so that half-working is not the outcome nobody
-#: suspects.
-#:
-#: Additive in the same release, and *not* on their own a reason to bump:
-#: `POST /v1/tasks` accepts `intent` (with `mode` still read as a synonym),
-#: `POST /v1/credential` is new, `turn_start` carries `intent`, and the tool
-#: catalog gained `finish`, `submit_plan` and `ask_developer`.
-API_VERSION = "1.1"
 
 #: How long a run waits for an approval before giving up. Long enough for someone
 #: to read a seven-file scaffold; short enough that a developer who closed the
@@ -710,6 +700,9 @@ def create_app(runtime: Loopback) -> FastAPI:
         payload: dict[str, Any] = {
             "ok": True,
             "api_version": API_VERSION,
+            # Unauthenticated, like api_version. It describes the code, not the
+            # machine, and a client needs it before it has a token.
+            "contract_hash": app.state.contract["hash"],
             "version": runtime.version,
         }
         try:
@@ -1306,7 +1299,35 @@ def create_app(runtime: Loopback) -> FastAPI:
     async def _http_error(_request: Request, exc: HTTPException) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
 
+    # After every route above is registered, so the table in the contract is
+    # read from this app and cannot disagree with it.
+    app.state.contract = contract.document(route_table(app))
     return app
+
+
+def route_table(app: FastAPI) -> list[str]:
+    """Every route the app serves, as ``"METHOD /path"``.
+
+    FastAPI's own ``/docs`` and ``/openapi.json`` are not ``APIRoute``s, so they
+    are left out. They are not part of the contract.
+    """
+    return sorted(
+        f"{method} {route.path}"
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    )
+
+
+def published_contract() -> str:
+    """The contract as ``make contract`` writes it to ``api/contract.json``.
+
+    Built from a real app on an empty workspace, so the published route table
+    comes from the same ``create_app`` the runtime serves.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        app = create_app(Loopback(Path(tmp), lambda _session, _approve: None))
+        return contract.as_json(route_table(app))
 
 
 async def _stream(session: Session, since_id: int, request: Request) -> AsyncIterator[bytes]:

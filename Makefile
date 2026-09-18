@@ -1,6 +1,6 @@
 # Repository-level targets. The Go sidecar has its own Makefile in gotools/;
 # this one covers the Python side and the things that span both.
-.PHONY: help test test-fast test-integration catalog catalog-check knowledge knowledge-check verify
+.PHONY: help test test-fast test-integration catalog catalog-check contract contract-check knowledge knowledge-check verify
 
 PY := python
 
@@ -32,6 +32,22 @@ print('api/TOOL-CATALOG.md and api/tool-catalog.json written')"
 # the artifact it compares against.
 catalog-check: ## Fail if the published catalogue has drifted from the registry
 	@$(PY) -m pytest apps/agent/tests/test_catalog.py -q
+
+# The wire contract (C2 events, the REST route table, API_VERSION), declared in
+# dakcoder_shared.contract and the runtime's app. Python writes the JSON; the
+# extension generates its TypeScript from that JSON, so each side's check runs
+# with only its own toolchain in CI.
+contract: ## Write api/contract.json and the extension's contract.gen.ts
+	@$(PY) -c "import sys; sys.path[:0]=['apps/agent/src','apps/shared/src']; \
+from pathlib import Path; from dakcoder_agent.loopback import published_contract; \
+Path('api').mkdir(exist_ok=True); \
+Path('api/contract.json').write_text(published_contract(), encoding='utf-8', newline=''); \
+print('api/contract.json written')"
+	@cd extension && node scripts/gen-contract.mjs
+
+contract-check: ## Fail if either side of the wire contract has drifted
+	@$(PY) -m pytest apps/agent/tests/test_contract.py -q
+	@cd extension && node scripts/gen-contract.mjs --check
 
 # Two copies, deliberately. `packages/knowledge` is where a developer looks and
 # what `gotools knowledge --check` compares against in CI; the copy inside the

@@ -31,7 +31,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build:test": "tsc --outDir dist-test --module CommonJS --moduleResolution Node --target ES2022 --lib ES2022,DOM --skipLibCheck --rootDir src --esModuleInterop --types node,vscode src/test/protocol.test.ts src/test/state.test.ts src/test/migration-plan.test.ts src/test/textdiff.test.ts",
     "test": "npm run build:test && node --test dist-test/test/protocol.test.js dist-test/test/state.test.js dist-test/test/migration-plan.test.js dist-test/test/textdiff.test.js src/test/renderer.test.mjs",
-    "verify": "npm run typecheck && npm run test && npm run compile && npm run check:credentials && npm run check:commands && npm run check:l10n && npm run check:gotools",
+    "verify": "npm run check:contract && npm run typecheck && npm run test && npm run compile && npm run check:credentials && npm run check:commands && npm run check:l10n && npm run check:gotools",
     "package": "npm run verify && npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository",
     "check:credentials": "node scripts/check-no-credentials.mjs",
     "build:integration": "tsc --outDir dist-test --module CommonJS --moduleResolution Node --target ES2022 --lib ES2022,DOM --skipLibCheck --rootDir src --esModuleInterop --types node,vscode src/test/runIntegration.ts src/test/integration/index.ts src/test/integration/activation.test.ts",
@@ -41,6 +41,8 @@
     "check:l10n": "node scripts/extract-l10n.mjs --check",
     "check:commands": "node scripts/check-commands.mjs",
     "check:gotools": "node scripts/build-gotools.mjs --check",
+    "contract": "node scripts/gen-contract.mjs",
+    "check:contract": "node scripts/gen-contract.mjs --check",
     "preview": "node scripts/preview-panel.mjs"
   },
   "devDependencies": {

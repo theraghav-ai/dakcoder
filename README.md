@@ -50,8 +50,11 @@ apps/
                       in the .vsix; see ARCHITECTURE D-36)
 
 packages/knowledge/ the agent's knowledge base — generated, do not edit
-api/                generated contracts — TOOL-CATALOG.md (C1, model-facing);
-                    `make catalog`, checked by `make catalog-check`
+api/                generated contracts, each with a drift check:
+                      TOOL-CATALOG.md  C1, model-facing tools   `make catalog`
+                      contract.json    API version, C2 events,  `make contract`
+                                       REST routes (the extension's
+                                       contract.gen.ts is built from it)
 docs/               ARCHITECTURE.md
 plan*.md            the programme plan: shared context, Part A, Part B
 

@@ -29,7 +29,7 @@ import * as vscode from 'vscode';
 
 import { RuntimeClient } from './client';
 import { resolveGotools } from './diagnostics';
-import { API_VERSION, type Health } from './protocol';
+import { API_VERSION, CONTRACT_HASH, type Health } from './protocol';
 
 /** Variables that must never reach the child, whatever the developer's shell holds. */
 const FORBIDDEN_IN_CHILD = [
@@ -259,7 +259,18 @@ export class Runtime implements vscode.Disposable {
    * seam.
    */
   private assertVersion(health: Health): void {
-    if (health.api_version === API_VERSION) return;
+    if (health.api_version === API_VERSION) {
+      // Same version, different contract: the runtime has additions this build
+      // does not know about. Legal under C2, so it is logged, not refused.
+      // Refusing would turn every additive release into a breaking one.
+      if (health.contract_hash && health.contract_hash !== CONTRACT_HASH) {
+        this.opts.log.warn(
+          `the runtime's contract (${health.contract_hash}) differs from this build's ` +
+            `(${CONTRACT_HASH}) within API ${API_VERSION}; newer events or routes will be ignored`,
+        );
+      }
+      return;
+    }
     throw new RuntimeError(
       vscode.l10n.t(
         'This extension speaks runtime API {0}; the runtime reports {1}.',
