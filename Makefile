@@ -1,6 +1,6 @@
 # Repository-level targets. The Go sidecar has its own Makefile in gotools/;
 # this one covers the Python side and the things that span both.
-.PHONY: help test test-fast test-integration catalog catalog-check contract contract-check knowledge knowledge-check verify
+.PHONY: help test test-fast test-integration catalog catalog-check contract contract-check contract-baseline knowledge knowledge-check verify
 
 PY := python
 
@@ -49,6 +49,12 @@ print('api/contract.json and api/openapi.json written')"
 contract-check: ## Fail if either side of the wire contract has drifted
 	@$(PY) -m pytest apps/agent/tests/test_contract.py -q
 	@cd extension && node scripts/gen-contract.mjs --check
+
+# What a release promises clients. scripts/release.py runs this; by hand it is
+# for seeding, or for accepting a major API version's removals.
+contract-baseline: ## Snapshot api/contract-baseline.json (RELEASE=x.y.z)
+	@test -n "$(RELEASE)" || { echo "usage: make contract-baseline RELEASE=x.y.z"; exit 2; }
+	@$(PY) scripts/contract-baseline.py --release $(RELEASE)
 
 # Two copies, deliberately. `packages/knowledge` is where a developer looks and
 # what `gotools knowledge --check` compares against in CI; the copy inside the

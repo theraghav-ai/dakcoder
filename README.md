@@ -57,6 +57,8 @@ api/                generated contracts, each with a drift check:
                                        contract.gen.ts is built from it)
                       openapi.json     every request and       `make contract`
                                        response shape
+                      contract-baseline.json  what the last   scripts/release.py
+                                       release promised; the contract may only grow
 docs/               ARCHITECTURE.md
 plan*.md            the programme plan: shared context, Part A, Part B
 

@@ -44,7 +44,7 @@ from dakcoder_agent.session import Status
 from dakcoder_agent.tools.control import STEP_STATUSES
 from dakcoder_agent.tools.router import ApprovalRequest
 from dakcoder_agent.migration import MigrationState
-from dakcoder_shared.contract import events, rest
+from dakcoder_shared.contract import compat, events, rest
 from dakcoder_shared.envelope import DeltaCoalescer, EventType, ToolResult
 from scripted import build, planning_router  # noqa: F401 - fixture
 from test_loopback import client, scripted, settle, start  # noqa: F401 - fixtures
@@ -94,7 +94,7 @@ def test_the_published_openapi_is_current() -> None:
     )
 
 
-@pytest.mark.parametrize("name", ["contract.json", "openapi.json"])
+@pytest.mark.parametrize("name", ["contract.json", "openapi.json", "contract-baseline.json"])
 def test_the_published_files_are_not_ignored_by_git(name: str) -> None:
     if shutil.which("git") is None or not (ROOT / ".git").exists():
         pytest.skip("not a git checkout")
@@ -313,3 +313,87 @@ def test_the_compaction_and_route_gates_match_their_contract(planning_router) ->
     kinds = [e.data.get("kind") for e in [*relayed, *compacted]]
     assert "routes" in kinds and "compaction" in kinds, kinds
     assert_matches([*relayed, *compacted])
+
+
+# ── additive only (host-plan §4.6) ──────────────────────────────────────────
+
+BASELINE = API / "contract-baseline.json"
+
+
+def current_surface() -> list[str]:
+    return compat.surface(published(), json.loads(published_openapi()))
+
+
+def test_the_contract_only_grows() -> None:
+    """Nothing the last release promised may disappear within a major version.
+
+    C2 allowed additive changes and forbade removals, and nothing checked the
+    second half. `API_VERSION` stayed 1.1 while the surface grew by a third,
+    which was legal; a removal under the same number would have been exactly
+    as silent.
+    """
+    assert BASELINE.is_file(), (
+        "api/contract-baseline.json is missing. Seed it with "
+        "`make contract-baseline RELEASE=<last release>` and commit it."
+    )
+    previous = json.loads(BASELINE.read_text(encoding="utf-8"))
+    broken = compat.breaks(previous, current_surface(), published()["api_version"])
+    assert not broken, (
+        f"The contract no longer promises {len(broken)} thing(s) that "
+        f"api/contract-baseline.json ({previous['release']}) does. C2 is additive-only "
+        "within a major version: put them back, or bump API_VERSION's major and serve "
+        "both shapes through a deprecation window (host-plan §4.6).\n  "
+        + "\n  ".join(broken[:50])
+    )
+
+
+def _schemas(openapi: dict) -> dict:
+    return openapi["components"]["schemas"]
+
+
+@pytest.mark.parametrize(
+    ("change", "edit"),
+    [
+        ("a response field removed",
+         lambda c, o: _schemas(o)["Session"]["properties"].pop("turns")),
+        ("a response field made optional",
+         lambda c, o: _schemas(o)["Session"]["required"].remove("turns")),
+        ("a response field made nullable",
+         lambda c, o: _schemas(o)["Session"]["properties"].update(
+             turns={"anyOf": [{"type": "integer"}, {"type": "null"}]})),
+        ("an event payload field removed",
+         lambda c, o: _schemas(o)["UsagePayload"]["properties"].pop("budget")),
+        ("an optional request field made required",
+         lambda c, o: _schemas(o)["TaskRequest"]["required"].append("intent")),
+        ("an accepted request value dropped",
+         lambda c, o: _schemas(o)["TaskRequest"]["properties"]["intent"]["enum"].remove("auto")),
+        ("an event type removed", lambda c, o: c["events"].remove("metrics")),
+        ("a route removed", lambda c, o: c["routes"].remove("GET /v1/agenda")),
+        ("a gate kind removed", lambda c, o: _schemas(o)["GatePayload"]["oneOf"].pop()),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_the_compat_check_catches(change: str, edit) -> None:
+    """The check above is only as good as what it can see. Each of these is a
+    change that would break a client written against the previous release."""
+    contract, openapi = published(), json.loads(published_openapi())
+    before = {"api_version": contract["api_version"], "facts": compat.surface(contract, openapi)}
+    edit(contract, openapi)
+    assert compat.breaks(before, compat.surface(contract, openapi), contract["api_version"]), change
+
+
+def test_additions_and_a_major_bump_are_not_breaks() -> None:
+    contract, openapi = published(), json.loads(published_openapi())
+    before = {"api_version": contract["api_version"], "facts": compat.surface(contract, openapi)}
+
+    grown_contract, grown = published(), json.loads(published_openapi())
+    _schemas(grown)["Session"]["properties"]["new_field"] = {"type": "string"}
+    _schemas(grown)["TaskRequest"]["properties"]["new_option"] = {"type": "string"}
+    grown_contract["events"].append("new_event")
+    grown_contract["routes"].append("GET /v1/new")
+    assert compat.breaks(before, compat.surface(grown_contract, grown), "1.1") == []
+
+    _schemas(openapi)["Session"]["properties"].pop("turns")
+    assert compat.breaks(before, compat.surface(contract, openapi), "2.0") == [], (
+        "a major version is allowed to remove things; that is what it is for"
+    )

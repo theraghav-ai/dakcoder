@@ -230,6 +230,14 @@ def run_python_tests(python: str, full: bool) -> None:
         run([python, "-m", "pytest", "apps", "-m", "not slow", "--tb=short"])
 
 
+def snapshot_contract(python: str, version: str) -> None:
+    """Record what this release promises clients, after checking it still
+    promises everything the last one did. After the tests, before packaging:
+    a release whose contract shrank stops here."""
+    step("Snapshotting the wire contract")
+    run([python, str(ROOT / "scripts" / "contract-baseline.py"), "--release", version])
+
+
 def package_extension() -> None:
     """`npm run package` is verify + vsce: typecheck, unit tests, esbuild, the
     credential/command/l10n/checksum checks, then the `.vsix` itself."""
@@ -385,6 +393,7 @@ def main() -> None:
     build_wheels(python, args.no_isolation)
     if not args.skip_tests:
         run_python_tests(python, args.full_tests)
+    snapshot_contract(python, version)
     package_extension()
     vsix = verify(version)
     update_gitignore(version, untrack=not args.keep_tracked_vsix)
