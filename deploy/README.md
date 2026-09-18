@@ -16,6 +16,8 @@ setsid bash -c 'cd /mnt/data/raghav/dakcoder && \
 
 
 Everything the server side needs, and one command that brings it up.
+Hosting it for others (GitLab sign-in, workspaces, isolated runners, merge
+requests, A2A) is **[HOSTING.md](HOSTING.md)**, which builds on this file.
 
 ```bash
 deploy/start.sh          # bring it all up in a tmux session called "dakcoder"
@@ -38,6 +40,8 @@ is that decision for this host.
 | Postgres — the usage ledger | `127.0.0.1:55432/dakcoder` | `start.sh` (`dakcoder-postgres`) |
 | **gateway** — identity, quota, ledger, model proxy | `127.0.0.1:8790` | `start.sh`, tmux window `gateway` |
 | **dakcoderd** — the runtime the extension spawns | `127.0.0.1:8791` | `start.sh`, tmux window `runtime` |
+| **agentsvc** — the hosted control plane (only when configured) | `127.0.0.1:8792` | `start.sh`, tmux window `agentsvc`; [HOSTING.md](HOSTING.md) |
+| runner containers — one `dakcoderd` per hosted workspace | `dakcoder-runners` network | agentsvc, on demand |
 | `gotools` — the Go sidecar, over MCP on stdio | `gotools/gotools` | `build-gotools.sh`, spawned per session |
 | Go toolchain — the agent's verification gates | `$DAKCODER_HOME/go` | `install-go.sh` |
 
@@ -49,7 +53,7 @@ LiteLLM's spend tables are a cross-check on ours, not a home for them (§16.6).
 
 ```bash
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -e apps/shared -e apps/gateway -e apps/agent pyyaml
+uv pip install --python .venv/bin/python -e apps/shared -e apps/gateway -e apps/agent -e apps/agentsvc pyyaml
 deploy/install-go.sh        # no system Go on this host
 deploy/build-gotools.sh     # builds in a container, runs on the host
 deploy/start.sh
