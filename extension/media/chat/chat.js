@@ -1525,9 +1525,11 @@
   /** Runtime step status -> the label and glyph this panel shows for it. */
   const PLAN_STATUS = {
     pending: 'planStatusPending',
+    written: 'planStatusWritten',
     passed: 'planStatusPassed',
     failed: 'planStatusFailed',
     skipped: 'planStatusSkipped',
+    blocked: 'planStatusBlocked',
   };
 
   function renderPlan(row) {

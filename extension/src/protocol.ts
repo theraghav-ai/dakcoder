@@ -19,7 +19,7 @@
  * mismatch only happens with a hand-mixed pair. That is exactly when refusing
  * to connect is the right answer.
  */
-import type { EventType, Session, SessionDetail } from './contract.gen';
+import type { EventType, PlanStep as WirePlanStep, Session, SessionDetail } from './contract.gen';
 
 export { API_VERSION, CONTRACT_HASH } from './contract.gen';
 export type { EventType } from './contract.gen';
@@ -397,7 +397,7 @@ export interface PlanStep {
    * along and the event simply did not forward it. Now it does, so a dash means
    * "an older runtime", not "unknowable".
    */
-  status: 'unknown' | 'pending' | 'running' | 'passed' | 'failed' | 'skipped';
+  status: 'unknown' | 'pending' | 'running' | 'written' | 'passed' | 'failed' | 'skipped' | 'blocked';
   /** The file this step changes. Empty when recovered from prose. */
   file: string;
   /** Why a step was skipped or failed, when the runtime says. */
@@ -407,13 +407,30 @@ export interface PlanStep {
 /** The server's own step regex, so client and server agree on the count. */
 const STEP = /^\s*\d+[.)]\s/;
 
-/** Runtime step status → the status this file renders. */
-const STATUS: Record<string, PlanStep['status']> = {
+/** Every status the runtime gives a step. From its own model, so it cannot lag. */
+type StepStatus = WirePlanStep['status'];
+
+/**
+ * Runtime step status → the status this file renders.
+ *
+ * Keyed on the generated type, so a status the runtime adds is a compile error
+ * here rather than a dash on screen. That is how `written` and `blocked` went
+ * missing: the map was `Record<string, …>`, the runtime added both, and every
+ * step between its write and its gate rendered as "—" with a footnote blaming
+ * an old runtime.
+ */
+const STATUS: Record<StepStatus, PlanStep['status']> = {
   pending: 'pending',
+  written: 'written',
   done: 'passed',
   failed: 'failed',
   skipped: 'skipped',
+  blocked: 'blocked',
 };
+
+function stepStatus(status: string): PlanStep['status'] {
+  return Object.hasOwn(STATUS, status) ? STATUS[status as StepStatus] : 'unknown';
+}
 
 /**
  * The plan, from the runtime's typed steps when it sent them.
@@ -438,7 +455,7 @@ export function parsePlan(
       // number the list already supplies.
       text: item.file ? `${item.file} — ${item.action}` : item.action,
       accepts: item.accepts ?? '',
-      status: STATUS[item.status] ?? 'unknown',
+      status: stepStatus(item.status),
       file: item.file ?? '',
       note: item.note ?? '',
     }));

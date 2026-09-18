@@ -991,10 +991,12 @@ function strings(): Record<string, string> {
     planAccepts: vscode.l10n.t('Accepts: {0}'),
     planStatusUnknown: vscode.l10n.t('—'),
     planStatusPending: vscode.l10n.t('pending'),
+    planStatusWritten: vscode.l10n.t('written'),
     planStatusPassed: vscode.l10n.t('done'),
     planStatusFailed: vscode.l10n.t('failed'),
     planStatusSkipped: vscode.l10n.t('skipped'),
-    planFootnote: vscode.l10n.t('A step shows a dash when this runtime is older than the field that carries per-step status. Where a status is shown it comes from the change set — a step is done when a write landed on its file — never from what the model said about its own progress.'),
+    planStatusBlocked: vscode.l10n.t('blocked'),
+    planFootnote: vscode.l10n.t('A step shows a dash when this runtime is older than the field that carries per-step status. Where a status is shown it comes from the change set and the gate — a step is written when a write lands on its file, and done when the gate then passes over it — never from what the model said about its own progress.'),
 
     // gate
     gateInner: vscode.l10n.t('Inner gate'),

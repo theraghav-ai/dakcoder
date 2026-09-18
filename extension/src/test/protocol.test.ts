@@ -333,13 +333,24 @@ describe('parsePlan, from the runtime typed steps', () => {
       { index: 2, file: 'b.go', action: 'edit', accepts: 'builds', status: 'failed', note: '' },
       { index: 3, file: 'c.go', action: 'edit', accepts: 'builds', status: 'pending', note: '' },
       { index: 4, file: 'd.go', action: 'edit', accepts: 'builds', status: 'skipped', note: 'not needed' },
+      // Every step passes through `written` between its write and its gate, so
+      // a map without it showed a dash for most of every run.
+      { index: 5, file: 'e.go', action: 'edit', accepts: 'builds', status: 'written', note: '' },
+      { index: 6, file: 'f.go', action: 'edit', accepts: 'builds', status: 'blocked', note: 'no DB access' },
     ];
     const steps = parsePlan('Goal.', items).steps;
     assert.deepEqual(
       steps.map((s) => s.status),
-      ['passed', 'failed', 'pending', 'skipped'],
+      ['passed', 'failed', 'pending', 'skipped', 'written', 'blocked'],
     );
     assert.equal(steps[3].note, 'not needed');
+  });
+
+  it('does not treat an inherited property name as a status', () => {
+    const items = [
+      { index: 1, file: 'a.go', action: 'edit', accepts: 'builds', status: 'toString', note: '' },
+    ];
+    assert.equal(parsePlan('Goal.', items).steps[0].status, 'unknown');
   });
 
   it('still says unknown for a status it does not recognise', () => {
