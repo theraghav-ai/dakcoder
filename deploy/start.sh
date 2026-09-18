@@ -83,12 +83,20 @@ fi
 # adds — and a hand-maintained list is only as good as whoever remembers to
 # extend it. The shape is matched instead: every DAKCODER_MODEL*_API_KEY there
 # is, plus the names other tools use.
+#
+# The gateway's own secrets go too. The env file is loaded with `set -a`, so
+# without this the runtime was started holding the JWT signing secret, the
+# ledger's DSN and the GitLab client secret, none of which it reads. The
+# runtime is the process that runs `go build` and `go test` on repository
+# code, and anything that code can read from its environment it can use: with
+# the signing secret, that is a token for any user (host-plan §8).
 RUNTIME_ENV="env"
 _others="OPENAI_API_KEY LITELLM_API_KEY ANTHROPIC_API_KEY AZURE_OPENAI_API_KEY"
-for _var in $(compgen -v | grep -E '^DAKCODER_MODEL[A-Z0-9_]*_API_KEY$') $_others; do
+_gateway_only="DAKCODER_JWT_SECRET DAKCODER_POSTGRES_DSN DAKCODER_REDIS_URL DAKCODER_GITLAB_CLIENT_SECRET"
+for _var in $(compgen -v | grep -E '^DAKCODER_MODEL[A-Z0-9_]*_API_KEY$') $_others $_gateway_only; do
   RUNTIME_ENV="$RUNTIME_ENV -u $_var"
 done
-unset _var _others
+unset _var _others _gateway_only
 
 tmux new-session -d -s "$SESSION" -n gateway -c "$ROOT"
 tmux send-keys -t "$SESSION:gateway" \
