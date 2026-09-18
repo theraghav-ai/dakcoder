@@ -71,6 +71,11 @@ function event(id: number, type: string, data: Record<string, unknown> = {}): Wi
   return { id, type, data };
 }
 
+/** A stored event as a session's transcript returns it: with when it was recorded. */
+function recorded(id: number, type: string, data: Record<string, unknown> = {}) {
+  return { ...event(id, type, data), at: new Date(0).toISOString() };
+}
+
 class ScriptedClient {
   constructor(private script: WireEvent[]) {}
   connections = 0;
@@ -566,10 +571,14 @@ describe('RunState — raising an approval', () => {
         events: 0,
         resumable: true,
         queued: 0,
+        turns: 1,
         winding_down: false,
         pending_approvals: [
           {
             id: 'a2',
+            session_id: 's1',
+            seconds_left: null,
+            extensions: 0,
             tool: 'write_file',
             arguments: { path: 'repo/postgres/message.go' },
             reason: 'writes a file',
@@ -607,9 +616,10 @@ describe('RunState — raising an approval', () => {
         events: 2,
         resumable: true,
         queued: 0,
+        turns: 1,
         winding_down: false,
         transcript: [
-          event(1, 'tool_pending', {
+          recorded(1, 'tool_pending', {
             id: 'answered',
             tool: 'write_file',
             arguments: { path: 'a.go' },
@@ -618,7 +628,7 @@ describe('RunState — raising an approval', () => {
             protected: [],
             unconditional: false,
           }),
-          event(2, 'tool_result', { id: 'answered', name: 'write_file', ok: true }),
+          recorded(2, 'tool_result', { id: 'answered', name: 'write_file', ok: true }),
         ],
         pending_approvals: [],
       }),

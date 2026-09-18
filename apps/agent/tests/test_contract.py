@@ -17,6 +17,7 @@ model, with unknown fields rejected.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -115,6 +116,13 @@ def test_the_extension_was_generated_from_this_contract() -> None:
         f"extension/src/contract.gen.ts was generated from a different contract. {REGENERATE}"
     )
     assert f"export const API_VERSION = '{contract['api_version']}';" in text
+    # The REST types come from openapi.json, which the hash does not cover
+    # byte for byte. The generator records a digest of the file it read.
+    # `read_text` has already turned CRLF into LF, as the generator does.
+    openapi = hashlib.sha256(OPENAPI.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    assert f"// openapi.json digest: {openapi}" in text, (
+        f"extension/src/contract.gen.ts was generated from a different openapi.json. {REGENERATE}"
+    )
 
 
 def test_every_ref_in_the_openapi_resolves() -> None:

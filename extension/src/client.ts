@@ -19,7 +19,25 @@
  * to abort a stream that other surfaces are still reading.
  */
 
-import type { ContextSnapshot, Health, QuotaSnapshot, RevertPlan, SessionSummary, WireEvent } from './protocol';
+import type {
+  Aborting,
+  ApprovalList,
+  CredentialAccepted,
+  CredentialRequest,
+  Decision,
+  DecisionRequest,
+  Deleted,
+  Extended,
+  MessageRequest,
+  ResumeRequest,
+  Session,
+  SessionDetail,
+  SessionList,
+  TaskRequest,
+  ToolCatalog,
+  WindingDown,
+} from './contract.gen';
+import type { ContextSnapshot, Health, QuotaSnapshot, RevertPlan, WireEvent } from './protocol';
 import { normaliseQuota } from './protocol';
 
 export class HttpError extends Error {
@@ -177,36 +195,38 @@ export class RuntimeClient extends Rest {
     return this.get<Health>('/v1/health', signal);
   }
 
-  tools(): Promise<{ version: string; tools: unknown[] }> {
-    return this.get('/v1/tools');
+  // Every route below is typed from the runtime's own models (`contract.gen.ts`),
+  // request bodies included. A hand-written reply type here once said a number
+  // where the runtime sent null.
+
+  tools(): Promise<ToolCatalog> {
+    return this.get<ToolCatalog>('/v1/tools');
   }
 
-  startTask(
-    task: string,
-    opts: { intent?: string; acceptance?: string[] } = {},
-  ): Promise<SessionSummary> {
-    return this.post<SessionSummary>('/v1/tasks', { task, ...opts });
+  startTask(task: string, opts: Omit<TaskRequest, 'task'> = {}): Promise<Session> {
+    const body: TaskRequest = { task, ...opts };
+    return this.post<Session>('/v1/tasks', body);
   }
 
-  sessions(status?: string): Promise<{ sessions: SessionSummary[] }> {
-    return this.get(`/v1/sessions${status ? `?status=${encodeURIComponent(status)}` : ''}`);
+  sessions(status?: string): Promise<SessionList> {
+    return this.get<SessionList>(`/v1/sessions${status ? `?status=${encodeURIComponent(status)}` : ''}`);
   }
 
-  session(id: string, transcript = false): Promise<SessionSummary> {
-    return this.get<SessionSummary>(`/v1/sessions/${id}${transcript ? '?transcript=true' : ''}`);
+  session(id: string, transcript = false): Promise<SessionDetail> {
+    return this.get<SessionDetail>(`/v1/sessions/${id}${transcript ? '?transcript=true' : ''}`);
   }
 
-  deleteSession(id: string): Promise<void> {
-    return this.request<void>('DELETE', `/v1/sessions/${id}`);
+  deleteSession(id: string): Promise<Deleted> {
+    return this.request<Deleted>('DELETE', `/v1/sessions/${id}`);
   }
 
-  abort(id: string): Promise<unknown> {
-    return this.post(`/v1/sessions/${id}/abort`);
+  abort(id: string): Promise<Aborting> {
+    return this.post<Aborting>(`/v1/sessions/${id}/abort`);
   }
 
   /** Stop after the current turn, so work in flight completes coherently. */
-  windDown(id: string): Promise<unknown> {
-    return this.post(`/v1/sessions/${id}/wind-down`);
+  windDown(id: string): Promise<WindingDown> {
+    return this.post<WindingDown>(`/v1/sessions/${id}/wind-down`);
   }
 
   /**
@@ -223,15 +243,14 @@ export class RuntimeClient extends Rest {
    * many corrections are waiting, `status` says whether it started running
    * again.
    */
-  message(id: string, text: string, mode?: string): Promise<SessionSummary> {
-    return this.post<SessionSummary>(`/v1/sessions/${id}/messages`, {
-      text,
-      ...(mode ? { mode } : {}),
-    });
+  message(id: string, text: string, mode?: string): Promise<Session> {
+    const body: MessageRequest = { text, ...(mode ? { mode } : {}) };
+    return this.post<Session>(`/v1/sessions/${id}/messages`, body);
   }
 
-  resume(id: string, note = ''): Promise<SessionSummary> {
-    return this.post<SessionSummary>(`/v1/sessions/${id}/resume`, { note });
+  resume(id: string, note = ''): Promise<Session> {
+    const body: ResumeRequest = { note };
+    return this.post<Session>(`/v1/sessions/${id}/resume`, body);
   }
 
   revertPlan(id: string): Promise<RevertPlan> {
@@ -246,27 +265,25 @@ export class RuntimeClient extends Rest {
     return this.get<ContextSnapshot>(`/v1/sessions/${id}/context`);
   }
 
-  approvals(): Promise<{ approvals: unknown[] }> {
-    return this.get('/v1/approvals');
+  approvals(): Promise<ApprovalList> {
+    return this.get<ApprovalList>('/v1/approvals');
   }
 
   decide(
     id: string,
-    decision: 'accept' | 'reject' | 'edit',
+    decision: DecisionRequest['decision'],
     args?: Record<string, unknown>,
-  ): Promise<unknown> {
-    return this.post(`/v1/approvals/${id}`, {
-      decision,
-      ...(args ? { arguments: args } : {}),
-    });
+  ): Promise<Decision> {
+    const body: DecisionRequest = { decision, ...(args ? { arguments: args } : {}) };
+    return this.post<Decision>(`/v1/approvals/${id}`, body);
   }
 
   /**
    * Give the reviewer more time, so a slow review never becomes a rejection.
    * `seconds_left` is null when the runtime has no approval timeout.
    */
-  extendApproval(id: string): Promise<{ seconds_left: number | null; extensions: number }> {
-    return this.post(`/v1/approvals/${id}/extend`);
+  extendApproval(id: string): Promise<Extended> {
+    return this.post<Extended>(`/v1/approvals/${id}/extend`);
   }
 
   /**
@@ -285,8 +302,9 @@ export class RuntimeClient extends Rest {
    * every task ended in an error - and restarting the runtime was the only
    * cure. The extension is the only party that can mint a new one.
    */
-  setCredential(jwt: string): Promise<{ ok: boolean }> {
-    return this.post<{ ok: boolean }>('/v1/credential', { jwt });
+  setCredential(jwt: string): Promise<CredentialAccepted> {
+    const body: CredentialRequest = { jwt };
+    return this.post<CredentialAccepted>('/v1/credential', body);
   }
 
   async *events(

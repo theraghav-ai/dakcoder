@@ -22,7 +22,7 @@ import * as chat from './chat';
 import { GatewayClient, HttpError } from './client';
 import * as diagnostics from './diagnostics';
 import * as doctor from './doctor';
-import { API_VERSION, isResumable, type SessionSummary } from './protocol';
+import { API_VERSION, isResumable, type Intent, type SessionSummary } from './protocol';
 import { Runtime, RuntimeError } from './runtime';
 import { RunState, readGateEvent } from './session-state';
 import { StatusBar } from './statusbar';
@@ -973,7 +973,7 @@ export function deactivate(): void {
  * mode names are still accepted, here and on the server, because a developer's
  * saved setting should not need editing for the extension to keep working.
  */
-function intentFor(setting: string): string {
+function intentFor(setting: string): Intent {
   switch (setting) {
     case 'ask':
     case 'agent':

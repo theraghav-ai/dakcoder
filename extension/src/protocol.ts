@@ -19,7 +19,7 @@
  * mismatch only happens with a hand-mixed pair. That is exactly when refusing
  * to connect is the right answer.
  */
-import type { EventType } from './contract.gen';
+import type { EventType, Session, SessionDetail } from './contract.gen';
 
 export { API_VERSION, CONTRACT_HASH } from './contract.gen';
 export type { EventType } from './contract.gen';
@@ -127,8 +127,10 @@ export interface ApprovalEvent {
    * Reported by the server rather than counted locally: a client counting from
    * when it happened to *see* the card is wrong by however long the panel was
    * hidden, and would show a guess about the server's clock as if it were a fact.
+   *
+   * Null when the runtime has no approval timeout: there is no countdown.
    */
-  seconds_left?: number;
+  seconds_left?: number | null;
   extensions?: number;
   session_id?: string;
 }
@@ -238,66 +240,18 @@ export function isResumable(status: string): boolean {
 }
 
 // ── REST shapes ─────────────────────────────────────────────────────────────
+//
+// Generated from the runtime's own models (`api/openapi.json`). These were
+// hand-written here, and had drifted: `SessionSummary` did not have `turns`,
+// and `ContextSnapshot` was missing six of its eighteen fields.
 
-export interface SessionSummary {
-  id: string;
-  task: string;
-  workspace: string;
-  status: SessionStatus;
-  created_at: string;
-  finished_at: string | null;
-  summary: string;
-  mutations: string[];
-  events: number;
-  resumable: boolean;
-  queued: number;
-  winding_down: boolean;
-  transcript?: WireEvent[];
-  pending_approvals?: ApprovalEvent[];
-}
+export type { ContextSnapshot, Health, RevertPlan } from './contract.gen';
 
-export interface Health {
-  ok: boolean;
-  api_version: string;
-  /** Compared with `CONTRACT_HASH`. Absent from runtimes that predate it. */
-  contract_hash?: string;
-  version: string;
-  /**
-   * Everything below describes the developer's machine — which directory is
-   * open, which gateway it talks to, what is running — and needs the loopback
-   * token. `/v1/health` answers without one so the extension can tell "the
-   * runtime is down" from "the credential is wrong", but any process on the box
-   * could ask, and "which repository is this person working on" is not a
-   * liveness fact. Optional here because an unauthenticated caller does not get
-   * them, not because the runtime sometimes omits them.
-   */
-  workspace?: string;
-  gateway?: string;
-  ready?: { prewarmed: boolean; latency_ms?: number; reason?: string };
-  sessions?: { total: number; running: number };
-}
-
-export interface RevertPlan {
-  session_id: string;
-  restore: string[];
-  delete: string[];
-  blocked: { path: string; reason: string }[];
-}
-
-export interface ContextSnapshot {
-  mode: Mode;
-  turn: number;
-  total_tokens: number;
-  budget: number;
-  used_pct: number;
-  tool_schema_tokens: number;
-  by_layer: Record<string, number>;
-  messages: number;
-  compactions: number;
-  stale_slices: number;
-  calibrated: boolean;
-  prefix: string;
-}
+/**
+ * A session as `GET /v1/sessions` lists it. `GET /v1/sessions/{id}` adds the
+ * transcript (when asked for) and the approvals still waiting on it.
+ */
+export type SessionSummary = Session & Partial<Pick<SessionDetail, 'transcript' | 'pending_approvals'>>;
 
 export interface QuotaWindow {
   used: number;
