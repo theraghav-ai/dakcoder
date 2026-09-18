@@ -1,27 +1,19 @@
-"""The gateway's front for a hosted runtime (host-plan §3, Phase 1).
+"""The gateway's front for the hosted side (host-plan §3).
 
-The runtime is never published. A caller reaches it through
-``/v1/runtime/{path}`` here: the gateway verifies the caller's JWT, as it does
-on every route, then forwards the request with the runtime's own token and the
-caller's ``sub`` in ``X-Dakcoder-Caller``. A runtime started with ``--hosted``
+What sits behind ``/v1/runtime/{path}`` is either one hosted runtime (Phase 1)
+or the control plane that routes to one per workspace (Phase 2). Either way it
+is never published. The gateway verifies the caller's JWT, as it does on every
+route, and forwards the request with the upstream's own token and the caller's
+``sub`` in ``X-Dakcoder-Caller`` (``dakcoder_shared.forwarding``). The upstream
 believes that header only alongside its token, so the one party that can say
-who a caller is is the one that checked. The runtime never sees a user's token
-and never holds the key that signs one.
+who a caller is is the one that checked. Nothing behind the gateway ever sees a
+user's token or holds the key that signs one.
 
-What is not forwarded, on purpose:
-
-* The caller's ``Authorization``. Their JWT is ours to verify, not the
-  runtime's to hold.
-* Any ``X-Dakcoder-*`` header from the client. A client naming its own caller
-  would be the whole attack.
-* Everything else not on ``REQUEST_HEADERS``. An allow-list, because a header
-  nobody decided to forward is one nobody reviewed.
-
-What is refused: any path outside the runtime's ``v1/`` API, and any with an
-empty, ``.`` or ``..`` segment, since a path that normalises to somewhere else
-is a way around the first rule. Also ``POST v1/credential``, which is how the
-extension hands a local runtime the developer's gateway token and means nothing
-for a hosted one (§6).
+On top of the forwarding rule, a path policy. Refused: any path outside the
+``v1/`` API, and any with an empty, ``.`` or ``..`` segment, since a path that
+normalises to somewhere else is a way around the first rule. Also
+``POST v1/credential``, which is how the extension hands a *local* runtime the
+developer's gateway token and means nothing for a hosted one (§6).
 """
 
 from __future__ import annotations
@@ -30,27 +22,19 @@ from collections.abc import AsyncIterator, Mapping
 
 import httpx
 
-from dakcoder_shared.contract import CALLER_HEADER
+from dakcoder_shared.forwarding import Unreachable, Upstream
 
 __all__ = ["RuntimeProxy", "RuntimeRefused", "RuntimeUnavailable"]
-
-#: Headers a client may send the runtime. Lower case.
-REQUEST_HEADERS = ("accept", "content-type", "last-event-id")
-
-#: Headers the runtime's answer keeps on the way back. `x-accel-buffering`
-#: matters: without it nginx holds a stream until it ends.
-RESPONSE_HEADERS = ("content-type", "cache-control", "x-accel-buffering", "retry-after")
 
 #: Routes a hosted caller may not reach, as (method, path).
 REFUSED = frozenset({("POST", "v1/credential")})
 
+#: The upstream did not answer.
+RuntimeUnavailable = Unreachable
+
 
 class RuntimeRefused(Exception):
     """A path this gateway does not forward. Answered as if it did not exist."""
-
-
-class RuntimeUnavailable(Exception):
-    """The runtime did not answer. A 502: ours, not the caller's."""
 
 
 class RuntimeProxy:
@@ -63,19 +47,9 @@ class RuntimeProxy:
     ) -> None:
         if not token:
             raise ValueError(
-                "the runtime's token is required: a hosted runtime answers nothing without it"
+                "the upstream's token is required: a hosted runtime answers nothing without it"
             )
-        self._token = token
-        self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
-            transport=transport,
-            # No read timeout: the event stream is meant to stay open for a
-            # whole run, with keep-alive frames every fifteen seconds.
-            timeout=httpx.Timeout(10.0, read=None),
-            # The corporate proxy must never sit between the gateway and a
-            # loopback service (see deploy/start.sh).
-            trust_env=False,
-        )
+        self._upstream = Upstream(base_url, token, transport=transport)
 
     @staticmethod
     def check(method: str, path: str) -> None:
@@ -98,34 +72,16 @@ class RuntimeProxy:
         headers: Mapping[str, str],
         sub: str,
     ) -> httpx.Response:
-        """Send one request on the caller's behalf. The response is a stream;
-        ``relay`` reads it and closes it."""
         self.check(method, path)
-        forwarded = {name: value for name in REQUEST_HEADERS if (value := headers.get(name))}
-        forwarded["authorization"] = f"Bearer {self._token}"
-        forwarded[CALLER_HEADER] = sub
-        url = f"/{path}?{query}" if query else f"/{path}"
-        request = self._client.build_request(
-            method, url, content=body or None, headers=forwarded
+        return await self._upstream.open(
+            method, path, sub=sub, query=query, body=body, headers=headers
         )
-        try:
-            return await self._client.send(request, stream=True)
-        except httpx.HTTPError as exc:
-            raise RuntimeUnavailable(f"the runtime did not answer: {exc}") from exc
+
+    response_headers = staticmethod(Upstream.response_headers)
 
     @staticmethod
-    def response_headers(response: httpx.Response) -> dict[str, str]:
-        return {
-            name: value for name in RESPONSE_HEADERS if (value := response.headers.get(name))
-        }
-
-    @staticmethod
-    async def relay(response: httpx.Response) -> AsyncIterator[bytes]:
-        try:
-            async for chunk in response.aiter_raw():
-                yield chunk
-        finally:
-            await response.aclose()
+    def relay(response: httpx.Response) -> AsyncIterator[bytes]:
+        return Upstream.relay(response)
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        await self._upstream.aclose()
