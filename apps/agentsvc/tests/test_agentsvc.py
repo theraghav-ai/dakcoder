@@ -13,7 +13,7 @@ from fastapi.routing import APIRoute
 from dakcoder_agentsvc.repos import AllowedRepo, Allowlist, Git
 from dakcoder_agentsvc.service import Service
 
-from conftest import BASE, StandInAgent, as_caller, remote_branches, remote_files
+from support import BASE, StandInAgent, as_caller, remote_branches, remote_files
 
 
 async def lease(http, remote: str) -> dict:

@@ -18,7 +18,7 @@ import pytest
 
 from dakcoder_agentsvc.repos import AllowedRepo, Allowlist, Git, NotAllowed, normalise, project_path
 
-from conftest import BASE, git, remote_branches, remote_files
+from support import BASE, git, remote_branches, remote_files
 
 
 @pytest.fixture
