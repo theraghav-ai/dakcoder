@@ -105,6 +105,12 @@ class TaskRequest(Wire):
         "`auto_safe`: decided by rule, for a caller with nobody to ask; protected files, "
         "deletions and new dependencies are refused.",
     )
+    approval_timeout: Absent[float] = Field(
+        default=None,
+        description="Seconds an approval may wait before the run gives up on it, never "
+        "more than the runtime's own limit. Hosted, a run whose approval times out is "
+        "suspended, not refused: resume it to continue.",
+    )
 
 
 class DecisionRequest(Wire):

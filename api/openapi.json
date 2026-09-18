@@ -2104,6 +2104,7 @@
             "phase": "#/components/schemas/GatePhase",
             "replan": "#/components/schemas/GateReplan",
             "routes": "#/components/schemas/GateRoutes",
+            "suspended": "#/components/schemas/GateSuspended",
             "tool_choice_unsupported": "#/components/schemas/GateToolChoiceUnsupported"
           },
           "propertyName": "kind"
@@ -2135,6 +2136,9 @@
           },
           {
             "$ref": "#/components/schemas/GateAutoApproval"
+          },
+          {
+            "$ref": "#/components/schemas/GateSuspended"
           }
         ]
       },
@@ -2330,6 +2334,31 @@
           "blocking",
           "skipped",
           "seconds"
+        ],
+        "type": "object"
+      },
+      "GateSuspended": {
+        "description": "A hosted run stopped because an approval waited longer than it may. The\nsession ends `aborted`, which is resumable; resuming proposes the change\nagain.",
+        "properties": {
+          "kind": {
+            "const": "suspended",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "id",
+          "tool",
+          "reason"
         ],
         "type": "object"
       },
@@ -3339,6 +3368,10 @@
               "auto_safe"
             ],
             "type": "string"
+          },
+          "approval_timeout": {
+            "description": "Seconds an approval may wait before the run gives up on it, never more than the runtime's own limit. Hosted, a run whose approval times out is suspended, not refused: resume it to continue.",
+            "type": "number"
           }
         },
         "required": [

@@ -204,6 +204,17 @@ class GateAutoApproval(Wire):
     reason: str
 
 
+class GateSuspended(Wire):
+    """A hosted run stopped because an approval waited longer than it may. The
+    session ends `aborted`, which is resumable; resuming proposes the change
+    again."""
+
+    kind: Literal["suspended"]
+    id: str
+    tool: str
+    reason: str
+
+
 class GateCompaction(Wire):
     kind: Literal["compaction"]
     reason: str
@@ -228,6 +239,7 @@ class GatePayload(
                 GateReplan,
                 GateCompaction,
                 GateAutoApproval,
+                GateSuspended,
             ],
             Field(discriminator="kind"),
         ]

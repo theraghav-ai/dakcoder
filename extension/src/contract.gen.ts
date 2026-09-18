@@ -1,6 +1,6 @@
 // Generated from api/contract.json and api/openapi.json by scripts/gen-contract.mjs.
 // Do not edit. Run `make contract` at the repository root and commit the result.
-// openapi.json digest: 033f0e23044029cd
+// openapi.json digest: c0c17e60d2f0603b
 
 /**
  * The runtime API this build speaks. A mismatch with `/v1/health` is refused
@@ -14,7 +14,7 @@ export const API_VERSION = '1.1';
  * with additions this build does not know about. That is legal under C2, so it
  * is logged, not refused.
  */
-export const CONTRACT_HASH = 'c7951dfa23939e88';
+export const CONTRACT_HASH = '58ab570013e4b196';
 
 /**
  * Every event type the runtime can emit (C2). A lower bound: a newer runtime
@@ -276,7 +276,7 @@ export interface GateOverflowRecovery {
 }
 
 /** One of several shapes, told apart by `kind`. */
-export type GatePayload = GateRun | GateForcedToolCall | GateToolChoiceUnsupported | GateOverflowRecovery | GatePhase | GateRoutes | GateReplan | GateCompaction | GateAutoApproval;
+export type GatePayload = GateRun | GateForcedToolCall | GateToolChoiceUnsupported | GateOverflowRecovery | GatePhase | GateRoutes | GateReplan | GateCompaction | GateAutoApproval | GateSuspended;
 
 /** A migration phase closed and the gate is deferred until the last one. */
 export interface GatePhase {
@@ -332,6 +332,18 @@ export interface GateStage {
   /** Only for a stage that failed. */
   content?: string;
   truncated?: boolean;
+}
+
+/**
+ * A hosted run stopped because an approval waited longer than it may. The
+ * session ends `aborted`, which is resumable; resuming proposes the change
+ * again.
+ */
+export interface GateSuspended {
+  kind: 'suspended';
+  id: string;
+  tool: string;
+  reason: string;
 }
 
 export interface GateToolChoiceUnsupported {
@@ -594,6 +606,8 @@ export interface TaskRequest {
   acceptance?: string[];
   /** `interactive` (the default): a person answers every approval. `auto_safe`: decided by rule, for a caller with nobody to ask; protected files, deletions and new dependencies are refused. */
   approval_policy?: 'interactive' | 'auto_safe';
+  /** Seconds an approval may wait before the run gives up on it, never more than the runtime's own limit. Hosted, a run whose approval times out is suspended, not refused: resume it to continue. */
+  approval_timeout?: number;
 }
 
 /** `assistant` (the whole reply) and `assistant_delta` (a streamed piece of it). */

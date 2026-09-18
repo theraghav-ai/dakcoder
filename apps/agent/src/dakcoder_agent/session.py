@@ -167,6 +167,12 @@ class Session:
     #: ``interactive`` (a person answers every approval) or ``auto_safe``
     #: (decided by rule, for a caller with nobody to ask). See policies.py.
     approval_policy: str = "interactive"
+    #: Seconds an approval of this session's may wait, when its task said
+    #: (bounded by the runtime's own maximum). None: the runtime's.
+    approval_timeout: float | None = None
+    #: Why the run was suspended, when it was (loopback._suspend). Cleared
+    #: when it runs again.
+    suspended: str = ""
     events: list[StoredEvent] = field(default_factory=list)
     #: Paths mutated, in order, for revert and for the gate's scoping.
     mutations: list[str] = field(default_factory=list)
@@ -295,6 +301,7 @@ class Session:
                 "mutations": list(self.mutations),
                 "owner": self.owner,
                 "approval_policy": self.approval_policy,
+                "approval_timeout": self.approval_timeout,
             }
         )
 
@@ -373,6 +380,9 @@ class Session:
         """Take corrections again. Called when a session starts another run."""
         with self._lock:
             self._steer_closed = False
+            # And whatever suspended the last run no longer applies to this one.
+            # (`cancel` itself is replaced by resume and follow_up.)
+            self.suspended = ""
 
     @property
     def queued(self) -> int:
@@ -464,6 +474,9 @@ class SessionStore:
                 # developer: the only caller there was.
                 owner=str(meta.get("owner") or ""),
                 approval_policy=str(meta.get("approval_policy") or "interactive"),
+                approval_timeout=(
+                    float(meta["approval_timeout"]) if meta.get("approval_timeout") else None
+                ),
                 journal=Journal(self.workspace, session_id),
                 _events_pending=True,
                 _steer_closed=True,
@@ -473,7 +486,12 @@ class SessionStore:
         return loaded
 
     def create(
-        self, task: str, *, owner: str = "", approval_policy: str = "interactive"
+        self,
+        task: str,
+        *,
+        owner: str = "",
+        approval_policy: str = "interactive",
+        approval_timeout: float | None = None,
     ) -> Session:
         session_id = uuid.uuid4().hex[:12]
         session = Session(
@@ -482,6 +500,7 @@ class SessionStore:
             workspace=str(self.workspace),
             owner=owner,
             approval_policy=approval_policy,
+            approval_timeout=approval_timeout,
             journal=Journal(self.workspace, session_id) if self.persist else None,
         )
         session._write_meta()

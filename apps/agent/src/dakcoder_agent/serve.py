@@ -83,6 +83,7 @@ def build(
     gateway_url: str,
     jwt: str,
     loopback_token: str,
+    hosted: bool = False,
     version: str = "dev",
 ) -> tuple[Loopback, GoTools]:
     """Wire the runtime. Returns the sidecar too, so the caller can close it."""
@@ -147,6 +148,7 @@ def build(
         tool_catalog=json.loads(as_json(version)),
         version=version,
         gateway_url=gateway_url,
+        suspend_on_timeout=hosted,
     )
     holder["runtime"] = runtime
     # Closed with the sidecar at shutdown; `main` already owns both.
@@ -290,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
             jwt=jwt,
             loopback_token=token,
             version=args.version_string,
+            hosted=args.hosted,
         )
     except Exception as exc:  # noqa: BLE001 - startup failure must be legible
         print(f"dakcoderd could not start: {exc}", file=sys.stderr)
