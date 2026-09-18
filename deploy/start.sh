@@ -124,6 +124,12 @@ wait_for runtime "http://127.0.0.1:${DAKCODER_RUNTIME_PORT}/v1/health"
 # It holds the GitLab service account's token (to clone and push) and none of
 # the gateway's secrets; its runners hold neither (see runners.py).
 if [[ -n "${DAKCODER_AGENTSVC_TOKEN:-}" ]]; then
+  # Its own gateway token, with the one scope nothing else holds: `delegate`,
+  # which gets each runner a model-only token minted for its lease's owner, so
+  # each hosted run is charged to the person whose run it is (host-plan §8).
+  "$PY" "$ROOT/deploy/gateway_main.py" --mint "svc:agentsvc" --mint-roles service \
+    --mint-scope delegate --mint-hours 720 > "$ROOT/deploy/logs/agentsvc-jwt"
+  chmod 600 "$ROOT/deploy/logs/agentsvc-jwt"
   AGENTSVC_ENV="env"
   for _var in $(compgen -v | grep -E '^DAKCODER_MODEL[A-Z0-9_]*_API_KEY$') \
       DAKCODER_JWT_SECRET DAKCODER_POSTGRES_DSN DAKCODER_REDIS_URL DAKCODER_GITLAB_CLIENT_SECRET; do
@@ -132,7 +138,7 @@ if [[ -n "${DAKCODER_AGENTSVC_TOKEN:-}" ]]; then
   unset _var
   tmux new-window -t "$SESSION" -n agentsvc -c "$ROOT"
   tmux send-keys -t "$SESSION:agentsvc" \
-    ". deploy/shellenv.sh && $AGENTSVC_ENV .venv/bin/dakcoder-agentsvc 2>&1 | tee -a deploy/logs/agentsvc.log" C-m
+    ". deploy/shellenv.sh && $AGENTSVC_ENV DAKCODER_AGENTSVC_GATEWAY_JWT=\"\$(cat deploy/logs/agentsvc-jwt)\" .venv/bin/dakcoder-agentsvc 2>&1 | tee -a deploy/logs/agentsvc.log" C-m
   wait_for agentsvc "http://127.0.0.1:${DAKCODER_AGENTSVC_PORT:-8792}/v1/health"
 fi
 

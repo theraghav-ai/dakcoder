@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .credentials import Credentials
 from .gitlab import GitLab, GitLabError
 from .repos import Allowlist, Git, GitError, NotAllowed, project_path
 from .runners import Runner, RunnerFailed, Runners
@@ -89,6 +90,7 @@ class Service:
         runners: Runners,
         gitlab: GitLab | None = None,
         *,
+        credentials: Credentials | None = None,
         clock=time.time,
     ) -> None:
         self.settings = settings
@@ -98,6 +100,9 @@ class Service:
         self.runners = runners
         self.gitlab = gitlab
         self.clock = clock
+        self.credentials = credentials or Credentials(
+            settings.gateway_url, delegator_jwt=settings.gateway_jwt, static=settings.runner_jwt
+        )
         self._locks: dict[str, asyncio.Lock] = {}
 
     def _lock(self, lease_id: str) -> asyncio.Lock:
@@ -189,7 +194,11 @@ class Service:
 
     async def runner_for(self, lease: Lease) -> Runner:
         try:
-            runner = await self.runners.ensure(lease.id, Git.worktree(self._dir(lease)))
+            runner = await self.runners.ensure(
+                lease.id,
+                Git.worktree(self._dir(lease)),
+                lambda: self.credentials.for_owner(lease.owner),
+            )
         except RunnerFailed as exc:
             raise Refused(503, f"the workspace's runner could not be started: {exc}") from None
         self.store.touch_lease(lease.id, self.clock())
@@ -415,6 +424,7 @@ class Service:
                 continue
             await self.runners.stop(lease_id)
             stopped.append(lease_id)
+        refreshed = await self.refresh_credentials(leases)
         expired: list[str] = []
         for lease in leases.values():
             if lease.expires_at > self.clock():
@@ -424,4 +434,33 @@ class Service:
                     continue  # never under a running session; next pass
                 await self._retire(lease)
                 expired.append(lease.id)
-        return {"stopped": stopped, "expired": expired}
+        return {"stopped": stopped, "expired": expired, "refreshed": refreshed}
+
+    #: Replace a runner's gateway token this long before it expires.
+    REFRESH_MARGIN = 3600.0
+
+    async def refresh_credentials(self, leases: dict[str, Lease] | None = None) -> list[str]:
+        """Give every runner whose token is about to expire a new one.
+
+        Through the runtime's own ``POST /v1/credential``: a run can outlive the
+        token it was started with, and a model call on an expired token is a
+        401 that ends the run.
+        """
+        leases = leases or {lease.id: lease for lease in self.store.all_leases()}
+        refreshed: list[str] = []
+        for runner in self.runners.running():
+            lease = leases.get(runner.lease_id)
+            if lease is None or runner.credential_expires - self.clock() > self.REFRESH_MARGIN:
+                continue
+            try:
+                jwt, expires = await self.credentials.for_owner(lease.owner)
+                status, _ = await runner.upstream.call(
+                    "POST", "v1/credential", sub=lease.owner, json={"jwt": jwt}
+                )
+            except Exception:  # noqa: BLE001 - the next pass tries again
+                log.warning("could not refresh the credential of %s's runner", lease.id, exc_info=True)
+                continue
+            if status == 200:
+                runner.credential_expires = expires
+                refreshed.append(lease.id)
+        return refreshed

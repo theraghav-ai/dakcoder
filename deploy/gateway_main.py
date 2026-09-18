@@ -34,6 +34,8 @@ lives outside ``apps/`` so nothing here can end up inside a wheel.
                               Unset: no CORS. '*' is refused.
     DAKCODER_PUBLIC_URL       where callers reach this gateway, for the agent
                               card; default https://ai.cept.gov.in/dakcoder
+    DAKCODER_CLIENTS          machine callers for the client-credentials grant:
+                              a JSON file (auth/clients.py). Unset: none.
 
 ``--mint`` prints a signed access token instead of serving, which is how a
 runtime gets a JWT here without a browser and a GitLab OAuth application.
@@ -51,6 +53,7 @@ from pathlib import Path
 
 from dakcoder_gateway.app import Gateway, create_app
 from dakcoder_gateway.auth import AuthService, RoleMap, TokenMinter
+from dakcoder_gateway.auth.clients import Clients
 from dakcoder_gateway.auth.identity import GitLabIdentity, Profile
 from dakcoder_gateway.ledger import MemoryLedger, PostgresLedger
 from dakcoder_gateway.probe import EndpointProbes
@@ -171,6 +174,11 @@ def build_runtime_proxy() -> tuple[RuntimeProxy | None, str]:
     return RuntimeProxy(url, token), f"fronted at /v1/runtime -> {url}"
 
 
+def _path(name: str) -> Path | None:
+    raw = os.environ.get(name, "").strip()
+    return Path(raw) if raw else None
+
+
 def cors_origins() -> tuple[str, ...]:
     """Browser origins allowed to call this gateway: DAKCODER_CORS_ORIGINS,
     comma-separated. Unset means no CORS, which is right for every client that
@@ -220,12 +228,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mint", metavar="SUB", help="print an access token for SUB and exit")
     parser.add_argument("--mint-hours", type=float, default=12.0)
     parser.add_argument("--mint-roles", default="user,admin")
+    parser.add_argument(
+        "--mint-scope",
+        default=None,
+        help="space-separated scopes for the minted token (auth/scopes.py); "
+        "none means a person's token",
+    )
     args = parser.parse_args(argv)
 
     if args.mint:
         minter = build_minter(timedelta(hours=args.mint_hours))
         roles = tuple(r for r in args.mint_roles.split(",") if r)
-        print(minter.mint(sub=args.mint, username=args.mint.split(":")[-1], roles=roles))
+        print(
+            minter.mint(
+                sub=args.mint, username=args.mint.split(":")[-1], roles=roles, scope=args.mint_scope
+            )
+        )
         return 0
 
     identity, kind = build_identity(args.host)
@@ -261,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime=runtime,
             cors_origins=cors_origins(),
             public_url=os.environ.get("DAKCODER_PUBLIC_URL", "").strip(),
+            clients=Clients.load(_path("DAKCODER_CLIENTS")),
         )
         gateway.capabilities = {"status": "not probed", "identity": kind}
 

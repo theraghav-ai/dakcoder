@@ -27,6 +27,7 @@ from dakcoder_agent.loopback import Loopback
 from dakcoder_agent.loopback import create_app as create_runtime
 from dakcoder_agentsvc.app import create_app
 from dakcoder_agentsvc.config import Settings
+from dakcoder_agentsvc.credentials import Credentials
 from dakcoder_agentsvc.gitlab import GitLab
 from dakcoder_agentsvc.repos import Allowlist, AllowedRepo, Git
 from dakcoder_agentsvc.runners import Runners
@@ -138,11 +139,15 @@ class InProcessBackend:
         self.apps: dict[str, Any] = {}
         self.runtimes: dict[str, Loopback] = {}
         self.started: list[str] = []
+        #: The gateway credential each lease's runner was started with.
+        self.credentials: dict[str, str] = {}
 
-    def start(self, lease_id: str, worktree: Path, token: str) -> tuple[str, Any]:
+    def start(self, lease_id: str, worktree: Path, token: str, credential: str) -> tuple[str, Any]:
+        self.credentials[lease_id] = credential
         runtime = Loopback(
             worktree, lambda session, _a: StandInAgent(worktree, session.approval_policy), token=token
         )
+        runtime.set_credential(credential)
         url = f"http://runner-{lease_id}-{len(self.started)}"
         self.apps[url] = create_runtime(runtime, authenticate=gateway_forwarded(lambda: token))
         self.runtimes[lease_id] = runtime
@@ -180,6 +185,14 @@ class FakeGitLab:
         return httpx.Response(200, json={"iid": iid, "web_url": f"https://gitlab/mr/{iid}"})
 
 
+def delegating_gateway(request: httpx.Request) -> httpx.Response:
+    """The gateway's /v1/auth/delegate, for the control plane's token only."""
+    if request.headers.get("authorization") != "Bearer delegator-jwt":
+        return httpx.Response(403, json={"error": "unauthorized"})
+    sub = json.loads(request.content)["sub"]
+    return httpx.Response(200, json={"access_token": f"delegated:{sub}", "expires_in": 43200})
+
+
 @pytest.fixture
 def backend() -> InProcessBackend:
     return InProcessBackend()
@@ -196,7 +209,7 @@ def settings(tmp_path: Path) -> Settings:
         data_dir=tmp_path / "data",
         token=CP_TOKEN,
         gateway_url="http://gateway",
-        runner_jwt="runner-jwt",
+        gateway_jwt="delegator-jwt",
         max_leases_per_user=2,
         max_running_per_user=2,
     )
@@ -218,6 +231,11 @@ def service(settings: Settings, remote: str, backend: InProcessBackend, gitlab: 
         Git(),
         Runners(backend, transport_for=backend.transport_for),
         GitLab("https://gitlab.example", "service-token", transport=httpx.MockTransport(gitlab.handle)),
+        credentials=Credentials(
+            settings.gateway_url,
+            delegator_jwt=settings.gateway_jwt,
+            transport=httpx.MockTransport(delegating_gateway),
+        ),
     )
 
 

@@ -31,9 +31,14 @@ class Settings:
     data_dir: Path
     #: What the gateway presents to us. Without it, nothing is answered.
     token: str
-    #: Where runners send model traffic, and the credential they send it with.
+    #: Where runners send model traffic.
     gateway_url: str
-    runner_jwt: str
+    #: The control plane's own gateway token, with the `delegate` scope: how it
+    #: gets each runner a token minted for its lease's owner (credentials.py).
+    gateway_jwt: str = ""
+    #: One token for every runner: the fallback, which charges every hosted run
+    #: to the account it names.
+    runner_jwt: str = ""
 
     #: `process` (a local dakcoderd per workspace; no isolation, for one
     #: trusted host and for tests) or `docker` (host-plan §7.2's container).
@@ -94,6 +99,7 @@ class Settings:
             data_dir=Path(env("DAKCODER_AGENTSVC_DATA", "./agentsvc-data")).resolve(),
             token=env("DAKCODER_AGENTSVC_TOKEN"),
             gateway_url=env("DAKCODER_GATEWAY_URL"),
+            gateway_jwt=env("DAKCODER_AGENTSVC_GATEWAY_JWT"),
             runner_jwt=env("DAKCODER_RUNNER_JWT"),
             runner_backend=env("DAKCODER_RUNNER_BACKEND", "process"),
             runner_command=tuple(command.split()),

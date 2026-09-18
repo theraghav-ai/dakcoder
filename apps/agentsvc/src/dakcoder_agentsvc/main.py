@@ -61,7 +61,10 @@ def main(argv: list[str] | None = None) -> int:
         for name, value in (
             ("DAKCODER_AGENTSVC_TOKEN", settings.token),
             ("DAKCODER_GATEWAY_URL", settings.gateway_url),
-            ("DAKCODER_RUNNER_JWT", settings.runner_jwt),
+            (
+                "DAKCODER_AGENTSVC_GATEWAY_JWT (or DAKCODER_RUNNER_JWT)",
+                settings.gateway_jwt or settings.runner_jwt,
+            ),
         )
         if not value
     ]

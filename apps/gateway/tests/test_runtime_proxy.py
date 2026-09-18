@@ -264,3 +264,21 @@ async def test_a2a_reaches_the_control_plane_for_the_verified_caller(recorded) -
     (request,) = seen
     assert request["path"] == "v1/a2a"
     assert request["headers"][CALLER_HEADER.lower()] == "agent-7"
+
+
+async def test_a_compressed_answer_reaches_the_client_readable() -> None:
+    """`Content-Encoding` is not passed back, so the body must be decoded on the
+    way through. Relaying the raw bytes handed clients gzip they could not read."""
+    import gzip
+
+    def compressed(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=gzip.compress(b'{"sessions": []}'),
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        )
+
+    proxy = RuntimeProxy("http://runtime", RUNTIME_TOKEN, transport=httpx.MockTransport(compressed))
+    async with client_for(gateway_with(proxy)) as gw:
+        response = await gw.get("/v1/runtime/v1/sessions", headers=jwt("alice"))
+    assert response.json() == {"sessions": []}

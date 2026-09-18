@@ -8,6 +8,8 @@ casually is one where the next thing to cross is something nobody decided about.
     POST /v1/auth/start      issue a state, build the authorize URL   (C3)
     POST /v1/auth/exchange   code -> session                          (C3)
     POST /v1/auth/refresh    rotate, re-checking the account          (C3)
+    POST /v1/auth/token      client credentials, for machine callers  (host-plan §8)
+    POST /v1/auth/delegate   a runner's model-only token for its owner (§8)
     GET  /v1/quota           the window snapshot                      (C4)
     GET  /v1/health          capabilities and the limits in force
     GET  /v1/models          the role -> model routing in force
@@ -38,7 +40,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from dakcoder_shared.contract import card
 
-from .auth import AuthError, AuthService, Claims
+from .auth import AuthError, AuthService, Claims, scopes
+from .auth.clients import Clients
 from .ledger import Ledger, MemoryLedger
 from .probe import CapabilityProbe, EndpointProbes
 from .proxy import ModelProxy, ProxyError
@@ -72,6 +75,10 @@ class Gateway:
         cors_origins: tuple[str, ...] = (),
         #: Where callers reach this gateway, for the agent card's URLs.
         public_url: str = "",
+        #: Machine callers registered for the client-credentials grant.
+        clients: Clients | None = None,
+        #: The longest a runner's delegated token may live.
+        max_delegation: timedelta = timedelta(hours=24),
     ) -> None:
         if "*" in cors_origins:
             # These are credentialed requests: an Authorization header on every
@@ -88,6 +95,8 @@ class Gateway:
         self.runtime = runtime
         self.cors_origins = cors_origins
         self.public_url = public_url or card.PUBLIC_URL
+        self.clients = clients
+        self.max_delegation = max_delegation
         #: Filled by the startup probe, so /v1/health answers instantly rather
         #: than making every caller wait on an upstream round trip.
         self.capabilities: dict[str, Any] = {"status": "not probed"}
@@ -197,6 +206,82 @@ def create_app(gateway: Gateway) -> FastAPI:
     ) -> Claims:
         return request.app.state.gateway.auth.verify(authorization)
 
+    def needs(scope: str):
+        """A verified caller whose token may be used for ``scope`` (scopes.py)."""
+
+        async def scoped(claims: Claims = Depends(caller)) -> Claims:
+            if not scopes.allowed(claims, scope):
+                raise AuthError(f"this token may not be used for {scope}", status=403)
+            return claims
+
+        scoped.__name__ = f"needs_{scope.replace(':', '_')}"
+        return scoped
+
+    # -- machine callers and runners (host-plan §8) -------------------------
+
+    @app.post("/v1/auth/token")
+    async def token(request: Request) -> JSONResponse:
+        """OAuth's client-credentials grant, for callers that cannot sign in.
+
+        A portal's backend or another agent, registered with the scopes it
+        needs and a named owner (clients.py). JSON or a form body, as OAuth
+        clients send either.
+        """
+        body = await _grant_body(request)
+        if body.get("grant_type") != "client_credentials":
+            return JSONResponse(status_code=400, content={"error": "unsupported_grant_type"})
+        client = (
+            gateway.clients.verify(body.get("client_id", ""), body.get("client_secret", ""))
+            if gateway.clients is not None
+            else None
+        )
+        if client is None:
+            return JSONResponse(status_code=401, content={"error": "invalid_client"})
+        minter = gateway.auth.minter
+        scope = " ".join(client.scopes)
+        access = minter.mint(
+            sub=f"client:{client.client_id}", username=client.client_id, roles=("machine",),
+            scope=scope,
+        )
+        return JSONResponse(
+            {
+                "access_token": access,
+                "token_type": "Bearer",
+                "expires_in": int(minter.access_ttl.total_seconds()),
+                "scope": scope,
+            }
+        )
+
+    @app.post("/v1/auth/delegate")
+    async def delegate(
+        body: dict[str, Any], _claims: Claims = Depends(needs("delegate"))
+    ) -> dict[str, Any]:
+        """A runner's token for its lease's owner: model traffic only.
+
+        Minted as the owner so that quota and the ledger charge the person
+        whose run it is, not one service account for every hosted run; scoped
+        to ``llm`` so a token stolen from inside a runner cannot act as the
+        owner anywhere else. Only a token with the service-only ``delegate``
+        scope, the control plane's, may ask.
+        """
+        sub = str(body.get("sub") or "").strip()
+        if not sub:
+            raise AuthError("sub is required", status=400)
+        try:
+            hours = float(body.get("hours") or 12)
+        except (TypeError, ValueError):
+            raise AuthError("hours must be a number", status=400) from None
+        ttl = min(timedelta(hours=max(hours, 0.25)), gateway.max_delegation)
+        access = gateway.auth.minter.mint(
+            sub=sub, username=sub, roles=("runner",), scope="llm", ttl=ttl
+        )
+        return {
+            "access_token": access,
+            "token_type": "Bearer",
+            "expires_in": int(ttl.total_seconds()),
+            "scope": "llm",
+        }
+
     # -- identity (C3) ------------------------------------------------------
 
     @app.post("/v1/auth/start")
@@ -228,13 +313,13 @@ def create_app(gateway: Gateway) -> FastAPI:
 
     @app.get("/v1/quota")
     async def quota_snapshot(
-        claims: Claims = Depends(caller), lane: str = "interactive"
+        claims: Claims = Depends(needs("llm")), lane: str = "interactive"
     ) -> dict[str, Any]:
         return (await gateway.quota.snapshot(claims.sub, Lane(lane))).as_dict()
 
     @app.post("/v1/quota/preflight")
     async def quota_preflight(
-        body: dict[str, Any], claims: Claims = Depends(caller)
+        body: dict[str, Any], claims: Claims = Depends(needs("llm"))
     ) -> dict[str, Any]:
         """Would a run of this size be admitted? Asked before starting one, so a
         developer learns a long task will not fit before watching half of it."""
@@ -249,7 +334,7 @@ def create_app(gateway: Gateway) -> FastAPI:
 
     @app.post("/v1/runs")
     async def start_run(
-        body: dict[str, Any], claims: Claims = Depends(caller)
+        body: dict[str, Any], claims: Claims = Depends(needs("llm"))
     ) -> dict[str, Any]:
         """Open a run, which opens a session window if none is live."""
         lane = Lane(str(body.get("lane", "interactive")))
@@ -285,7 +370,7 @@ def create_app(gateway: Gateway) -> FastAPI:
         }
 
     @app.get("/v1/models")
-    async def models(_claims: Claims = Depends(caller)) -> dict[str, Any]:
+    async def models(_claims: Claims = Depends(needs("llm"))) -> dict[str, Any]:
         """The routing table in force: role, model, endpoint, what was overridden.
 
         Authenticated, unlike /v1/health, because the endpoints are internal
@@ -314,7 +399,7 @@ def create_app(gateway: Gateway) -> FastAPI:
     async def llm(
         path: str,
         request: Request,
-        claims: Claims = Depends(caller),
+        claims: Claims = Depends(needs("llm")),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> StreamingResponse:
         if gateway.proxy is None:
@@ -390,7 +475,7 @@ def create_app(gateway: Gateway) -> FastAPI:
         return card.card(gateway.public_url)
 
     @app.post("/v1/a2a")
-    async def a2a(request: Request, claims: Claims = Depends(caller)) -> Response:
+    async def a2a(request: Request, claims: Claims = Depends(needs("a2a"))) -> Response:
         """JSON-RPC for other agents, answered by the control plane's adapter."""
         if gateway.runtime is None:
             raise RuntimeRefused("v1/a2a")
@@ -416,6 +501,9 @@ def create_app(gateway: Gateway) -> FastAPI:
         """
         if gateway.runtime is None:
             raise RuntimeRefused(path)
+        needed = scopes.runtime_scope(request.method, path)
+        if not scopes.allowed(claims, needed):
+            raise AuthError(f"this token may not be used for {needed}", status=403)
         upstream = await gateway.runtime.open(
             request.method,
             path,
@@ -431,6 +519,20 @@ def create_app(gateway: Gateway) -> FastAPI:
         )
 
     return app
+
+
+async def _grant_body(request: Request) -> dict[str, str]:
+    """An OAuth token request's fields, from a form or from JSON."""
+    raw = await request.body()
+    if request.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
+        from urllib.parse import parse_qs
+
+        return {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "replace")).items()}
+    try:
+        body = json.loads(raw or b"{}")
+    except ValueError:
+        return {}
+    return {str(k): str(v) for k, v in body.items()} if isinstance(body, dict) else {}
 
 
 async def _with_error_events(first: bytes, rest) -> Any:

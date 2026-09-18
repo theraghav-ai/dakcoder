@@ -60,6 +60,9 @@ class Claims:
     #: Ties an access token to the refresh family it came from, so revoking a
     #: family can invalidate tokens minted from it.
     family: str = ""
+    #: What this token may be used for (``scopes.py``). None for a token that
+    #: names no scope: a person's, which may do anything a person may.
+    scopes: frozenset[str] | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     def has_role(self, role: str) -> bool:
@@ -106,7 +109,16 @@ class TokenMinter:
         self.access_ttl = access_ttl
         self._clock = clock
 
-    def mint(self, *, sub: str, username: str, roles: tuple[str, ...], family: str = "") -> str:
+    def mint(
+        self,
+        *,
+        sub: str,
+        username: str,
+        roles: tuple[str, ...],
+        family: str = "",
+        scope: str | None = None,
+        ttl: timedelta | None = None,
+    ) -> str:
         now = self._clock()
         payload = {
             "iss": ISSUER,
@@ -116,10 +128,12 @@ class TokenMinter:
             "dop_roles": list(roles),
             "iat": int(now.timestamp()),
             "nbf": int(now.timestamp()),
-            "exp": int((now + self.access_ttl).timestamp()),
+            "exp": int((now + (ttl or self.access_ttl)).timestamp()),
         }
         if family:
             payload["fam"] = family
+        if scope is not None:
+            payload["scope"] = scope
         return jwt.encode(payload, self.secret, algorithm=ALGORITHM)
 
     def verify(self, token: str) -> Claims:
@@ -149,5 +163,6 @@ class TokenMinter:
             issued_at=datetime.fromtimestamp(payload["iat"], tz=timezone.utc),
             expires_at=datetime.fromtimestamp(payload["exp"], tz=timezone.utc),
             family=str(payload.get("fam", "")),
+            scopes=frozenset(str(payload["scope"]).split()) if "scope" in payload else None,
             raw=payload,
         )

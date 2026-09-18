@@ -43,6 +43,7 @@ import secrets
 import subprocess
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -77,22 +78,31 @@ class Runner:
     token: str
     handle: Any
     upstream: Upstream
+    #: The runner's gateway credential expires then (epoch seconds); the reaper
+    #: replaces it before it does (credentials.py).
+    credential_expires: float = float("inf")
     started_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
 
 
 class Backend(Protocol):
-    def start(self, lease_id: str, worktree: Path, token: str) -> tuple[str, Any]: ...
+    def start(
+        self, lease_id: str, worktree: Path, token: str, credential: str
+    ) -> tuple[str, Any]: ...
     def stop(self, handle: Any) -> None: ...
     def alive(self, handle: Any) -> bool: ...
 
 
-def runner_env(settings: Settings, token: str) -> dict[str, str]:
-    """A runner's whole environment, apart from what `_INHERIT` passes through."""
+def runner_env(settings: Settings, token: str, credential: str) -> dict[str, str]:
+    """A runner's whole environment, apart from what `_INHERIT` passes through.
+
+    ``credential`` is the runner's gateway token, delegated for its lease's
+    owner (credentials.py).
+    """
     env = {
         "DAKCODER_HOSTED": "1",
         "DAKCODER_GATEWAY_URL": settings.gateway_url,
-        "DAKCODER_JWT": settings.runner_jwt,
+        "DAKCODER_JWT": credential,
         # The runtime's own token: what this control plane presents to it.
         "DAKCODER_GATEWAY_TOKEN": token,
         # Never "wait forever" hosted (§10): it parks a runner and a lease.
@@ -109,9 +119,11 @@ class ProcessBackend:
         self.settings = settings
         self.ready_timeout = ready_timeout
 
-    def start(self, lease_id: str, worktree: Path, token: str) -> tuple[str, Any]:
+    def start(
+        self, lease_id: str, worktree: Path, token: str, credential: str
+    ) -> tuple[str, Any]:
         env = {k: v for k in _INHERIT if (v := os.environ.get(k))}
-        env.update(runner_env(self.settings, token))
+        env.update(runner_env(self.settings, token, credential))
         argv = [
             *self.settings.runner_command,
             "--hosted",
@@ -174,7 +186,18 @@ class DockerBackend:
         self.settings = settings
         self.docker = docker
 
-    def run_argv(self, lease_id: str, worktree: Path, token: str) -> list[str]:
+    def environment(self, token: str, credential: str) -> dict[str, str]:
+        """The container's environment. Handed to `docker run` through its own
+        environment, by name: never in its arguments, where every user of the
+        host can read them in the process list."""
+        env = runner_env(self.settings, token, credential)
+        if self.settings.gomodcache is not None:
+            env["GOMODCACHE"] = "/gomodcache"
+        return env
+
+    def run_argv(
+        self, lease_id: str, worktree: Path, token: str, credential: str = ""
+    ) -> list[str]:
         """The whole `docker run`, as data, so it can be read and tested."""
         s = self.settings
         argv = [
@@ -195,11 +218,8 @@ class DockerBackend:
             argv += ["--mount", f"type=bind,source={s.gomodcache},target=/gomodcache"]
         if s.runner_network:
             argv += ["--network", s.runner_network]
-        env = runner_env(s, token)
-        if s.gomodcache is not None:
-            env["GOMODCACHE"] = "/gomodcache"
-        for name, value in sorted(env.items()):
-            argv += ["--env", f"{name}={value}"]
+        for name in sorted(self.environment(token, credential)):
+            argv += ["--env", name]  # the value comes from docker's own environment
         argv += [
             s.runner_image,
             "dakcoderd", "--hosted", "--workspace", "/workspace",
@@ -208,9 +228,13 @@ class DockerBackend:
         ]
         return argv
 
-    def start(self, lease_id: str, worktree: Path, token: str) -> tuple[str, Any]:
+    def start(
+        self, lease_id: str, worktree: Path, token: str, credential: str
+    ) -> tuple[str, Any]:
         started = subprocess.run(
-            self.run_argv(lease_id, worktree, token), capture_output=True, text=True, check=False
+            self.run_argv(lease_id, worktree, token, credential),
+            env={**_docker_env(), **self.environment(token, credential)},
+            capture_output=True, text=True, check=False,
         )
         if started.returncode != 0:
             raise RunnerFailed(f"docker run failed: {started.stderr.strip()[:300]}")
@@ -236,6 +260,14 @@ class DockerBackend:
         return state.stdout.strip() == "true"
 
 
+def _docker_env() -> dict[str, str]:
+    """What the docker CLI itself needs from ours: where it is, and where the
+    daemon is."""
+    names = ("PATH", "SYSTEMROOT", "WINDIR", "HOME", "USERPROFILE", "DOCKER_HOST",
+             "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY")
+    return {k: v for k in names if (v := os.environ.get(k))}
+
+
 def backend_for(settings: Settings) -> Backend:
     if settings.runner_backend == "docker":
         return DockerBackend(settings)
@@ -254,7 +286,14 @@ class Runners:
         #: For tests: an httpx transport per runner URL instead of the network.
         self._transport_for = transport_for
 
-    async def ensure(self, lease_id: str, worktree: Path) -> Runner:
+    async def ensure(
+        self,
+        lease_id: str,
+        worktree: Path,
+        credential: Callable[[], Awaitable[tuple[str, float]]],
+    ) -> Runner:
+        """The lease's runner, started if it is not running. ``credential`` is
+        asked only when one has to be started."""
         lock = self._locks.setdefault(lease_id, asyncio.Lock())
         async with lock:
             runner = self._running.get(lease_id)
@@ -264,9 +303,13 @@ class Runners:
             if runner is not None:
                 await runner.upstream.aclose()
             token = secrets.token_urlsafe(32)
-            url, handle = await asyncio.to_thread(self.backend.start, lease_id, worktree, token)
+            jwt, expires = await credential()
+            url, handle = await asyncio.to_thread(self.backend.start, lease_id, worktree, token, jwt)
             transport = self._transport_for(url) if self._transport_for else None
-            runner = Runner(lease_id, url, token, handle, Upstream(url, token, transport=transport))
+            runner = Runner(
+                lease_id, url, token, handle, Upstream(url, token, transport=transport),
+                credential_expires=expires,
+            )
             self._running[lease_id] = runner
             await self._wait_healthy(runner)
             return runner

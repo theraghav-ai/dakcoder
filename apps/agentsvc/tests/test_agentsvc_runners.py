@@ -28,7 +28,8 @@ def settings_for(tmp_path: Path, **kw) -> Settings:
 def test_a_container_runner_is_locked_down(tmp_path: Path) -> None:
     """host-plan §7.2, as data."""
     settings = settings_for(tmp_path, runner_network="dakcoder-runners", gomodcache=tmp_path / "gomod")
-    argv = DockerBackend(settings).run_argv("abc123", tmp_path / "repo", "runner-token")
+    backend = DockerBackend(settings)
+    argv = backend.run_argv("abc123", tmp_path / "repo", "runner-token", "delegated-jwt")
     text = " ".join(argv)
 
     for flag in ("--read-only", "--rm", "no-new-privileges"):
@@ -39,8 +40,13 @@ def test_a_container_runner_is_locked_down(tmp_path: Path) -> None:
     assert argv[argv.index("--publish") + 1].startswith("127.0.0.1::"), "loopback only"
     assert argv[argv.index("--network") + 1] == "dakcoder-runners"
     assert f"source={tmp_path / 'repo'},target=/workspace" in text
-    assert "DAKCODER_HOSTED=1" in argv and "DAKCODER_GATEWAY_TOKEN=runner-token" in argv
-    assert "GOMODCACHE=/gomodcache" in argv
+    env = backend.environment("runner-token", "delegated-jwt")
+    assert env["DAKCODER_HOSTED"] == "1" and env["DAKCODER_GATEWAY_TOKEN"] == "runner-token"
+    assert env["DAKCODER_JWT"] == "delegated-jwt" and env["GOMODCACHE"] == "/gomodcache"
+    assert argv.count("--env") == len(env) and "DAKCODER_JWT" in argv
+    assert "runner-token" not in text and "delegated-jwt" not in text, (
+        "values go through docker's environment: argv is readable by every user of the host"
+    )
     assert "cp-secret" not in text and "gl-secret" not in text, (
         "the control plane's secrets never reach a runner"
     )
@@ -59,7 +65,7 @@ def test_a_process_runner_inherits_nothing_it_should_not(tmp_path: Path, monkeyp
     )
     settings = settings_for(tmp_path, runner_command=(sys.executable, "-c", script))
     backend = ProcessBackend(settings)
-    url, proc = backend.start("abc", tmp_path, "runner-token")
+    url, proc = backend.start("abc", tmp_path, "runner-token", "runner-jwt")
     proc.wait(timeout=30)
 
     env = json.loads(seen.read_text())
@@ -91,7 +97,11 @@ async def test_the_real_runtime_starts_hosted(tmp_path: Path, monkeypatch) -> No
         runner_args=("--no-prewarm",),
     )
     runners = Runners(ProcessBackend(settings))
-    runner = await runners.ensure("lease1", workspace)
+
+    async def credential():
+        return "runner-jwt", float("inf")
+
+    runner = await runners.ensure("lease1", workspace, credential)
     try:
         async with httpx.AsyncClient(base_url=runner.url, trust_env=False) as http:
             health = (await http.get("/v1/health")).json()

@@ -272,7 +272,8 @@ async def test_the_reaper_never_stops_a_running_session(app, remote, service) ->
         StandInAgent.release.set()
         service.clock = time.time
         await settled(alice, busy["id"])
-    assert reaped == {"stopped": [], "expired": []}
+    assert (reaped["stopped"], reaped["expired"]) == ([], [])
+    assert reaped["refreshed"] == [workspace["id"]], "a long run is exactly when its token runs out"
 
 
 # ── the route table (§8, as in the runtime) ─────────────────────────────────
@@ -305,3 +306,50 @@ def test_every_route_takes_what_it_names_through_an_ownership_check(app) -> None
         if isinstance(route, APIRoute) and route.path != "/v1/health" and "caller" not in dependencies(route)
     ]
     assert anonymous == []
+
+
+# ── whose account a hosted run is charged to (host-plan §8) ─────────────────
+
+
+async def test_a_runner_calls_the_model_as_its_leases_owner(app, remote, backend, service) -> None:
+    async with as_caller(app, "alice") as alice:
+        workspace = await lease(alice, remote)
+        session = await run(alice, workspace["id"], "noop")
+        await settled(alice, session["id"])
+    assert backend.credentials[workspace["id"]] == "delegated:alice", (
+        "one service token for every runner would charge one account for every hosted run"
+    )
+    assert backend.runtimes[workspace["id"]].credential() == "delegated:alice"
+
+
+async def test_a_runners_token_is_replaced_before_it_expires(app, remote, backend, service) -> None:
+    async with as_caller(app, "alice") as alice:
+        workspace = await lease(alice, remote)
+        await run(alice, workspace["id"], "noop")
+    runner = service.runners.get(workspace["id"])
+    backend.runtimes[workspace["id"]].set_credential("old")
+    runner.credential_expires = time.time() + 60
+    refreshed = await service.refresh_credentials()
+    assert refreshed == [workspace["id"]]
+    assert backend.runtimes[workspace["id"]].credential() == "delegated:alice"
+    assert runner.credential_expires > time.time() + 3600
+
+
+async def test_without_a_credential_for_runners_nothing_starts(app, remote, service) -> None:
+    from dakcoder_agentsvc.credentials import Credentials
+
+    service.credentials = Credentials("http://gateway")
+    async with as_caller(app, "alice") as alice:
+        workspace = await lease(alice, remote)
+        response = await alice.post(f"/v1/workspaces/{workspace['id']}/tasks", json={"task": "x"})
+    assert response.status_code == 503
+
+
+async def test_the_shared_token_fallback_still_works(app, remote, service, backend) -> None:
+    from dakcoder_agentsvc.credentials import Credentials
+
+    service.credentials = Credentials("http://gateway", static="one-token-for-all")
+    async with as_caller(app, "alice") as alice:
+        workspace = await lease(alice, remote)
+        await run(alice, workspace["id"], "noop")
+    assert backend.credentials[workspace["id"]] == "one-token-for-all"

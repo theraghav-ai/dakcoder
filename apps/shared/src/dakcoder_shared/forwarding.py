@@ -109,8 +109,11 @@ class Upstream:
 
     @staticmethod
     async def relay(response: httpx.Response) -> AsyncIterator[bytes]:
+        """The body, decoded. Decoded because ``Content-Encoding`` is not among
+        the headers passed back: relaying the raw bytes of a compressed answer
+        without it would hand the client something it cannot read."""
         try:
-            async for chunk in response.aiter_raw():
+            async for chunk in response.aiter_bytes():
                 yield chunk
         finally:
             await response.aclose()
