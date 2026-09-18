@@ -159,8 +159,20 @@ def create_app(
     # -- sessions -----------------------------------------------------------
 
     @app.get("/v1/sessions")
-    async def sessions(workspace: str | None = None, who: Caller = Depends(caller)) -> dict[str, Any]:
-        return {"sessions": await service.sessions(who.sub, workspace)}
+    async def sessions(
+        workspace: str | None = None,
+        limit: int = 50,
+        before: float | None = None,
+        who: Caller = Depends(caller),
+    ) -> dict[str, Any]:
+        """The caller's sessions, newest first, a page at a time. ``next`` is
+        the ``before`` for the following page, absent on the last."""
+        limit = max(1, min(200, limit))
+        page = await service.sessions(who.sub, workspace, limit=limit, before=before)
+        body: dict[str, Any] = {"sessions": page}
+        if len(page) == limit:
+            body["next"] = page[-1]["listed_at"]
+        return body
 
     @app.post("/v1/sessions/{session_id}/deliver")
     async def deliver(

@@ -46,8 +46,12 @@ gotools/            the Go analysis and scaffolding sidecar — built
 apps/
   shared/             dakcoder-shared — token estimation, contracts
   agent/              dakcoder-agent — context manager, mode config
-  gateway/            dakcoder-gateway — not started (server only, never
-                      in the .vsix; see ARCHITECTURE D-36)
+  gateway/            dakcoder-gateway — identity, quota, ledger, the model
+                      proxy, and the front door to the hosted side (server
+                      only, never in the .vsix; see ARCHITECTURE D-36)
+  agentsvc/           dakcoder-agentsvc — the hosted control plane: workspace
+                      leases, one runner per lease, delivery as a merge
+                      request, A2A (server only; host-plan §3)
 
 packages/knowledge/ the agent's knowledge base — generated, do not edit
 api/                generated contracts, each with a drift check:

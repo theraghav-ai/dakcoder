@@ -353,3 +353,22 @@ async def test_the_shared_token_fallback_still_works(app, remote, service, backe
         workspace = await lease(alice, remote)
         await run(alice, workspace["id"], "noop")
     assert backend.credentials[workspace["id"]] == "one-token-for-all"
+
+
+async def test_the_session_list_pages_over_everything_the_caller_ran(app, remote, service) -> None:
+    """A runner keeps its latest 200; the registry keeps them all (§9.1)."""
+    from dakcoder_agentsvc.store import SessionRow
+
+    async with as_caller(app, "alice") as alice:
+        workspace = await lease(alice, remote)
+        for i in range(5):
+            service.store.add_session(
+                SessionRow(f"s{i}", workspace["id"], "alice", f"dakcoder/s{i}", f"task {i}", 1000.0 + i, {})
+            )
+        first = (await alice.get("/v1/sessions", params={"limit": 2})).json()
+        second = (await alice.get("/v1/sessions", params={"limit": 2, "before": first["next"]})).json()
+        last = (await alice.get("/v1/sessions", params={"limit": 2, "before": second["next"]})).json()
+
+    assert [s["id"] for s in first["sessions"]] == ["s4", "s3"]
+    assert [s["id"] for s in second["sessions"]] == ["s2", "s1"]
+    assert [s["id"] for s in last["sessions"]] == ["s0"] and "next" not in last

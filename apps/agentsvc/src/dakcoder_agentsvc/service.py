@@ -286,8 +286,15 @@ class Service:
         _, lease = self.owned_session(sub, session_id)
         return await self.runner_for(lease)
 
-    async def sessions(self, sub: str, workspace: str | None = None) -> list[dict[str, Any]]:
-        rows = self.store.sessions(sub, workspace)
+    async def sessions(
+        self,
+        sub: str,
+        workspace: str | None = None,
+        *,
+        limit: int | None = None,
+        before: float | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = self.store.sessions(sub, workspace, limit=limit, before=before)
         for lease_id in {r.lease_id for r in rows}:
             runner = self.runners.get(lease_id)
             if runner is None:
@@ -296,10 +303,10 @@ class Service:
             if status == 200:
                 for live in body.get("sessions", []):
                     self.store.remember(str(live.get("id")), live)
-        rows = self.store.sessions(sub, workspace)
+        rows = self.store.sessions(sub, workspace, limit=limit, before=before)
         return [
             {**row.summary, "id": row.id, "task": row.task or row.summary.get("task", ""),
-             "workspace_id": row.lease_id, "branch": row.branch}
+             "workspace_id": row.lease_id, "branch": row.branch, "listed_at": row.created_at}
             for row in rows
         ]
 

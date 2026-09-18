@@ -162,18 +162,26 @@ class Store:
         rows = self._all("select * from sessions where id = ? and owner = ?", session_id, owner)
         return _session(rows[0]) if rows else None
 
-    def sessions(self, owner: str, lease_id: str | None = None) -> list[SessionRow]:
-        if lease_id is None:
-            rows = self._all(
-                "select * from sessions where owner = ? order by created_at desc", owner
-            )
-        else:
-            rows = self._all(
-                "select * from sessions where owner = ? and lease_id = ? "
-                "order by created_at desc",
-                owner, lease_id,
-            )
-        return [_session(r) for r in rows]
+    def sessions(
+        self,
+        owner: str,
+        lease_id: str | None = None,
+        *,
+        limit: int | None = None,
+        before: float | None = None,
+    ) -> list[SessionRow]:
+        """Newest first. ``before`` and ``limit`` page through them: a runner
+        keeps its latest 200 (``SessionStore``), and this is every session the
+        caller ever ran, released workspaces included (host-plan §9.1)."""
+        sql, args = "select * from sessions where owner = ?", [owner]
+        if lease_id is not None:
+            sql, args = sql + " and lease_id = ?", [*args, lease_id]
+        if before is not None:
+            sql, args = sql + " and created_at < ?", [*args, before]
+        sql += " order by created_at desc"
+        if limit is not None:
+            sql, args = sql + " limit ?", [*args, limit]
+        return [_session(r) for r in self._all(sql, *args)]
 
     def lease_sessions(self, lease_id: str) -> list[SessionRow]:
         """For release and the reaper, which act on a lease already owned."""
