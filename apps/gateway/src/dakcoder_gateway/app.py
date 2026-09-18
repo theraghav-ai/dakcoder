@@ -13,7 +13,9 @@ casually is one where the next thing to cross is something nobody decided about.
     GET  /v1/models          the role -> model routing in force
     GET  /v1/tools           the tool schemas                         (C1)
     POST /v1/llm/{path}      the model proxy                          (§15.4)
-    *    /v1/runtime/{path}  a hosted runtime, for the verified caller (host-plan §3)
+    *    /v1/runtime/{path}  the hosted side, for the verified caller (host-plan §3)
+    POST /v1/a2a             agent-to-agent JSON-RPC, answered by the control plane
+    GET  /.well-known/agent-card.json   what dakcoder offers other agents (§5)
 
 **Errors are translated in one place.** Each domain raises its own exception —
 ``AuthError``, ``QuotaExceeded``, ``ProxyError``, ``StoreUnavailable`` — and the
@@ -33,6 +35,8 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from dakcoder_shared.contract import card
 
 from .auth import AuthError, AuthService, Claims
 from .ledger import Ledger, MemoryLedger
@@ -66,6 +70,8 @@ class Gateway:
         #: Browser origins allowed to call this gateway. Empty: no CORS at all,
         #: which is what every non-browser client needs.
         cors_origins: tuple[str, ...] = (),
+        #: Where callers reach this gateway, for the agent card's URLs.
+        public_url: str = "",
     ) -> None:
         if "*" in cors_origins:
             # These are credentialed requests: an Authorization header on every
@@ -81,6 +87,7 @@ class Gateway:
         self.version = version
         self.runtime = runtime
         self.cors_origins = cors_origins
+        self.public_url = public_url or card.PUBLIC_URL
         #: Filled by the startup probe, so /v1/health answers instantly rather
         #: than making every caller wait on an upstream round trip.
         self.capabilities: dict[str, Any] = {"status": "not probed"}
@@ -364,6 +371,37 @@ def create_app(gateway: Gateway) -> FastAPI:
                 # endpoint into a slow non-streaming one, silently.
                 "X-Accel-Buffering": "no",
             },
+        )
+
+    # -- other agents (host-plan §5) -----------------------------------------
+
+    @app.get("/.well-known/agent-card.json")
+    async def agent_card() -> dict[str, Any]:
+        """Unauthenticated, like /v1/health: discovery comes before sign-in.
+
+        Served only when this gateway fronts the hosted side, because the card
+        promises an A2A endpoint and a card whose endpoint 404s is a false one.
+        The A2A convention expects this at the domain root; under nginx today it
+        is at /dakcoder/.well-known/..., and the root needs a location block on
+        the shared host (§5.2).
+        """
+        if gateway.runtime is None:
+            raise RuntimeRefused(".well-known/agent-card.json")
+        return card.card(gateway.public_url)
+
+    @app.post("/v1/a2a")
+    async def a2a(request: Request, claims: Claims = Depends(caller)) -> Response:
+        """JSON-RPC for other agents, answered by the control plane's adapter."""
+        if gateway.runtime is None:
+            raise RuntimeRefused("v1/a2a")
+        upstream = await gateway.runtime.open(
+            "POST", "v1/a2a", query="", body=await request.body(), headers=request.headers,
+            sub=claims.sub,
+        )
+        return StreamingResponse(
+            gateway.runtime.relay(upstream),
+            status_code=upstream.status_code,
+            headers=gateway.runtime.response_headers(upstream),
         )
 
     # -- a hosted runtime, fronted (host-plan §3) ----------------------------

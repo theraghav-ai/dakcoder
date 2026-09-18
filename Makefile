@@ -37,13 +37,15 @@ catalog-check: ## Fail if the published catalogue has drifted from the registry
 # dakcoder_shared.contract and the runtime's app. Python writes the JSON; the
 # extension generates its TypeScript from that JSON, so each side's check runs
 # with only its own toolchain in CI.
-contract: ## Write api/contract.json, api/openapi.json and the extension's contract.gen.ts
+contract: ## Write api/contract.json, openapi.json, agent-card.json and the extension's contract.gen.ts
 	@$(PY) -c "import sys; sys.path[:0]=['apps/agent/src','apps/shared/src']; \
 from pathlib import Path; from dakcoder_agent.loopback import published_contract, published_openapi; \
 Path('api').mkdir(exist_ok=True); \
 Path('api/contract.json').write_text(published_contract(), encoding='utf-8', newline=''); \
 Path('api/openapi.json').write_text(published_openapi(), encoding='utf-8', newline=''); \
-print('api/contract.json and api/openapi.json written')"
+from dakcoder_shared.contract import card; \
+Path('api/agent-card.json').write_text(card.as_json(), encoding='utf-8', newline=''); \
+print('api/contract.json, api/openapi.json and api/agent-card.json written')"
 	@cd extension && node scripts/gen-contract.mjs
 
 contract-check: ## Fail if either side of the wire contract has drifted

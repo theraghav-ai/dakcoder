@@ -44,7 +44,7 @@ from dakcoder_agent.session import Status
 from dakcoder_agent.tools.control import STEP_STATUSES
 from dakcoder_agent.tools.router import ApprovalRequest
 from dakcoder_agent.migration import MigrationState
-from dakcoder_shared.contract import compat, events, rest
+from dakcoder_shared.contract import card, compat, events, rest
 from dakcoder_shared.envelope import DeltaCoalescer, EventType, ToolResult
 from scripted import build, planning_router  # noqa: F401 - fixture
 from test_loopback import client, scripted, settle, start  # noqa: F401 - fixtures
@@ -94,7 +94,7 @@ def test_the_published_openapi_is_current() -> None:
     )
 
 
-@pytest.mark.parametrize("name", ["contract.json", "openapi.json", "contract-baseline.json"])
+@pytest.mark.parametrize("name", ["contract.json", "openapi.json", "contract-baseline.json", "agent-card.json"])
 def test_the_published_files_are_not_ignored_by_git(name: str) -> None:
     if shutil.which("git") is None or not (ROOT / ".git").exists():
         pytest.skip("not a git checkout")
@@ -398,3 +398,35 @@ def test_additions_and_a_major_bump_are_not_breaks() -> None:
     assert compat.breaks(before, compat.surface(contract, openapi), "2.0") == [], (
         "a major version is allowed to remove things; that is what it is for"
     )
+
+
+# ── the agent card (host-plan §5) ───────────────────────────────────────────
+
+
+def test_the_published_agent_card_is_current() -> None:
+    path = API / "agent-card.json"
+    assert path.is_file(), f"api/agent-card.json is missing. {REGENERATE}"
+    assert path.read_text(encoding="utf-8") == card.as_json(), (
+        f"api/agent-card.json is stale. {REGENERATE}"
+    )
+
+
+def test_every_skill_is_something_the_runtime_can_do() -> None:
+    assert {s["id"] for s in card.SKILLS} == set(card.SKILL_INTENTS)
+    assert set(card.SKILL_INTENTS.values()) <= {str(i) for i in Intent}
+
+
+def test_the_card_promises_skills_not_tools() -> None:
+    """Callers submit tasks, never tool calls. A tool name in the public card
+    would be a reconnaissance leak and a promise the API does not make (§5.1)."""
+    from dakcoder_agent.tools import registry
+
+    published = card.as_json()
+    leaked = sorted(name for name in registry.REGISTRY if f'"{name}"' in published or f" {name} " in published)
+    assert leaked == []
+
+
+def test_the_card_says_where_it_is_served_and_which_version() -> None:
+    served = card.card("https://example.test/dakcoder/")
+    assert served["url"] == "https://example.test/dakcoder/v1/a2a"
+    assert served["version"].startswith(published()["api_version"])

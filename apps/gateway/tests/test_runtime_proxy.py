@@ -236,3 +236,31 @@ async def test_no_origins_means_no_cors_at_all() -> None:
 def test_a_wildcard_origin_is_refused() -> None:
     with pytest.raises(ValueError):
         gateway_with(None, cors_origins=("*",))
+
+
+# ── the agent card and A2A (host-plan §5) ───────────────────────────────────
+
+
+async def test_the_agent_card_is_served_to_anyone_once_something_is_fronted(recorded) -> None:
+    proxy, _ = recorded
+    async with client_for(gateway_with(proxy, public_url="https://example.test/dakcoder")) as gw:
+        served = await gw.get("/.well-known/agent-card.json")
+    assert served.status_code == 200, "discovery comes before sign-in"
+    assert served.json()["url"] == "https://example.test/dakcoder/v1/a2a"
+    async with client_for(gateway_with(None)) as gw:
+        assert (await gw.get("/.well-known/agent-card.json")).status_code == 404, (
+            "a card whose endpoint would 404 is a false promise"
+        )
+
+
+async def test_a2a_reaches_the_control_plane_for_the_verified_caller(recorded) -> None:
+    proxy, seen = recorded
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "x"}}
+    async with client_for(gateway_with(proxy)) as gw:
+        anonymous = await gw.post("/v1/a2a", json=body)
+        signed_in = await gw.post("/v1/a2a", json=body, headers={**jwt("agent-7"), CALLER_HEADER: "bob"})
+    assert anonymous.status_code == 401
+    assert signed_in.status_code == 200
+    (request,) = seen
+    assert request["path"] == "v1/a2a"
+    assert request["headers"][CALLER_HEADER.lower()] == "agent-7"

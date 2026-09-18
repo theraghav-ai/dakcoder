@@ -32,6 +32,8 @@ lives outside ``apps/`` so nothing here can end up inside a wheel.
                               DAKCODER_GATEWAY_TOKEN, the runtime's)
     DAKCODER_CORS_ORIGINS     browser origins allowed to call, comma-separated.
                               Unset: no CORS. '*' is refused.
+    DAKCODER_PUBLIC_URL       where callers reach this gateway, for the agent
+                              card; default https://ai.cept.gov.in/dakcoder
 
 ``--mint`` prints a signed access token instead of serving, which is how a
 runtime gets a JWT here without a browser and a GitLab OAuth application.
@@ -258,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
             version=os.environ.get("DAKCODER_VERSION", "local"),
             runtime=runtime,
             cors_origins=cors_origins(),
+            public_url=os.environ.get("DAKCODER_PUBLIC_URL", "").strip(),
         )
         gateway.capabilities = {"status": "not probed", "identity": kind}
 

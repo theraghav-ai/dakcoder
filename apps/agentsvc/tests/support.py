@@ -100,14 +100,18 @@ class StandInAgent:
     `wait` runs until `release` is set; anything else changes nothing."""
 
     release = threading.Event()
+    #: (task, intent, approval policy) for every run, in order.
+    seen: list[tuple[str, str, str]] = []
 
-    def __init__(self, worktree: Path) -> None:
+    def __init__(self, worktree: Path, policy: str = "") -> None:
         self.worktree = worktree
+        self.policy = policy
         self.context = _Context()
         self.router = _Router()
         self.result: RunResult | None = None
 
-    def run(self, task: str, **_kw: Any):
+    def run(self, task: str, **kw: Any):
+        StandInAgent.seen.append((task, str(kw.get("intent", "")), self.policy))
         words = task.split()
         outcome = "done"
         written: list[str] = []
@@ -136,7 +140,9 @@ class InProcessBackend:
         self.started: list[str] = []
 
     def start(self, lease_id: str, worktree: Path, token: str) -> tuple[str, Any]:
-        runtime = Loopback(worktree, lambda _s, _a: StandInAgent(worktree), token=token)
+        runtime = Loopback(
+            worktree, lambda session, _a: StandInAgent(worktree, session.approval_policy), token=token
+        )
         url = f"http://runner-{lease_id}-{len(self.started)}"
         self.apps[url] = create_runtime(runtime, authenticate=gateway_forwarded(lambda: token))
         self.runtimes[lease_id] = runtime
@@ -204,6 +210,7 @@ def service(settings: Settings, remote: str, backend: InProcessBackend, gitlab: 
         [AllowedRepo(repo=remote, owner="Ops Person", expires=date.today() + timedelta(days=30))]
     )
     StandInAgent.release.clear()
+    StandInAgent.seen.clear()
     return Service(
         settings,
         Store(settings.data_dir / "registry.sqlite3"),

@@ -1,0 +1,80 @@
+{
+  "protocolVersion": "0.3.0",
+  "name": "dakcoder",
+  "description": "Backend coding agent for IT 2.0 Go microservices on n-api-template: migrates legacy api-* services, implements endpoints, and answers questions about the template contract. Works on a server-side clone of a repository the caller may lease, and delivers changes as merge requests.",
+  "url": "https://ai.cept.gov.in/dakcoder/v1/a2a",
+  "preferredTransport": "JSONRPC",
+  "version": "1.1.0",
+  "provider": {
+    "organization": "CEPT IT 2.0",
+    "url": "https://cept.gov.in"
+  },
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false,
+    "stateTransitionHistory": false
+  },
+  "defaultInputModes": [
+    "text/plain"
+  ],
+  "defaultOutputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "securitySchemes": {
+    "dakcoderJwt": {
+      "type": "http",
+      "scheme": "bearer",
+      "bearerFormat": "JWT"
+    }
+  },
+  "security": [
+    {
+      "dakcoderJwt": []
+    }
+  ],
+  "skills": [
+    {
+      "id": "migrate-service",
+      "name": "Convert a legacy service to n-api-template",
+      "description": "Applies the migration SOP end to end: branch from the base the caller names, dependency swap, handler conversion, govalid regeneration, test harness, swagger verification. Long: the gate is deferred until the last phase closes. Delivered as a branch and a merge request.",
+      "tags": [
+        "go",
+        "migration",
+        "n-api-template"
+      ],
+      "examples": [
+        "Convert pao-back-end-development to the new template"
+      ]
+    },
+    {
+      "id": "implement-change",
+      "name": "Implement a change in a Go service",
+      "description": "Adds or changes an endpoint, DTO, repository method or domain field, verified by the gate (build, vet, rules_lint, tests). Delivered as a branch and a merge request.",
+      "tags": [
+        "go",
+        "codegen"
+      ],
+      "examples": [
+        "Add a Pension resource with CRUD and a status filter"
+      ]
+    },
+    {
+      "id": "review-service",
+      "name": "Audit a service against the template contract",
+      "description": "Runs the compliance rule set and the legacy, temporal, validation and DB round-trip audits, and reports findings with fixes and citations. Read-only.",
+      "tags": [
+        "go",
+        "review"
+      ]
+    },
+    {
+      "id": "answer",
+      "name": "Answer a question about a service or the template",
+      "description": "Read-only. Cites the knowledge base and the repository.",
+      "tags": [
+        "qa"
+      ]
+    }
+  ]
+}

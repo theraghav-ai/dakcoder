@@ -6,7 +6,8 @@ and this. What is new is the workspace around them.
 
 Ownership, as in the runtime, is a dependency and never a lookup in a handler:
 ``workspace`` for a route with a workspace in its path, ``session_runner`` for
-one with a session. ``test_agentsvc_tenancy`` walks the route table and fails on
+one with a session, ``approval_runner`` for an approval. A test in
+``test_agentsvc.py`` walks the route table and fails on
 any route that does not use them.
 """
 
@@ -23,6 +24,7 @@ from dakcoder_shared.callers import Authenticator, Caller, Unauthorised
 from dakcoder_shared.contract import API_VERSION
 from dakcoder_shared.forwarding import Unreachable, Upstream
 
+from .a2a import A2A
 from .runners import Runner
 from .service import Refused, Service
 from .store import Lease
@@ -55,6 +57,7 @@ def create_app(
 
     app = FastAPI(title="dakcoder control plane", version=API_VERSION, lifespan=lifespan)
     app.state.service = service
+    adapter = A2A(service)
 
     # -- errors -------------------------------------------------------------
 
@@ -220,5 +223,11 @@ def create_app(
         runner: Runner = Depends(approval_runner),
     ) -> Response:
         return await forward(runner, request, f"v1/approvals/{_safe(approval_id)}/extend", who.sub)
+
+    # -- other agents (§5.4) -------------------------------------------------
+
+    @app.post("/v1/a2a")
+    async def a2a(request: Request, who: Caller = Depends(caller)) -> Response:
+        return await adapter.handle(who.sub, await request.body())
 
     return app
