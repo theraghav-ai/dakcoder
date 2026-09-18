@@ -819,7 +819,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Server-sent events. Each frame's `event:` is a C2 event type and its `data:` is that event's payload. Resume with `since_id` or `Last-Event-ID`.",
+            "description": "Server-sent events. Each frame's `event:` is a C2 event type and its `data:` is that event's payload: `api/contract.json` names the schema for each type. Resume with `since_id` or `Last-Event-ID`.",
             "content": {
               "text/event-stream": {
                 "schema": {
@@ -1652,6 +1652,44 @@
         ],
         "type": "object"
       },
+      "CompactionRecord": {
+        "properties": {
+          "turn": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "before": {
+            "type": "integer"
+          },
+          "after": {
+            "type": "integer"
+          },
+          "freed": {
+            "type": "integer"
+          },
+          "evicted_messages": {
+            "type": "integer"
+          },
+          "evicted_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "turn",
+          "reason",
+          "before",
+          "after",
+          "freed",
+          "evicted_messages",
+          "evicted_paths"
+        ],
+        "type": "object"
+      },
       "CompactionReport": {
         "properties": {
           "session_id": {
@@ -1915,6 +1953,28 @@
         ],
         "type": "object"
       },
+      "ErrorPayload": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "where": {
+            "description": "What failed, when it was not the run itself.",
+            "type": "string"
+          },
+          "effect": {
+            "description": "What the run did instead.",
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
       "Extended": {
         "properties": {
           "id": {
@@ -1939,6 +1999,353 @@
           "id",
           "extensions",
           "seconds_left"
+        ],
+        "type": "object"
+      },
+      "GateCompaction": {
+        "properties": {
+          "kind": {
+            "const": "compaction",
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "strategy": {
+            "type": "string"
+          },
+          "before": {
+            "type": "integer"
+          },
+          "after": {
+            "type": "integer"
+          },
+          "turns": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evicted_messages": {
+            "type": "integer"
+          },
+          "evicted_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "reason",
+          "strategy",
+          "before",
+          "after",
+          "turns",
+          "evicted_messages",
+          "evicted_paths"
+        ],
+        "type": "object"
+      },
+      "GateForcedToolCall": {
+        "properties": {
+          "kind": {
+            "const": "forced_tool_call",
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "mode"
+        ],
+        "type": "object"
+      },
+      "GateOverflowRecovery": {
+        "properties": {
+          "kind": {
+            "const": "overflow_recovery",
+            "type": "string"
+          },
+          "before": {
+            "type": "integer"
+          },
+          "after": {
+            "type": "integer"
+          },
+          "retrying": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "before",
+          "after",
+          "retrying"
+        ],
+        "type": "object"
+      },
+      "GatePayload": {
+        "description": "One of several shapes, told apart by `kind`.",
+        "discriminator": {
+          "mapping": {
+            "compaction": "#/components/schemas/GateCompaction",
+            "forced_tool_call": "#/components/schemas/GateForcedToolCall",
+            "full": "#/components/schemas/GateRun",
+            "inner": "#/components/schemas/GateRun",
+            "overflow_recovery": "#/components/schemas/GateOverflowRecovery",
+            "phase": "#/components/schemas/GatePhase",
+            "replan": "#/components/schemas/GateReplan",
+            "routes": "#/components/schemas/GateRoutes",
+            "tool_choice_unsupported": "#/components/schemas/GateToolChoiceUnsupported"
+          },
+          "propertyName": "kind"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/GateRun"
+          },
+          {
+            "$ref": "#/components/schemas/GateForcedToolCall"
+          },
+          {
+            "$ref": "#/components/schemas/GateToolChoiceUnsupported"
+          },
+          {
+            "$ref": "#/components/schemas/GateOverflowRecovery"
+          },
+          {
+            "$ref": "#/components/schemas/GatePhase"
+          },
+          {
+            "$ref": "#/components/schemas/GateRoutes"
+          },
+          {
+            "$ref": "#/components/schemas/GateReplan"
+          },
+          {
+            "$ref": "#/components/schemas/GateCompaction"
+          }
+        ]
+      },
+      "GatePhase": {
+        "description": "A migration phase closed and the gate is deferred until the last one.",
+        "properties": {
+          "kind": {
+            "const": "phase",
+            "type": "string"
+          },
+          "deferred": {
+            "type": "boolean"
+          },
+          "closed": {
+            "type": "string"
+          },
+          "phase": {
+            "type": "string"
+          },
+          "index": {
+            "type": "integer"
+          },
+          "phases": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "deferred",
+          "closed",
+          "phase",
+          "index",
+          "phases"
+        ],
+        "type": "object"
+      },
+      "GateReplan": {
+        "properties": {
+          "kind": {
+            "const": "replan",
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "tried": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "reason",
+          "tried"
+        ],
+        "type": "object"
+      },
+      "GateReport": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "seconds": {
+            "type": "number"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/GateStage"
+            },
+            "type": "array"
+          },
+          "not_run": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "blocked_by": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "seconds",
+          "stages",
+          "not_run",
+          "blocked_by"
+        ],
+        "type": "object"
+      },
+      "GateRoutes": {
+        "description": "The route inventory was saved before a migration touched anything.",
+        "properties": {
+          "kind": {
+            "const": "routes",
+            "type": "string"
+          },
+          "saved": {
+            "type": "string"
+          },
+          "routes": {
+            "type": "integer"
+          },
+          "unresolved": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "saved",
+          "routes",
+          "unresolved"
+        ],
+        "type": "object"
+      },
+      "GateRun": {
+        "description": "The verification gate ran: `inner` over the files just changed, `full` at the end.",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "seconds": {
+            "type": "number"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/GateStage"
+            },
+            "type": "array"
+          },
+          "not_run": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "blocked_by": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "inner",
+              "full"
+            ],
+            "type": "string"
+          },
+          "cached": {
+            "description": "A full gate answered from its last run.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "seconds",
+          "stages",
+          "not_run",
+          "blocked_by",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "GateStage": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "skipped": {
+            "description": "Why the stage did not run. Empty when it ran.",
+            "type": "string"
+          },
+          "seconds": {
+            "type": "number"
+          },
+          "content": {
+            "description": "Only for a stage that failed.",
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "ok",
+          "blocking",
+          "skipped",
+          "seconds"
+        ],
+        "type": "object"
+      },
+      "GateToolChoiceUnsupported": {
+        "properties": {
+          "kind": {
+            "const": "tool_choice_unsupported",
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "value"
         ],
         "type": "object"
       },
@@ -1978,6 +2385,11 @@
         ],
         "type": "object"
       },
+      "HeartbeatPayload": {
+        "description": "Declared and never emitted. The stream keeps itself alive with SSE comment\nframes (`: keep-alive`), which are not events.",
+        "properties": {},
+        "type": "object"
+      },
       "MessageRequest": {
         "properties": {
           "text": {
@@ -1999,6 +2411,150 @@
         },
         "required": [
           "text"
+        ],
+        "type": "object"
+      },
+      "MetricsPayload": {
+        "description": "What the whole run cost and where it ran out of room. Sent once, before `end`.",
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "task": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "turns": {
+            "type": "integer"
+          },
+          "prompt_tokens": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "completion_tokens": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "cached_tokens": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "reasoning_tokens": {
+            "type": "integer"
+          },
+          "budget": {
+            "type": "integer"
+          },
+          "context_window": {
+            "type": "integer"
+          },
+          "compactions": {
+            "items": {
+              "$ref": "#/components/schemas/CompactionRecord"
+            },
+            "type": "array"
+          },
+          "evicted_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "evicted_paths_reread": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "truncations": {
+            "type": "integer"
+          },
+          "output_limit": {
+            "type": "integer"
+          },
+          "intercepted_cached": {
+            "type": "integer"
+          },
+          "intercepted_dead_end": {
+            "type": "integer"
+          },
+          "intercepted_re_read": {
+            "type": "integer"
+          },
+          "files_read": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bytes_read": {
+            "type": "integer"
+          },
+          "bytes_reread": {
+            "type": "integer"
+          },
+          "incomplete": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "peak_prompt_tokens": {
+            "type": "integer"
+          },
+          "total_prompt_tokens": {
+            "type": "integer"
+          },
+          "peak_pct_of_budget": {
+            "type": "number"
+          },
+          "peak_pct_of_window": {
+            "type": "number"
+          },
+          "pressed_the_ceiling": {
+            "type": "boolean"
+          },
+          "lost_work": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "session_id",
+          "task",
+          "outcome",
+          "turns",
+          "prompt_tokens",
+          "completion_tokens",
+          "cached_tokens",
+          "reasoning_tokens",
+          "budget",
+          "context_window",
+          "compactions",
+          "evicted_paths",
+          "evicted_paths_reread",
+          "truncations",
+          "output_limit",
+          "intercepted_cached",
+          "intercepted_dead_end",
+          "intercepted_re_read",
+          "files_read",
+          "bytes_read",
+          "bytes_reread",
+          "incomplete",
+          "peak_prompt_tokens",
+          "total_prompt_tokens",
+          "peak_pct_of_budget",
+          "peak_pct_of_window",
+          "pressed_the_ceiling",
+          "lost_work"
         ],
         "type": "object"
       },
@@ -2095,6 +2651,31 @@
         ],
         "type": "object"
       },
+      "Mutation": {
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "create",
+              "modify",
+              "delete"
+            ],
+            "type": "string"
+          },
+          "protected": {
+            "description": "Computed by the runtime. Never recompute it client-side.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "kind",
+          "protected"
+        ],
+        "type": "object"
+      },
       "Phase": {
         "properties": {
           "name": {
@@ -2120,6 +2701,67 @@
           "covers",
           "parts",
           "status"
+        ],
+        "type": "object"
+      },
+      "PlanItem": {
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "file": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "accepts": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "written",
+              "done",
+              "failed",
+              "skipped",
+              "blocked"
+            ],
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "file",
+          "action",
+          "accepts",
+          "status",
+          "note"
+        ],
+        "type": "object"
+      },
+      "PlanPayload": {
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PlanItem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "text",
+          "steps",
+          "items"
         ],
         "type": "object"
       },
@@ -2235,6 +2877,18 @@
           "part",
           "status",
           "note"
+        ],
+        "type": "object"
+      },
+      "QuotaPayload": {
+        "description": "A signal to re-read `GET /v1/quota`. It carries no numbers on purpose.",
+        "properties": {
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
         ],
         "type": "object"
       },
@@ -2372,6 +3026,52 @@
           "restore",
           "delete",
           "blocked"
+        ],
+        "type": "object"
+      },
+      "RunResultPayload": {
+        "description": "`finish`, then `end`: how the run ended.",
+        "properties": {
+          "outcome": {
+            "enum": [
+              "done",
+              "aborted",
+              "unverified",
+              "no_progress",
+              "exhausted",
+              "error"
+            ],
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "turns": {
+            "type": "integer"
+          },
+          "mutations": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "gate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GateReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "outcome",
+          "summary",
+          "turns",
+          "mutations",
+          "gate"
         ],
         "type": "object"
       },
@@ -2578,6 +3278,22 @@
         ],
         "type": "object"
       },
+      "SteerPayload": {
+        "description": "A correction the running loop has read.",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "turn": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "text",
+          "turn"
+        ],
+        "type": "object"
+      },
       "TaskRequest": {
         "properties": {
           "task": {
@@ -2605,6 +3321,18 @@
         },
         "required": [
           "task"
+        ],
+        "type": "object"
+      },
+      "TextPayload": {
+        "description": "`assistant` (the whole reply) and `assistant_delta` (a streamed piece of it).",
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
         ],
         "type": "object"
       },
@@ -2666,6 +3394,29 @@
         ],
         "type": "object"
       },
+      "ToolCallPayload": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "arguments": {
+            "description": "As the model sent them, parsed when they parse."
+          },
+          "turn": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "arguments",
+          "turn"
+        ],
+        "type": "object"
+      },
       "ToolCatalog": {
         "description": "Contract C1. The published copy is `api/tool-catalog.json`.",
         "properties": {
@@ -2718,6 +3469,123 @@
         ],
         "type": "object"
       },
+      "ToolPendingPayload": {
+        "description": "An approval being raised. `id` is what `POST /v1/approvals/{id}` takes.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "arguments": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unconditional": {
+            "type": "boolean"
+          },
+          "protected": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "turn": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "tool",
+          "arguments",
+          "reason",
+          "paths",
+          "unconditional",
+          "protected",
+          "turn"
+        ],
+        "type": "object"
+      },
+      "ToolResultPayload": {
+        "description": "A tool call's outcome, or a call that was answered without being run.\n\n`mutations` is absent when nothing was dispatched: a call skipped, refused\nfor the output limit, or answered from a ledger.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "content": {
+            "type": "string"
+          },
+          "turn": {
+            "type": "integer"
+          },
+          "mutations": {
+            "items": {
+              "$ref": "#/components/schemas/Mutation"
+            },
+            "type": "array"
+          },
+          "fix": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "ms": {
+            "description": "Server-measured; excludes the approval wait.",
+            "type": "integer"
+          },
+          "meta": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "dispatched": {
+            "description": "False when the call never ran.",
+            "type": "boolean"
+          },
+          "hooked": {
+            "description": "A hook answered in the tool's place.",
+            "type": "boolean"
+          },
+          "intercepted": {
+            "description": "Answered from a ledger. `ok` stays true: the content is current.",
+            "type": "boolean"
+          },
+          "intercept": {
+            "type": "string"
+          },
+          "arguments": {},
+          "truncated_by_output_limit": {
+            "type": "boolean"
+          },
+          "output_limit": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "ok",
+          "content",
+          "turn"
+        ],
+        "type": "object"
+      },
       "TranscriptView": {
         "description": "`view=canonical` returns `CanonicalRow` rows, anything else `ModelRow` rows.",
         "properties": {
@@ -2764,6 +3632,116 @@
           "returned",
           "compaction",
           "messages"
+        ],
+        "type": "object"
+      },
+      "TurnStartPayload": {
+        "properties": {
+          "turn": {
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "ask",
+              "planner",
+              "agent"
+            ],
+            "type": "string"
+          },
+          "intent": {
+            "enum": [
+              "auto",
+              "ask",
+              "agent"
+            ],
+            "type": "string"
+          },
+          "intent_source": {
+            "description": "Whether a person chose the intent or it was classified.",
+            "type": "string"
+          },
+          "intent_why": {
+            "type": "string"
+          },
+          "attempt": {
+            "description": "The attempt about to be made: 1, then 2 after a failed gate.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "turn",
+          "mode",
+          "intent",
+          "intent_source",
+          "intent_why",
+          "attempt"
+        ],
+        "type": "object"
+      },
+      "UsagePayload": {
+        "properties": {
+          "prompt_tokens": {
+            "type": "integer"
+          },
+          "completion_tokens": {
+            "type": "integer"
+          },
+          "cached_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null until the endpoint reports it. Show it as not reported, not as 0%."
+          },
+          "budget": {
+            "type": "integer"
+          },
+          "budget_used_pct": {
+            "type": "number"
+          },
+          "reasoning_tokens": {
+            "type": "integer"
+          },
+          "estimate_error": {
+            "type": "number"
+          },
+          "prefix_break": {
+            "type": "string"
+          },
+          "reasoning_leaked": {
+            "description": "Only on the anomaly: reasoning charged in a thinking-off mode.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "cached_tokens",
+          "budget",
+          "budget_used_pct",
+          "reasoning_tokens",
+          "estimate_error",
+          "prefix_break"
+        ],
+        "type": "object"
+      },
+      "UserPayload": {
+        "description": "A message the developer sent: the task, a follow-up or a correction.",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "turn": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "text",
+          "turn"
         ],
         "type": "object"
       },

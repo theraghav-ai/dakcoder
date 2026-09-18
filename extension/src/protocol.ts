@@ -19,12 +19,31 @@
  * mismatch only happens with a hand-mixed pair. That is exactly when refusing
  * to connect is the right answer.
  */
-import type { EventType, PlanStep as WirePlanStep, Session, SessionDetail } from './contract.gen';
+import type {
+  EventType,
+  GateStage,
+  PlanItem as WirePlanItem,
+  PlanStep as WirePlanStep,
+  Session,
+  SessionDetail,
+} from './contract.gen';
 
 export { API_VERSION, CONTRACT_HASH } from './contract.gen';
 export type { EventType } from './contract.gen';
 
 // ── events (C2) ─────────────────────────────────────────────────────────────
+//
+// What each event carries is generated from the runtime's own models:
+// `EventPayloads['tool_result']` and so on. The hand-written interfaces that
+// used to be here had drifted — `ToolResultEvent` declared `mutations` as
+// always present, and the runtime leaves it out of every call it answers
+// without running — and most of them were used by nothing.
+//
+// Events are still read defensively from `unknown` (`session-state.ts`). These
+// types are a lower bound on what arrives, not a guarantee: a newer runtime may
+// add fields, event types and `gate` kinds.
+
+export type { EventPayloads, GatePayload, GateStage, Mutation } from './contract.gen';
 
 export interface WireEvent {
   /** Monotonic, server-assigned. What `since_id` and `Last-Event-ID` resume from. */
@@ -33,81 +52,12 @@ export interface WireEvent {
   data: Record<string, unknown>;
 }
 
-export interface TurnStart {
-  turn: number;
-  mode: Mode;
-  /** Why the run is in that mode. Carried on every turn. */
-  intent?: Intent;
-  /** How many failing gates have come back with nothing edited between them. */
-  attempt?: number;
-}
-
-export interface AssistantText {
-  text: string;
-}
-
-/** One step of a plan, exactly as `submit_plan` validated it. */
-export interface PlanItem {
-  index: number;
-  file: string;
-  action: string;
-  accepts: string;
-  status: string;
-  note: string;
-}
-
-export interface PlanEvent {
-  text: string;
-  /** How many steps. Kept for older runtimes, which sent nothing else. */
-  steps: number;
-  /**
-   * The steps themselves. Absent from a runtime older than this field, which
-   * is why `parsePlan` still carries a prose fallback — and why that fallback
-   * is documented as lossy rather than as an equivalent.
-   */
-  items?: PlanItem[];
-}
-
-export interface ToolCallEvent {
-  id: string;
-  name: string;
-  arguments: unknown;
-}
-
-export interface Mutation {
-  path: string;
-  kind: 'create' | 'modify' | 'delete';
-  /**
-   * Computed server-side against `PROTECTED_GLOBS`. Never recomputed here: the
-   * matcher is custom rather than `fnmatch`, so a reimplementation disagrees at
-   * exactly the edges that matter, and it would be a security-relevant constant
-   * duplicated across the seam with no test binding the copies.
-   */
-  protected: boolean;
-}
-
-export interface ToolResultEvent {
-  id: string;
-  name: string;
-  ok: boolean;
-  content: string;
-  mutations: Mutation[];
-  fix?: string;
-  /**
-   * The answer came from a ledger; no call was dispatched.
-   *
-   * `ok` stays true because the content IS the current answer — marking it
-   * failed would read as an error and invite a retry. But a row that never ran
-   * must not look identical to one that did: the field transcript showed four
-   * green `patch_file` ticks against a file that never changed, and that is
-   * what made a seventeen-turn deadlock look like progress.
-   *
-   * Optional, so an older runtime that never sends it keeps working.
-   */
-  intercepted?: boolean;
-  /** Server-measured, so it excludes the approval wait — the developer's time. */
-  ms?: number;
-}
+/**
+ * One step of a plan as a `plan` event carries it, with `status` left open. A
+ * runtime newer than this build may send a status it does not know, and
+ * `parsePlan` shows that as unknown rather than refusing the plan.
+ */
+export type PlanItem = Omit<WirePlanItem, 'status'> & { status: string };
 
 export interface ApprovalEvent {
   /** Minted with the request. `POST /v1/approvals/{id}` takes this. */
@@ -135,17 +85,12 @@ export interface ApprovalEvent {
   session_id?: string;
 }
 
-export interface GateStage {
-  name: string;
-  ok: boolean;
-  blocking: boolean;
-  skipped: string;
-  seconds: number;
-  /** Only present for stages that failed. Absent on a clean run, by design. */
-  content?: string;
-  truncated?: boolean;
-}
-
+/**
+ * A verification gate (`inner`, `full`) or a compaction, as `readGate` reads
+ * either. Not the wire shape, which is `GatePayload`, a union of about ten
+ * kinds: this is the view the gate ladder and the compaction rows are drawn
+ * from, and the other kinds never reach it.
+ */
 export interface GateEvent {
   kind: 'inner' | 'full' | 'compaction';
   ok: boolean;
@@ -156,31 +101,6 @@ export interface GateEvent {
   /** compaction only */
   before?: number;
   after?: number;
-}
-
-export interface UsageEvent {
-  prompt_tokens: number;
-  completion_tokens: number;
-  /**
-   * Null until the endpoint reports `prompt_tokens_details`. Render the segment
-   * as "not reported" and never as `cache 0%`, which reads as a failure rather
-   * than an unknown.
-   */
-  cached_tokens: number | null;
-  /** The absolute denominator, so nothing has to divide to recover it. */
-  budget: number;
-  budget_used_pct: number;
-  reasoning_tokens: number;
-  estimate_error?: number;
-  /** Present only on the anomaly: reasoning charged in a thinking-off mode. */
-  reasoning_leaked?: number;
-}
-
-export interface FinishEvent {
-  outcome: SessionStatus;
-  summary: string;
-  turns: number;
-  mutations: string[];
 }
 
 /**

@@ -26,7 +26,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute
 from pydantic.json_schema import models_json_schema
 
-from dakcoder_shared.contract import API_VERSION, rest
+from dakcoder_shared.contract import API_VERSION, events, rest
 
 __all__ = ["build"]
 
@@ -60,8 +60,12 @@ def build(app: FastAPI) -> dict[str, Any]:
         method, path = key.split(" ", 1)
         _fill(doc["paths"][path][method.lower()], route, handlers[key])
 
+    # Event payloads are published alongside the REST shapes. Nothing in
+    # `paths` refers to them, because the stream is text/event-stream, but they
+    # are what its frames carry: `api/contract.json` maps each event type to one.
     _, defs = models_json_schema(
-        [(model, "validation") for model in rest.models()], ref_template=_REF
+        [(model, "validation") for model in [*rest.models(), *events.models()]],
+        ref_template=_REF,
     )
     doc["components"] = {
         "schemas": dict(sorted(_untitled(defs.get("$defs", {})).items())),
@@ -115,7 +119,8 @@ def _fill(op: dict[str, Any], route: rest.Route, handler: str) -> None:
     if route.stream:
         ok["description"] = (
             "Server-sent events. Each frame's `event:` is a C2 event type and its "
-            "`data:` is that event's payload. Resume with `since_id` or `Last-Event-ID`."
+            "`data:` is that event's payload: `api/contract.json` names the schema "
+            "for each type. Resume with `since_id` or `Last-Event-ID`."
         )
         ok["content"] = {"text/event-stream": {"schema": {"type": "string"}}}
     else:

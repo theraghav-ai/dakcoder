@@ -1,6 +1,6 @@
 // Generated from api/contract.json and api/openapi.json by scripts/gen-contract.mjs.
 // Do not edit. Run `make contract` at the repository root and commit the result.
-// openapi.json digest: 7d268f2d0b7107ac
+// openapi.json digest: 8a1c1adbdb404cf7
 
 /**
  * The runtime API this build speaks. A mismatch with `/v1/health` is refused
@@ -14,7 +14,7 @@ export const API_VERSION = '1.1';
  * with additions this build does not know about. That is legal under C2, so it
  * is logged, not refused.
  */
-export const CONTRACT_HASH = '60c910b774fc2063';
+export const CONTRACT_HASH = '396b81dbb16d78ae';
 
 /**
  * Every event type the runtime can emit (C2). A lower bound: a newer runtime
@@ -39,10 +39,35 @@ export type EventType =
   | 'usage'
   | 'user';
 
-// ── REST shapes ─────────────────────────────────────────────────────────────
+/**
+ * What each event type's `data` carries. A lower bound, like everything here:
+ * a newer runtime may add fields, and they must be ignored.
+ */
+export interface EventPayloads {
+  assistant: TextPayload;
+  assistant_delta: TextPayload;
+  end: RunResultPayload;
+  error: ErrorPayload;
+  finish: RunResultPayload;
+  gate: GatePayload;
+  heartbeat: HeartbeatPayload;
+  metrics: MetricsPayload;
+  plan: PlanPayload;
+  quota: QuotaPayload;
+  steer: SteerPayload;
+  tool_call: ToolCallPayload;
+  tool_pending: ToolPendingPayload;
+  tool_result: ToolResultPayload;
+  turn_start: TurnStartPayload;
+  usage: UsagePayload;
+  user: UserPayload;
+}
+
+// ── shapes ──────────────────────────────────────────────────────────────────
 //
-// Every request and response body, from api/openapi.json. Each is a lower
-// bound (C2): a newer runtime may add fields, and they must be ignored.
+// Every request and response body, and every event payload, from
+// api/openapi.json. Each is a lower bound (C2): a newer runtime may add fields,
+// and they must be ignored.
 
 export interface Aborting {
   aborting: string;
@@ -118,6 +143,16 @@ export interface CanonicalRow {
   content: string;
 }
 
+export interface CompactionRecord {
+  turn: number;
+  reason: string;
+  before: number;
+  after: number;
+  freed: number;
+  evicted_messages: number;
+  evicted_paths: string[];
+}
+
 export interface CompactionReport {
   session_id: string;
   strategy: string;
@@ -191,11 +226,107 @@ export interface Error {
   error: string;
 }
 
+export interface ErrorPayload {
+  message: string;
+  /** What failed, when it was not the run itself. */
+  where?: string;
+  /** What the run did instead. */
+  effect?: string;
+  kind?: string;
+}
+
 export interface Extended {
   id: string;
   extensions: number;
   /** Null when approvals have no timeout. */
   seconds_left: number | null;
+}
+
+export interface GateCompaction {
+  kind: 'compaction';
+  reason: string;
+  strategy: string;
+  before: number;
+  after: number;
+  turns: number[] | null;
+  evicted_messages: number;
+  evicted_paths: string[];
+}
+
+export interface GateForcedToolCall {
+  kind: 'forced_tool_call';
+  mode: string;
+}
+
+export interface GateOverflowRecovery {
+  kind: 'overflow_recovery';
+  before: number;
+  after: number;
+  retrying: boolean;
+}
+
+/** One of several shapes, told apart by `kind`. */
+export type GatePayload = GateRun | GateForcedToolCall | GateToolChoiceUnsupported | GateOverflowRecovery | GatePhase | GateRoutes | GateReplan | GateCompaction;
+
+/** A migration phase closed and the gate is deferred until the last one. */
+export interface GatePhase {
+  kind: 'phase';
+  deferred: boolean;
+  closed: string;
+  phase: string;
+  index: number;
+  phases: number;
+}
+
+export interface GateReplan {
+  kind: 'replan';
+  reason: string;
+  tried: string[];
+}
+
+export interface GateReport {
+  ok: boolean;
+  seconds: number;
+  stages: GateStage[];
+  not_run: string[];
+  blocked_by: string;
+}
+
+/** The route inventory was saved before a migration touched anything. */
+export interface GateRoutes {
+  kind: 'routes';
+  saved: string;
+  routes: number;
+  unresolved: number;
+}
+
+/** The verification gate ran: `inner` over the files just changed, `full` at the end. */
+export interface GateRun {
+  ok: boolean;
+  seconds: number;
+  stages: GateStage[];
+  not_run: string[];
+  blocked_by: string;
+  kind: 'inner' | 'full';
+  /** A full gate answered from its last run. */
+  cached?: boolean;
+}
+
+export interface GateStage {
+  name: string;
+  ok: boolean;
+  blocking: boolean;
+  /** Why the stage did not run. Empty when it ran. */
+  skipped: string;
+  seconds: number;
+  /** Only for a stage that failed. */
+  content?: string;
+  truncated?: boolean;
+}
+
+export interface GateToolChoiceUnsupported {
+  kind: 'tool_choice_unsupported';
+  value: string;
 }
 
 /** The fields after `version` need the token and are absent without it. */
@@ -210,6 +341,14 @@ export interface Health {
   sessions?: SessionCounts;
 }
 
+/**
+ * Declared and never emitted. The stream keeps itself alive with SSE comment
+ * frames (`: keep-alive`), which are not events.
+ */
+export interface HeartbeatPayload {
+
+}
+
 export interface MessageRequest {
   text: string;
   intent?: 'auto' | 'ask' | 'agent';
@@ -218,6 +357,38 @@ export interface MessageRequest {
    * @deprecated
    */
   mode?: string;
+}
+
+/** What the whole run cost and where it ran out of room. Sent once, before `end`. */
+export interface MetricsPayload {
+  session_id: string;
+  task: string;
+  outcome: string;
+  turns: number;
+  prompt_tokens: number[];
+  completion_tokens: number[];
+  cached_tokens: number[];
+  reasoning_tokens: number;
+  budget: number;
+  context_window: number;
+  compactions: CompactionRecord[];
+  evicted_paths: string[];
+  evicted_paths_reread: string[];
+  truncations: number;
+  output_limit: number;
+  intercepted_cached: number;
+  intercepted_dead_end: number;
+  intercepted_re_read: number;
+  files_read: string[];
+  bytes_read: number;
+  bytes_reread: number;
+  incomplete: string[];
+  peak_prompt_tokens: number;
+  total_prompt_tokens: number;
+  peak_pct_of_budget: number;
+  peak_pct_of_window: number;
+  pressed_the_ceiling: boolean;
+  lost_work: boolean;
 }
 
 export interface Migration {
@@ -240,12 +411,34 @@ export interface ModelRow {
   content: string;
 }
 
+export interface Mutation {
+  path: string;
+  kind: 'create' | 'modify' | 'delete';
+  /** Computed by the runtime. Never recompute it client-side. */
+  protected: boolean;
+}
+
 export interface Phase {
   name: string;
   covers: string;
   /** Comma-separated. */
   parts: string;
   status: 'pending' | 'done';
+}
+
+export interface PlanItem {
+  index: number;
+  file: string;
+  action: string;
+  accepts: string;
+  status: 'pending' | 'written' | 'done' | 'failed' | 'skipped' | 'blocked';
+  note: string;
+}
+
+export interface PlanPayload {
+  text: string;
+  steps: number;
+  items: PlanItem[];
 }
 
 export interface PlanRecord {
@@ -275,6 +468,11 @@ export interface PlanStep {
   part: string;
   status: 'pending' | 'written' | 'done' | 'failed' | 'skipped' | 'blocked';
   note: string;
+}
+
+/** A signal to re-read `GET /v1/quota`. It carries no numbers on purpose. */
+export interface QuotaPayload {
+  reason: string;
 }
 
 export interface Readiness {
@@ -308,6 +506,15 @@ export interface RevertPlan {
   delete: string[];
   /** Changed, but cannot be reverted. */
   blocked: Blocked[];
+}
+
+/** `finish`, then `end`: how the run ended. */
+export interface RunResultPayload {
+  outcome: 'done' | 'aborted' | 'unverified' | 'no_progress' | 'exhausted' | 'error';
+  summary: string;
+  turns: number;
+  mutations: string[];
+  gate: GateReport | null;
 }
 
 export interface Session {
@@ -358,6 +565,12 @@ export interface SessionList {
   sessions: Session[];
 }
 
+/** A correction the running loop has read. */
+export interface SteerPayload {
+  text: string;
+  turn: number;
+}
+
 export interface TaskRequest {
   task: string;
   intent?: 'auto' | 'ask' | 'agent';
@@ -367,6 +580,11 @@ export interface TaskRequest {
    */
   mode?: string;
   acceptance?: string[];
+}
+
+/** `assistant` (the whole reply) and `assistant_delta` (a streamed piece of it). */
+export interface TextPayload {
+  text: string;
 }
 
 export interface Tool {
@@ -380,6 +598,14 @@ export interface Tool {
   gate_only?: boolean;
   unavailable?: string;
   instead?: string;
+}
+
+export interface ToolCallPayload {
+  id: string;
+  name: string;
+  /** As the model sent them, parsed when they parse. */
+  arguments: unknown;
+  turn: number;
 }
 
 /** Contract C1. The published copy is `api/tool-catalog.json`. */
@@ -397,6 +623,48 @@ export interface ToolLimits {
   max_description: number;
 }
 
+/** An approval being raised. `id` is what `POST /v1/approvals/{id}` takes. */
+export interface ToolPendingPayload {
+  id: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+  reason: string;
+  paths: string[];
+  unconditional: boolean;
+  protected: string[];
+  turn: number;
+}
+
+/**
+ * A tool call's outcome, or a call that was answered without being run.
+ *
+ * `mutations` is absent when nothing was dispatched: a call skipped, refused
+ * for the output limit, or answered from a ledger.
+ */
+export interface ToolResultPayload {
+  id: string;
+  name: string;
+  ok: boolean;
+  content: string;
+  turn: number;
+  mutations?: Mutation[];
+  fix?: string;
+  truncated?: boolean;
+  /** Server-measured; excludes the approval wait. */
+  ms?: number;
+  meta?: Record<string, unknown>;
+  /** False when the call never ran. */
+  dispatched?: boolean;
+  /** A hook answered in the tool's place. */
+  hooked?: boolean;
+  /** Answered from a ledger. `ok` stays true: the content is current. */
+  intercepted?: boolean;
+  intercept?: string;
+  arguments?: unknown;
+  truncated_by_output_limit?: boolean;
+  output_limit?: number;
+}
+
 /** `view=canonical` returns `CanonicalRow` rows, anything else `ModelRow` rows. */
 export interface TranscriptView {
   session_id: string;
@@ -405,6 +673,37 @@ export interface TranscriptView {
   returned: number;
   compaction: CompactionState | null;
   messages: (CanonicalRow | ModelRow)[];
+}
+
+export interface TurnStartPayload {
+  turn: number;
+  mode: 'ask' | 'planner' | 'agent';
+  intent: 'auto' | 'ask' | 'agent';
+  /** Whether a person chose the intent or it was classified. */
+  intent_source: string;
+  intent_why: string;
+  /** The attempt about to be made: 1, then 2 after a failed gate. */
+  attempt: number;
+}
+
+export interface UsagePayload {
+  prompt_tokens: number;
+  completion_tokens: number;
+  /** Null until the endpoint reports it. Show it as not reported, not as 0%. */
+  cached_tokens: number | null;
+  budget: number;
+  budget_used_pct: number;
+  reasoning_tokens: number;
+  estimate_error: number;
+  prefix_break: string;
+  /** Only on the anomaly: reasoning charged in a thinking-off mode. */
+  reasoning_leaked?: number;
+}
+
+/** A message the developer sent: the task, a follow-up or a correction. */
+export interface UserPayload {
+  text: string;
+  turn: number;
 }
 
 /** FastAPI's own 422, for a path or query parameter of the wrong type. */

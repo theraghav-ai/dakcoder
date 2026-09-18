@@ -51,8 +51,11 @@ if (process.argv.includes('--check')) {
   console.log(`wrote src/contract.gen.ts (api ${contract.api_version}, ${contract.hash})`);
 }
 
-function render({ api_version, hash, events }, openapi, openapiDigest) {
+function render({ api_version, hash, events, payloads }, openapi, openapiDigest) {
   const union = events.map((type) => `  | '${type}'`).join('\n');
+  const payloadMap = Object.entries(payloads)
+    .map(([type, model]) => `  ${key(type)}: ${model};`)
+    .join('\n');
   const schemas = Object.entries(openapi.components.schemas)
     .map(([name, schema]) => declaration(name, schema))
     .join('\n');
@@ -81,10 +84,19 @@ export const CONTRACT_HASH = '${hash}';
 export type EventType =
 ${union};
 
-// ── REST shapes ─────────────────────────────────────────────────────────────
+/**
+ * What each event type's \`data\` carries. A lower bound, like everything here:
+ * a newer runtime may add fields, and they must be ignored.
+ */
+export interface EventPayloads {
+${payloadMap}
+}
+
+// ── shapes ──────────────────────────────────────────────────────────────────
 //
-// Every request and response body, from api/openapi.json. Each is a lower
-// bound (C2): a newer runtime may add fields, and they must be ignored.
+// Every request and response body, and every event payload, from
+// api/openapi.json. Each is a lower bound (C2): a newer runtime may add fields,
+// and they must be ignored.
 
 ${schemas}`;
 }
@@ -105,6 +117,9 @@ function declaration(name, schema) {
 function tsType(schema, where) {
   if (schema.$ref) return schema.$ref.split('/').pop();
   if (schema.anyOf) return schema.anyOf.map((s) => tsType(s, where)).join(' | ');
+  // A discriminated union (`gate`). The discriminator's mapping is not needed:
+  // each member's `kind` is a literal, so TypeScript narrows on it by itself.
+  if (schema.oneOf) return schema.oneOf.map((s) => tsType(s, where)).join(' | ');
   if (schema.enum) return schema.enum.map(literal).join(' | ');
   if ('const' in schema) return literal(schema.const);
   switch (schema.type) {

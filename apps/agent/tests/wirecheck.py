@@ -13,18 +13,47 @@ in the test that first sees it.
 
 from __future__ import annotations
 
+import json
+
 import httpx
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
-from dakcoder_shared.contract import rest
+from dakcoder_shared.contract import events, rest
+from dakcoder_shared.envelope import Event
 
-__all__ = ["CheckedTransport", "checked"]
+__all__ = ["CheckedTransport", "checked", "checked_events", "event_problem"]
 
 #: Every route key a CheckedTransport has validated a 2xx response for, across
-#: the whole test session. ``test_contract`` reads it.
+#: the whole test session.
 checked: set[str] = set()
+
+#: Every event type ``event_problem`` has validated, across the whole session.
+checked_events: set[str] = set()
+
+
+def event_problem(event: Event) -> str | None:
+    """Why ``event`` does not match its payload model, or None when it does.
+
+    Validated as JSON, because JSON is what goes on the wire: the SSE encoder
+    is ``json.dumps`` of the payload, and a payload it cannot encode is a bug
+    whatever the model says.
+    """
+    model = events.PAYLOADS.get(event.type)
+    if model is None:
+        return f"{event.type} has no payload model in contract.events.PAYLOADS"
+    try:
+        model.model_validate_json(json.dumps(event.data))
+    except (TypeError, ValueError) as exc:
+        return (
+            f"a {event.type} event carried a payload its contract ({model.__name__}) "
+            f"does not describe:\n{exc}\n\ndata: {str(event.data)[:2000]}"
+        )
+    checked_events.add(str(event.type))
+    if "kind" in event.data:
+        checked_events.add(f"{event.type}:{event.data['kind']}")
+    return None
 
 
 class CheckedTransport(httpx.ASGITransport):

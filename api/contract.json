@@ -20,6 +20,25 @@
     "usage",
     "user"
   ],
+  "payloads": {
+    "assistant": "TextPayload",
+    "assistant_delta": "TextPayload",
+    "end": "RunResultPayload",
+    "error": "ErrorPayload",
+    "finish": "RunResultPayload",
+    "gate": "GatePayload",
+    "heartbeat": "HeartbeatPayload",
+    "metrics": "MetricsPayload",
+    "plan": "PlanPayload",
+    "quota": "QuotaPayload",
+    "steer": "SteerPayload",
+    "tool_call": "ToolCallPayload",
+    "tool_pending": "ToolPendingPayload",
+    "tool_result": "ToolResultPayload",
+    "turn_start": "TurnStartPayload",
+    "usage": "UsagePayload",
+    "user": "UserPayload"
+  },
   "routes": [
     "DELETE /v1/sessions/{session_id}",
     "GET /v1/agenda",
@@ -46,5 +65,5 @@
     "POST /v1/sessions/{session_id}/wind-down",
     "POST /v1/tasks"
   ],
-  "hash": "60c910b774fc2063"
+  "hash": "396b81dbb16d78ae"
 }

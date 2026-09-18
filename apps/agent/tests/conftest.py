@@ -94,3 +94,52 @@ def router(workspace: Workspace, sidecar: FakeSidecar) -> Router:
         **gotools.handlers_for(sidecar),
     }
     return Router(workspace, handlers)
+
+
+@pytest.fixture(autouse=True)
+def events_match_the_contract(monkeypatch):
+    """Every event an ``AgentLoop`` emits must match its payload model.
+
+    Hooked on ``run``, which the loop documents as the one funnel every event
+    passes through, and on its out-of-band sink (``on_event``), which carries
+    what is sent outside that funnel: streamed deltas, the classifier's and the
+    baseline's errors, the route inventory.
+
+    Problems are collected and reported when the test ends rather than raised
+    where they happen. The sink runs inside ``_relay``, which swallows
+    exceptions and switches streaming off by design, so a raise there would be
+    lost.
+    """
+    from dakcoder_agent.loop import AgentLoop
+
+    from wirecheck import event_problem
+
+    problems: list[str] = []
+    original = AgentLoop.run
+
+    def check(event) -> None:
+        problem = event_problem(event)
+        if problem is not None:
+            problems.append(problem)
+
+    def run(self, *args, **kwargs):
+        sink = self.on_event
+        if not getattr(sink, "_contract_checked", False):
+
+            def checked(event) -> None:
+                check(event)
+                sink(event)
+
+            checked._contract_checked = True  # type: ignore[attr-defined]
+            self.on_event = checked
+        inner = original(self, *args, **kwargs)
+        try:
+            for event in inner:
+                check(event)
+                yield event
+        finally:
+            inner.close()
+
+    monkeypatch.setattr(AgentLoop, "run", run)
+    yield
+    assert not problems, "\n\n".join(dict.fromkeys(problems))

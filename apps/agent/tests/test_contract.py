@@ -29,6 +29,7 @@ import httpx
 import pytest
 
 from dakcoder_agent import loopback
+from dakcoder_agent.loop import AgentLoop, Outcome
 from dakcoder_agent.loopback import (
     Loopback,
     PendingApproval,
@@ -42,9 +43,12 @@ from dakcoder_agent.plan import AGENDA_STATES
 from dakcoder_agent.session import Status
 from dakcoder_agent.tools.control import STEP_STATUSES
 from dakcoder_agent.tools.router import ApprovalRequest
-from dakcoder_shared.contract import rest
-from dakcoder_shared.envelope import EventType
-from wirecheck import CheckedTransport
+from dakcoder_agent.migration import MigrationState
+from dakcoder_shared.contract import events, rest
+from dakcoder_shared.envelope import DeltaCoalescer, EventType, ToolResult
+from scripted import build, planning_router  # noqa: F401 - fixture
+from test_loopback import client, scripted, settle, start  # noqa: F401 - fixtures
+from wirecheck import CheckedTransport, event_problem
 
 ROOT = Path(__file__).resolve().parents[3]
 API = ROOT / "api"
@@ -65,7 +69,7 @@ def app(tmp_path: Path):
     return create_app(Loopback(tmp_path, lambda _s, _a: None, token=TOKEN))
 
 
-def client(app) -> httpx.AsyncClient:
+def http_for(app) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         transport=CheckedTransport(app),
         base_url="http://127.0.0.1",
@@ -140,6 +144,13 @@ def test_every_event_type_is_published() -> None:
     assert set(published()["events"]) == {str(t) for t in EventType}
 
 
+def test_every_event_type_has_a_payload_model() -> None:
+    assert set(events.PAYLOADS) == set(EventType)
+    schemas = json.loads(published_openapi())["components"]["schemas"]
+    for event, model in published()["payloads"].items():
+        assert model in schemas, f"{event}'s payload {model} is not in api/openapi.json"
+
+
 def test_api_version_is_declared_once() -> None:
     """The extension used to declare it too, by hand. Now nothing but
     ``dakcoder_shared.contract`` may assign it."""
@@ -167,8 +178,9 @@ def test_every_route_is_described_and_every_description_is_served(app) -> None:
         (rest.Mode, [str(m) for m in Mode]),
         (rest.AgendaState, list(AGENDA_STATES)),
         (rest.StepStatus, list(STEP_STATUSES)),
+        (events.Outcome, [v for k, v in vars(Outcome).items() if k.isupper()]),
     ],
-    ids=["Status", "Intent", "Mode", "AgendaState", "StepStatus"],
+    ids=["Status", "Intent", "Mode", "AgendaState", "StepStatus", "Outcome"],
 )
 def test_the_contract_copies_of_agent_enumerations_match(literal: Any, owner: list[str]) -> None:
     """The contract cannot import the agent, so it copies these. This is what
@@ -195,7 +207,7 @@ async def test_health_reports_the_published_hash_without_a_token(app) -> None:
 
 
 async def test_the_runtime_serves_the_published_openapi(app) -> None:
-    async with client(app) as http:
+    async with http_for(app) as http:
         served = (await http.get("/openapi.json")).json()
     assert served == json.loads(published_openapi())
 
@@ -214,7 +226,7 @@ def test_the_hash_covers_response_fields(monkeypatch) -> None:
 
 
 async def test_the_credential_route_matches_its_contract(app) -> None:
-    async with client(app) as http:
+    async with http_for(app) as http:
         accepted = await http.post("/v1/credential", json={"jwt": "a.b.c"})
         refused = await http.post("/v1/credential", json={})
     assert accepted.status_code == 200
@@ -227,7 +239,7 @@ async def test_the_extend_route_matches_its_contract(app, monkeypatch) -> None:
     runtime.approvals[request.id] = PendingApproval(
         id=request.id, session_id="s", request=request
     )
-    async with client(app) as http:
+    async with http_for(app) as http:
         # With a timeout, and without one: `seconds_left` is null then.
         timed = await http.post(f"/v1/approvals/{request.id}/extend")
         monkeypatch.setattr(loopback, "APPROVAL_TIMEOUT", 0.0)
@@ -237,3 +249,67 @@ async def test_the_extend_route_matches_its_contract(app, monkeypatch) -> None:
     assert timed.json()["seconds_left"] > 0
     assert untimed.json()["seconds_left"] is None
     assert gone.status_code == 410
+
+
+# ── events the loop tests do not reach ──────────────────────────────────────
+#
+# conftest.py validates every event an AgentLoop emits. These are the ones that
+# do not come out of a loop in the suite: the loopback's own, the streamed
+# text, and two `gate` kinds only a long or migrating run produces.
+
+
+def assert_matches(recorded) -> None:
+    problems = [p for e in recorded if (p := event_problem(e)) is not None]
+    assert not problems, "\n\n".join(problems)
+
+
+async def test_the_loopbacks_own_events_match_their_contract(client, scripted) -> None:
+    """`user` is only ever emitted by the loopback, never by the loop."""
+    session = await start(client)
+    await settle(session["id"], scripted)
+    await client.post(f"/v1/sessions/{session['id']}/messages", json={"text": "and a test"})
+    await settle(session["id"], scripted)
+
+    recorded = scripted.sessions.get(session["id"]).events
+    assert [e for e in recorded if e.type is EventType.USER]
+    assert_matches(recorded)
+
+
+async def test_a_crashed_runs_events_match_their_contract(client, scripted, monkeypatch) -> None:
+    """The loopback writes `error`, `finish` and `end` itself when a run raises."""
+
+    def crash(self, *args, **kwargs):
+        raise RuntimeError("boom")
+        yield  # pragma: no cover - makes this a generator, like the real one
+
+    monkeypatch.setattr(AgentLoop, "run", crash)
+    session = await start(client)
+    await settle(session["id"], scripted)
+
+    recorded = scripted.sessions.get(session["id"]).events
+    assert {EventType.ERROR, EventType.FINISH, EventType.END} <= {e.type for e in recorded}
+    assert_matches(recorded)
+
+
+def test_streamed_text_matches_its_contract() -> None:
+    coalescer = DeltaCoalescer()
+    assert_matches(list(coalescer.drain(["half ", "a ", "sentence"])))
+
+
+def test_the_compaction_and_route_gates_match_their_contract(planning_router) -> None:
+    loop, _ = build(planning_router, [])
+    for i in range(6):
+        loop.context.append_user(f"message {i} " + "x" * 400)
+
+    relayed: list = []
+    loop._relay = relayed.append
+    loop.state.migration = MigrationState(active=True)
+    loop.router.run_gate_tool = lambda name, args=None: ToolResult.success(
+        "12 route(s)", meta={"routes": 12, "unresolved": 0}
+    )
+    loop._save_routes()
+    compacted = list(loop._compact(retain_pct=0.15, reason="test", strategy="basic"))
+
+    kinds = [e.data.get("kind") for e in [*relayed, *compacted]]
+    assert "routes" in kinds and "compaction" in kinds, kinds
+    assert_matches([*relayed, *compacted])
