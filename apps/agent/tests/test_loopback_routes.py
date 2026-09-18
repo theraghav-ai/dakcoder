@@ -17,6 +17,7 @@ from dakcoder_agent.loopback import Loopback
 from dakcoder_agent.session import Status
 
 from test_loopback import TOKEN, client, scripted, settle, start  # noqa: F401
+from wirecheck import CheckedTransport
 
 
 # ── steering ────────────────────────────────────────────────────────────────
@@ -317,7 +318,7 @@ async def test_every_new_route_requires_the_loopback_token(
     the machine, which is the threat this token exists for."""
     from dakcoder_agent.loopback import create_app
 
-    transport = httpx.ASGITransport(app=create_app(scripted))
+    transport = CheckedTransport(create_app(scripted))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as http:
         response = await http.request(method, path.format(id="whatever"), json={})
     assert response.status_code == 401, f"{method} {path} answered without a token"
@@ -526,7 +527,7 @@ async def test_moving_a_task_that_is_not_there_is_a_404(
 async def test_the_agenda_needs_a_token(scripted: Loopback) -> None:
     from dakcoder_agent.loopback import create_app
 
-    transport = httpx.ASGITransport(app=create_app(scripted))
+    transport = CheckedTransport(create_app(scripted))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as anon:
         assert (await anon.get("/v1/agenda")).status_code == 401
 

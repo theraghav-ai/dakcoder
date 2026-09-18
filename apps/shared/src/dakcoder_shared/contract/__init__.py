@@ -26,6 +26,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from ..envelope import EventType
+from . import rest
 
 __all__ = ["API_VERSION", "as_json", "digest", "document"]
 
@@ -53,13 +54,18 @@ def document(routes: Iterable[str]) -> dict[str, Any]:
     Routes are passed in because they belong to the agent's app, and this
     package must not import the agent. Everything is sorted, so reordering a
     declaration does not change the hash.
+
+    The hash also covers every REST model's field names (``rest.fields``), so a
+    response that gains or loses a field changes it. The shapes themselves are
+    published in ``api/openapi.json``.
     """
     body: dict[str, Any] = {
         "api_version": API_VERSION,
         "events": sorted(str(t) for t in EventType),
         "routes": sorted(set(routes)),
     }
-    return {"contract": "dakcoder", **body, "hash": digest(body)}
+    covered = {**body, "fields": rest.fields()}
+    return {"contract": "dakcoder", **body, "hash": digest(covered)}
 
 
 def digest(body: dict[str, Any]) -> str:

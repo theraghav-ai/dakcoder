@@ -1,0 +1,2835 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "dakcoderd",
+    "version": "1.1"
+  },
+  "paths": {
+    "/v1/agenda": {
+      "get": {
+        "summary": "Work proposed for later",
+        "operationId": "list_agenda",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "open"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgendaList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      },
+      "post": {
+        "summary": "Propose work for later",
+        "operationId": "add_agenda_task",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgendaTask"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgendaProposal"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agenda/{task_id}": {
+      "post": {
+        "summary": "Approve, drop or complete a proposal",
+        "operationId": "move_agenda_task",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgendaTask"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgendaMove"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/approvals": {
+      "get": {
+        "summary": "Approvals waiting for a decision",
+        "operationId": "list_approvals",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/approvals/{approval_id}": {
+      "post": {
+        "summary": "Accept, reject or edit",
+        "operationId": "decide",
+        "parameters": [
+          {
+            "name": "approval_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Decision"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/approvals/{approval_id}/extend": {
+      "post": {
+        "summary": "Give the reviewer more time",
+        "operationId": "extend_approval",
+        "parameters": [
+          {
+            "name": "approval_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Extended"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/credential": {
+      "post": {
+        "summary": "Replace the gateway JWT",
+        "operationId": "credential",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialAccepted"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "summary": "Liveness, API version and contract hash",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {},
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions": {
+      "get": {
+        "summary": "List sessions",
+        "operationId": "list_sessions",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}": {
+      "get": {
+        "summary": "One session, optionally with its transcript",
+        "operationId": "get_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "transcript",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      },
+      "delete": {
+        "summary": "Delete a finished session",
+        "operationId": "delete_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Deleted"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/abort": {
+      "post": {
+        "summary": "Stop a run now",
+        "operationId": "abort",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Aborting"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/compact": {
+      "post": {
+        "summary": "Compact the context now",
+        "operationId": "compact_now",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "strategy",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "basic"
+            }
+          },
+          {
+            "name": "retain",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "default": 0.35
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompactionReport"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/context": {
+      "get": {
+        "summary": "The live context, for the inspector",
+        "operationId": "context_inspector",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContextSnapshot"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/events": {
+      "get": {
+        "summary": "The session's events as SSE, resumable",
+        "operationId": "events",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-sent events. Each frame's `event:` is a C2 event type and its `data:` is that event's payload. Resume with `since_id` or `Last-Event-ID`.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/messages": {
+      "post": {
+        "summary": "Correct a running session, or follow up on a finished one",
+        "operationId": "message_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MessageRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/plan": {
+      "get": {
+        "summary": "The plan, its statuses and revisions",
+        "operationId": "session_plan",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanRecord"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resume": {
+      "post": {
+        "summary": "Run a failed or stopped session again",
+        "operationId": "resume_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResumeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/revert": {
+      "get": {
+        "summary": "What a revert would do",
+        "operationId": "revert_plan",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevertPlan"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      },
+      "post": {
+        "summary": "Revert what the session changed",
+        "operationId": "revert",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevertPlan"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/transcript": {
+      "get": {
+        "summary": "What happened, or what the model saw",
+        "operationId": "session_transcript",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "view",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "model"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 200
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscriptView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/wind-down": {
+      "post": {
+        "summary": "Stop after the current turn",
+        "operationId": "wind_down",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WindingDown"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/tasks": {
+      "post": {
+        "summary": "Start a run",
+        "operationId": "start_task",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    },
+    "/v1/tools": {
+      "get": {
+        "summary": "The model-facing tool catalogue (C1)",
+        "operationId": "tools",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolCatalog"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A parameter could not be read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationFailure"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Refused. The body says why.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "token": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Aborting": {
+        "properties": {
+          "aborting": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "running",
+              "done",
+              "unverified",
+              "no_progress",
+              "exhausted",
+              "error",
+              "aborted"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "aborting",
+          "status"
+        ],
+        "type": "object"
+      },
+      "AgendaList": {
+        "properties": {
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/AgendaTask"
+            },
+            "type": "array"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tasks",
+          "state"
+        ],
+        "type": "object"
+      },
+      "AgendaMove": {
+        "properties": {
+          "state": {
+            "enum": [
+              "proposed",
+              "approved",
+              "done",
+              "dropped"
+            ],
+            "type": "string"
+          },
+          "by": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      "AgendaProposal": {
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "priority": {
+            "description": "1 (highest) to 5. Defaults to 3.",
+            "type": "integer"
+          },
+          "session_id": {
+            "description": "The session that proposed it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      },
+      "AgendaTask": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "proposed",
+              "approved",
+              "done",
+              "dropped"
+            ],
+            "type": "string"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "origin_session": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "decided_by": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "why",
+          "state",
+          "paths",
+          "priority",
+          "origin_session",
+          "created_at",
+          "updated_at",
+          "decided_by",
+          "note"
+        ],
+        "type": "object"
+      },
+      "Approval": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "seconds_left": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null when approvals have no timeout."
+          },
+          "extensions": {
+            "type": "integer"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "arguments": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unconditional": {
+            "type": "boolean"
+          },
+          "protected": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "session_id",
+          "seconds_left",
+          "extensions",
+          "tool",
+          "arguments",
+          "reason",
+          "paths",
+          "unconditional",
+          "protected"
+        ],
+        "type": "object"
+      },
+      "ApprovalList": {
+        "properties": {
+          "approvals": {
+            "items": {
+              "$ref": "#/components/schemas/Approval"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "approvals"
+        ],
+        "type": "object"
+      },
+      "Blocked": {
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "CanonicalRow": {
+        "properties": {
+          "seq": {
+            "type": "integer"
+          },
+          "role": {
+            "type": "string"
+          },
+          "turn": {
+            "type": "integer"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "visibility": {
+            "type": "string"
+          },
+          "characters": {
+            "type": "integer"
+          },
+          "content": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "seq",
+          "role",
+          "turn",
+          "tool",
+          "path",
+          "visibility",
+          "characters",
+          "content"
+        ],
+        "type": "object"
+      },
+      "CompactionReport": {
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "strategy": {
+            "type": "string"
+          },
+          "before": {
+            "type": "integer"
+          },
+          "after": {
+            "type": "integer"
+          },
+          "evicted_messages": {
+            "type": "integer"
+          },
+          "evicted_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "goal": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "strategy",
+          "before",
+          "after",
+          "evicted_messages",
+          "evicted_paths",
+          "goal"
+        ],
+        "type": "object"
+      },
+      "CompactionState": {
+        "properties": {
+          "recap": {
+            "$ref": "#/components/schemas/Recap"
+          },
+          "source_seq": {
+            "type": "integer"
+          },
+          "source_prefix_hash": {
+            "type": "string"
+          },
+          "source_count": {
+            "type": "integer"
+          },
+          "source_tokens": {
+            "type": "integer"
+          },
+          "source_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "strategy": {
+            "type": "string"
+          },
+          "turn": {
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "recap",
+          "source_seq",
+          "source_prefix_hash",
+          "source_count",
+          "source_tokens",
+          "source_paths",
+          "strategy",
+          "turn",
+          "created_at",
+          "generation"
+        ],
+        "type": "object"
+      },
+      "ContextSnapshot": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "ask",
+              "planner",
+              "agent"
+            ],
+            "type": "string"
+          },
+          "turn": {
+            "type": "integer"
+          },
+          "total_tokens": {
+            "type": "integer"
+          },
+          "budget": {
+            "type": "integer"
+          },
+          "used_pct": {
+            "type": "number"
+          },
+          "tool_schema_tokens": {
+            "type": "integer"
+          },
+          "by_layer": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object"
+          },
+          "messages": {
+            "type": "integer"
+          },
+          "compactions": {
+            "type": "integer"
+          },
+          "stale_slices": {
+            "type": "integer"
+          },
+          "calibrated": {
+            "type": "boolean"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "canonical_records": {
+            "type": "integer"
+          },
+          "compacted_records": {
+            "type": "integer"
+          },
+          "compaction_stale": {
+            "type": "boolean"
+          },
+          "elided_records": {
+            "type": "integer"
+          },
+          "elided_lines": {
+            "type": "integer"
+          },
+          "collapsed_echoes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mode",
+          "turn",
+          "total_tokens",
+          "budget",
+          "used_pct",
+          "tool_schema_tokens",
+          "by_layer",
+          "messages",
+          "compactions",
+          "stale_slices",
+          "calibrated",
+          "prefix",
+          "canonical_records",
+          "compacted_records",
+          "compaction_stale",
+          "elided_records",
+          "elided_lines",
+          "collapsed_echoes"
+        ],
+        "type": "object"
+      },
+      "CredentialAccepted": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "fingerprint": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "fingerprint"
+        ],
+        "type": "object"
+      },
+      "CredentialRequest": {
+        "properties": {
+          "jwt": {
+            "description": "A fresh gateway JWT. Only a fingerprint is echoed back.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "jwt"
+        ],
+        "type": "object"
+      },
+      "Decision": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "decision": {
+            "enum": [
+              "accept",
+              "reject",
+              "edit"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "DecisionRequest": {
+        "properties": {
+          "decision": {
+            "default": "reject",
+            "enum": [
+              "accept",
+              "reject",
+              "edit"
+            ],
+            "type": "string"
+          },
+          "arguments": {
+            "additionalProperties": true,
+            "description": "Required for `edit`: the corrected arguments.",
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "Deleted": {
+        "properties": {
+          "deleted": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "Error": {
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "Extended": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "extensions": {
+            "type": "integer"
+          },
+          "seconds_left": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null when approvals have no timeout."
+          }
+        },
+        "required": [
+          "id",
+          "extensions",
+          "seconds_left"
+        ],
+        "type": "object"
+      },
+      "Health": {
+        "description": "The fields after `version` need the token and are absent without it.",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "api_version": {
+            "type": "string"
+          },
+          "contract_hash": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "workspace": {
+            "type": "string"
+          },
+          "gateway": {
+            "type": "string"
+          },
+          "ready": {
+            "$ref": "#/components/schemas/Readiness"
+          },
+          "sessions": {
+            "$ref": "#/components/schemas/SessionCounts"
+          }
+        },
+        "required": [
+          "ok",
+          "api_version",
+          "contract_hash",
+          "version"
+        ],
+        "type": "object"
+      },
+      "MessageRequest": {
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "intent": {
+            "enum": [
+              "auto",
+              "ask",
+              "agent"
+            ],
+            "type": "string"
+          },
+          "mode": {
+            "deprecated": true,
+            "description": "Read as `intent` by older clients.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "Migration": {
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "base": {
+            "type": "string"
+          },
+          "closed": {
+            "type": "integer"
+          },
+          "log": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "phases": {
+            "items": {
+              "$ref": "#/components/schemas/Phase"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "active",
+          "branch",
+          "base",
+          "closed",
+          "log",
+          "phases"
+        ],
+        "type": "object"
+      },
+      "ModelRow": {
+        "properties": {
+          "seq": {
+            "type": "integer"
+          },
+          "role": {
+            "type": "string"
+          },
+          "layer": {
+            "type": "string"
+          },
+          "turn": {
+            "type": "integer"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "line_range": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "characters": {
+            "type": "integer"
+          },
+          "content": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "seq",
+          "role",
+          "layer",
+          "turn",
+          "path",
+          "line_range",
+          "characters",
+          "content"
+        ],
+        "type": "object"
+      },
+      "Phase": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "covers": {
+            "type": "string"
+          },
+          "parts": {
+            "description": "Comma-separated.",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "done"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "covers",
+          "parts",
+          "status"
+        ],
+        "type": "object"
+      },
+      "PlanRecord": {
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "forced": {
+            "type": "boolean"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "migration": {
+            "$ref": "#/components/schemas/Migration"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/PlanStep"
+            },
+            "type": "array"
+          },
+          "revisions": {
+            "items": {
+              "$ref": "#/components/schemas/PlanRevision"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "session_id",
+          "summary",
+          "forced",
+          "updated_at",
+          "migration",
+          "steps",
+          "revisions"
+        ],
+        "type": "object"
+      },
+      "PlanRevision": {
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "cause": {
+            "description": "`submitted`, `replanned` (the loop) or `revised` (the model).",
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/PlanStep"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "at",
+          "cause",
+          "summary",
+          "reason",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "PlanStep": {
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "accepts": {
+            "type": "string"
+          },
+          "phase": {
+            "type": "string"
+          },
+          "part": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "written",
+              "done",
+              "failed",
+              "skipped",
+              "blocked"
+            ],
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "action",
+          "accepts",
+          "phase",
+          "part",
+          "status",
+          "note"
+        ],
+        "type": "object"
+      },
+      "Readiness": {
+        "properties": {
+          "prewarmed": {
+            "type": "boolean"
+          },
+          "latency_ms": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "prewarmed"
+        ],
+        "type": "object"
+      },
+      "Recap": {
+        "properties": {
+          "goal": {
+            "type": "string"
+          },
+          "plan_step": {
+            "type": "string"
+          },
+          "files_created": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files_modified": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files_read": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "decisions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "findings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "verified": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "open_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "do_not_retry": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "turns": {
+            "description": "First and last turn the recap covers.",
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "goal",
+          "plan_step",
+          "files_created",
+          "files_modified",
+          "files_read",
+          "decisions",
+          "findings",
+          "verified",
+          "open_items",
+          "do_not_retry",
+          "turns"
+        ],
+        "type": "object"
+      },
+      "ResumeRequest": {
+        "properties": {
+          "note": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "RevertPlan": {
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "restore": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "delete": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "blocked": {
+            "description": "Changed, but cannot be reverted.",
+            "items": {
+              "$ref": "#/components/schemas/Blocked"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "session_id",
+          "restore",
+          "delete",
+          "blocked"
+        ],
+        "type": "object"
+      },
+      "Session": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "task": {
+            "type": "string"
+          },
+          "workspace": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "running",
+              "done",
+              "unverified",
+              "no_progress",
+              "exhausted",
+              "error",
+              "aborted"
+            ],
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "mutations": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "events": {
+            "type": "integer"
+          },
+          "resumable": {
+            "type": "boolean"
+          },
+          "queued": {
+            "description": "Corrections typed during the run and not yet read.",
+            "type": "integer"
+          },
+          "turns": {
+            "description": "Messages the developer has sent in this conversation.",
+            "type": "integer"
+          },
+          "winding_down": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "task",
+          "workspace",
+          "status",
+          "created_at",
+          "finished_at",
+          "summary",
+          "mutations",
+          "events",
+          "resumable",
+          "queued",
+          "turns",
+          "winding_down"
+        ],
+        "type": "object"
+      },
+      "SessionCounts": {
+        "properties": {
+          "total": {
+            "type": "integer"
+          },
+          "running": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "running"
+        ],
+        "type": "object"
+      },
+      "SessionDetail": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "task": {
+            "type": "string"
+          },
+          "workspace": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "running",
+              "done",
+              "unverified",
+              "no_progress",
+              "exhausted",
+              "error",
+              "aborted"
+            ],
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "mutations": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "events": {
+            "type": "integer"
+          },
+          "resumable": {
+            "type": "boolean"
+          },
+          "queued": {
+            "description": "Corrections typed during the run and not yet read.",
+            "type": "integer"
+          },
+          "turns": {
+            "description": "Messages the developer has sent in this conversation.",
+            "type": "integer"
+          },
+          "winding_down": {
+            "type": "boolean"
+          },
+          "transcript": {
+            "description": "Present with `?transcript=true`.",
+            "items": {
+              "$ref": "#/components/schemas/WireEvent"
+            },
+            "type": "array"
+          },
+          "pending_approvals": {
+            "items": {
+              "$ref": "#/components/schemas/Approval"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "task",
+          "workspace",
+          "status",
+          "created_at",
+          "finished_at",
+          "summary",
+          "mutations",
+          "events",
+          "resumable",
+          "queued",
+          "turns",
+          "winding_down",
+          "pending_approvals"
+        ],
+        "type": "object"
+      },
+      "SessionList": {
+        "properties": {
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/Session"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "type": "object"
+      },
+      "TaskRequest": {
+        "properties": {
+          "task": {
+            "type": "string"
+          },
+          "intent": {
+            "enum": [
+              "auto",
+              "ask",
+              "agent"
+            ],
+            "type": "string"
+          },
+          "mode": {
+            "deprecated": true,
+            "description": "Read as `intent` by older clients.",
+            "type": "string"
+          },
+          "acceptance": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "task"
+        ],
+        "type": "object"
+      },
+      "Tool": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "modes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mutates": {
+            "type": "boolean"
+          },
+          "approval": {
+            "enum": [
+              "none",
+              "conditional",
+              "always"
+            ],
+            "type": "string"
+          },
+          "provider": {
+            "enum": [
+              "python",
+              "gotools",
+              "gopls"
+            ],
+            "type": "string"
+          },
+          "gate_only": {
+            "type": "boolean"
+          },
+          "unavailable": {
+            "type": "string"
+          },
+          "instead": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "parameters",
+          "modes",
+          "mutates",
+          "approval",
+          "provider"
+        ],
+        "type": "object"
+      },
+      "ToolCatalog": {
+        "description": "Contract C1. The published copy is `api/tool-catalog.json`.",
+        "properties": {
+          "component": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "contract": {
+            "type": "string"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/ToolLimits"
+          },
+          "visible_per_mode": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/Tool"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "contract",
+          "tools"
+        ],
+        "type": "object"
+      },
+      "ToolLimits": {
+        "properties": {
+          "max_params": {
+            "type": "integer"
+          },
+          "max_description": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_params",
+          "max_description"
+        ],
+        "type": "object"
+      },
+      "TranscriptView": {
+        "description": "`view=canonical` returns `CanonicalRow` rows, anything else `ModelRow` rows.",
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "view": {
+            "type": "string"
+          },
+          "records": {
+            "type": "integer"
+          },
+          "returned": {
+            "type": "integer"
+          },
+          "compaction": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompactionState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "messages": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/CanonicalRow"
+                },
+                {
+                  "$ref": "#/components/schemas/ModelRow"
+                }
+              ]
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "session_id",
+          "view",
+          "records",
+          "returned",
+          "compaction",
+          "messages"
+        ],
+        "type": "object"
+      },
+      "ValidationFailure": {
+        "description": "FastAPI's own 422, for a path or query parameter of the wrong type.",
+        "properties": {
+          "detail": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "type": "object"
+      },
+      "WindingDown": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "winding_down": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "winding_down"
+        ],
+        "type": "object"
+      },
+      "WireEvent": {
+        "description": "One stored event (C2). `type` is a lower bound: ignore unknown types.",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "type": {
+            "type": "string"
+          },
+          "data": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "data",
+          "at"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "token": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The loopback token the extension passes to the runtime at spawn."
+      }
+    }
+  }
+}

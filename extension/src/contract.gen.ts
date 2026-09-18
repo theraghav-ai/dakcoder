@@ -13,7 +13,7 @@ export const API_VERSION = '1.1';
  * with additions this build does not know about. That is legal under C2, so it
  * is logged, not refused.
  */
-export const CONTRACT_HASH = '431a75cd3ee1d6dc';
+export const CONTRACT_HASH = '60c910b774fc2063';
 
 /**
  * Every event type the runtime can emit (C2). A lower bound: a newer runtime

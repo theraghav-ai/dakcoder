@@ -1516,9 +1516,10 @@ def test_health_says_nothing_about_the_machine_without_a_token(workspace) -> Non
     import httpx
 
     from dakcoder_agent.loopback import Loopback, create_app
+    from wirecheck import CheckedTransport
 
     runtime = Loopback(workspace.root, lambda _s, _a: None, token="tok", version="1.2.3")
-    transport = httpx.ASGITransport(app=create_app(runtime))
+    transport = CheckedTransport(create_app(runtime))
 
     async def check() -> None:
         async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as http:

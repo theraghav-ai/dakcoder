@@ -55,6 +55,8 @@ api/                generated contracts, each with a drift check:
                       contract.json    API version, C2 events,  `make contract`
                                        REST routes (the extension's
                                        contract.gen.ts is built from it)
+                      openapi.json     every request and       `make contract`
+                                       response shape
 docs/               ARCHITECTURE.md
 plan*.md            the programme plan: shared context, Part A, Part B
 

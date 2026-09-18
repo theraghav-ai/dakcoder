@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
@@ -73,6 +74,7 @@ from .context import Recap
 from .debug import DebugLog
 from .journal import Journal
 from .loop import AgentLoop, Outcome, RunResult
+from . import openapi
 from .modes import Intent
 from .plan import AGENDA_STATES, AgendaStore, AgendaTask, PlanRecord
 from .rehydrate import rehydrate, restorable, restore_canonical
@@ -80,7 +82,15 @@ from .session import Session, SessionStore, Status
 from .transcript import Transcript
 from .tools.router import ApprovalRequest
 
-__all__ = ["API_VERSION", "Loopback", "PendingApproval", "create_app", "published_contract", "route_table"]
+__all__ = [
+    "API_VERSION",
+    "Loopback",
+    "PendingApproval",
+    "create_app",
+    "published_contract",
+    "published_openapi",
+    "route_table",
+]
 
 log = logging.getLogger(__name__)
 
@@ -1302,6 +1312,15 @@ def create_app(runtime: Loopback) -> FastAPI:
     # After every route above is registered, so the table in the contract is
     # read from this app and cannot disagree with it.
     app.state.contract = contract.document(route_table(app))
+
+    def documented() -> dict[str, Any]:
+        # The runtime's own /openapi.json serves the published document, not
+        # FastAPI's untyped one. Built on first request and kept.
+        if app.openapi_schema is None:
+            app.openapi_schema = openapi.build(app)
+        return app.openapi_schema
+
+    app.openapi = documented  # type: ignore[method-assign]
     return app
 
 
@@ -1328,6 +1347,13 @@ def published_contract() -> str:
     with tempfile.TemporaryDirectory() as tmp:
         app = create_app(Loopback(Path(tmp), lambda _session, _approve: None))
         return contract.as_json(route_table(app))
+
+
+def published_openapi() -> str:
+    """The REST reference as ``make contract`` writes it to ``api/openapi.json``."""
+    with tempfile.TemporaryDirectory() as tmp:
+        app = create_app(Loopback(Path(tmp), lambda _session, _approve: None))
+        return json.dumps(openapi.build(app), indent=2, ensure_ascii=False) + "\n"
 
 
 async def _stream(session: Session, since_id: int, request: Request) -> AsyncIterator[bytes]:

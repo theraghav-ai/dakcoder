@@ -32,6 +32,7 @@ from dakcoder_agent.undo import UndoStore
 from dakcoder_shared.llm import ChatResult, ToolCall, Usage
 
 from test_loop import ScriptedClient, calls, say
+from wirecheck import CheckedTransport
 
 TOKEN = "loopback-token-for-tests"
 
@@ -128,7 +129,7 @@ def scripted(router: Router, workspace):
 
 @pytest.fixture
 async def client(scripted: Loopback):
-    transport = httpx.ASGITransport(app=create_app(scripted))
+    transport = CheckedTransport(create_app(scripted))
     async with httpx.AsyncClient(
         transport=transport,
         base_url="http://127.0.0.1",
@@ -169,7 +170,7 @@ async def test_health_needs_no_token(scripted: Loopback) -> None:
     """This is what the extension polls for up to sixty seconds while deciding
     whether the runtime came up. A health check that needs a credential cannot
     tell it whether the credential path is the broken thing."""
-    transport = httpx.ASGITransport(app=create_app(scripted))
+    transport = CheckedTransport(create_app(scripted))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as http:
         response = await http.get("/v1/health")
     assert response.status_code == 200
@@ -183,7 +184,7 @@ async def test_everything_else_needs_the_loopback_token(
     """Bound to 127.0.0.1, so this is not defending against the network — it is
     defending against other processes on the same machine, which on a developer
     laptop includes every postinstall script that can reach localhost."""
-    transport = httpx.ASGITransport(app=create_app(scripted))
+    transport = CheckedTransport(create_app(scripted))
     headers = {"Authorization": header} if header is not None else {}
     async with httpx.AsyncClient(
         transport=transport, base_url="http://127.0.0.1", headers=headers
