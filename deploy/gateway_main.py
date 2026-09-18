@@ -24,10 +24,12 @@ lives outside ``apps/`` so nothing here can end up inside a wheel.
                               the fact is stated on /v1/health rather than
                               hidden — an identity provider that trusts whatever
                               it is told must never be mistaken for the real one.
-    DAKCODER_RUNTIME_URL      a hosted runtime to front at /v1/runtime/*, e.g.
-                              http://127.0.0.1:8791. Needs DAKCODER_GATEWAY_TOKEN
-                              (the runtime's token) and a runtime started with
-                              DAKCODER_HOSTED=1. Unset: no such route.
+    DAKCODER_RUNTIME_URL      what to front at /v1/runtime/*: the control plane
+                              (http://127.0.0.1:8792) or a single hosted runtime
+                              (http://127.0.0.1:8791, started DAKCODER_HOSTED=1).
+                              Unset: no such route.
+    DAKCODER_RUNTIME_TOKEN    that upstream's own token (falls back to
+                              DAKCODER_GATEWAY_TOKEN, the runtime's)
     DAKCODER_CORS_ORIGINS     browser origins allowed to call, comma-separated.
                               Unset: no CORS. '*' is refused.
 
@@ -156,9 +158,14 @@ def build_runtime_proxy() -> tuple[RuntimeProxy | None, str]:
     url = os.environ.get("DAKCODER_RUNTIME_URL", "").strip()
     if not url:
         return None, "not fronted"
-    token = os.environ.get("DAKCODER_GATEWAY_TOKEN", "").strip()
+    # The upstream's own token: the control plane's (Phase 2) or, fronting a
+    # single hosted runtime (Phase 1), the runtime's.
+    token = (
+        os.environ.get("DAKCODER_RUNTIME_TOKEN", "").strip()
+        or os.environ.get("DAKCODER_GATEWAY_TOKEN", "").strip()
+    )
     if not token:
-        raise SystemExit("DAKCODER_RUNTIME_URL is set but DAKCODER_GATEWAY_TOKEN is not.")
+        raise SystemExit("DAKCODER_RUNTIME_URL is set but DAKCODER_RUNTIME_TOKEN is not.")
     return RuntimeProxy(url, token), f"fronted at /v1/runtime -> {url}"
 
 

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dakcoder-agentsvc"
+version = "0.4.8"
+description = "The dakcoder control plane: workspace leases, runners and delivery (host-plan §3)"
+requires-python = ">=3.11"
+# SERVER ONLY, like the gateway. It holds the GitLab credential that clones and
+# pushes, and nothing that holds one belongs in a .vsix.
+dependencies = [
+    "dakcoder-shared",
+    "fastapi>=0.110",
+    "httpx>=0.27",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+dakcoder-agentsvc = "dakcoder_agentsvc.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

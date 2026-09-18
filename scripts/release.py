@@ -3,8 +3,8 @@
 
     python scripts/release.py 0.3.7
 
-Four files declare the version and they must agree: the extension manifest and
-the three `pyproject.toml`s. Everything downstream is derived from them — the
+Five files declare the version and they must agree: the extension manifest and
+the four `pyproject.toml`s. Everything downstream is derived from them — the
 `gotools` binaries are stamped with the version at link time, the wheels carry
 it in their filename, and the `.vsix` takes its name from the manifest — so a
 bump that is not followed by a rebuild ships the previous build under the new
@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 EXTENSION = ROOT / "extension"
 RUNTIME = EXTENSION / "runtime"
 
-#: The version is declared in exactly these four places. Each pattern anchors
+#: The version is declared in exactly these five places. Each pattern anchors
 #: the *top-level* declaration: `package.json` carries other `"version"` keys
 #: further in, under deeper indentation, and `pyproject.toml`'s is the only key
 #: at column zero.
@@ -44,6 +44,7 @@ VERSION_FILES = [
     (ROOT / "apps" / "agent" / "pyproject.toml", re.compile(r'^(version = ")([^"]+)(")', re.M)),
     (ROOT / "apps" / "shared" / "pyproject.toml", re.compile(r'^(version = ")([^"]+)(")', re.M)),
     (ROOT / "apps" / "gateway" / "pyproject.toml", re.compile(r'^(version = ")([^"]+)(")', re.M)),
+    (ROOT / "apps" / "agentsvc" / "pyproject.toml", re.compile(r'^(version = ")([^"]+)(")', re.M)),
 ]
 
 #: The two wheels this repository builds. The rest of `extension/runtime` is a
