@@ -25,6 +25,16 @@ docker exec dakcoder-postgres pg_isready -U postgres >/dev/null 2>&1 \
 [[ "$(probe "http://127.0.0.1:$DAKCODER_RUNTIME_PORT/v1/health")" =~ ^(200|401)$ ]] \
   && row up "dakcoderd (runtime)" "http://127.0.0.1:$DAKCODER_RUNTIME_PORT" \
   || row DOWN "dakcoderd (runtime)" "http://127.0.0.1:$DAKCODER_RUNTIME_PORT"
+if [[ -n "${DAKCODER_AGENTSVC_TOKEN:-}" ]]; then
+  _svc="http://127.0.0.1:${DAKCODER_AGENTSVC_PORT:-8792}"
+  [[ "$(probe "$_svc/v1/health")" == "200" ]] \
+    && row up "agentsvc (control plane)" "$_svc" \
+    || row DOWN "agentsvc (control plane)" "$_svc"
+  if [[ "${DAKCODER_RUNNER_BACKEND:-process}" == "docker" ]]; then
+    row "$(docker ps -q --filter name=dakcoder-runner- 2>/dev/null | wc -l)" \
+      "runner containers" "${DAKCODER_RUNNER_IMAGE:-dakcoder-runner:latest}"
+  fi
+fi
 [[ -x "$ROOT/gotools/gotools" ]] \
   && row built "gotools (Go sidecar)" "$ROOT/gotools/gotools" \
   || row MISSING "gotools (Go sidecar)" "deploy/build-gotools.sh"

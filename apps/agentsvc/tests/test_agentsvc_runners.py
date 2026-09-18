@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import httpx
 import pytest
 
 from dakcoder_agentsvc.config import Settings
-from dakcoder_agentsvc.runners import DockerBackend, ProcessBackend, Runners
+from dakcoder_agentsvc.runners import DockerBackend, ProcessBackend, RunnerFailed, Runners
 from dakcoder_shared.callers import CALLER_HEADER
 
 
@@ -35,14 +36,18 @@ def test_a_container_runner_is_locked_down(tmp_path: Path) -> None:
     for flag in ("--read-only", "--rm", "no-new-privileges"):
         assert flag in argv, flag
     assert argv[argv.index("--cap-drop") + 1] == "ALL"
-    assert argv[argv.index("--user") + 1] == "10001:10001", "never root"
+    assert argv[argv.index("--user") + 1].split(":")[0] not in ("0", "root"), "never root"
     assert argv[argv.index("--pids-limit") + 1] == "512"
     assert argv[argv.index("--publish") + 1].startswith("127.0.0.1::"), "loopback only"
     assert argv[argv.index("--network") + 1] == "dakcoder-runners"
     assert f"source={tmp_path / 'repo'},target=/workspace" in text
+    assert f"source={tmp_path / 'gomod'},target=/gomodcache,readonly" in text, (
+        "shared by every tenant: a runner that could write it could poison another's build"
+    )
     env = backend.environment("runner-token", "delegated-jwt")
     assert env["DAKCODER_HOSTED"] == "1" and env["DAKCODER_GATEWAY_TOKEN"] == "runner-token"
     assert env["DAKCODER_JWT"] == "delegated-jwt" and env["GOMODCACHE"] == "/gomodcache"
+    assert env["GOPROXY"] == "off" and env["GOTOOLCHAIN"] == "local", "no network to fetch with"
     assert argv.count("--env") == len(env) and "DAKCODER_JWT" in argv
     assert "runner-token" not in text and "delegated-jwt" not in text, (
         "values go through docker's environment: argv is readable by every user of the host"
@@ -50,6 +55,37 @@ def test_a_container_runner_is_locked_down(tmp_path: Path) -> None:
     assert "cp-secret" not in text and "gl-secret" not in text, (
         "the control plane's secrets never reach a runner"
     )
+
+
+def test_a_container_runner_runs_as_the_owner_of_its_working_copy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The working copy is the control plane's: a runner as another uid could
+    not write it, nor could the control plane then reset what it wrote."""
+    monkeypatch.setattr(os, "getuid", lambda: 1234, raising=False)
+    monkeypatch.setattr(os, "getgid", lambda: 5678, raising=False)
+
+    def user(**kw) -> str:
+        argv = DockerBackend(settings_for(tmp_path, **kw)).run_argv("a", tmp_path, "t")
+        return argv[argv.index("--user") + 1]
+
+    assert user() == "1234:5678"
+    assert user(runner_user="4000:4000") == "4000:4000"
+    for root in ("0:0", "root"):
+        with pytest.raises(RunnerFailed, match="root"):
+            user(runner_user=root)
+    monkeypatch.setattr(os, "getuid", lambda: 0, raising=False)
+    with pytest.raises(RunnerFailed, match="root"):
+        user()
+
+
+def test_a_container_runner_reaches_the_gateway_on_the_runners_bridge(tmp_path: Path) -> None:
+    """A container cannot reach the host's loopback, so a docker runner is
+    given the gateway's bridge address; the control plane keeps loopback."""
+    settings = settings_for(tmp_path, runner_gateway_url="http://172.30.0.1:8790")
+    env = DockerBackend(settings).environment("t", "c")
+    assert env["DAKCODER_GATEWAY_URL"] == "http://172.30.0.1:8790"
+    assert settings.gateway_url == "http://127.0.0.1:9"
 
 
 def test_a_process_runner_inherits_nothing_it_should_not(tmp_path: Path, monkeypatch) -> None:

@@ -1,12 +1,13 @@
 # The runner image: one hosted dakcoderd per workspace lease (host-plan §7.2).
 #
-#   docker build -f deploy/runner/Dockerfile -t dakcoder-runner:<version> .
+#   deploy/build-runner.sh     the wheels, the sidecar, then this
 #
-# Built from the repository root, after `python -m build --wheel` has put the
-# shared and agent wheels in extension/runtime and `make -C gotools build` has
-# built the sidecar. The control plane runs it read-only, as uid 10001, with no
-# capabilities, and with the lease's working copy the only writable mount besides
-# /tmp (runners.DockerBackend.run_argv is the whole command).
+# Built from the repository root, after the shared and agent wheels are in
+# extension/runtime and the sidecar is built; Dockerfile.dockerignore keeps the
+# rest of the repository out of the context. The control plane runs it
+# read-only, as its own uid (the owner of the lease's working copy; never root),
+# with no capabilities, and with that working copy the only writable mount
+# besides /tmp (runners.DockerBackend.run_argv is the whole command).
 #
 # The Go toolchain is the same image deploy/install-go.sh lifts the host's from,
 # so a hosted runner and a local runtime build with the same Go (§7.3). The

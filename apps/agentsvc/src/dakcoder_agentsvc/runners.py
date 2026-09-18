@@ -101,7 +101,7 @@ def runner_env(settings: Settings, token: str, credential: str) -> dict[str, str
     """
     env = {
         "DAKCODER_HOSTED": "1",
-        "DAKCODER_GATEWAY_URL": settings.gateway_url,
+        "DAKCODER_GATEWAY_URL": settings.runner_gateway_url or settings.gateway_url,
         "DAKCODER_JWT": credential,
         # The runtime's own token: what this control plane presents to it.
         "DAKCODER_GATEWAY_TOKEN": token,
@@ -193,6 +193,11 @@ class DockerBackend:
         env = runner_env(self.settings, token, credential)
         if self.settings.gomodcache is not None:
             env["GOMODCACHE"] = "/gomodcache"
+        # A container runner reaches the gateway and nothing else, so a module
+        # or a toolchain it does not already have cannot be fetched. Say so at
+        # once, rather than after a connection timeout the model reads as flaky.
+        env["GOPROXY"] = "off"
+        env["GOTOOLCHAIN"] = "local"
         return env
 
     def run_argv(
@@ -204,7 +209,7 @@ class DockerBackend:
             self.docker, "run", "--detach", "--rm",
             "--name", f"dakcoder-runner-{lease_id}",
             "--read-only", "--tmpfs", "/tmp:rw,size=512m",
-            "--user", "10001:10001",
+            "--user", container_user(s),
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
             "--pids-limit", str(s.runner_pids),
@@ -215,7 +220,13 @@ class DockerBackend:
             "--mount", f"type=bind,source={worktree},target=/workspace",
         ]
         if s.gomodcache is not None:
-            argv += ["--mount", f"type=bind,source={s.gomodcache},target=/gomodcache"]
+            # Read-only: every tenant's runner mounts it, and one that could
+            # write it could put its own code in another's next build. The
+            # operator fills it (deploy/HOSTING.md); a runner could not
+            # download into it anyway.
+            argv += [
+                "--mount", f"type=bind,source={s.gomodcache},target=/gomodcache,readonly",
+            ]
         if s.runner_network:
             argv += ["--network", s.runner_network]
         for name in sorted(self.environment(token, credential)):
@@ -258,6 +269,26 @@ class DockerBackend:
             capture_output=True, text=True, check=False,
         )
         return state.stdout.strip() == "true"
+
+
+def container_user(settings: Settings) -> str:
+    """Who a container runner runs as: by default, the control plane's own uid.
+
+    The lease's working copy is the control plane's (it cloned it, and it
+    snapshots, resets and delivers it), and it is the one writable mount. A
+    runner as any other uid could not write it, and what it did write the
+    control plane could not then reset or delete. The container gives the uid
+    nothing else: no capabilities, a read-only root, one mount. Never root.
+    """
+    user = settings.runner_user or (
+        f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else "10001:10001"
+    )
+    if user.split(":", 1)[0] in ("0", "root"):
+        raise RunnerFailed(
+            "refusing to run a runner as root: run the control plane as an ordinary "
+            "user, or set DAKCODER_RUNNER_USER"
+        )
+    return user
 
 
 def _docker_env() -> dict[str, str]:

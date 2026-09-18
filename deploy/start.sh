@@ -68,6 +68,20 @@ DAKCODER_HOME="${DAKCODER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/dakcoder}"
 [[ -x "$DAKCODER_HOME/go/bin/go" ]] \
   || { echo "!! the Go toolchain is missing — run deploy/install-go.sh"; exit 1; }
 
+# A container runner reaches the gateway on the runners' bridge, whose address
+# exists only once the network is created (deploy/HOSTING.md). Say so here,
+# rather than as a bind error scrolling past in the gateway's pane.
+if [[ -n "${DAKCODER_GATEWAY_RUNNER_LISTEN:-}" ]]; then
+  _bridge_ip="${DAKCODER_GATEWAY_RUNNER_LISTEN%:*}"
+  ip -4 -o addr show | grep -qF "inet $_bridge_ip/" \
+    || { echo "!! no interface has $_bridge_ip (DAKCODER_GATEWAY_RUNNER_LISTEN) — create the runners' network, deploy/HOSTING.md"; exit 1; }
+  unset _bridge_ip
+fi
+if [[ -n "${DAKCODER_AGENTSVC_TOKEN:-}" && "${DAKCODER_RUNNER_BACKEND:-process}" == "docker" ]]; then
+  docker image inspect "${DAKCODER_RUNNER_IMAGE:-dakcoder-runner:latest}" >/dev/null 2>&1 \
+    || { echo "!! runner image ${DAKCODER_RUNNER_IMAGE:-dakcoder-runner:latest} is not built — deploy/HOSTING.md"; exit 1; }
+fi
+
 # -- the tmux session --------------------------------------------------------
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -89,14 +103,17 @@ fi
 # ledger's DSN and the GitLab client secret, none of which it reads. The
 # runtime is the process that runs `go build` and `go test` on repository
 # code, and anything that code can read from its environment it can use: with
-# the signing secret, that is a token for any user (host-plan §8).
+# the signing secret, that is a token for any user (host-plan §8). The control
+# plane's go as well: the GitLab service account's token pushes to every listed
+# repository, and the control plane's own tokens speak for every caller.
 RUNTIME_ENV="env"
 _others="OPENAI_API_KEY LITELLM_API_KEY ANTHROPIC_API_KEY AZURE_OPENAI_API_KEY"
 _gateway_only="DAKCODER_JWT_SECRET DAKCODER_POSTGRES_DSN DAKCODER_REDIS_URL DAKCODER_GITLAB_CLIENT_SECRET"
-for _var in $(compgen -v | grep -E '^DAKCODER_MODEL[A-Z0-9_]*_API_KEY$') $_others $_gateway_only; do
+_control_plane="DAKCODER_GITLAB_SERVICE_TOKEN DAKCODER_AGENTSVC_TOKEN DAKCODER_RUNTIME_TOKEN DAKCODER_AGENTSVC_GATEWAY_JWT DAKCODER_RUNNER_JWT"
+for _var in $(compgen -v | grep -E '^DAKCODER_MODEL[A-Z0-9_]*_API_KEY$') $_others $_gateway_only $_control_plane; do
   RUNTIME_ENV="$RUNTIME_ENV -u $_var"
 done
-unset _var _others _gateway_only
+unset _var _others _gateway_only _control_plane
 
 tmux new-session -d -s "$SESSION" -n gateway -c "$ROOT"
 tmux send-keys -t "$SESSION:gateway" \
@@ -136,6 +153,13 @@ if [[ -n "${DAKCODER_AGENTSVC_TOKEN:-}" ]]; then
     AGENTSVC_ENV="$AGENTSVC_ENV -u $_var"
   done
   unset _var
+  # A runner container still here belongs to a control plane that is gone: the
+  # session was killed above. It holds its workspace's name, so starting that
+  # workspace's runner again would fail. Its sessions are on the lease's
+  # volume and resume from there.
+  _runners="$(docker ps -aq --filter name=dakcoder-runner- 2>/dev/null)"
+  [[ -n "$_runners" ]] && docker rm -f $_runners >/dev/null && echo "==> removed stale runner containers"
+  unset _runners
   tmux new-window -t "$SESSION" -n agentsvc -c "$ROOT"
   tmux send-keys -t "$SESSION:agentsvc" \
     ". deploy/shellenv.sh && $AGENTSVC_ENV DAKCODER_AGENTSVC_GATEWAY_JWT=\"\$(cat deploy/logs/agentsvc-jwt)\" .venv/bin/dakcoder-agentsvc 2>&1 | tee -a deploy/logs/agentsvc.log" C-m

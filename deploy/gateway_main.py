@@ -36,6 +36,10 @@ lives outside ``apps/`` so nothing here can end up inside a wheel.
                               card; default https://ai.cept.gov.in/dakcoder
     DAKCODER_CLIENTS          machine callers for the client-credentials grant:
                               a JSON file (auth/clients.py). Unset: none.
+    DAKCODER_GATEWAY_RUNNER_LISTEN
+                              a second address to listen on, for container
+                              runners: the runners' bridge, e.g. 172.30.0.1:8790.
+                              Refused with the dev identity provider.
 
 ``--mint`` prints a signed access token instead of serving, which is how a
 runtime gets a JWT here without a browser and a GitLab OAuth application.
@@ -179,6 +183,37 @@ def _path(name: str) -> Path | None:
     return Path(raw) if raw else None
 
 
+def _runner_listen(identity: str) -> tuple[str, int] | None:
+    """DAKCODER_GATEWAY_RUNNER_LISTEN: a second address, for container runners.
+
+    A runner in a container cannot reach the host's loopback, so the gateway
+    also listens on the runners' private bridge (e.g. 172.30.0.1:8790), and the
+    host's firewall lets that bridge reach this port and nothing else (see
+    deploy/HOSTING.md). Refused with the dev identity provider, for the reason
+    it is refused off loopback: it accepts any authorization code, and a runner
+    is where untrusted code runs.
+    """
+    raw = os.environ.get("DAKCODER_GATEWAY_RUNNER_LISTEN", "").strip()
+    if not raw:
+        return None
+    if identity == "dev":
+        raise SystemExit(
+            "refusing DAKCODER_GATEWAY_RUNNER_LISTEN with the dev identity provider: "
+            "configure GitLab first."
+        )
+    host, _, port = raw.rpartition(":")
+    return host, int(port)
+
+
+def _bind(host: str, port: int):
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    return sock
+
+
 def cors_origins() -> tuple[str, ...]:
     """Browser origins allowed to call this gateway: DAKCODER_CORS_ORIGINS,
     comma-separated. Unset means no CORS, which is right for every client that
@@ -247,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     identity, kind = build_identity(args.host)
+    runner_listen = _runner_listen(kind)
     # Which model answers for which role, on which endpoint, with whose key —
     # all of it from the environment. Raises if any role would be left without a
     # credential, because the gateway has no reason to exist without one.
@@ -321,7 +357,12 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_keep_alive=75,
             )
         )
-        await server.serve()
+        if runner_listen:
+            # Loopback for everything on this host, and the runners' bridge for
+            # the containers on it, which cannot reach the host's loopback.
+            await server.serve(sockets=[_bind(args.host, args.port), _bind(*runner_listen)])
+        else:
+            await server.serve()
 
     asyncio.run(serve())
     return 0

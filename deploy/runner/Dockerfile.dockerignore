@@ -1,0 +1,7 @@
+# The build context for deploy/runner/Dockerfile, which is the repository root.
+# The image needs two wheels and one binary; the rest (the venv, node_modules,
+# the corpora) would only be sent to the daemon to be ignored there.
+*
+!extension/runtime/dakcoder_shared-*.whl
+!extension/runtime/dakcoder_agent-*.whl
+!gotools/gotools

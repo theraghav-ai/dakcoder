@@ -31,7 +31,7 @@ class Settings:
     data_dir: Path
     #: What the gateway presents to us. Without it, nothing is answered.
     token: str
-    #: Where runners send model traffic.
+    #: The gateway, as this control plane reaches it (delegation).
     gateway_url: str
     #: The control plane's own gateway token, with the `delegate` scope: how it
     #: gets each runner a token minted for its lease's owner (credentials.py).
@@ -39,6 +39,10 @@ class Settings:
     #: One token for every runner: the fallback, which charges every hosted run
     #: to the account it names.
     runner_jwt: str = ""
+    #: The gateway as a *runner* reaches it, when that differs: a container
+    #: cannot reach the host's loopback, so a docker runner needs the address
+    #: of the gateway's listener on the runners' bridge. Empty: `gateway_url`.
+    runner_gateway_url: str = ""
 
     #: `process` (a local dakcoderd per workspace; no isolation, for one
     #: trusted host and for tests) or `docker` (host-plan §7.2's container).
@@ -52,8 +56,12 @@ class Settings:
     runner_cpus: str = "2"
     runner_memory: str = "4g"
     runner_pids: int = 512
+    #: `uid:gid` a container runner runs as. Empty: this control plane's own,
+    #: because it owns the lease's working copy the runner writes (runners.py).
+    runner_user: str = ""
     #: A module cache shared by every runner, so a new one does not start with
-    #: `go mod download` (§7.2's warm pool, as a warm cache).
+    #: `go mod download` (§7.2's warm pool, as a warm cache). Read-only to a
+    #: container runner, which cannot download: the operator keeps it filled.
     gomodcache: Path | None = None
 
     #: The repositories a lease may clone, until clones can act as the caller
@@ -101,6 +109,7 @@ class Settings:
             gateway_url=env("DAKCODER_GATEWAY_URL"),
             gateway_jwt=env("DAKCODER_AGENTSVC_GATEWAY_JWT"),
             runner_jwt=env("DAKCODER_RUNNER_JWT"),
+            runner_gateway_url=env("DAKCODER_RUNNER_GATEWAY_URL"),
             runner_backend=env("DAKCODER_RUNNER_BACKEND", "process"),
             runner_command=tuple(command.split()),
             runner_image=env("DAKCODER_RUNNER_IMAGE", "dakcoder-runner:latest"),
@@ -108,6 +117,7 @@ class Settings:
             runner_cpus=env("DAKCODER_RUNNER_CPUS", "2"),
             runner_memory=env("DAKCODER_RUNNER_MEMORY", "4g"),
             runner_pids=_int("DAKCODER_RUNNER_PIDS", 512),
+            runner_user=env("DAKCODER_RUNNER_USER"),
             gomodcache=Path(cache) if cache else None,
             allowlist=Path(allowlist) if allowlist else None,
             gitlab_url=env("DAKCODER_GITLAB_URL"),
