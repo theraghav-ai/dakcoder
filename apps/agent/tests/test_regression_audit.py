@@ -155,17 +155,17 @@ def test_wire_keeps_an_orphaned_result_as_prose() -> None:
     Deleting it edits the model's history; leaving it as `role: "tool"` is
     malformed. It becomes a user message carrying the same text.
     """
-    from dakcoder_agent.context import ContextManager
+    from dakcoder_agent.context import ContextManager, Layer, Message, Role
 
     context = ContextManager(system_prompt="sys")
-    # Constructing the state a restore can leave: a result whose declaring
-    # assistant is not in the transcript.
-    context.transcript.append(  # noqa: SLF001 - deliberate, see above
-        "tool",
-        "the important finding",
-        source="read_file",
-        tool="read_file",
-        tool_call_id="gone",
+    context._working.append(  # noqa: SLF001 - constructing the state compaction can leave
+        Message(
+            role=Role.TOOL,
+            content="the important finding",
+            layer=Layer.WORKING_SET,
+            tool_call_id="gone",
+            source="read_file",
+        )
     )
 
     wire = context.wire()
@@ -408,19 +408,11 @@ def test_capped_read_then_tail_read_dispatches(planning_router: Router, workspac
     exactly that re-read as "already in context above". Two true-sounding
     messages that could not both be obeyed, and on any file over ~150KB the
     tail was unreachable for the rest of the run.
-
-    The explicit `end` is what now reaches the cap at all: a read with no range
-    is windowed to `READ_WINDOW_LINES` by the tool (see `fs.read_file`), so the
-    projection's cap is reached only by a model that asked for the width. That
-    is the case the invariant has to hold for — the cap and the ledger still
-    have to agree about what survived — so the test asks for it.
     """
     path = _big_file(workspace)
     loop, _client = build(planning_router, [say("noop")])
 
-    out = planning_router.dispatch(
-        "read_file", {"path": path, "start": 1, "end": 8000}, mode="agent"
-    )
+    out = planning_router.dispatch("read_file", {"path": path}, mode="agent")
     assert out.ok
     span = tuple(out.meta["span"])
     appended = loop.context.append_tool_result(
@@ -448,16 +440,10 @@ def test_capped_read_then_tail_read_dispatches(planning_router: Router, workspac
 
 def test_the_elision_marker_names_what_survived(planning_router: Router, workspace) -> None:
     """"Re-read with a narrower range" is only actionable if the model can tell
-    which range is missing.
-
-    An explicit `end`, for the reason given in the test above: the tool windows
-    a range-less read before the cap can see it.
-    """
+    which range is missing."""
     path = _big_file(workspace)
     loop, _client = build(planning_router, [say("noop")])
-    out = planning_router.dispatch(
-        "read_file", {"path": path, "start": 1, "end": 8000}, mode="agent"
-    )
+    out = planning_router.dispatch("read_file", {"path": path}, mode="agent")
 
     appended = loop.context.append_tool_result(
         "read_file", out.for_model(), tool_call_id="t1", path=path,
@@ -575,25 +561,21 @@ def test_write_heavy_compaction_frees_tokens() -> None:
 
 def test_the_cut_and_the_budget_agree_on_every_message() -> None:
     """Invariant #3: one cost model, asserted over messages with and without calls."""
-    from dakcoder_agent.context import ContextManager, Layer
+    from dakcoder_agent.context import ContextManager, Layer, Message, Role
     from dakcoder_shared.llm import ToolCall
 
     context = ContextManager(system_prompt="sys")
-    context.append_user("plain text")
-    context.append_assistant(
-        "",
-        tool_calls=(
-            ToolCall(id="1", name="write_file",
-                     arguments='{"content":"' + "y" * 5000 + '"}'),
-        ),
-    )
-    context.append_assistant(
-        "prose and a call",
-        tool_calls=(ToolCall(id="2", name="read_file", arguments='{"path":"a.go"}'),),
-    )
-    context.append_tool_result("write_file", "a result", tool_call_id="1")
+    samples = [
+        Message(Role.USER, "plain text"),
+        Message(Role.ASSISTANT, "", tool_calls=(ToolCall(id="1", name="write_file",
+                                                         arguments='{"content":"' + "y" * 5000 + '"}'),)),
+        Message(Role.ASSISTANT, "prose and a call", tool_calls=(
+            ToolCall(id="2", name="read_file", arguments='{"path":"a.go"}'),)),
+        Message(Role.TOOL, "a result", tool_call_id="1"),
+    ]
+    for message in samples:
+        context._working.append(message)
 
-    samples = [m for m in context.build() if m.layer is Layer.WORKING_SET]
     charged = context.usage().by_layer[Layer.WORKING_SET]
     counted = sum(context._message_cost(m) for m in samples)
     assert charged == counted
@@ -1111,33 +1093,19 @@ def test_subprocess_timeout_kills_process_tree(tmp_path) -> None:
 def test_capture_is_bounded(tmp_path) -> None:
     """`capture_output=True` buffered everything and the cap was applied after
     the process had finished, so a runaway `go test -v` could exhaust the
-    runtime's memory before anything looked at the result.
-
-    The loud process is ``sys.executable``, not ``sh``. It was a shell script,
-    and that made a portable assertion accidentally POSIX-only: `sh` is on PATH
-    under Git Bash and is not under PowerShell, so this passed for anyone
-    running the suite from one shell and failed the release for anyone running
-    it from the other. Nothing here is about shells -- it is about `_pump`
-    bounding a producer faster than the reader -- and `sys.executable` is the
-    one binary a Python test can always name.
-
-    Not skipped on Windows, deliberately. ``run`` has a Windows-specific
-    process-group path, so this is the platform where an unbounded pump would
-    be least likely to be noticed any other way.
-    """
-    import sys
-
+    runtime's memory before anything looked at the result."""
     from dakcoder_agent.tools.commands import MAX_CAPTURE, run
 
-    # 20,000 lines of 60 characters: comfortably past the 400k cap.
-    loud = (
-        "import sys\n"
-        "line = 'a' * 60 + '\\n'\n"
-        "for _ in range(20000): sys.stdout.write(line)\n"
+    script = tmp_path / "loud.sh"
+    script.write_text(
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 20000 ]; do "
+        "echo 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; "
+        "i=$((i+1)); done\n",
+        encoding="utf-8",
     )
+    script.chmod(0o755)
 
-    done = run([sys.executable, "-c", loud], tmp_path, timeout=60)
-
+    done = run(["sh", str(script)], tmp_path, timeout=60)
     assert len(done.output) <= MAX_CAPTURE + 200
     assert "truncated" in done.output
 
@@ -1516,10 +1484,9 @@ def test_health_says_nothing_about_the_machine_without_a_token(workspace) -> Non
     import httpx
 
     from dakcoder_agent.loopback import Loopback, create_app
-    from wirecheck import CheckedTransport
 
     runtime = Loopback(workspace.root, lambda _s, _a: None, token="tok", version="1.2.3")
-    transport = CheckedTransport(create_app(runtime))
+    transport = httpx.ASGITransport(app=create_app(runtime))
 
     async def check() -> None:
         async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as http:
@@ -2149,7 +2116,7 @@ def test_the_window_arithmetic_is_checked_not_documented() -> None:
     from dakcoder_agent.modes import CONTEXT_WINDOW, Mode, ModeConfig
 
     with pytest.raises(ValueError, match="share it"):
-        ModeConfig(Mode.AGENT, CONTEXT_WINDOW - 1_000, 32_768, False, 0.1)
+        ModeConfig(Mode.AGENT, CONTEXT_WINDOW - 1_000, 16_384, False, 0.1)
 
 
 def test_the_agent_window_is_sized_against_the_largest_output_budget() -> None:
@@ -2300,11 +2267,11 @@ def test_truncation_is_countable_without_reading_prose(
     acc.feed({"type": "tool_result", "data": {
         "id": "c1", "name": "write_file", "ok": False,
         "content": "output limit reached mid-call; write_file was not dispatched",
-        "truncated_by_output_limit": True, "output_limit": 32_768}})
+        "truncated_by_output_limit": True, "output_limit": 16_384}})
     m = acc.finish()
 
     assert m.truncations == 1
-    assert m.output_limit == 32_768
+    assert m.output_limit == 16_384
     assert m.pressed_the_ceiling is True
 
 
@@ -2323,7 +2290,7 @@ def test_the_report_reads_a_journal_and_separates_pressure_from_loss(tmp_path) -
 
     quiet = [
         {"id": 1, "type": "user", "data": {"text": "add a handler"}},
-        {"id": 2, "type": "usage", "data": {"prompt_tokens": 20_000, "budget": 219_136}},
+        {"id": 2, "type": "usage", "data": {"prompt_tokens": 20_000, "budget": 235_520}},
         {"id": 3, "type": "finish", "data": {"outcome": "done", "turns": 3}},
         {"id": 4, "type": "metrics", "data": {"context_window": 262_144}},
     ]
@@ -2339,7 +2306,7 @@ def test_the_report_reads_a_journal_and_separates_pressure_from_loss(tmp_path) -
                                                 "arguments": {"path": "a.go"}, "turn": 9}},
         {"id": 6, "type": "tool_result", "data": {"id": "c2", "name": "read_file", "ok": True,
                                                   "turn": 9, "meta": {"bytes": 90_000}}},
-        {"id": 7, "type": "usage", "data": {"prompt_tokens": 214_000, "budget": 219_136}},
+        {"id": 7, "type": "usage", "data": {"prompt_tokens": 230_000, "budget": 235_520}},
         {"id": 8, "type": "finish", "data": {"outcome": "unverified", "turns": 9}},
         {"id": 9, "type": "metrics", "data": {"context_window": 262_144}},
     ]
@@ -2365,4 +2332,4 @@ def test_the_report_reads_a_journal_and_separates_pressure_from_loss(tmp_path) -
     assert hard["lost_work"] is True, "and the run needed what it threw away"
     assert hard["evicted_paths_reread"] == ["a.go"]
     assert hard["bytes_read"] == 180_000, "the true size, not the 64k event cap"
-    assert hard["peak_prompt_tokens"] == 214_000
+    assert hard["peak_prompt_tokens"] == 230_000

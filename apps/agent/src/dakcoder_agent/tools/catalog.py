@@ -1,13 +1,9 @@
 """Publish the model-facing tool catalogue: contract C1, in full.
 
-``gotools`` already publishes its own tools. That is the *sidecar's* half of C1
-— the schemas the Go process accepts. This is the other half and the larger one:
-every tool the model is actually offered, which mode each belongs to, which need
-approval, and which are specified but not yet wired.
-
-No counts here, on purpose. This docstring once said "seven" and "twenty-nine"
-and was wrong within weeks. The generated catalogue states the real numbers
-(``api/TOOL-CATALOG.md``), and the drift check keeps them correct.
+``gotools`` already publishes its own seven tools. That is the *sidecar's* half
+of C1 — the schemas the Go process accepts. This is the other half and the larger
+one: the twenty-nine tools the model is actually offered, which mode each belongs
+to, which need approval, and which are specified but not yet wired.
 
 The distinction matters because the two shapes are allowed to differ. The
 model-facing schema is bound by C1's six-parameter limit and by what a model can
@@ -98,7 +94,7 @@ def as_markdown(version: str = "dev") -> str:
     lines = [
         "# Tool catalogue — the model-facing contract",
         "",
-        "> **Generated.** Do not edit. Run `make catalog` and commit the result.",
+        "> **Generated.** Do not edit. Run `make tool-catalog` and commit the result.",
         "> Regenerating is how this file stays true; editing it is how it stops being.",
         "",
         "Contract **C1** (plan.md §7) in full: every tool the model can be offered, "
@@ -138,10 +134,8 @@ def as_markdown(version: str = "dev") -> str:
     ]
 
     for spec in registry.all_specs():
-        # Full names, in declaration order. Initials were ambiguous once the
-        # modes became ask/planner/agent: both `ask` and `agent` rendered as A.
-        modes = "gate" if spec.gate_only else ", ".join(
-            str(m) for m in Mode if m in spec.modes
+        modes = "gate" if spec.gate_only else "".join(
+            sorted(str(m)[0].upper() for m in spec.modes)
         )
         approval = {
             Approval.NONE: "",
@@ -161,8 +155,7 @@ def as_markdown(version: str = "dev") -> str:
 
     lines += [
         "",
-        "Modes: **ask** is read-only · **planner** is read-only plus `submit_plan` and "
-        "`ask_developer` · **agent** is everything. "
+        "Modes: **P**lanner · **C**oder · **S**caffolder · **V**erifier · **D**ebugger. "
         "`gate` means the verification gate runs it on a fixed schedule and the model "
         "never chooses it (Part A §9.3).",
         "",

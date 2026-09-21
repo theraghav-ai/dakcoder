@@ -41,8 +41,6 @@ from .llm import make_client
 from .loop import AgentLoop
 from .loopback import Loopback, create_app
 from .modes import Mode
-from . import toolchain
-from .callers import gateway_forwarded
 from .prompts import system_prompt
 from .tools import commands, control, fs, knowledge
 from .tools.catalog import as_json
@@ -83,7 +81,6 @@ def build(
     gateway_url: str,
     jwt: str,
     loopback_token: str,
-    hosted: bool = False,
     version: str = "dev",
 ) -> tuple[Loopback, GoTools]:
     """Wire the runtime. Returns the sidecar too, so the caller can close it."""
@@ -148,7 +145,6 @@ def build(
         tool_catalog=json.loads(as_json(version)),
         version=version,
         gateway_url=gateway_url,
-        suspend_on_timeout=hosted,
     )
     holder["runtime"] = runtime
     # Closed with the sidecar at shutdown; `main` already owns both.
@@ -256,13 +252,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--no-prewarm", action="store_true")
     parser.add_argument("--version-string", default=os.environ.get("DAKCODER_VERSION", "dev"))
-    parser.add_argument(
-        "--hosted",
-        action="store_true",
-        default=os.environ.get("DAKCODER_HOSTED", "").strip() == "1",
-        help="answer only requests the gateway forwards, each for the caller it names "
-        "(see callers.gateway_forwarded); also DAKCODER_HOSTED=1",
-    )
     args = parser.parse_args(argv)
 
     gateway_url = os.environ.get("DAKCODER_GATEWAY_URL", "")
@@ -292,7 +281,6 @@ def main(argv: list[str] | None = None) -> int:
             jwt=jwt,
             loopback_token=token,
             version=args.version_string,
-            hosted=args.hosted,
         )
     except Exception as exc:  # noqa: BLE001 - startup failure must be legible
         print(f"dakcoderd could not start: {exc}", file=sys.stderr)
@@ -323,12 +311,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.no_prewarm:
         prewarm(runtime, local_config(gateway_url, jwt))
-    toolchain.probe_in_background(runtime.set_toolchain)
 
-    app = create_app(
-        runtime,
-        authenticate=gateway_forwarded(lambda: runtime.token) if args.hosted else None,
-    )
+    app = create_app(runtime)
     # `Server.run(sockets=[...])` rather than `uvicorn.run(fd=...)`: passing a
     # file descriptor works on POSIX and silently fails on Windows, where socket
     # handles are not file descriptors. The primary platform here is Windows 11,

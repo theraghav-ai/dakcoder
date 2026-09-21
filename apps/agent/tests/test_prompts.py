@@ -178,60 +178,7 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 #: had -- a forced `finish`, a turn cap, a gate bound -- ended the run; the
 #: reported transcripts ended `unverified` with the fix one different approach
 #: away. About 250 tokens in the stable prefix, paid once per run.
-#: Both moved again for the migration work: `planner` 3,100 to 3,250 and `agent`
-#: 4,100 to 4,350. The tripwire fired, the schemas were trimmed to the shortest
-#: wording that still names the fields, and what is left is two decisions.
-#:
-#: `submit_plan` gained `phases`, and the steps gained `phase` and `part`. That
-#: is what makes a whole-service conversion plannable at all: `steps` caps at
-#: eight and a service has forty handlers, so without a roadmap held separately
-#: the only plan that fits is one whose steps are directories -- the plan whose
-#: cursor never advances and whose every `finish` is refused on an objection it
-#: cannot satisfy. About 150 tokens, and only on the planning turns.
-#:
-#: `agent` grew because `ask_developer` is now dispatchable there. Note what
-#: this number measures: `registry.schemas_for`, which does not know whether the
-#: run is a migration. `AgentLoop._tools` withholds the tool on every acting
-#: turn that is not one, so an ordinary agent turn still pays the old prefix and
-#: this ceiling is the migration case, measured against the looser of the two.
-#: Every mode moved again, by about 110 tokens, and this one is the cheapest
-#: arithmetic in the file.
-#:
-#: The system prompt gained two rules: that a reply may carry several calls, and
-#: that a whole-file read is re-sent on every turn after it. Both are paid once
-#: per turn in the stable prefix. What they buy is *turns removed*, and a turn is
-#: the expensive unit here by three orders of magnitude.
-#:
-#: Measured on a real 74-turn run before the change: 7,597,219 prompt tokens
-#: against 36,891 completion — 206 to 1 — with a mean prompt of 102,665 and
-#: 71 of 74 turns making exactly one tool call (none made more than one). Eleven
-#: file edits cost 1,691,433 prompt tokens between them, about 154,000 each,
-#: because each one was its own turn and each turn re-sent the conversation.
-#:
-#: So 110 tokens a turn against ~103,000 per turn removed: the rules pay for
-#: themselves nine hundred times over on the first turn they save, and there
-#: were sixty spare. See `test_batching_cost.py`.
-#: `planner` moved again, by twenty tokens, for the `accepts` field naming the
-#: tools that can satisfy it. It is the cheapest line in this table to justify.
-#: A migration plan wrote "legacy_audit reports no findings" as the acceptance
-#: criterion of all seven of its steps; `legacy_audit` is an ask/planner tool,
-#: so the acting phase had seven steps and no check it could apply to any of
-#: them -- it called the tool, was refused, and spent the turn learning that its
-#: own plan had given it nothing to verify against. Twenty tokens, on planning
-#: turns only, against a turn thrown away on every phase of every migration.
-#: `agent` moved by 77 tokens for `lib_version_check`, and this number measures
-#: the *migration* case rather than an ordinary acting turn — `schemas_for` does
-#: not know which kind of run it is in, and `AgentLoop._tools` withholds the tool
-#: on every acting turn that is not a conversion, exactly as it does
-#: `ask_developer`. So an ordinary agent turn still pays the old prefix.
-#:
-#: What the 77 buys on the turns that do pay it: the acting phase can ask what
-#: version a library is at during the one phase whose whole job is to change
-#: library versions. Without it a field run guessed — it carried the superseded
-#: module's version across the rename into a separate release line, put six
-#: revisions that had never existed into go.mod, and spent thirty-eight turns
-#: blocked on the result while reporting the cause as missing credentials.
-PREFIX_CEILING = {Mode.ASK: 2_800, Mode.PLANNER: 3_380, Mode.AGENT: 4_500}
+PREFIX_CEILING = {Mode.ASK: 2_700, Mode.PLANNER: 3_100, Mode.AGENT: 4_100}
 
 
 @pytest.mark.parametrize("mode", list(Mode))

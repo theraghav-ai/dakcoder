@@ -50,17 +50,10 @@ import logging
 import re
 import threading
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from dakcoder_shared.envelope import (
-    DeltaCoalescer,
-    Event,
-    EventType,
-    MutationKind,
-    ToolResult,
-)
+from dakcoder_shared.envelope import DeltaCoalescer, Event, EventType, ToolResult
 from dakcoder_shared.llm import (
     LLMClient,
     Metering,
@@ -70,7 +63,6 @@ from dakcoder_shared.llm import (
 from dakcoder_shared.paths import PathEscape
 from dakcoder_shared.tokens import estimate_tokens
 
-from .debug import DebugLog
 from .context import (
     MAX_RECAP_ITEMS,
     ContextManager,
@@ -79,11 +71,9 @@ from .context import (
     OverBudgetError,
     Recap,
     Role,
-    Visibility,
 )
 from .gate import (
-    ROUTES_BEFORE,
-    finding_path,
+    Baseline,
     GateReport,
     StageResult,
     full_gate,
@@ -92,32 +82,9 @@ from .gate import (
 )
 from .llm import TurnResult, complete, reasoning_leaked
 from . import metrics
-from .hooks import (
-    MAX_PARALLEL_CALLS,
-    HookContext,
-    Hooks,
-    hook_context_block,
-    parallel_batch,
-)
-from .loopstate import CallLedger, GateState, Progress, ReadState, TaskState
-from .migration import (
-    BASE_BRANCH,
-    DEFAULT_BRANCH,
-    MIN_PHASES,
-    PROGRESS_PATH,
-    PROTECTED,
-    Phase,
-    phases_from_meta,
-    plan_objection,
-    progress_document,
-    steps_for_phase,
-)
 from .modes import CONTEXT_WINDOW, Intent, Mode, config_for
-from .plan import PlanRecord
-from .undo import ensure_private
 from .prompts import mode_instruction, system_prompt
-from .tools import registry
-from .tools.control import PlanStep, split_paths, steps_from_meta
+from .tools.control import PlanStep, steps_from_meta
 from .tools.router import ApprovalRequest, Router
 
 log = logging.getLogger(__name__)
@@ -243,146 +210,207 @@ class _ReadLedger:
         return f"earlier reads covering lines {shown}{more}"
 
 
-#: Which group owns each of ``_State``'s field names.
-#:
-#: The table *is* the decomposition: one line per field saying which question it
-#: answers. It exists rather than forty properties because a table can be read
-#: end to end -- "what does the gate group hold" is a grep for ``"gate"`` in one
-#: place, not a walk through four hundred lines of boilerplate -- and because
-#: moving a field between groups is a one-line change here instead of a rename
-#: at two hundred and seventy-nine call sites.
-_OWNER: dict[str, str] = {
-    # What the run was asked for, and what it committed to.
-    "mode": "task",
-    "intent": "task",
-    "intent_source": "task",
-    "intent_why": "task",
-    "plan": "task",
-    "plan_summary": "task",
-    "plan_forced": "task",
-    "cursor": "task",
-    "removed": "task",
-    "gone_once": "task",
-    "rewritten": "task",
-    "churn": "task",
-    "retired": "task",
-    "routes_saved": "task",
-    "routes_before": "task",
-    "migration": "task",
-    "awaiting": "task",
-    "asked": "task",
-    "answered": "task",
-    # What has been asked and answered. Invalidated as a unit.
-    "seen_calls": "calls",
-    "mutations_seen": "calls",
-    "last_results": "calls",
-    "partial_results": "calls",
-    "dead_ends": "calls",
-    "truncated_at": "calls",
-    # What has been read and searched, and how much of each.
-    "reads": "reading",
-    "retrievals": "reading",
-    "retrieval_repeats": "reading",
-    "search_hits": "reading",
-    "search_repeats": "reading",
-    # What the gate has said, and what has happened since.
-    "baseline": "gate",
-    "last_gate": "gate",
-    "gate_key": "gate",
-    "gate_failures": "gate",
-    "gate_mutations": "gate",
-    "idle_since_gate": "gate",
-    "gate_turn": "gate",
-    "dependencies_changed": "gate",
-    # How the turn budget is being spent, and every bound on spending it.
-    "stalled_turns": "progress",
-    "research_turns": "progress",
-    "must_answer": "progress",
-    "answer_because": "progress",
-    "forced": "progress",
-    "forced_terminal": "progress",
-    "terminal_forced": "progress",
-    "truncated_turns": "progress",
-    "truncations": "progress",
-    "finish_refused": "progress",
-    "preamble_refused": "progress",
-    "plan_objections": "progress",
-    "reasks": "progress",
-    "reply_key": "progress",
-    "reply_repeats": "progress",
-    "prefix_key": "progress",
-    "prefix_break": "progress",
-    "degenerate_refused": "progress",
-    "replans": "progress",
-    "revisions": "progress",
-    "compactions": "progress",
-    "tried": "progress",
-}
-
-
 @dataclass
 class _State:
     """Everything the loop tracks that is not in the context manager.
 
-    Five groups, not thirty-eight fields. Each group is a question -- what was
-    asked for, what has been called, what has been read, what the gate said, how
-    the budget is being spent -- and each owns the fields and the invalidation
-    rules that answer it. ``loopstate.py`` has the groups and the reasoning.
+    Twenty fields, where there were thirty-four -- and the count matters less
+    than what went. What is gone, and why:
 
-    Every old field name still resolves, through ``_OWNER`` above. That is
-    deliberate and it is transitional: the split had to be a refactor rather
-    than a rewrite, so the two hundred and seventy-nine existing uses keep
-    working and can move to ``state.calls.seen_calls`` group by group, with the
-    table saying where each one goes. New code should reach for the group.
+    ``attempts``, ``cycles``, ``blocked_stage``, ``route_mutations`` -- the
+    escalation ladder. Coder twice, then Debugger three times, then stop. It
+    spent its budget on Verifier turns that had attempted nothing, and its whole
+    purpose was to get a second model persona to look at a gate failure that, on
+    the legacy corpus, no persona could have fixed.
 
-    What is gone, and why. ``attempts``, ``cycles``, ``blocked_stage``,
-    ``route_mutations`` -- the escalation ladder, which spent its budget on
-    Verifier turns that had attempted nothing. ``said``, ``echoes`` -- text
-    detectors that ended runs on a symptom. ``idle``, ``planner_idle``,
-    ``planner_research``, ``executing_research`` and five more -- one counter
-    per mode with no stopping condition; a mode that must call a tool is now
-    made to, and a mode that must not is over when it stops. ``scaffolded`` --
-    there is no Scaffolder. ``dup_results``, ``intercepts`` -- ledgers of
-    messages to delete from the transcript later, which is not a thing that
-    happens to an append-only transcript.
+    ``said``, ``echoes`` -- text detectors that ended runs. "The same reply three
+    turns running" is a symptom; the loop now ends runs on decisions about the
+    work.
 
-    And two that went with the canonical/projection split, because the
-    projection answers them from the request instead: ``echoes`` (repeated
-    answers collapse in ``projection``) and ``seen_bodies``
-    (``context.visible_bodies``). Both were copies of what the model could see,
-    and a copy of that is exactly what goes stale.
+    ``idle``, ``idle_mutations``, ``planner_idle``, ``planner_research``,
+    ``planner_nudged``, ``executing_research``, ``executing_nudged``,
+    ``research_mutations``, ``unfinished_nudges`` -- nine counters, each with its
+    own watermark, each existing because a mode had no stopping condition. A
+    mode that must call a tool is now made to; a mode that must not is over when
+    it stops.
+
+    ``scaffolded`` -- the Scaffolder's hand-off. There is no Scaffolder.
+
+    ``dup_results``, ``intercepts`` -- ledgers of messages to delete from the
+    transcript later. History is append-only.
     """
 
-    task: TaskState = field(default_factory=TaskState)
-    calls: CallLedger = field(default_factory=CallLedger)
-    reading: ReadState = field(default_factory=ReadState)
-    gate: GateState = field(default_factory=GateState)
-    progress: Progress = field(default_factory=Progress)
-
-    def __getattr__(self, name: str) -> Any:
-        # Only reached for names the dataclass itself does not define, so the
-        # five groups above never come through here.
-        owner = _OWNER.get(name)
-        if owner is None:
-            raise AttributeError(name)
-        return getattr(object.__getattribute__(self, owner), name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        owner = _OWNER.get(name)
-        if owner is None:
-            object.__setattr__(self, name, value)
-            return
-        setattr(getattr(self, owner), name, value)
-
-    def groups(self) -> dict[str, Any]:
-        """The five groups by name, for diagnostics and for ``carry_from``."""
-        return {
-            "task": self.task,
-            "calls": self.calls,
-            "reading": self.reading,
-            "gate": self.gate,
-            "progress": self.progress,
-        }
+    mode: Mode = Mode.ASK
+    #: What the developer asked for. Fixed before the first turn.
+    intent: Intent = Intent.AUTO
+    #: Where `intent` came from: "given" (the panel's Ask/Agent toggle, or an
+    #: explicit caller), "start" (a legacy mode name), or "classified".
+    #:
+    #: The decision the whole run turns on, and nothing on the wire distinguished
+    #: a developer who *said* this was work from a 64-token call that guessed it.
+    #: Twenty turns into an unrequested migration is a late moment to find out
+    #: which it was.
+    intent_source: str = "given"
+    #: The classifier's own one-line reason. The schema has asked for it since
+    #: the classifier was written and the reply was thrown away.
+    intent_why: str = ""
+    #: The plan, as ``submit_plan`` typed it. Empty in ASK.
+    plan: tuple[PlanStep, ...] = ()
+    plan_summary: str = ""
+    #: How many times each exact call has been asked this run. Cleared when a
+    #: mutation lands, because repeating a call after an edit is re-checking
+    #: work rather than looping.
+    seen_calls: dict[str, int] = field(default_factory=dict)
+    #: ``router.mutations`` as of the last call, so the ledgers can be cleared
+    #: when something actually changed.
+    mutations_seen: int = 0
+    #: What each fingerprinted call last returned, so a repeat is answered with
+    #: the result rather than run again. Cut to ``CACHED_RESULT_CHARS``.
+    last_results: dict[str, str] = field(default_factory=dict)
+    #: Fingerprints whose cached result is only the head of what the tool
+    #: returned, and how long the whole thing was. A replay of one of these has
+    #: to say it is partial: presenting a third of a result as "the current
+    #: answer" is what makes asking again the reasonable move (BUG L-17).
+    partial_results: dict[str, int] = field(default_factory=dict)
+    #: Calls the tools themselves declared can never succeed as asked.
+    #: fingerprint -> the tool's one-line reason.
+    dead_ends: dict[str, str] = field(default_factory=dict)
+    #: Fingerprint -> the ``max``/``limit`` that produced a *truncated* answer,
+    #: so raising the cap genuinely asks for something the ledger does not hold.
+    truncated_at: dict[str, int] = field(default_factory=dict)
+    #: Consecutive tool-calling turns that added nothing new -- every call in
+    #: them answered from a ledger rather than dispatched.
+    stalled_turns: int = 0
+    #: What has already been delivered of each path, as line intervals. See
+    #: ``_ReadLedger``: the old form was a list of range *labels* and a count,
+    #: which could say how often a file had been asked for and not how much of
+    #: it the model had actually seen.
+    reads: dict[str, _ReadLedger] = field(default_factory=dict)
+    #: What each ``search_docs`` query returned, as section citations.
+    retrievals: list[tuple[str, frozenset[str]]] = field(default_factory=list)
+    retrieval_repeats: int = 0
+    #: The turn each compaction fired on, for the thrash detector.
+    compactions: list[int] = field(default_factory=list)
+    #: What was already broken when the run started. See ``_take_baseline``.
+    baseline: Baseline = field(default_factory=Baseline)
+    last_gate: GateReport | None = None
+    #: The workspace state the last full gate ran against.
+    gate_key: tuple[int, tuple[str, ...]] | None = None
+    #: Failing gates in a row with no new edit between them.
+    gate_failures: int = 0
+    dependencies_changed: bool = False
+    #: Whether a turn has already been re-asked with ``tool_choice: required``.
+    #:
+    #: Once per **phase**, not once per turn. Forcing on every prose turn reads as
+    #: harmless and is not: a Planner that has decided there is nothing to plan
+    #: says so, is forced, complies with some call it does not need, says so
+    #: again, is forced again -- two model calls a turn to relitigate a decision
+    #: it has already made twice. The first refusal might be a turn whose call
+    #: was never emitted; the second is an answer, and the loop already knows
+    #: what to do with it.
+    #:
+    #: Reset when a phase ends. Run scope was the wrong reading of that argument:
+    #: it is about one mode relitigating one decision, and a Planner that used
+    #: the re-ask left the acting mode without one (prior-audit TC-4).
+    forced: bool = False
+    #: The most recent intercept result per fingerprint, so the next repeat can
+    #: supersede it rather than stack beside it. Measured: one such pair in
+    #: history and the model moves on; two and it repeats forever. See
+    #: ``ContextManager.supersede``.
+    echoes: dict[str, Message] = field(default_factory=dict)
+    #: Set when a turn asked for nothing it had not already been given, and the
+    #: next turn must therefore answer rather than call. Cleared once used.
+    must_answer: bool = False
+    #: Why the next turn is being made to answer. Two situations reach the same
+    #: mechanism and they are not the same thing: a *stall* is the model asking
+    #: for what it has already been given; a *refused terminal* is the model
+    #: reaching for the exit with arguments the schema would not take. Telling it
+    #: "that call has already been answered and asking it again returns the same
+    #: thing" after the second is false on every clause, and it teaches the wrong
+    #: correction -- the arguments, not the repetition, are the problem
+    #: (BUG L-14).
+    answer_because: str = ""
+    #: ``router.mutations`` as of the last failing gate, so turns that follow it
+    #: without editing anything can be counted. See ``_gate_stalled``.
+    gate_mutations: int = 0
+    #: Turns since a failing gate in which nothing was written.
+    idle_since_gate: int = 0
+    #: Tool-calling turns in this phase that have not reached a terminal tool.
+    #: Reset when a phase ends, because the next one starts its own count.
+    research_turns: int = 0
+    #: How many times a `finish` that abandoned the plan has been sent back.
+    #: Bounded: the model may have decided a step is unnecessary, and this reads
+    #: paths out of the plan rather than out of the work, so it is not the
+    #: arbiter of who is right.
+    finish_refused: int = 0
+    #: How many times an answer that was only its own opening line was sent
+    #: back. Separate from `finish_refused` because they are different
+    #: mistakes -- one is work not done, the other is work done and not
+    #: delivered -- and a run may honestly make both.
+    preamble_refused: int = 0
+    #: Terminal calls forced that did not land -- the model was made to call
+    #: `submit_plan` and sent arguments the schema refused, say. Bounded,
+    #: because forcing the same call again is the loop this exists to escape.
+    forced_terminal: int = 0
+    #: Whether the turn just sent was one the loop forced to end the phase.
+    #: Read by `_phase_ended`, which is the only thing that can tell a plan the
+    #: model volunteered from one it was left no other move to produce.
+    terminal_forced: bool = False
+    #: Whether the current plan came out of a forced `submit_plan`.
+    #:
+    #: A plan is normally a commitment, and `_unwritten_targets` treats it as
+    #: one. A plan extracted at the research fence is not: the developer asked
+    #: a question, the fence fired, and the only call the turn accepted was
+    #: `submit_plan`, so the model wrote one. Enforcing it turns a question
+    #: into an unrequested migration and gives the run no exit (BUG L-28).
+    #:
+    #: Asking the model to reconsider before acting on a forced plan was tried
+    #: and reverted. It read as an invitation to stop: measured live at the
+    #: fence, genuine change tasks went from 4/4 writing the code to 2/4, to
+    #: buy one analysis run in four. The misroute is worth preventing at the
+    #: classifier, not worth talking every forced plan out of existence.
+    #:
+    #: Set by `_phase_ended`, cleared by any plan the model submits of its own
+    #: accord. It stops mattering the moment anything is written -- a forced
+    #: plan the run has started acting on is a plan, whatever produced it --
+    #: and that condition lives in `_open_targets`, which is the one place
+    #: every enforcement path reads.
+    plan_forced: bool = False
+    #: Consecutive replies the output budget cut off. Reset by any reply that
+    #: completes. The per-turn handling of a truncated reply is careful -- every
+    #: declared call answered, the cause named accurately -- but nothing counted
+    #: the *repetition*, so a model that always overran its output budget spent
+    #: the entire turn budget doing it and ended EXHAUSTED without truncation
+    #: ever being mentioned (BUG L-13).
+    truncated_turns: int = 0
+    #: Truncated replies in the whole run, never reset. The streak above can be
+    #: dodged by one complete reply between two overruns, which is exactly what
+    #: a model does while it hunts for a way to send something too large
+    #: (BUG FS-3).
+    truncations: int = 0
+    #: What has been tried and did not work, one line each, oldest first:
+    #: a gate failure and the stage it blocked at, a `revise_plan` and its
+    #: reason, a search the corpus could not answer. Rendered into the state
+    #: block every turn, so the model reads its own dead ends rather than
+    #: reconstructing them from a transcript that contains its statements of
+    #: intent. Bounded by ``STATE_ITEMS`` at render time.
+    tried: list[str] = field(default_factory=list)
+    #: Digests of tool-result bodies already shown this run. A dispatched call
+    #: whose result the model has seen before -- the same search under other
+    #: words, the same build log -- did not inform the run, whatever its
+    #: arguments looked like. Cleared with the cached-result ledgers on
+    #: eviction, because a body the context no longer holds is news again.
+    seen_bodies: set[str] = field(default_factory=set)
+    #: What each ``search_repo`` returned, as ``path:line`` keys, for the same
+    #: overlap test ``search_docs`` has had all along.
+    search_hits: list[tuple[str, frozenset[str]]] = field(default_factory=list)
+    search_repeats: int = 0
+    #: The turn the last full gate ran on, for the state block.
+    gate_turn: int = 0
+    #: Loop-initiated returns to the Planner this run. See ``_replan``.
+    replans: int = 0
+    #: Model-initiated ``revise_plan`` calls this run.
+    revisions: int = 0
 
 
 _RECAP_PROMPT = """Summarise this agent transcript for a handover to a fresh context.
@@ -460,13 +488,6 @@ Also "change" when they are approving work just described to them ("go", "do
 it", "yes please"), or when they ask a question and then ask for the work as
 well ("explain the handler, then migrate it").
 
-Then one more question, only when the answer above is "change": is this a
-**whole-service migration** -- converting a legacy api-* service to the n-api
-template, or being asked to carry on with one already under way? Set
-"migration" true for that, and for nothing else. One handler, one bug, one new
-endpoint is ordinary work however much it touches, and a *question* about a
-migration is not one.
-
 Answer with the JSON object only. Keep "why" to at most eight words.
 
 CONVERSATION SO FAR:
@@ -500,24 +521,10 @@ _INTENT_SCHEMA: dict[str, Any] = {
                     "description": "At most eight words: the word that decided it.",
                     "maxLength": 120,
                 },
-                # Third, and last, because it is the only one with a default
-                # that is right when the model says nothing: an ordinary
-                # change. A false negative costs a migration the phased
-                # treatment and is visible immediately -- the developer sees an
-                # eight-step plan for a forty-file conversion. A false positive
-                # costs a bug fix its gate, which is the expensive direction,
-                # so the prompt spends its words ruling that out.
-                "migration": {
-                    "type": "boolean",
-                    "description": "True only for a whole-service legacy-to-template conversion.",
-                },
             },
-            # The first two. `why` was optional and the model simply left it
+            # Both of them. `why` was optional and the model simply left it
             # out -- measured live, empty on every classification -- so the
             # field the loop reads back to explain a misroute never arrived.
-            # `migration` is not required: it is meaningless on a question, and
-            # a required boolean is one more thing a 160-token reply can be cut
-            # in the middle of.
             "required": ["kind", "why"],
         },
     },
@@ -703,75 +710,6 @@ def _is_preamble(answer: str) -> bool:
         return False
     return answer.rstrip().endswith((":", "：")) or bool(_PROMISES_MORE.search(answer))
 
-
-#: Below this an answer is too short for a repetition ratio to mean anything,
-#: and a short answer that repeats itself is cheap for a developer to read past.
-DEGENERATE_CHARS = 2_000
-
-#: The n in the n-gram. Eight words is long enough that ordinary prose does not
-#: repeat one by accident -- measured at 0.999 distinct over this repository's
-#: own documentation and source -- and short enough to catch a clause-length
-#: loop.
-_DEGENERATE_N = 8
-
-#: Distinct 8-grams as a fraction of all of them, below which a long answer is
-#: a loop rather than a document.
-#:
-#: Measured, not guessed, against the field answer this exists for and against
-#: the legitimate shapes most likely to look like it:
-#:
-#:     turn-34 field answer      0.012      a clause repeated ~100 times
-#:     300-row markdown table    0.612
-#:     200-item checklist        0.801
-#:     this repo's own docs      0.999
-#:     Python source             0.999
-#:
-#: 0.30 sits in a fifty-fold gap. Compression ratio was tried first and
-#: rejected: zlib scores the table at 0.055 and the checklist at 0.044 against
-#: the degenerate answer's 0.011, which is not a gap anything can be thresholded
-#: on -- structured content is compressible, and that is not the same thing as
-#: being a loop.
-DEGENERATE_RATIO = 0.30
-
-#: How many times a degenerate `answer` is sent back. One, like a preamble, and
-#: for the same reason: re-sending it unchanged is taken as final, so a false
-#: positive costs a turn.
-MAX_DEGENERATE_REFUSALS = 1
-
-
-def _is_degenerate(answer: str) -> bool:
-    """Whether this answer is the model looping rather than writing.
-
-    The failure this catches, from the field: a `finish` forced at a 119,000-
-    token context returned 7,036 tokens of "1 routes file, 1 temporal_instrument
-    file, 1 main file, ..." repeated about a hundred times until it hit
-    `MAX_ANSWER_CHARS`. The developer was shown 24,000 characters of it. The
-    same forced-finish path at a 55,000-token context, thirteen turns earlier,
-    produced a coherent plan -- so this is a property of the reply, and the only
-    place to catch it is the reply.
-
-    **It has to be caught before it is shown, and before it is kept.** A
-    `finish` travels as the assistant's tool-call arguments, so an answer this
-    long is appended to the conversation and read back on every turn after it;
-    the field run carried those 7,000 tokens of its own looped text for the
-    remaining fifteen turns, and spent them repeating a one-line preamble
-    verbatim.
-
-    ``_is_preamble`` cannot see this: it only looks at answers under
-    `PREAMBLE_CHARS`, and this failure is only possible well above it. The two
-    are opposite ends of the same question -- did the model actually say
-    anything -- so they sit together.
-    """
-    words = answer.split()
-    if len(answer) < DEGENERATE_CHARS or len(words) <= _DEGENERATE_N:
-        return False
-    grams = {
-        tuple(words[i : i + _DEGENERATE_N])
-        for i in range(len(words) - _DEGENERATE_N + 1)
-    }
-    return len(grams) / (len(words) - _DEGENERATE_N + 1) < DEGENERATE_RATIO
-
-
 #: How many times a `finish` that abandons the plan is sent back.
 #:
 #: One. The acting mode gained a terminal tool to escape a loop and
@@ -782,158 +720,6 @@ def _is_degenerate(answer: str) -> bool:
 #: is believed, because this reads paths out of the plan and is not the
 #: arbiter of whether a step was still needed.
 MAX_FINISH_REFUSALS = 1
-
-#: A tool name as it appears inside a sentence. Tool names are lower_snake_case
-#: by the registry's own rule, so this needs no vocabulary of its own.
-_IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
-
-#: How many times a question already answered is sent back before it is simply
-#: put to the developer again.
-#:
-#: One, like the other refusals here, and for their reason: the model may be
-#: asking something the previous answer genuinely did not cover, and it is
-#: entitled to say so and be believed. What it is not entitled to is asking the
-#: *same* question, word for word, at a developer who has already answered it --
-#: which a field run did three times across five turns.
-#: The checks whose failure is expected while a conversion is open.
-#:
-#: Not every tool -- `rules_lint` is scoped to what the run touched and its
-#: findings are about this phase's own edits, which is exactly what a
-#: mid-conversion run should act on. These three compile or run the *whole*
-#: module, so mid-conversion they report the plan not being finished yet.
-_TOOLCHAIN_CHECKS = frozenset({"go_build", "go_vet", "go_test"})
-
-MAX_REASKS = 1
-
-#: Turns on one plan step, with nothing written to it, before the cursor block
-#: names ``blocked`` as the likely answer.
-#:
-#: Four. Long enough that an ordinary step -- read the file, plan the edit, make
-#: it -- never sees the line, and short enough to arrive while there is budget
-#: left to act on it. The loops this is for ran twenty turns and more.
-STUCK_TURNS = 4
-
-
-#: How many identical replies pass before the loop stops taking the prose.
-#:
-#: One. The second copy of a reply is the first evidence of a loop, its prose is
-#: already in the working set verbatim, and appending it again is the whole
-#: mechanism: session 6d923ab574ae carried 25 copies of one 110-token message
-#: into a 153,000-token prompt -- 7% of the context spent teaching the model to
-#: send it a 26th time. What replaces it names the repetition, which is the one
-#: thing the model cannot see from a transcript of its own confident narration.
-REPLY_PROSE_REPEATS = 1
-
-#: Identical replies before the turn after is made to answer.
-#:
-#: Two, matching `STALLS_BEFORE_ANSWER`, and reached sooner than it in practice:
-#: a stall needs every call in the batch to be a repeat, and this needs only the
-#: reply to be the same one. They are different questions -- "did this turn
-#: learn anything" and "is this turn a copy of the last one" -- and the second
-#: is the one a model in a loop answers wrong.
-REPLY_REPEATS_BEFORE_ANSWER = 2
-
-#: Identical replies before the run ends.
-#:
-#: Four. By then the escape at `REPLY_REPEATS_BEFORE_ANSWER` has fired twice and
-#: not taken, the prose has been stubbed twice, and every further turn is a full
-#: prefill of a context the size of a migration's for a reply already on file.
-#: The field run spent 41 turns and roughly 5.9 million prompt tokens past this
-#: point, and ended with the same `no_progress` it would have ended with here.
-MAX_REPLY_REPEATS = 4
-
-
-def _reply_fingerprint(content: str, calls: Sequence[ToolCall]) -> str:
-    """A stable key for a whole reply: its prose and every call in it.
-
-    Whitespace-folded, because a model that repeats itself does reproduce its
-    own formatting but nothing is gained by insisting on it, and keyed on both
-    halves because either alone is a legitimate repeat: two turns may honestly
-    open with the same sentence, and two `read_file` calls for different ranges
-    are different work. It is the pair coming back unchanged that means nothing
-    happened.
-    """
-    prose = " ".join((content or "").split())
-    fingerprints = "|".join(_fingerprint(call) for call in calls)
-    if not prose and not fingerprints:
-        return ""
-    return hashlib.sha256(
-        f"{prose}\x00{fingerprints}".encode("utf-8")
-    ).hexdigest()[:16]
-
-
-def _holds_a_phase_open(step: PlanStep) -> bool:
-    """Whether this step must be finished before its phase may close.
-
-    ``PlanStep.open`` answers a narrower question -- "does this step still ask
-    for a *write*" -- and ``written`` is deliberately outside it, because "you
-    planned to write this and did not" is the wrong objection to raise about a
-    file that exists. That reading is right everywhere it is used to decide what
-    to *ask the model for*, and wrong everywhere it is used to decide whether
-    the work is finished.
-
-    Session 6d923ab574ae is what the difference costs: three call sites read
-    ``open`` as "is there outstanding work" -- `_close_phase`, `_work_in_flight`
-    and the stall escape's `_open_targets` -- while `_why_not_done`, the one
-    predicate that decides whether a run may end, read ``written`` as
-    unfinished. The phase closed, the follow-up re-planned, the forced turn took
-    the write tools away, and the `finish` that all three pointed at was refused
-    by the fourth. Naming the question separately is what stops them drifting
-    apart again.
-    """
-    return step.open or step.status == "written"
-
-
-def _asked_fingerprint(questions: Sequence[Any]) -> str:
-    """A stable key for a set of questions, so a repeat is recognisable.
-
-    Order-insensitive and whitespace-insensitive, because neither changes what
-    is being asked, and a model re-asking rarely reproduces its own formatting.
-    """
-    cleaned = sorted(" ".join(str(q).lower().split()) for q in questions if str(q).strip())
-    return hashlib.sha256("\n".join(cleaned).encode("utf-8")).hexdigest()[:16]
-
-
-#: Control tools, which an ``accepts`` criterion would never legitimately name.
-#:
-#: Excluded from the check below so that a step checked by "submit_plan" -- which
-#: no plan has ever said and none should -- is not reported as an unrunnable
-#: criterion in a message about verification.
-_CONTROL_TOOLS = frozenset({"submit_plan", "revise_plan", "ask_developer", "finish"})
-
-
-def _unrunnable_checks() -> frozenset[str]:
-    """Tools an ``accepts`` may cite that the acting phase cannot call.
-
-    Derived from the registry rather than listed, so a tool moved between modes
-    does not leave a stale name here. Gate tools are excluded: the model never
-    calls `gofmt` or `swagger_check` and does not need to -- the gate runs them
-    on a schedule, so "swagger_check passes" is a criterion the run does apply.
-
-    The failure this answers: a migration plan wrote "legacy_audit reports no
-    legacy-lib-generation findings" as the acceptance criterion of all seven of
-    its steps. `legacy_audit` is an ask/planner tool. The acting phase called it,
-    was refused, and spent the turn discovering that its own plan had given it
-    nothing it could check -- on a phase where the criterion was the only thing
-    that could have told it a step was finished.
-    """
-    acting = set(registry.names_for(Mode.AGENT))
-    gate = set(registry.gate_tools())
-    return frozenset(
-        spec.name
-        for spec in registry.all_specs()
-        if spec.name not in acting and spec.name not in gate and spec.name not in _CONTROL_TOOLS
-    )
-
-
-#: How many times a migration's plan is sent back for not being phased.
-#:
-#: Two, where the refusals above are one, because this objection is answerable:
-#: `plan_objection` names the missing field and the values it will accept, and
-#: the fix is re-emitting the same call with one more argument. The first
-#: push-back usually gets phases and no `parts`; the second gets both. A third
-#: would be arguing.
-MAX_PLAN_OBJECTIONS = 2
 
 #: How many failing gates in a row, with nothing edited between them, end the
 #: run.
@@ -1047,29 +833,6 @@ class AgentLoop:
         self.max_turns = max_turns
         self.session_id = session_id
         self.state = _State()
-        #: The before/after seam around a tool call. Empty by default, and
-        #: cheap when empty -- the loop's fast path is a length check.
-        #:
-        #: It exists so that a policy, a linter, a redaction pass or an audit
-        #: log can be added without editing this file. Everything load-bearing
-        #: -- the router's six checks, the intercept ledgers, the gate -- stays
-        #: hard-wired, because those are not opinions a deployment gets to
-        #: hold. See ``hooks.py``.
-        self.hooks = Hooks()
-        #: The plan as it will be written to disk. Held here rather than
-        #: derived at save time so the revision history accumulates across the
-        #: run instead of being one entry deep.
-        self._plan_record = PlanRecord()
-        #: Whether this run has already recovered from the endpoint refusing a
-        #: request as too large. Once per run: a second overflow after a
-        #: deterministic compaction to 15% is not a estimate that drifted, it is
-        #: a context that cannot be made to fit, and retrying it is a bill.
-        self._overflow_recovered = False
-        #: Full-fidelity turn recording, or None. See `debug.py`: off by
-        #: default, one `is None` check per seam when off, and it hangs off the
-        #: four places that already funnel rather than being sprinkled through
-        #: the logic.
-        self._debug: DebugLog | None = None
         self.result: RunResult | None = None
         #: The background baseline. See ``_take_baseline``.
         self._baseline_thread: threading.Thread | None = None
@@ -1112,12 +875,6 @@ class AgentLoop:
                 self._metrics_acc.feed({"type": str(event.type), "data": event.data})
             except Exception:  # noqa: BLE001 - accounting must never fail a run
                 log.warning("run metrics could not read an event", exc_info=True)
-            # The same funnel, for the same reason it exists: a new `yield
-            # Event(...)` anywhere inside cannot be missed by omission. The
-            # recorder is `None` unless DAKCODER_DEBUG is set, so this is one
-            # identity check per event when it is off.
-            if self._debug is not None:
-                self._debug.event(str(event.type), event.data)
             yield event
 
     def _run(
@@ -1149,73 +906,18 @@ class AgentLoop:
         else:
             self.context.set_task(task, acceptance=acceptance)
 
-        # What this run is for, in order of how much the loop actually knows.
-        #
-        # The classifier is **last**, and that is the fix: it used to be the
-        # only answer for every message a caller did not label, so a session
-        # with work in flight had its intent re-guessed from scratch on every
-        # follow-up. Measured on one field transcript, three of five messages
-        # in a migration session were guessed "question" -- and a question runs
-        # in ASK, which has no write tools and no `submit_plan`, so the model
-        # spent forty turns reading a repository it had been told to change.
-        #
-        # The two rules in front of it are not better guesses. They are facts:
-        # an answer to `ask_developer` continues the run that asked, and a
-        # follow-up on a plan with open steps continues that plan.
         decided = Intent.coerce(intent)
         source = "given"
         if decided is Intent.AUTO and start is not None:
             decided, source = Intent.coerce(start), "start"
-        awaiting, self.state.awaiting = self.state.awaiting, Intent.AUTO
-        if continued and awaiting is not Intent.AUTO:
-            # This message answers the question the previous run stopped on, and
-            # that is a fact rather than a guess -- `awaiting` is set only by
-            # `ask_developer`. Held so the *next* asking of the same question
-            # can be answered from here instead of from the developer.
-            self.state.answered = task
-        if decided is Intent.AUTO and continued and awaiting is not Intent.AUTO:
-            decided, source = awaiting, "answer"
-        if decided is Intent.AUTO and continued and self._work_in_flight():
-            decided, source = Intent.AGENT, "session"
         if decided is Intent.AUTO:
             decided, source = self._classify(task, continued=continued), "classified"
-        elif (
-            decided is Intent.AGENT
-            and not continued
-            and not self.state.migration.active
-        ):
-            # The kind is settled and the *shape* is not, and they are different
-            # questions.
-            #
-            # A caller that supplies the intent -- the panel's Agent toggle, the
-            # `/migrate` command, any API client -- skips the classifier
-            # entirely, and the classifier is the only thing that asks whether
-            # this is a whole-service conversion. So the one entry point named
-            # after migrating was the one where none of the migration rules
-            # engaged: no phased plan, no branch held, no route inventory, and
-            # the gate running on a service in the middle of being converted.
-            #
-            # One call, on the first message of a session that may write, and
-            # never when a roadmap already says the answer. `_classify`'s return
-            # is discarded here on purpose: the developer has answered that half
-            # already and their answer is not the classifier's to revise.
-            self._classify(task, continued=continued, kind_known=True)
         self.state.intent = decided
         self.state.intent_source = source
 
-        self._switch(self._opening_mode(decided, continued=continued))
+        self._switch(Mode.PLANNER if decided is Intent.AGENT else Mode.ASK)
         # Only a run that may write needs to know what was already broken.
-        #
-        # And not a migration, which needs the opposite. The baseline exists so
-        # the gate charges this run only for its own damage; during a conversion
-        # the run's own damage *is* the workspace -- a service half on
-        # `api-server` and half on `n-api-server` -- so a baseline taken here
-        # would be a picture of the previous phase's breakage, handed to the
-        # final gate as "already broken, not your fault". The migration's gate
-        # runs without one deliberately: a converted service that does not build
-        # has not been converted. It also saves about thirty seconds of `go vet`
-        # per message on a module that cannot compile.
-        if decided is Intent.AGENT and not self.state.migration.defers_gate:
+        if decided is Intent.AGENT:
             self._take_baseline()
 
         for _ in range(self.max_turns):
@@ -1225,12 +927,6 @@ class AgentLoop:
                 self.result = self._abort()
                 break
             yield from self._turn()
-            # The canonical transcript and the compaction sidecar, written at
-            # the boundary where the run is already waiting on something slower
-            # than a disk. Best-effort, like the journal it goes through: a
-            # read-only checkout costs the ability to resume this session
-            # exactly, never the work the developer is waiting for.
-            self.context.persist()
             if self.result is None and self.winding_down():
                 self.result = RunResult(
                     Outcome.ABORTED,
@@ -1319,15 +1015,8 @@ class AgentLoop:
 
     # -- intent -----------------------------------------------------------
 
-    def _classify(self, task: str, *, continued: bool, kind_known: bool = False) -> Intent:
-        """Ask the model, once, what kind of request this is — and what shape.
-
-        ``kind_known`` is the call made for the second answer alone, when the
-        caller already supplied the intent. The verdict is still parsed and
-        still returned, because the reply carries both; what changes is that
-        ``intent_why`` is left alone. That field exists to explain a *misroute*,
-        and filling it from a classification the run did not act on would
-        attribute the routing to a call that had no part in it.
+    def _classify(self, task: str, *, continued: bool) -> Intent:
+        """Ask the model, once, what kind of request this is.
 
         One call, ``role="fast"``, a two-key schema and a handful of output
         tokens. The conversation so far is included because a follow-up cannot be
@@ -1347,14 +1036,6 @@ class AgentLoop:
         ) or "(this is the first message)"
         if continued and self.context.task_text:
             conversation = f"- {self.context.task_text}\n{conversation}"
-        # And what the agent last said, which is half of what the newest
-        # message means. `directives` is the developer's side only, so "do it,
-        # and don't run the gates until the end" arrived with no trace that the
-        # agent had just put a ten-phase migration on screen -- and was scored
-        # on its grammar, "Asking for confirmation of a constraint", rather
-        # than on the job it was continuing.
-        if continued and (reply := self._last_reply()):
-            conversation += f"\n\nTHE AGENT'S LAST REPLY:\n{reply}"
 
         try:
             reply = self.client.chat(
@@ -1405,41 +1086,8 @@ class AgentLoop:
         # Kept, not discarded. `why` has been in `_INTENT_SCHEMA` since the
         # classifier was written and the answer went straight in the bin, so the
         # one artefact that could explain a misroute never existed.
-        if not kind_known:
-            self.state.intent_why = str((parsed or {}).get("why", "") or "").strip()[:300]
-
-        # Only ever set here, never cleared here. A session that has been told
-        # once that it is a migration stays one: the later messages of a
-        # migration are "carry on", "start phase 3", "yes" -- and a classifier
-        # given those in isolation has no reason to say migration, so re-asking
-        # would drop the roadmap, the branch rule and the deferred gate exactly
-        # when the run is deepest into needing them.
-        #
-        # Read only off a "change", which is what the prompt asks the question
-        # about. A reply that says this changes no files is not evidence that it
-        # is a whole-service conversion, whatever it puts in the third field.
-        if kind == "change" and bool((parsed or {}).get("migration")):
-            self.state.migration.active = True
-
-        if kind != "change":
-            # The caller's own answer stands when there is one. This call was
-            # made for the shape, and the kind was not its to revise.
-            return Intent.AGENT if kind_known else Intent.ASK
-        return Intent.AGENT
-
-    def _last_reply(self, limit: int = 600) -> str:
-        """The last thing the agent said to the developer, or ``""``.
-
-        Read off the assembled messages rather than remembered, for the reason
-        `_live_reads` is: the context is the authority on what the conversation
-        contains, and a second copy would eventually disagree with it. Bounded,
-        because the classifier gets 160 output tokens and a whole migration plan
-        pasted into its prompt would bury the message it is being asked about.
-        """
-        for message in reversed(self.context.build()):
-            if message.role is Role.ASSISTANT and (text := (message.content or "").strip()):
-                return text[:limit]
-        return ""
+        self.state.intent_why = str((parsed or {}).get("why", "") or "").strip()[:300]
+        return Intent.AGENT if kind == "change" else Intent.ASK
 
     # -- the baseline -----------------------------------------------------
 
@@ -1538,19 +1186,6 @@ class AgentLoop:
         # The task state, from ground truth, at the end of the prompt. The one
         # thing the loop knew and the model was never told.
         self.context.set_state(self._state_block())
-        if self._debug is not None:
-            self._debug.turn_start(
-                turn=turn,
-                mode=str(self.state.mode),
-                state={
-                    name: _describe(group) for name, group in self.state.groups().items()
-                },
-                context=self.context.inspect(),
-                plan=[
-                    {"file": s.file, "status": s.status, "action": s.action, "note": s.note}
-                    for s in self.state.plan
-                ],
-            )
         yield Event(
             EventType.TURN_START,
             {
@@ -1598,33 +1233,15 @@ class AgentLoop:
             # here was told "that call has already been answered and asking it
             # again returns the same thing" -- false on every clause, and it
             # points the model at the wrong correction (BUG L-14).
-            #
-            # And so does the *tool list*, for the same reason one step further
-            # down. Ending the phase is the right answer to a stall only when
-            # there is nothing left to do; with work the plan still names, a
-            # turn cut to `finish` alone (see `_terminal_tools`) is a turn the
-            # model can only answer by abandoning that work -- and it answers it
-            # accurately: "I am in a read-only phase and cannot write files",
-            # which was true of the turn and of nothing else. The refusal in
-            # `_phase_ended` then sent it straight back into the same loop.
-            #
-            # A stall is not a reason to stop. It is a reason to stop *reading*,
-            # and `required` over the whole list says exactly that, which is
-            # already how the research fence answers the identical situation
-            # twenty lines below.
-            outstanding = [] if because else self._outstanding()
-            if outstanding:
-                forced_choice = "required"
-                self.context.append_user(self._stall_notice() + self._outstanding_ask())
-            else:
-                self.context.append_user(
-                    because
-                    or (
-                        self._stall_notice()
-                        + "Give the developer what you have established now, and say what "
-                        "you could not find out."
-                    )
+            self.context.append_user(
+                because
+                or (
+                    "Stop searching. That call has already been answered and asking it "
+                    "again returns the same thing.\n\n"
+                    "Give the developer what you have established now, and say what you "
+                    "could not find out."
                 )
+            )
         elif self.state.research_turns >= MAX_RESEARCH_TURNS:
             # Walked to the fence rather than off the cliff. See
             # MAX_RESEARCH_TURNS: past six consecutive fruitless calls this
@@ -1637,7 +1254,7 @@ class AgentLoop:
             # `finish` -- and finished, honestly and uselessly, with "nothing
             # was changed". The bound had fired correctly and pointed at the
             # exit instead of at the work.
-            outstanding = self._outstanding()
+            outstanding = self._open_targets()
             answering = True
             if self._gate_wants_an_edit():
                 # A failing gate in the same context says "Make the edit, or say
@@ -1665,9 +1282,12 @@ class AgentLoop:
                 # and which one depends on whether the file exists yet.
                 forced_choice = "required"
                 self.context.append_user(
-                    f"You have spent {self.state.research_turns} turns reading in "
-                    "this phase and have not closed it. You have read enough.\n\n"
-                    + self._outstanding_ask()
+                    f"You have spent {self.state.research_turns} turns reading and "
+                    "have written nothing. You have read enough.\n\n"
+                    "Your plan set out to write " + ", ".join(outstanding) + ". "
+                    + ("Write them now" if len(outstanding) > 1 else "Write it now")
+                    + ", from what you already have. If a file genuinely cannot be "
+                    "written, say which and why in one line and call `finish`."
                 )
             else:
                 self.context.append_user(
@@ -1703,17 +1323,7 @@ class AgentLoop:
         if answering:
             tool_choice = forced_choice or self._terminal_choice()
             if forced_choice is None:
-                offered, tool_choice = self._terminal_request(tools, tool_choice)
-
-        # Measured on what is actually sent, not on what `_tools` returned: the
-        # narrowing above is a prefix break, and hashing the unnarrowed list
-        # would hide the one case most worth seeing.
-        if moved := self._note_prefix(offered):
-            log.info(
-                "turn %d: prompt prefix broken at %s — the server re-prefills this turn",
-                self.context.turn,
-                moved,
-            )
+                offered = self._terminal_tools()
         # Recorded before the call, read after it by `_phase_ended`: a plan that
         # arrives on a turn like this one was not volunteered.
         self.state.terminal_forced = answering and forced_choice is None
@@ -1774,11 +1384,10 @@ class AgentLoop:
         # the wire declares -- malformed against a strict endpoint, and worse as
         # a prompt: the model's visible history of itself becomes paragraphs of
         # narration with results appearing beside them unexplained.
-        repeats = self._note_reply(result.chat.content or "", result.chat.tool_calls)
         assistant_msg: Message | None = None
         if result.chat.content or result.chat.tool_calls:
             assistant_msg = self.context.append_assistant(
-                self._reply_prose(result.chat.content or "", repeats, result.chat.tool_calls),
+                result.chat.content or "",
                 tool_calls=tuple(result.chat.tool_calls),
             )
 
@@ -1790,37 +1399,6 @@ class AgentLoop:
         # took, and the next overrun is a new run of bad luck rather than a
         # continuation of this one.
         self.state.truncated_turns = 0
-
-        if repeats >= MAX_REPLY_REPEATS:
-            # Every call in the reply still gets an answer. The assistant
-            # message declaring them is in the working set, and an orphaned
-            # `tool_call_id` poisons the resume as surely as it poisons the wire.
-            self._answer_unrun(
-                result.chat.tool_calls,
-                f"the run ended: this reply had been sent {repeats} times before, "
-                "unchanged.",
-            )
-            still_open = self._outstanding()
-            self.result = RunResult(
-                Outcome.NO_PROGRESS,
-                f"the model sent the same reply {repeats + 1} times running -- the same "
-                "text and the same call each time -- so nothing this phase did could "
-                "have changed anything"
-                + (". Still outstanding: " + ", ".join(still_open) if still_open else ""),
-                self.context.turn,
-                tuple(self.router.touched),
-                self.state.last_gate,
-            )
-            return
-        if repeats >= REPLY_REPEATS_BEFORE_ANSWER:
-            # `must_answer` and nothing else. Setting `answer_because` too would
-            # route the next turn down the branch that narrows the tool list --
-            # `because` is the refused-terminal path, where forcing a write
-            # would be wrong -- and that is the branch `_outstanding` exists to
-            # keep a stall out of. A repeated reply *is* a stall, with the
-            # strongest evidence there is, so it takes the stall's path and
-            # `_stall_notice` adds the one sentence that is new.
-            self.state.must_answer = True
 
         if result.chat.tool_calls:
             self.state.research_turns += 1
@@ -1899,7 +1477,6 @@ class AgentLoop:
                 tool_choice=choice,
                 session_id=self.session_id,
                 on_delta=lambda fragment: self._relay(deltas.feed(fragment)),
-                debug=self._debug,
             )
 
         ticker.start()
@@ -1952,42 +1529,6 @@ class AgentLoop:
                 )
                 return None
         except Exception as exc:  # noqa: BLE001 - the transport failing is not the model's fault
-            # The endpoint refusing the request as too large is the one failure
-            # here that is recoverable, and it was being ended as ERROR with the
-            # machinery to recover sitting three lines above.
-            #
-            # It happens because the local estimate and the server's tokeniser
-            # disagree: `Calibration` narrows that gap but cannot close it, and
-            # the disagreement is largest exactly where it matters, on a context
-            # near the budget. `OverBudgetError` is the estimate noticing; this
-            # is the server noticing first.
-            #
-            # Deterministic compaction, not the summariser: a run that has just
-            # been refused for sending too much should not answer by sending a
-            # summarisation request built from the same context. One retry, and
-            # only if the prompt actually got smaller -- retrying an unchanged
-            # request is how a recovery becomes a loop with a bill attached.
-            if _context_length_error(exc) and not self._overflow_recovered:
-                self._overflow_recovered = True
-                before = self.context.usage().total
-                yield from self._compact(
-                    retain_pct=0.15, reason="overflow recovery", strategy="basic"
-                )
-                after = self.context.usage().total
-                yield Event(
-                    EventType.GATE,
-                    {
-                        "kind": "overflow_recovery",
-                        "before": before,
-                        "after": after,
-                        "retrying": after < before,
-                    },
-                )
-                if after < before:
-                    try:
-                        return dispatch(tool_choice)
-                    except Exception as retried:  # noqa: BLE001 - report the second one
-                        exc = retried
             yield Event(EventType.ERROR, {"message": str(exc)})
             self.result = RunResult(
                 Outcome.ERROR, str(exc), self.context.turn, tuple(self.router.touched)
@@ -2012,20 +1553,6 @@ class AgentLoop:
         decided the answer is in the knowledge base keeps rewording the
         question.
 
-        **That one is no longer done here.** It was, and it was the most
-        expensive line in this method: the tool schemas are serialised into the
-        prompt by the chat template *ahead of the system message*, so dropping
-        one mid-run changes the token stream at position zero and invalidates
-        the server's prefix cache for the whole rest of the run. Measured on
-        this manager's own `novel_tokens`, a break at turn 20 re-prefills about
-        15,000 tokens and at turn 100 about 76,000 -- to withhold one schema of
-        roughly forty.
-        ``_tool_calls`` refuses the call instead, in the same batch pre-check
-        that answers a repeat: same hard stop, same wording, and the request the
-        model is judged against does not move. The refusal is stronger than the
-        withdrawal was, not weaker -- a removed tool is silent, and a refusal
-        names what to do instead.
-
         Nothing else is ever withdrawn. The old loop took the read tools away
         from a Planner at turn 16 and the lookup tools away from a Coder at
         turn 16, in both cases to force a decision the mode had no other way to
@@ -2033,101 +1560,9 @@ class AgentLoop:
         model about what exists.
         """
         tools = self.router.schemas_for(self.state.mode)
-        # And one withheld, which is the same mechanism pointed the other way.
-        #
-        # `ask_developer` is dispatchable in the acting phase -- the registry
-        # says so, and `_phase_ended` has always handled the call from any mode.
-        # It is *shown* there only during a migration. The unknowns a conversion
-        # runs into do not arrive while planning, which is when the Planner
-        # holds this tool: the field type, the route base and the branch to cut
-        # surface while the file is being converted, and the acting phase's only
-        # answers to one were to guess or to stop. A forty-file conversion can
-        # afford neither.
-        #
-        # Withheld rather than added, because the two locks are not symmetric:
-        # `schemas_for` decides what the model is shown and the router decides
-        # what it may run. Making this conditional on the schema side keeps
-        # ordinary acting turns exactly as they were, while a replayed stale
-        # schema list still dispatches correctly instead of being refused.
-        #
-        # `lib_version_check` is withheld on the same condition and for the
-        # mirror of the same reason. Outside a conversion, a version tool in the
-        # phase that edits invites a library bump in the middle of unrelated
-        # work; inside one, the first phase *is* the bump, and a run that cannot
-        # ask what version a library is at guesses — a field run carried the
-        # superseded module's version across the rename and lost thirty-eight
-        # turns to six revisions that had never existed.
-        if self.state.mode is Mode.AGENT and not self.state.migration.active:
-            withheld = {"ask_developer", "lib_version_check"}
-            tools = [t for t in tools if t["function"]["name"] not in withheld]
+        if self.state.retrieval_repeats >= MAX_RETRIEVAL_REPEATS:
+            tools = [s for s in tools if s["function"]["name"] != "search_docs"]
         return tools
-
-    def _migration_guard(self, call: ToolCall) -> ToolResult | None:
-        """Hold a migration's first write until the branch it belongs on exists.
-
-        The SOP's step one, enforced rather than described. A conversion is
-        reviewable and revertible as one unit only if it is one branch cut from
-        ``development``; started on whatever the developer happened to be
-        standing on, it is forty commits interleaved with everybody else's work
-        and there is no revert.
-
-        Three things narrow it to the case it is for, because a guard that fires
-        anywhere else is a guard that stops ordinary work:
-
-        * only when the run is a migration;
-        * only for a tool that writes, and never for ``git_ops`` itself -- the
-          one call that can clear the condition must not be the one it blocks;
-        * only when the workspace is a git repository at all. "If a git repo is
-          provided" is the rule; a service opened as a plain directory has no
-          branches to cut and holding its writes would be refusing the task over
-          a condition it cannot satisfy.
-
-        The refusal names the whole move, including the confirmation: which
-        branch to cut and what to cut it from is a decision about somebody
-        else's repository, and ``ask_developer`` is how this loop asks.
-        """
-        migration = self.state.migration
-        if not migration.active:
-            return None
-        # A branch, *and* one that is not the branch everybody else is on.
-        #
-        # The recorded branch comes from `git_ops`, which reports whatever it
-        # checked out -- including `development` itself, if that is what it was
-        # asked for. Treating that as "the migration has a branch" would let the
-        # conversion land as forty commits on the shared branch, which is the
-        # one outcome step one exists to prevent.
-        if migration.branch and migration.branch.lower() not in PROTECTED:
-            return None
-        spec = registry.get(call.name)
-        if spec is None or not spec.mutates or call.name == "git_ops":
-            return None
-        if not (self.router.workspace.root / ".git").is_dir():
-            return None
-        self._save_routes()
-        on = (
-            f" It is on {migration.branch}, which is a shared branch."
-            if migration.branch
-            else ""
-        )
-        return ToolResult.failure(
-            f"{call.name} was not run: this is a service migration and it is not on "
-            f"a migration branch yet.{on}",
-            fix=(
-                "Do this first, in order. 1) `git_status` — it lists the local "
-                "branches, so you can see whether `"
-                + BASE_BRANCH
-                + "` exists. 2) `ask_developer` — confirm the branch to cut and what "
-                "to cut it from, naming what you found: `"
-                + BASE_BRANCH
-                + "` if it is there, otherwise the branch they want replicated. Do "
-                "not assume it. 3) `git_ops` with op=branch, message="
-                + DEFAULT_BRANCH
-                + " and base=<branch to cut from>, which creates the branch with "
-                "that base's code in it. The writes are held until then; nothing "
-                "else about the plan changes."
-            ),
-            meta={"migration": "needs a branch"},
-        )
 
     def _must_call_a_tool(self) -> bool:
         """Whether this turn is one the mode cannot legitimately end with prose.
@@ -2301,14 +1736,6 @@ class AgentLoop:
             "budget_used_pct": round(usage.used_pct, 1),
             "reasoning_tokens": result.chat.usage.reasoning_tokens,
             "estimate_error": result.estimate_error,
-            # Which part of the cacheable head moved this turn, or "".
-            #
-            # It belongs on the usage event because it *is* a usage fact: a
-            # broken prefix is the difference between the server reading this
-            # prompt and recomputing it, and on a shared GPU that is the
-            # largest single number in the row it sits next to. `cached_tokens`
-            # says what the cache gave; this says why it gave less.
-            "prefix_break": self.state.prefix_break,
         }
         # One line per call, which is the thing an in-progress run makes
         # visible and the end-of-run summary cannot: a run that is climbing
@@ -2370,29 +1797,17 @@ class AgentLoop:
         # The world changed since the ledgers were written: forget them. A
         # mutation invalidates all of them at once -- a cached search may now be
         # wrong, a missing path may now exist, and a repeat is re-checking work
-        # rather than looping. The rule lives on the ledger that owns the
-        # fields, so a sixth one added there cannot be missed here.
-        self.state.calls.world_changed(self.router.mutations)
+        # rather than looping.
+        if self.router.mutations != self.state.mutations_seen:
+            self.state.mutations_seen = self.router.mutations
+            self.state.seen_calls.clear()
+            self.state.last_results.clear()
+            self.state.dead_ends.clear()
+            self.state.truncated_at.clear()
 
         mutated = False
-        #: Whether anything this batch changed was a change the run had not
-        #: already made and undone. Distinct from ``mutated``, which is about
-        #: the disk: a turn that deletes a file it wrote back last turn has
-        #: mutated the workspace and moved the run nowhere. See ``churn``.
-        productive = False
         #: Dispatched calls that told the run something it did not already have.
         informed = 0
-        #: Files this batch deleted that the plan did not ask to have removed.
-        #: Reported after the batch, on the turn it happened. See the mutation
-        #: handling below.
-        removed_open: list[str] = []
-        #: Files this batch deleted for at least the second time, having written
-        #: them back in between. A different objection from ``removed_open`` and
-        #: it has to be, because ``removed_open``'s remedy is what produced it.
-        churned: list[str] = []
-        #: Toolchain checks that failed while a conversion is still open. Their
-        #: failure is expected and their own fix line is wrong there.
-        mid_migration_failures: set[str] = set()
 
         # What in this batch will not be dispatched, and why. Three rules, all
         # about the batch rather than any one call: a call repeated verbatim in
@@ -2413,28 +1828,6 @@ class AgentLoop:
                 )
                 continue
             seen_in_batch.add(fingerprint)
-            if (
-                call.name == "search_docs"
-                and self.state.retrieval_repeats >= MAX_RETRIEVAL_REPEATS
-            ):
-                # Refused here rather than withheld from the schema list.
-                #
-                # `_tools` used to drop `search_docs` on this condition, and the
-                # tool schemas sit ahead of the system message in the assembled
-                # prompt -- so the withdrawal changed the token stream at
-                # position zero and cost a full prefix re-prefill for the rest
-                # of the run, tens of thousands of tokens, to hide one schema.
-                #
-                # The stop itself is unchanged and is what was measured: the
-                # corpus does not acquire new sections mid-run, so nothing that
-                # follows could change the answer, and a model that has decided
-                # the answer is in the knowledge base keeps rewording the
-                # question. A refusal says so; a missing tool says nothing.
-                skipped[call.id] = self._retrieval_exhausted()
-                continue
-            if reason := self._resurrects_a_retired_file(call):
-                skipped[call.id] = reason
-                continue
             if call.name == "finish" and others:
                 skipped[call.id] = (
                     "it was sent in the same reply as other calls. Read their "
@@ -2447,44 +1840,6 @@ class AgentLoop:
                     f"more than {MAX_CALLS_PER_BATCH} calls were sent in one reply; "
                     "ask for it again in a later turn."
                 )
-
-        # A batch that is all reads runs at once.
-        #
-        # The calls used to run one after another on the worker thread, which
-        # is right for writes -- two `patch_file` calls against one file must
-        # not interleave, and the undo store's first-write-wins rule is about
-        # order -- and needlessly slow for six `read_file` calls that touch
-        # nothing. `hooks.parallel_safe` is the predicate and it is
-        # conservative: nothing that mutates, nothing that needs approval,
-        # nothing whose provider serialises its own work anyway.
-        #
-        # All or nothing. Splitting a batch into a parallel group and a serial
-        # one would reorder results relative to the calls that produced them,
-        # and a transcript's value depends on a read appearing where the model
-        # asked for it. The loop below is unchanged: it consumes a result that
-        # is already in hand instead of dispatching one.
-        runnable = [c for c in calls if c.id not in skipped]
-        prefetched: dict[str, ToolResult] = {}
-        prefetched_intercepts: dict[str, tuple[str, str, str]] = {}
-        intercepts_ready = False
-        if (
-            len(runnable) >= 2
-            and not self.cancelled()
-            and parallel_batch(runnable, registry.get)
-        ):
-            # The intercept decisions are taken first, once, for the whole
-            # batch -- otherwise a call answered from a ledger would still have
-            # been dispatched in parallel, and the ledgers would be consulted
-            # twice. Safe to hoist *here* and nowhere else: every call in a
-            # parallel batch is a read, so none of them can change what the
-            # ledgers would have said about the ones after it.
-            intercepts_ready = True
-            for call in runnable:
-                if (answer := self._intercept(call, _fingerprint(call))) is not None:
-                    prefetched_intercepts[call.id] = answer
-            fresh = [c for c in runnable if c.id not in prefetched_intercepts]
-            if len(fresh) >= 2:
-                prefetched = self._dispatch_parallel(fresh)
 
         for index, call in enumerate(calls):
             if call.id in skipped:
@@ -2522,19 +1877,13 @@ class AgentLoop:
             fingerprint = _fingerprint(call)
             args = _safe_args(call)
 
-            intercepted = (
-                prefetched_intercepts.get(call.id)
-                if intercepts_ready
-                else self._intercept(call, fingerprint)
-            )
-            if intercepted:
+            if intercepted := self._intercept(call, fingerprint):
                 body, said, intercept_kind = intercepted
-                # The previous answers to this same question are stubbed out in
-                # the projection when the new one is appended.
+                # The previous answer to this same question is stubbed out
+                # before the new one is appended.
                 #
-                # Not deleted -- the record keeps its place and its
-                # `tool_call_id`, so nothing is orphaned. What is removed from
-                # *what the model reads* is the
+                # Not deleted -- the message keeps its place and its
+                # `tool_call_id`, so nothing is orphaned. What is removed is the
                 # *pattern*: N identical (call -> "answered from the previous
                 # result") pairs sitting in history are a few-shot demonstration
                 # of exactly the behaviour the answer is asking the model to
@@ -2544,15 +1893,14 @@ class AgentLoop:
                 # commit` call seven times and another the same `search_repo`
                 # eight times, each intercepted correctly and each answered into
                 # a transcript that told it to do it again.
-                #
-                # Tagged as an echo of this exact call, and that is the whole
-                # of it: the projection keeps the newest answer to each repeated
-                # question and stubs the rest, on every turn, without the loop
-                # having to remember which message to go back and rewrite --
-                # and without anything being rewritten. The earlier answers are
-                # still in the canonical transcript exactly as they were sent.
-                self.context.append_tool_result(
-                    call.name, body, tool_call_id=call.id, echo=fingerprint
+                if (prior := self.state.echoes.get(fingerprint)) is not None:
+                    self.context.supersede(
+                        prior,
+                        f"[{call.name} was asked again with these arguments and answered "
+                        "from the earlier result; the newest answer is below]",
+                    )
+                self.state.echoes[fingerprint] = self.context.append_tool_result(
+                    call.name, body, tool_call_id=call.id
                 )
                 yield Event(
                     EventType.TOOL_RESULT,
@@ -2588,42 +1936,7 @@ class AgentLoop:
                 },
             )
 
-            hook_notes: list[str] = []
-            arguments_to_run: Any = call.arguments
-            if self.hooks.any_before:
-                context = HookContext(
-                    call=call,
-                    arguments=args if isinstance(args, dict) else {},
-                    mode=self.state.mode,
-                    turn=self.context.turn,
-                )
-                decision = self.hooks.run_before(context)
-                if decision.note:
-                    hook_notes.append(decision.note)
-                if decision.arguments is not None:
-                    arguments_to_run = decision.arguments
-                if decision.stops:
-                    # A hook that stops a call answers it, exactly as a router
-                    # refusal does. The alternative -- dropping the call -- is
-                    # the malformed shape the coherence pass exists to repair,
-                    # manufactured on purpose.
-                    stopped = (
-                        ToolResult.success(decision.answer)
-                        if decision.answer
-                        else ToolResult.failure(decision.deny, fix=decision.fix)
-                    )
-                    yield from self._hooked_result(call, stopped, hook_notes)
-                    continue
-
-            if held := self._migration_guard(call):
-                yield from self._hooked_result(call, held, hook_notes)
-                continue
-
-            outcome = prefetched.get(call.id)
-            if outcome is None:
-                outcome = self.router.dispatch(
-                    call.name, arguments_to_run, mode=self.state.mode
-                )
+            outcome = self.router.dispatch(call.name, call.arguments, mode=self.state.mode)
 
             if isinstance(outcome, ApprovalRequest):
                 request = outcome
@@ -2652,21 +1965,6 @@ class AgentLoop:
 
             assert isinstance(outcome, ToolResult)
 
-            if self.hooks.any_after:
-                after = self.hooks.run_after(
-                    HookContext(
-                        call=call,
-                        arguments=args if isinstance(args, dict) else {},
-                        mode=self.state.mode,
-                        turn=self.context.turn,
-                    ),
-                    outcome,
-                )
-                if after.result is not None:
-                    outcome = after.result
-                if after.note:
-                    hook_notes.append(after.note)
-
             # A tool refused because this mode does not hold it says nothing
             # about the call, only about who is asking. It is not progress and
             # it is never cached: the fingerprint carries no mode, so a refusal
@@ -2683,37 +1981,15 @@ class AgentLoop:
             # other words returns the same body), it is not an empty finding,
             # and the overlap test below did not say it repeats.
             digest = _body_digest(call.name, outcome.for_model())
-            # Asked of the context, not of a set the loop keeps. "Has this run
-            # already been told this" and "can the model read it right now" are
-            # the same question, and keeping two answers to it is what made a
-            # compaction silently turn news back into old news -- or, worse,
-            # leave a body counted as seen after the message carrying it had
-            # stopped being visible.
-            novel = digest not in self.context.visible_bodies
+            novel = digest not in self.state.seen_bodies
+            self.state.seen_bodies.add(digest)
             if not refused_by_mode and novel and not _empty_finding(outcome):
                 informed += 1
             mutated = mutated or bool(outcome.mutations)
-            if (
-                not outcome.ok
-                and call.name in _TOOLCHAIN_CHECKS
-                and self.state.migration.defers_gate
-            ):
-                mid_migration_failures.add(call.name)
             if call.name == "go_mod":
                 self.state.dependencies_changed = True
-            # Where the migration's branch rule is satisfied, and it is read off
-            # the tool that did it rather than off the model's account of it.
-            # `git_ops` reports the branch it actually checked out, which is the
-            # only statement about the repository that cannot be wrong.
-            if call.name == "git_ops" and outcome.ok and outcome.meta.get("branch"):
-                self.state.migration.branch = str(outcome.meta["branch"])
-                self.state.migration.base = str(outcome.meta.get("base") or "")
-                # Written now rather than at the next plan change: the branch is
-                # the fact a developer opening the document first wants, and the
-                # next change to the plan may be several turns away.
-                self._save_progress()
 
-            self.state.calls.asked(fingerprint)
+            self.state.seen_calls[fingerprint] = self.state.seen_calls.get(fingerprint, 0) + 1
             # Terminal calls are never cached. `_intercept` already declines to
             # answer them from a ledger, so this is belt and braces -- but the
             # entry it used to write is the one that deadlocked the run, and a
@@ -2740,77 +2016,10 @@ class AgentLoop:
             # A file that was just written is worth reading again.
             for mutation in outcome.mutations:
                 self.state.reads.pop(mutation.path, None)
-                if mutation.kind is MutationKind.DELETE:
-                    # **A delete is not a write**, and treating it as one loses
-                    # the file.
-                    #
-                    # `write_file` refuses to overwrite, so the way to replace a
-                    # file is to delete it and write it again -- and a field run
-                    # did exactly that to `handler/paogen.go` (6,571 lines),
-                    # `handler/publicacct.go`, `handler/transferentry.go` and
-                    # `handler/objectionfile.go`, deleting each one, never
-                    # writing the replacement, and moving to the next step. Four
-                    # files gone. The deletion counted as the step's mutation,
-                    # so the step went `written`, the cursor advanced, and
-                    # nothing in the run's own state disagreed.
-                    #
-                    # Unless the step *is* the deletion. `routes.go`, `docs.go`
-                    # and the swaggo artefacts are removed by this migration on
-                    # purpose, and a step that says so is satisfied by the
-                    # delete -- otherwise this becomes a condition no run can
-                    # clear, which is the failure this file keeps rebuilding.
-                    # `action` is a typed field the model filled in to say what
-                    # the step does; reading it is not the same as reading prose
-                    # out of a reply.
-                    cycles = self._note_delete(mutation.path)
-                    if cycles:
-                        # Told about whatever the plan says, because a turn that
-                        # goes round stops counting as progress whatever the
-                        # plan says, and a stall counter ticking with nothing
-                        # explaining it is the state this run was already in.
-                        churned.append(mutation.path)
-                    else:
-                        productive = True
-                    if self._step_wants_removal(mutation.path):
-                        self._mark_steps(mutation.path, "written")
-                        # Recorded so a later write can be recognised as undoing
-                        # it. See `TaskState.retired`.
-                        self.state.retired.add(mutation.path)
-                        continue
-                    # `removed` is the ledger of files *lost*, and it is written
-                    # here rather than above the branch for a reason a field run
-                    # paid for: a planned deletion used to enter it too, and
-                    # `_deleted_and_not_replaced` reads it against the disk and
-                    # nothing else. So a migration that removed `routes/routes.go`
-                    # exactly as its plan said had its first `finish` refused with
-                    # "you deleted routes/routes.go ... so that file is simply
-                    # gone", and only got past it because MAX_FINISH_REFUSALS is
-                    # 1. A deletion the plan asked for is not a loss.
-                    self.state.removed.add(mutation.path)
-                    self._mark_steps(
-                        mutation.path,
-                        "pending",
-                        "deleted; its replacement has not been written",
-                    )
-                    # One objection per path, and not this one while it cycles:
-                    # "write it back" is the instruction that produced the
-                    # second deletion, and repeating it is repeating the loop.
-                    if not cycles:
-                        removed_open.append(mutation.path)
-                    continue
-                if not self._note_write(mutation.path):
-                    productive = True
-                self.state.removed.discard(mutation.path)
-                # A mutation on a plan step's file is that step *written* --
-                # from the change set, which cannot lie, rather than from the
-                # model saying so.
-                #
-                # Written, not done. This used to be `done`, which meant a step
-                # was finished the instant a write landed on it, before anything
-                # looked at what had been written: a file written wrongly was a
-                # completed step. `_inner_loop`, which runs after this batch and
-                # is already scoped to the touched files, is what promotes it.
-                self._mark_steps(mutation.path, "written")
+                # A mutation on a plan step's file is that step done -- from the
+                # change set, which cannot lie, rather than from the model
+                # saying so.
+                self._mark_steps(mutation.path, "done")
 
             slice_path, slice_range = _slice_path(call, outcome)
             appended = self.context.append_tool_result(
@@ -2819,13 +2028,6 @@ class AgentLoop:
                 tool_call_id=call.id,
                 path=slice_path,
                 line_range=slice_range,
-                # Recorded on the message so the projection can answer, later
-                # and without the loop's help, whether this exact call's result
-                # is still readable and whether its body is still news.
-                fingerprint=fingerprint,
-                body=digest,
-                ok=outcome.ok,
-                mutation=bool(outcome.mutations),
             )
             if slice_path is not None:
                 # Recorded from what is *in context*, not from what the tool
@@ -2841,15 +2043,6 @@ class AgentLoop:
                     appended.line_range,
                     int(outcome.meta.get("lines") or 0),
                     delivered=appended.line_range is not None or slice_range is None,
-                )
-
-            for note in hook_notes:
-                # As a `role: user` message inside a `<hook_context>` block
-                # with sanitised attributes. A hook that could emit a
-                # `role: tool` message could tell the model that `go_build`
-                # passed, and the model has no way to tell the difference.
-                self.context.append_user(
-                    hook_context_block("hook", call, note), visibility=Visibility.MODEL
                 )
 
             if note := self._overlap(call, outcome):
@@ -2920,13 +2113,7 @@ class AgentLoop:
         # Turn-level progress, judged on the batch rather than on any one call.
         # A batch that dispatched nothing -- every call a verbatim repeat or a
         # known dead end -- moved the run nowhere, however many calls it held.
-        #
-        # ``productive`` rather than ``mutated``, and the difference is one
-        # field session: a run that deletes a file, is told to write it back,
-        # writes it back and deletes it again has mutated the workspace four
-        # times and changed nothing. Every one of those turns reset this
-        # counter, so the six-stall bound never came near firing.
-        if informed > 0 or productive:
+        if informed > 0 or mutated:
             self.state.stalled_turns = 0
         else:
             self.state.stalled_turns += 1
@@ -2953,84 +2140,6 @@ class AgentLoop:
                 self.result = self._stalled()
                 return
 
-        if broke := sorted(mid_migration_failures):
-            # The gate is deferred mid-conversion for a reason this file states
-            # at length -- "every build between those two points fails,
-            # correctly, on code the plan has not reached yet" -- and then
-            # leaves the model the same button. `go_build` is in the acting
-            # phase's tool list, `commands.py` has never heard of a migration,
-            # and its fix line says "fix the first error listed".
-            #
-            # A field run followed that instruction exactly. The first error was
-            # `package gotemplate/routes is not in std`, because `main.go` still
-            # imported a package the plan had correctly deleted, so it recreated
-            # `routes/routes.go`. Then `handler/response.go`, gin helpers and
-            # all. The tool told it to, and nothing told it otherwise.
-            self.context.append_user(
-                f"{', '.join(broke)} failed, and this service is mid-conversion. "
-                "Errors in code the plan has not reached yet are expected here: "
-                "half the service imports the old libraries and half imports the "
-                "new ones, and it does not build again until the last phase "
-                "closes. The gate knows that and is deferred until then.\n\n"
-                "So do not work down that error list. Fix only what *this phase's "
-                "steps* are about, and read the rest as the conversion being "
-                "half done.\n\n"
-                "In particular: if an error names a file the plan deleted, the "
-                "fix is in whatever still refers to it. Restoring the file puts "
-                "back the thing this migration exists to remove."
-            )
-
-        if churned:
-            # First, because it is the objection that supersedes the other one.
-            # A path in here has already been through `removed_open`'s remedy --
-            # "write it back" -- and come out the far side deleted again, so
-            # repeating that remedy is repeating the loop.
-            #
-            # What it asks for instead is a decision, and it names the two
-            # things that can be true. Either the plan step really does remove
-            # the file, in which case its `file` or its `action` is written in a
-            # way `_step_wants_removal` cannot read and `revise_plan` fixes it in
-            # one call; or it does not, in which case the file stays. The model
-            # is the only party that knows which, and until now nothing asked it.
-            names = ", ".join(dict.fromkeys(churned))
-            them = "them" if len(churned) > 1 else "it"
-            self.context.append_user(
-                f"You have deleted {names} again, having written {them} back after "
-                "the last time. That is a cycle, and this is the second time round.\n\n"
-                "Nothing about the workspace differs between those two turns, so a "
-                "third delete lands exactly where this one did. Decide instead:\n\n"
-                f"- If your plan step removes {them}, leave {them} deleted and work "
-                "the next step. If the step is not closing on the delete, its `file` "
-                "names more than one path or its `action` does not say the file is "
-                "removed -- `revise_plan` with one step per file, `action` saying it "
-                "is deleted, fixes both.\n"
-                f"- If the step does not remove {them}, leave {them} on disk and work "
-                "the next step.\n\n"
-                "Going round again ends the run as stalled."
-            )
-
-        if removed_open:
-            # Said immediately, on the turn the file went, because that is the
-            # only turn on which the model still holds what was in it. One turn
-            # later the read is out of context and the replacement has to be
-            # written from a file that no longer exists.
-            #
-            # After the batch rather than inside it: a user message between an
-            # assistant's tool calls and their results is the malformed shape
-            # the coherence pass exists to repair.
-            names = ", ".join(dict.fromkeys(removed_open))
-            self.context.append_user(
-                f"You deleted {names} and the plan does not say to remove "
-                + ("them" if len(removed_open) > 1 else "it")
-                + ". Nothing is there now.\n\n"
-                "If that was to rewrite the file, write it in this turn -- you are "
-                "holding what was in it and the next turn will not be. `write_file` "
-                "creates it, and `append=true` adds the rest if it does not fit in "
-                "one reply.\n\n"
-                "The step has been put back to pending, so it is still open and the "
-                "run cannot finish while it is."
-            )
-
         if mutated:
             # Writing is not research. The fence exists to stop a phase spent
             # reading and never deciding; a turn that changed a file has decided,
@@ -3038,72 +2147,6 @@ class AgentLoop:
             # a product that advertises 400 (BUG L-2).
             self.state.research_turns = 0
             yield from self._inner_loop()
-
-    def _dispatch_parallel(self, calls: Sequence[ToolCall]) -> dict[str, ToolResult]:
-        """Run a batch of read-only calls at once, and return them by call id.
-
-        Bounded by ``MAX_PARALLEL_CALLS`` threads: the work is IO-bound on one
-        developer's disk, and the marginal thread past four buys contention.
-
-        Anything that does not come back as a plain ``ToolResult`` is dropped
-        from the map rather than used, so the sequential path below dispatches
-        it normally. That covers the case ``parallel_safe`` is written to
-        exclude and cannot fully guarantee -- a tool that asks for approval --
-        and it fails towards the slow, correct behaviour rather than towards a
-        blocked thread pool.
-
-        A raised exception is dropped the same way. It will be raised again on
-        the sequential dispatch, where the loop's existing error handling can
-        see it in the right order.
-        """
-        out: dict[str, ToolResult] = {}
-        if not calls:
-            return out
-        mode = self.state.mode
-        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_CALLS, len(calls))) as pool:
-            futures = {
-                pool.submit(self.router.dispatch, call.name, call.arguments, mode=mode): call
-                for call in calls
-            }
-            for future in futures:
-                call = futures[future]
-                try:
-                    outcome = future.result()
-                except Exception:  # noqa: BLE001 - re-run in sequence, in order
-                    continue
-                if isinstance(outcome, ToolResult):
-                    out[call.id] = outcome
-        return out
-
-    def _hooked_result(
-        self, call: ToolCall, outcome: ToolResult, notes: Sequence[str]
-    ) -> Iterator[Event]:
-        """Record a result a hook produced instead of the tool, and report it.
-
-        Kept separate from the dispatch path because a hook's decision is not a
-        tool call: nothing was dispatched, no mutation happened, and no ledger
-        should learn anything about the tool from it. What the model gets is the
-        same shape it gets from any refusal, which is the whole point -- a
-        denied call the model is never told about is a call it will make again.
-        """
-        self.context.append_tool_result(
-            call.name, outcome.for_model(), tool_call_id=call.id, ok=outcome.ok
-        )
-        for note in notes:
-            self.context.append_user(
-                hook_context_block("hook", call, note), visibility=Visibility.MODEL
-            )
-        yield Event(
-            EventType.TOOL_RESULT,
-            {
-                "id": call.id,
-                "name": call.name,
-                "turn": self.context.turn,
-                "dispatched": False,
-                "hooked": True,
-                **outcome.as_dict(),
-            },
-        )
 
     def _stalled(self) -> RunResult:
         """End a run that stopped asking for anything new, and say what it did.
@@ -3197,7 +2240,7 @@ class AgentLoop:
         # A known dead end. The tool itself declared this exact call unable to
         # succeed, so asking again cannot change the answer.
         if reason := self.state.dead_ends.get(fingerprint):
-            self.state.calls.asked(fingerprint)
+            self.state.seen_calls[fingerprint] = self.state.seen_calls.get(fingerprint, 0) + 1
             return (
                 f"{call.name} with these arguments cannot succeed: {reason}. That was "
                 "established earlier this run and nothing has changed since, so it was "
@@ -3214,18 +2257,9 @@ class AgentLoop:
         capped = self.state.truncated_at.get(fingerprint)
         wants_more = capped is not None and _volume(call) > capped
         cached = self.state.last_results.get(fingerprint)
-        # ...and only while the model can still read the answer it is being
-        # pointed at. This is the exact shape of the failure the canonical
-        # transcript exists to prevent: the cache said "you already have this",
-        # a compaction had projected a recap over the message carrying it, and
-        # the two statements could not both be obeyed (BUG L-10, L-25). The
-        # ledger is no longer the authority on that -- the request is, and
-        # ``visible_results`` is computed from the request.
-        if cached is not None and fingerprint not in self.context.visible_results:
-            self.state.calls.forget(fingerprint)
-            cached = None
         if cached is not None and not wants_more:
-            asks = self.state.calls.asked(fingerprint)
+            asks = self.state.seen_calls.get(fingerprint, 0) + 1
+            self.state.seen_calls[fingerprint] = asks
             # The answer first, the bookkeeping after. This used to open "Not
             # run:" with ok=false, which is how a call that succeeded came to
             # look like a call that failed -- and a model that reads a failure
@@ -3308,71 +2342,6 @@ class AgentLoop:
             "- `ask_developer` only if one unknown blocks everything else."
         )
 
-    def _why_not_done(self) -> str:
-        """Why this run is not finished, or ``""`` when nothing says otherwise.
-
-        One predicate over what were three separate checks, in three places,
-        each with its own bound and its own idea of what "done" means:
-        ``_open_targets`` (the plan names files nothing has written),
-        ``_gate_wants_an_edit`` (a failing gate is asking for a change), and the
-        ``finish_refused`` counter that decides whether either may speak again.
-
-        Folding them is Cline's ``completionGuard`` -- a predicate that returns
-        the reason the run is not done, or nothing -- and it is worth taking for
-        a reason their version does not have: here the three checks *interact*.
-        A plan with unwritten targets and a failing gate is one situation, and
-        answering it twice reads to the model as two different objections to the
-        same move. A run that has been pushed back on once has had its say.
-
-        The bounds stay where they were and stay measured. What changes is that
-        "is this run done" is answerable in one place, by callers that used to
-        each ask half the question.
-        """
-        if self.state.finish_refused >= MAX_FINISH_REFUSALS:
-            # It has been sent back once. The model may have decided a step is
-            # unnecessary, and it is entitled to say so and be believed; what it
-            # is not entitled to is silence, and it has now spoken twice.
-            return ""
-        if gone := self._deleted_and_not_replaced():
-            # First, because it is the one objection that names work already
-            # *lost* rather than work not yet started. A run that finishes here
-            # leaves the developer a repository with four handlers missing.
-            return (
-                "you deleted "
-                + ", ".join(gone)
-                + " and "
-                + ("none of them have" if len(gone) > 1 else "it has not")
-                + " been written again, so "
-                + ("those files are" if len(gone) > 1 else "that file is")
-                + " simply gone"
-            )
-        if missing := self._open_targets():
-            return (
-                "your plan set out to write "
-                + ", ".join(missing)
-                + (" and none of them have been written" if len(missing) > 1
-                   else " and it has not been written")
-            )
-        if unverified := [s for s in self.state.plan if s.status == "written"]:
-            # Written but not clean. A distinct objection from "you never wrote
-            # it", and the plan could not state it at all before the `written`
-            # status existed -- the step was `done` the moment the write landed,
-            # so a file written wrongly closed its step.
-            names = ", ".join(s.file for s in unverified[:STATE_ITEMS])
-            return (
-                f"{names} " + ("have" if len(unverified) > 1 else "has")
-                + " been written but the formatter and the contract linter are not "
-                "clean on "
-                + ("them" if len(unverified) > 1 else "it")
-                + " yet"
-            )
-        if self._gate_wants_an_edit():
-            report = self.state.last_gate
-            blocker = getattr(report, "blocked_by", None) if report else None
-            where = f" at {blocker}" if blocker else ""
-            return f"the verification gate is failing{where} and nothing has been edited since"
-        return ""
-
     def _gate_wants_an_edit(self) -> bool:
         """Whether a failing gate is currently asking for a change that has not come.
 
@@ -3415,106 +2384,6 @@ class AgentLoop:
             return _FORCE_FINISH
         return "required"
 
-    def _note_prefix(self, tools: Sequence[dict[str, Any]]) -> str:
-        """Record what the cacheable head of this request hashes to; say if it moved.
-
-        The server reuses the KV state of a *prefix*, so the whole saving turns
-        on the head of the request being byte-identical from one turn to the
-        next. The message layers are ordered for that and the ordering is
-        measured (`ContextManager.build`). The head in front of them is not:
-        the chat template serialises the tool schemas ahead of the system
-        message, so the tools array is position zero, and two rules were
-        rewriting it mid-run -- one dropping `search_docs` at a repeat cap, one
-        narrowing to the terminals on a forced answer. Each cost a full
-        re-prefill, roughly 15,000 tokens at turn 20 and 76,000 at turn 100, and
-        nothing anywhere reported it. Both are fixed; this is what would have
-        found them, and what will find the next one.
-
-        Hashed in prompt order and reported by the *first* part that moved,
-        because a change in the tools invalidates the system message after it
-        whether or not the system message also changed. Naming all three would
-        be three findings about one event.
-
-        Free when nothing changes: three hashes of small strings, once a turn.
-        """
-        key = (
-            hashlib.sha256(
-                json.dumps(list(tools), sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()[:16],
-            hashlib.sha256(system_prompt().encode("utf-8")).hexdigest()[:16],
-            hashlib.sha256(
-                mode_instruction(self.state.mode).encode("utf-8")
-            ).hexdigest()[:16],
-        )
-        was, self.state.prefix_key = self.state.prefix_key, key
-        if was == ("", "", ""):
-            # The first turn of a run writes the cache rather than breaking it.
-            self.state.prefix_break = ""
-            return ""
-        for part, before, now in zip(("tools", "system", "mode"), was, key):
-            if before != now:
-                self.state.prefix_break = part
-                return part
-        self.state.prefix_break = ""
-        return ""
-
-    def _terminal_request(
-        self, tools: list[dict[str, Any]], choice: str | dict[str, Any]
-    ) -> tuple[list[dict[str, Any]], str | dict[str, Any]]:
-        """The tools and the choice for a turn that has to end the phase.
-
-        Two ways to constrain such a turn, and they cost very differently.
-
-        Narrowing the tool list to the terminals is what makes ``"required"``
-        safe -- with the full list, ``required`` only guarantees *a* call, and
-        the model carries on researching. But the schemas are serialised into
-        the prompt ahead of the system message, so a narrowed list is a
-        different token stream from position zero: the server's prefix cache
-        misses on the way in and misses again on the way out, two full
-        re-prefills for one turn. On a context of the size a migration reaches
-        that is ~15,000 tokens at turn 20 and ~76,000 at turn 100, each way.
-
-        **Naming the tool costs nothing.** ``tool_choice: {name: X}`` constrains
-        the turn exactly as hard as a one-tool list and leaves the request
-        byte-identical up to the last message. So when the mode has a single
-        terminal the list stays whole and the choice names it.
-
-        That is ASK always, and AGENT only outside a migration. **Inside one,
-        AGENT holds ``ask_developer`` too** -- `registry` shows it there
-        deliberately, because a conversion meets its unknowns while converting
-        -- so the cheap path does not fire and every forced turn of a migration
-        pays the re-prefill twice. This said "ASK and AGENT, where it is
-        ``finish``" for as long as that has been false, which is the kind of
-        comment that costs a reader an afternoon: `prefix_break` reported
-        ``tools`` on every turn of session 6d923ab574ae from 109 on and the
-        docstring said it could not.
-
-        Not fixed by naming ``finish`` anyway. Two terminals are two different
-        answers to "what is this turn for", and choosing for the model is BUG
-        L-28 in the other mode. What removes the cost is not reaching here: a
-        stall with outstanding work now takes the `required`-over-the-whole-list
-        branch in `_run`, which is the case this was being paid for.
-
-        PLANNER keeps the narrowed list, and that is deliberate rather than an
-        oversight. Its three terminals are three different answers to "what was
-        this task?", naming one of them is exactly the mistake that wrote an
-        unrequested migration (BUG L-28, see `_terminal_choice`), and there is
-        no way to say "one of these three" other than by sending those three.
-        One re-prefill is the price of not making that choice for the model.
-        """
-        if isinstance(choice, dict):
-            # Already named -- the second force, which says `finish`. Narrowing
-            # on top of a named choice buys nothing and costs a re-prefill: the
-            # endpoint is constrained to one tool either way.
-            return tools, choice
-        terminals = self._terminal_tools()
-        names = [t["function"]["name"] for t in terminals]
-        if len(names) == 1:
-            # `required` over one tool and a named choice over all of them are
-            # the same constraint; only one of them moves the prompt.
-            return tools, {"type": "function", "function": {"name": names[0]}}
-        return terminals, choice
-
     def _terminal_tools(self) -> list[dict[str, Any]]:
         """Every way this mode can end its phase, and nothing else.
 
@@ -3543,56 +2412,6 @@ class AgentLoop:
         prose used to mean there and is the thing this model can reliably say.
         """
         if tool == "ask_developer":
-            fingerprint = _asked_fingerprint(outcome.meta.get("questions") or ())
-            if (
-                fingerprint in self.state.asked
-                and self.state.answered
-                and self.state.reasks < MAX_REASKS
-            ):
-                # Sent back with the answer, rather than put to the developer a
-                # second time.
-                #
-                # `ask_developer` is exempt from all three intercept ledgers --
-                # a repeated terminal call is a model trying to stop, and the
-                # bounded refusals here are what answer it -- so this was the
-                # one call in the system that could repeat verbatim forever with
-                # nothing counting it. A field run asked which n-api-* versions
-                # to use, was told "use latest versions", and asked the
-                # identical question twice more, each answer ending one run and
-                # starting another that re-derived the same question from the
-                # same unchanged cursor.
-                #
-                # Bounded at one, like every other refusal here: the model may
-                # be asking something the answer genuinely did not cover, and
-                # the second asking is believed.
-                self.state.reasks += 1
-                self.context.append_user(
-                    "You have already asked that, and it was answered:\n\n"
-                    f"    {self.state.answered.strip()}\n\n"
-                    "Act on that answer. Asking again puts the same question to "
-                    "the developer a second time and moves nothing.\n\n"
-                    "If it genuinely does not settle the step, say which part of "
-                    "it does not and what you will do instead -- and if the step "
-                    "cannot be done at all, `revise_plan` it to `blocked` with "
-                    "the reason, which moves the plan past it rather than "
-                    "stopping the run."
-                )
-                return
-
-            # Held for the answer. This is the only follow-up whose intent the
-            # loop knows rather than guesses, and it is the one the classifier
-            # was measured getting wrong: a Planner's four questions about a
-            # migration came back answered and were read as "asking for
-            # validation, not code changes".
-            #
-            # Recorded before the run ends, so the next one can tell a fresh
-            # question from a repeat. The answer is cleared with it: what is
-            # outstanding now is *this* question, and the previous answer is not
-            # a reply to it.
-            self.state.asked.append(fingerprint)
-            del self.state.asked[:-STATE_ITEMS]
-            self.state.answered = ""
-            self.state.awaiting = self.state.intent
             self.result = RunResult(
                 Outcome.DONE,
                 "the planner asked for a decision before it could plan; answer it "
@@ -3619,61 +2438,17 @@ class AgentLoop:
             # step is unnecessary, and it is entitled to say so and be believed.
             # What it is not entitled to is silence.
             missing = self._open_targets()
-            if reason := self._why_not_done():
+            if missing and self.state.finish_refused < MAX_FINISH_REFUSALS:
                 self.state.finish_refused += 1
-                plural = len(missing) > 1
                 self.context.append_user(
-                    f"Not yet. {reason[0].upper()}{reason[1:]}.\n\n"
-                    + (
-                        "You have read enough to write "
-                        + ("them" if plural else "it")
-                        + " now. Do that. "
-                        if missing
-                        else "Make the change the gate is asking for. "
-                    )
-                    + "If "
-                    + ("a file" if missing else "that")
-                    + " genuinely should not be "
-                    + ("written" if missing else "done")
-                    + " after all, call `finish` again and say which and why in "
-                    "`blocked` -- that will be taken at face value.\n\n"
-                    # The third move, and the one the model does not find on its
-                    # own. A field run diagnosed its own plan correctly in the
-                    # prose of a `finish` -- "the go.mod cleanup should be the
-                    # last step, not the first" -- and never called
-                    # `revise_plan`, because nothing had ever named it as the
-                    # answer to "the plan is wrong". It had two advertised
-                    # exits, both of which were "stop".
-                    "If the *plan* is what is wrong -- the steps are in the "
-                    "wrong order, or one of them turned out to be unnecessary "
-                    "-- call `revise_plan` with the corrected steps and say why."
-                )
-                return
-
-            # An answer that is the model looping is sent back, once.
-            #
-            # Before the plan check reads it and before the developer sees it,
-            # because a degenerate answer is not a claim about the work at all
-            # -- refusing it for the wrong reason would teach the model to fix
-            # something that is not broken. See `_is_degenerate`.
-            #
-            # Unconditional on `blocked` and on the change set, unlike the
-            # preamble check below: an answer that has stopped being language
-            # is worthless however much was written, and a `blocked` field
-            # attached to it is not a reason to keep it.
-            if (
-                _is_degenerate(answer)
-                and self.state.degenerate_refused < MAX_DEGENERATE_REFUSALS
-            ):
-                self.state.degenerate_refused += 1
-                self.context.append_user(
-                    "Your `answer` repeated itself instead of ending: the same phrase "
-                    "runs over and over for thousands of characters. That is not what "
-                    "you meant to send, and the developer would have read all of it.\n\n"
-                    "Call `finish` again and keep the answer short -- a few hundred "
-                    "words. Say what you did, what you found, and what is left. If "
-                    "there is a long list to give, give its length and its first few "
-                    "entries rather than all of it."
+                    "Not yet. Your plan set out to write " + ", ".join(missing)
+                    + " and " + ("none of them have" if len(missing) > 1 else "it has not")
+                    + " been written.\n\n"
+                    + "You have read enough to write "
+                    + ("them" if len(missing) > 1 else "it")
+                    + " now. Do that. If a file genuinely should not be written after "
+                    "all, call `finish` again and say which and why in `blocked` -- "
+                    "that will be taken at face value."
                 )
                 return
 
@@ -3712,42 +2487,14 @@ class AgentLoop:
             # inside a tool result would be an answer nobody was shown.
             if answer:
                 yield Event(EventType.ASSISTANT, {"text": answer})
-            if self.state.mode is Mode.AGENT or (
-                self.state.mode is Mode.PLANNER and self.state.migration.active
-            ):
+            if self.state.mode is Mode.AGENT:
                 # The acting mode saying it is done is the gate's cue, exactly as
                 # a tool-free turn was. The gate still cannot be skipped.
-                #
-                # And the *planner* saying it during a migration is the same cue,
-                # because a migration phase can finish there. A phase whose work
-                # is a branch cut writes nothing, so its plan settles without the
-                # run ever entering AGENT -- and a `finish` from PLANNER used to
-                # end the run `DONE` while touching no phase state at all. A
-                # field session called it twice, both times with the answer
-                # "Phase 1 (branch) is complete", and the roadmap said `branch:
-                # pending` afterwards both times. The run reported success and
-                # the machine did not move.
-                #
-                # PLANNER and not ASK: a question asked mid-migration is still a
-                # question, and ending it should not close anybody's phase.
                 yield from self._verify()
                 return
-            # Answered -- and, if the session had committed work it did not
-            # touch, that too.
-            #
-            # `_open_targets` is silent outside AGENT on purpose: this phase has
-            # no write tools, so pushing back on the `finish` would be asking
-            # for a move the turn forbids, which is the permanently
-            # unsatisfiable condition the rest of this file is at pains to
-            # avoid. But a *report* costs nothing and is the difference between
-            # a developer reading "answered" and reading that seven planned
-            # files are still untouched. One field run ended exactly here, with
-            # "the migration.md file is written and ready for execution" and a
-            # migration nobody had started.
             self.result = RunResult(
                 Outcome.DONE,
-                (f"answered; blocked on: {blocked}" if blocked else "answered")
-                + self._unfinished(),
+                (f"answered; blocked on: {blocked}" if blocked else "answered"),
                 self.context.turn,
                 tuple(self.router.touched),
             )
@@ -3756,72 +2503,20 @@ class AgentLoop:
         # Whether this plan was volunteered or extracted. The turn that
         # produced it recorded which; `_open_targets` is what reads it.
         self.state.plan_forced = self.state.terminal_forced
+        self.state.research_turns = 0
         self.state.forced_terminal = 0
-        # The research fence and the narration re-ask are both once per
-        # *phase*, which is what the reasoning behind them was always about: a
-        # Planner that has decided there is nothing to plan should not be
-        # forced twice over the same decision. `forced` was scoped to the run,
-        # so a Planner that consumed it handed the acting mode a phase with no
-        # narration recovery at all — and the acting mode is where narration
-        # costs the most, because a "Making the edit now" with no tool call is
-        # a turn in which nothing was edited (prior-audit TC-4).
-        self.state.progress.phase_ended()
+        # And the narration re-ask. It is once per *phase*, which is what the
+        # reasoning behind it was always about: a Planner that has decided there
+        # is nothing to plan should not be forced twice over the same decision.
+        # It was scoped to the run, so a Planner that consumed it handed the
+        # acting mode a phase with no narration recovery at all — and the acting
+        # mode is where narration costs the most, because a "Making the edit
+        # now" with no tool call is a turn in which nothing was edited
+        # (prior-audit TC-4).
+        self.state.forced = False
         steps = self._normalise_plan(steps_from_meta(dict(outcome.meta)))
-        phases = phases_from_meta(dict(outcome.meta))
-        # A roadmap is itself the evidence. A plan that arrives with phases is a
-        # phased plan whatever the 160-token classifier decided, and the
-        # classifier is the weaker witness of the two.
-        if phases and len(phases) >= MIN_PHASES:
-            self.state.migration.active = True
-        if self.state.migration.active and (
-            objection := plan_objection(
-                self.state.migration, phases, steps, lines=self._line_count
-            )
-        ):
-            # Sent back rather than adopted, and *only* for a migration. The
-            # `submit_plan` handler cannot make this check -- it does not know
-            # which kind of run it is in, and a tool that demanded phases of
-            # every plan in the product would demand them of the three-step bug
-            # fixes too.
-            #
-            # Bounded by the same budget every other push-back is: at
-            # MAX_PLAN_OBJECTIONS the plan is taken as it stands. A condition
-            # the model cannot satisfy that never stops asking is the failure
-            # this file keeps rebuilding by accident, and a migration planned in
-            # two phases is worse than one planned in seven but much better than
-            # a run that spends its budget arguing about the shape of the plan.
-            if self.state.plan_objections < MAX_PLAN_OBJECTIONS:
-                self.state.plan_objections += 1
-                self.context.append_user(
-                    f"That plan was not adopted: {objection}.\n\n"
-                    "Call `submit_plan` again with the whole thing — `phases` for the "
-                    "roadmap and `steps` for the phase that opens now. The work has "
-                    "not started and nothing is lost."
-                )
-                return
-        if phases:
-            self.state.migration.adopt(phases)
-        deferred: list[PlanStep] = []
-        if self.state.migration.active and self.state.migration.phases:
-            # Trimmed to the open phase rather than refused. A model that has
-            # just thought about seven phases sends the steps for two of them,
-            # and that is a good plan in the wrong shape -- see
-            # `migration.steps_for_phase`.
-            kept, deferred = steps_for_phase(self.state.migration.phases, steps)
-            steps = tuple(kept)
         replanned = bool(self.state.plan) and self.state.replans > 0
         yield from self._adopt_plan(steps, str(outcome.meta.get("summary") or ""))
-        if deferred:
-            # Said, not silently dropped. A plan whose second half vanished
-            # without a word is a plan the model will re-send.
-            names = ", ".join(dict.fromkeys(s.file for s in deferred if s.file))
-            self.context.append_user(
-                f"{len(deferred)} step(s) in that plan belong to a later phase and "
-                f"were not adopted: {names}. The roadmap has them; they become work "
-                "when their phase opens, and the plan for that phase is written then, "
-                "against a workspace this one will have changed.\n\n"
-                "Work the steps above and nothing else."
-            )
         if replanned:
             # A new approach gets the full gate bound. MAX_REPLANS is what keeps
             # this finite: the second failed approach ends the run as before.
@@ -3854,17 +2549,6 @@ class AgentLoop:
         """
         report = inner_loop(self.router, self.router.touched)
         yield Event(EventType.GATE, {"kind": "inner", **report.as_dict()})
-        # The verification node. A step goes `written` when a mutation lands on
-        # it and reaches `done` only here, when the formatter and the contract
-        # linter come back clean over what was written. Before this there was no
-        # node between REQUIRED MUTATIONS and MARK PHASE COMPLETE at all, so
-        # "done" was a synonym for "a write happened".
-        #
-        # This costs nothing extra: the inner loop already runs after every
-        # mutating batch, sub-second, scoped to the touched files. What changes
-        # is that its verdict is recorded against the plan instead of being
-        # spoken once into the transcript and forgotten.
-        self._verify_written(report)
         if report.ok and not report.warnings:
             return
 
@@ -3967,27 +2651,6 @@ class AgentLoop:
         cannot produce a different verdict -- it can only spend another build,
         vet and swagger_check arriving at the report already in context.
         """
-        # A migration reports at its phase boundary whether or not anything was
-        # written, and this check is **above** the zero-mutation one for a
-        # reason that cost a field session its whole first phase.
-        #
-        # The migration's first phase cuts a branch. `git_ops` does that, and
-        # cutting a branch touches no file, so `router.mutations` is 0 -- which
-        # sent every branch phase down the "nothing was changed, so there was
-        # nothing to verify" path below and returned before `_phase_checkpoint`
-        # could run. `_close_phase` is reachable from nowhere else, so the
-        # phase could never close: the roadmap stayed at "phase 1 of 7 —
-        # branch" for the rest of the session, the state block said so in the
-        # recency slot on every turn, and the model re-derived "the branch
-        # phase is done" in prose each time, twice byte-identically, at
-        # twenty-five seconds a turn.
-        #
-        # A phase that legitimately writes nothing is not an unstarted run. It
-        # is a finished phase, and `_phase_checkpoint` is the thing that says so.
-        if self.state.migration.defers_gate:
-            yield from self._phase_checkpoint()
-            return
-
         if self.router.mutations == 0:
             # A run that wrote nothing cannot fail the gate -- but "nothing was
             # changed" and "nothing needed changing" are different claims, and
@@ -4015,28 +2678,6 @@ class AgentLoop:
             )
             return
 
-        # A migration that is not finished does not run the gate.
-        #
-        # Not a softening and not a bypass: the gate is a question about whether
-        # this run's work is sound, and mid-conversion it has no true answer to
-        # give. Phase two swaps `api-server` for `n-api-server` in `go.mod` and
-        # phase five converts the last handler; every build between those two
-        # points fails, correctly, on code the plan has not reached yet. Running
-        # it anyway costs seventy seconds to produce a failure the loop then
-        # treats as this run's -- `_gate_failed` sends it back to the model,
-        # which cannot fix it without doing the remaining four phases in one
-        # turn, and two rounds of that ends the run.
-        #
-        # So the phase closes, the developer is told exactly what landed and
-        # what is next, and the run stops there. The gate runs when the last
-        # phase closes, and `defers_gate` is false from that moment -- a
-        # deferral that outlived the migration would be an exemption.
-        #
-        # The check itself is now made at the top of this method, before the
-        # zero-mutation return, because a phase that writes nothing is still a
-        # phase. What is left here is the reasoning, which belongs with the
-        # gate it is about.
-
         key = (self.router.model_mutations, tuple(self.router.touched))
         if self.state.last_gate is not None and key == self.state.gate_key:
             # Only reachable on a failing report: a clean one ends the run below.
@@ -4059,8 +2700,6 @@ class AgentLoop:
 
         if report.ok:
             self.state.gate_failures = 0
-            # Before the summary is built, because the summary reads the plan.
-            self._settle_written()
             self.result = RunResult(
                 Outcome.DONE,
                 self._done_summary(report),
@@ -4071,352 +2710,6 @@ class AgentLoop:
             return
 
         yield from self._gate_failed(report, rerun=True)
-
-    def _phase_checkpoint(self) -> Iterator[Event]:
-        """End a migration run at the phase boundary, with the gate still held.
-
-        The counterpart of `_verify` for a run that must not be verified yet,
-        and the place requirement four is enforced: a migration stops at every
-        phase and hands back to the developer, rather than rolling on to the
-        next one. That is not politeness. A conversion carried out in one
-        unbroken run is one nobody reads until it is forty files long, on a
-        model whose output budget has been cut off three times by then -- which
-        is the shape of the field session this whole area exists because of.
-
-        What the developer gets is what the loop can prove: which phase closed,
-        which files the change set actually holds, what is still open, and what
-        the next phase is. Nothing here is read out of the model's prose.
-        """
-        closed = self._close_phase()
-        if not self.state.migration.defers_gate:
-            # The last phase just closed, so the conversion is supposed to
-            # compile. `_verify` re-entered here runs the gate for real -- and
-            # with no baseline, because nothing that is broken now was broken
-            # before the migration started.
-            yield from self._verify()
-            return
-
-        migration = self.state.migration
-        here = migration.working(self._plan_phase())
-        total = len(migration.phases)
-        touched = self.router.touched
-        written = ", ".join(touched[:STATE_ITEMS]) + (
-            f" and {len(touched) - STATE_ITEMS} more" if len(touched) > STATE_ITEMS else ""
-        )
-
-        if closed and here is not None:
-            index, nxt = here
-            headline = (
-                f"phase {index - 1} of {total} — {closed} — is complete. "
-                f"Next is phase {index}: {nxt.name}"
-                + (f" ({nxt.covers})" if nxt.covers else "")
-            )
-        elif closed:
-            headline = f"phase {closed} is complete and it was the last one"
-        elif here is not None:
-            index, phase = here
-            open_steps = [s.file for s in self.state.plan if s.open][:STATE_ITEMS]
-            headline = (
-                f"phase {index} of {total} — {phase.name} — is still open"
-                + (": " + ", ".join(open_steps) + " not done yet" if open_steps else "")
-            )
-        else:
-            headline = "the migration has no phases recorded yet"
-
-        yield Event(
-            EventType.GATE,
-            {
-                "kind": "phase",
-                "deferred": True,
-                "closed": closed,
-                "phase": here[1].name if here else "",
-                "index": here[0] if here else total,
-                "phases": total,
-            },
-        )
-        self.result = RunResult(
-            Outcome.DONE,
-            headline
-            + ". Written: "
-            + (written or "nothing")
-            + f". The branch is {migration.branch or 'not set'}"
-            + (
-                f", and the {self.state.routes_before} route(s) this service served "
-                "before the migration are recorded, so a lost one is caught when the "
-                "last phase closes"
-                if self.state.routes_before
-                else ""
-            )
-            + f". The plan, the phases and what is done are in {PROGRESS_PATH}, "
-            "rewritten on every change — the Migration view reads it, and so does "
-            "the next session"
-            + ". The verification gate has not run and will not until the last "
-            "phase closes — a half-converted service cannot build, so a gate now "
-            "would report the conversion's own middle as a failure. Say when to "
-            "open the next phase, or say what to change about this one first",
-            self.context.turn,
-            tuple(touched),
-        )
-
-    def _close_phase(self) -> str:
-        """Close the open phase when its steps have all settled. Its name, or ``""``.
-
-        From the plan, never from the model saying so -- the same rule
-        `_mark_steps` follows, one level up. A step is settled when it is
-        ``done``, ``skipped`` or ``blocked``.
-
-        **``written`` is not settled, and that is the whole of session
-        6d923ab574ae.** It used to count, on the reasoning that the inner loop is
-        the only verification a migration gets before the end and that holding a
-        phase open on a formatter which could not run is the
-        permanently-unsatisfiable condition this file keeps rebuilding by
-        accident. The first half is true; the second does not follow.
-        `_verify_written` leaves a step at ``written`` *only* when a stage that
-        actually ran produced a finding naming that step's file, and promotes it
-        to ``done`` when none did -- a step nothing could check is already
-        ``done``, so the unsatisfiable case this was guarding against cannot
-        reach here.
-
-        What counting it cost, measured: the `handlers` phase closed with both
-        its steps at ``written`` and `rules_lint` dirty on each. `_why_not_done`
-        then refused every `finish` *because* those steps were written and
-        unclean, and `plan_objection` refused every plan that named them
-        *because* their phase had closed. The model was ordered to fix two files
-        and forbidden from planning to; it emitted one byte-identical 128-token
-        reply on 24 of the next 41 turns, across five developer messages, and
-        the session ended `no_progress` with the fix one edit away.
-
-        The exit from a step that genuinely cannot be cleaned is `revise_plan`
-        to ``blocked``, which is settled here -- and which `_cursor_age` already
-        names, in the state block, at precisely the point this used to hang.
-
-        **The fallback matters more than the rule.** When no step carries any
-        phase name -- the model submitted a roadmap and then plain steps, which
-        it will -- the whole plan settling closes the phase. Without that, a
-        roadmap with one untagged plan under it is a migration that can never
-        reach its last phase and therefore never runs the gate at all.
-
-        A *tagged* plan gets no such fallback, and that is a second finding from
-        the same session. At turn 80 the plan's steps all carried `handlers`,
-        which was already closed, so `working` fell back to the roadmap's first
-        pending phase -- `branch` -- and the untagged fallback then closed it on
-        the strength of handler work. The developer was told "phase 3 of 7 —
-        branch — is complete" about a branch cut fifty-eight turns earlier. A
-        plan that names its phase has said which phase its settling is evidence
-        about, and it is not this one.
-        """
-        migration = self.state.migration
-        here = migration.working(self._plan_phase())
-        if here is None or not self.state.plan:
-            return ""
-        _, phase = here
-        key = phase.name.strip().lower()
-        scoped = [s for s in self.state.plan if s.phase.strip().lower() == key]
-        # Evidence first, because it is the stronger witness. A branch phase is
-        # finished when the branch exists, whatever its steps say -- and its
-        # steps are the weakest possible signal, since cutting a branch writes
-        # no file for a step to land on. See `MigrationState.evidenced`.
-        evidenced = migration.evidenced(phase.name)
-        if not scoped and any(s.phase.strip() for s in self.state.plan) and not evidenced:
-            return ""
-        steps = scoped or list(self.state.plan)
-        if any(_holds_a_phase_open(step) for step in steps) and not evidenced:
-            return ""
-        if not migration.close(phase.name):
-            return ""
-        self._save_plan()
-        return phase.name
-
-    def _deleted_and_not_replaced(self) -> list[str]:
-        """Files this session removed that are still not on disk.
-
-        Checked against the filesystem rather than trusted from the ledger, for
-        the reason every other check here is: the developer edits the workspace
-        between messages, and a file they restored themselves is not this run's
-        problem. A path that is back drops out of the ledger as it is read, so
-        the objection cannot outlive the thing it is about.
-        """
-        if not self.state.removed:
-            return []
-        back: list[str] = []
-        gone: list[str] = []
-        for path in sorted(self.state.removed):
-            try:
-                exists = self.router.workspace.resolve(path).exists()
-            except (PathEscape, ValueError):
-                exists = False
-            (back if exists else gone).append(path)
-        self.state.removed.difference_update(back)
-        return gone[:STATE_ITEMS]
-
-    def _cited_but_unrunnable(self) -> list[str]:
-        """Tools the plan's ``accepts`` criteria name that the acting phase lacks."""
-        pool = _unrunnable_checks()
-        found: list[str] = []
-        for step in self.state.plan:
-            for word in _IDENTIFIER.findall(step.accepts.lower()):
-                if word in pool and word not in found:
-                    found.append(word)
-        return found
-
-    def _note_unrunnable_criteria(self) -> None:
-        """Say so when the plan is checked by tools the phase that works it cannot call.
-
-        A note, not an objection. The plan is adopted either way, and that is the
-        point: `MAX_PLAN_OBJECTIONS` is two, the migration shape objections have
-        first claim on both, and spending one on the wording of a field would buy
-        a re-plan round trip to fix something the model can simply be told. The
-        steps themselves are fine -- it is the criterion that cannot be applied.
-
-        Sent once, at adoption, where the model is about to start work and can
-        still decide what "done" will look like for each step.
-        """
-        named = self._cited_but_unrunnable()
-        if not named:
-            return
-        which = ", ".join(f"`{name}`" for name in named[:STATE_ITEMS])
-        is_are = "is a tool" if len(named) == 1 else "are tools"
-        self.context.append_user(
-            f"One note on the plan before you start: {which} {is_are} the acting "
-            "phase does not have -- they belong to ask and planner -- and the steps "
-            "above are accepted on them. Calling one from here is refused, so those "
-            "steps would have no check you can actually apply.\n\n"
-            "Check them with what this phase runs: `go_build`, `go_vet`, `go_test`, "
-            "`rules_lint`, or a `read_file`/`search_repo` that shows the thing is "
-            "true -- \"go build succeeds\", \"no api-* import is left in go.mod\", "
-            "\"the file is gone\". The plan stands; this is about how you verify it."
-        )
-
-    def _resurrects_a_retired_file(self, call: ToolCall) -> str:
-        """Why this write undoes a deletion the plan asked for, or ``""``.
-
-        The mirror of `_step_wants_removal`, and it was missing. That predicate
-        could say "this deletion was planned"; nothing could say "this file
-        coming back undoes the plan". So a field run deleted `routes/routes.go`
-        and `handler/response.go` exactly as its migration said, ran `go_build`
-        mid-conversion, read `package gotemplate/routes is not in std` as the
-        first error -- true, and caused by `main.go` still importing what the
-        plan had removed -- and wrote both files back, gin helpers included.
-        Every existing guard passed it: the step was `written`, `removed`
-        correctly did not hold them, and churn counts a second *delete*.
-
-        Refused rather than reported, because by the time anything reports it
-        the legacy file is on disk and the next `go_build` is green -- which
-        reads as the problem being solved. The run then converts around a file
-        the conversion exists to delete.
-
-        The escape is `revise_plan`. If the file genuinely has to come back, the
-        step that removed it was wrong, and saying so is a plan revision rather
-        than a silent write.
-        """
-        if not self.state.retired:
-            return ""
-        spec = registry.get(call.name)
-        if spec is None or not spec.mutates:
-            return ""
-        try:
-            path = str((call.parsed() or {}).get("path", "") or "")
-        except ValueError:
-            return ""
-        if not path:
-            return ""
-        try:
-            rel = self.router.workspace.relative(self.router.workspace.resolve(path))
-        except (PathEscape, ValueError, OSError):
-            rel = path
-        if rel not in self.state.retired:
-            return ""
-        step = next(
-            (s for s in self.state.plan if s.covers(rel) and self._step_wants_removal(rel)),
-            None,
-        )
-        said = f' — "{step.action}"' if step is not None else ""
-        return (
-            f"{rel} was deleted by this migration on purpose{said}, and writing it "
-            "again undoes that step.\n\n"
-            "If a build error named it, the error is in whatever still refers to "
-            f"it, not in {rel} being absent — fix the import or the registration "
-            "that points at it. A service mid-conversion does not build, and "
-            "restoring the file it is converting away from is how a conversion "
-            "ends up shipping the thing it was meant to remove.\n\n"
-            "If the file genuinely has to come back, the step that removed it was "
-            "wrong: call `revise_plan` and say so."
-        )
-
-    def _note_delete(self, path: str) -> int:
-        """Record a deletion, and return how many cycles this path has been through.
-
-        A cycle is delete, write back, delete again. It is the shape of the loop
-        this counter exists to catch, and the reason nothing else caught it is
-        that every turn in it was a real mutation: `stalled_turns` resets on
-        ``mutated``, so a run oscillating on one file reset its own stall
-        counter on every turn of the oscillation and ran until the finish-refusal
-        budget happened to end it, eighteen turns later.
-
-        Zero on a first deletion, which is ordinary work -- replacing a file
-        means deleting it, and a migration removes files outright.
-        """
-        cycles = self.state.churn.get(path, 0)
-        if path in self.state.rewritten:
-            self.state.rewritten.discard(path)
-            cycles += 1
-            self.state.churn[path] = cycles
-        self.state.gone_once.add(path)
-        return cycles
-
-    def _note_write(self, path: str) -> int:
-        """Record a write, and return the path's cycle count.
-
-        A write to something this session deleted arms the next deletion of it
-        as a cycle. Any write does: `write_file`, an `append`, a `patch_file`
-        against the replacement. What closes the cycle is the *second delete*,
-        not the shape of the restoration.
-        """
-        if path in self.state.gone_once:
-            self.state.rewritten.add(path)
-        return self.state.churn.get(path, 0)
-
-    def _step_wants_removal(self, path: str) -> bool:
-        """Whether a plan step covering ``path`` asked for it to be deleted.
-
-        Read off ``action`` -- a typed field the model filled in to say what the
-        step does -- and only the step or steps that cover this path. A
-        migration genuinely removes files: ``routes/routes.go``, ``docs/docs.go``
-        and the swaggo artefacts all go, and a step that says so has to be
-        satisfiable by the deletion that carries it out. Without this, the guard
-        against losing a file becomes a condition no run can clear.
-
-        Narrow on purpose. It is not asking what the reply said; it is asking
-        whether *this step's own one-sentence description of itself* is a
-        removal.
-        """
-        verbs = ("delete", "remove", "drop", "retire")
-        return any(
-            step.covers(path) and any(v in step.action.lower() for v in verbs)
-            for step in self.state.plan
-        )
-
-    def _plan_phase(self) -> str:
-        """The phase the current plan's steps are for, or ``""``.
-
-        The plan is the authority on which phase is being worked -- it is the
-        commitment -- and the roadmap is the authority on the order. They differ
-        legitimately, which is why this is read rather than assumed: a developer
-        whose branch already exists opens the run at phase two while phase one
-        is still pending, and closing the roadmap's answer when that work
-        settled would close the wrong phase.
-
-        The cursor's phase while there is a cursor, so the state block names the
-        phase the next edit belongs to; the first step's otherwise, so it still
-        answers once every step has settled -- which is exactly when
-        `_close_phase` asks. A migration's plan carries one phase
-        (`plan_objection` refuses a submission that spans two), so the two
-        readings agree on every plan this is reached with.
-        """
-        active = self.active_step
-        if active is not None and active[1].phase:
-            return active[1].phase
-        return next((s.phase for s in self.state.plan if s.phase), "")
 
     def _gate_failed(self, report: GateReport, *, rerun: bool) -> Iterator[Event]:
         """Hand a failing gate back to the acting mode, or stop.
@@ -4521,102 +2814,6 @@ class AgentLoop:
             "cannot have moved" + self._unfinished()
         )
 
-    def _opening_mode(self, intent: Intent, *, continued: bool) -> Mode:
-        """Which mode this run starts in.
-
-        A question starts in ASK and work starts in PLANNER, with one exception
-        that the field made expensive: **a follow-up on a plan that still has
-        open steps starts in AGENT.**
-
-        Every AGENT run used to enter PLANNER unconditionally, and PLANNER has
-        no "the plan stands, carry on" exit -- its terminals are `submit_plan`,
-        `ask_developer` and `finish`. So a developer typing "complete the
-        migration plan you wrote" or "start phase 2" left the model exactly one
-        forward move: write the plan again. One field session re-submitted an
-        identical eight-step plan three times across four messages, and before
-        `_adopt_plan` learned to merge, each re-submission also reset the two
-        steps that were genuinely finished.
-
-        Re-planning is still available and is one tool call away: `revise_plan`
-        is visible in AGENT, and `_replan` still sends a run back to the Planner
-        when the gate fails twice after an edit. What is gone is being *made* to
-        re-plan in order to reach the work.
-
-        Deliberately narrow. It needs a plan, open steps *and* a follow-up: a
-        first message plans, and a plan whose steps are all settled plans again,
-        because a developer asking for more work on a finished plan is asking
-        for a new one.
-        """
-        if intent is not Intent.AGENT:
-            return Mode.ASK
-        if continued and self._work_in_flight():
-            return Mode.AGENT
-        return Mode.PLANNER
-
-    def _work_in_flight(self) -> bool:
-        """Whether this session has committed work that is not finished.
-
-        The one question both the mode and the intent turn on, so it is asked
-        once. ``_opening_mode`` reads it as "carry on rather than re-plan";
-        ``_run`` reads it as "this is a change session, do not re-guess".
-
-        **A forced plan does not count.** `plan_forced` records a plan that came
-        back because the research fence left the model no other move, and the
-        developer may have asked a question the whole time. Treating one as a
-        commitment is how a request to *validate* a migration plan turns into
-        the migration (BUG L-28) -- and doing it here would be worse than doing
-        it in the plan, because it would pin every later message in the session
-        to AGENT as well.
-
-        Once anything has been written the distinction lapses, exactly as it
-        does in `_open_targets`: a run that has started acting on a plan is
-        working to it, whatever produced it.
-
-        **A ``written`` step is work in flight.** It read ``open`` alone, so a
-        plan whose every step had been written and none verified looked finished
-        here and the follow-up opened in PLANNER -- which has no write tools, and
-        whose only forward move is to submit the plan it is already holding.
-        Session 6d923ab574ae did that on three separate developer messages
-        (turns 81-87, 91-97, 106-112): nineteen turns at ~140,000 prompt tokens
-        each, re-deriving a plan that was on disk, to reach an acting phase that
-        was one `patch_file` from done. See `_holds_a_phase_open`.
-        """
-        if not any(_holds_a_phase_open(step) for step in self.state.plan):
-            return False
-        return not self.state.plan_forced or bool(self.router.touched)
-
-    def restore_plan(self, session_id: str) -> bool:
-        """Reload this session's plan from disk. ``False`` when there is none.
-
-        The restart counterpart of ``carry_from``. A plan lived in a tuple in a
-        process, so a VS Code window reload at step 4 of 7 left the panel
-        showing four steps done and the agent believing it had never planned
-        anything -- and the first thing it did was plan again, against a
-        workspace its own earlier steps had already changed.
-
-        The statuses come back with the steps. They were derived from the change
-        set, and the change set is on disk, so restoring them is restoring a
-        conclusion the loop had already reached from evidence that has not
-        moved.
-        """
-        record = PlanRecord.load(self.router.workspace.root, session_id)
-        if record is None or not record.steps:
-            return False
-        self._plan_record = record
-        self.state.plan = record.steps
-        self.state.plan_summary = record.summary
-        self.state.plan_forced = record.forced
-        # With the plan, because half of it is useless: steps restored without
-        # the roadmap resume a migration into a phase the run cannot name, and a
-        # roadmap restored without the steps resumes a phase with no work in it.
-        # They are one atomic file for exactly this reason.
-        self.state.migration = record.migration
-        rendered = "\n".join(step.rendered(i) for i, step in enumerate(record.steps, 1))
-        if record.summary:
-            rendered = f"{record.summary}\n\n{rendered}"
-        self.context.set_plan(rendered)
-        return True
-
     def carry_from(self, previous: "AgentLoop") -> None:
         """Inherit the previous message's ledgers, the way the context is inherited.
 
@@ -4631,11 +2828,6 @@ class AgentLoop:
         from nothing, and reproduced the same loop over the same four turns. The
         transcript makes it look like the agent has no memory. It has memory and
         no *record*.
-
-        **And the counters that end a loop rather than inform one.** Everything
-        in ``_Progress`` used to be per message, which is right for a budget and
-        wrong for a bound: the loop being bounded is not always inside one
-        message. See the block below.
 
         Only what remains true between messages. ``last_results`` and
         ``dead_ends`` are deliberately **not** carried: the developer edits files
@@ -4658,30 +2850,6 @@ class AgentLoop:
         the undo snapshots are the session's, not the message's.
         """
         self.router = previous.router
-        # The reply ledger, and it is the one thing here that *ends* a run
-        # rather than informing one. Every other bound in `_Progress` is built
-        # per message on purpose -- a developer who types again is entitled to a
-        # fresh push-back budget -- and session 6d923ab574ae is what that costs
-        # when the loop is not per message either: the same reply, five runs,
-        # six developer messages, `stalled_turns` restarting from zero at each
-        # one and reaching its bound of six five separate times. A reply that is
-        # still identical *after* the developer has typed something is not a new
-        # attempt at the work; it is the same attempt with a witness.
-        self.state.reply_key = previous.state.reply_key
-        self.state.reply_repeats = previous.state.reply_repeats
-        # And the refusals, which carry in the lenient direction: a run whose
-        # `finish` has already been sent back once is not sent back again, and a
-        # plan that has already been objected to twice is adopted as it stands.
-        # `plan_forced` below was carried for exactly this reason and only
-        # solved it for one of the four counters -- the other three went on
-        # spending a fresh budget of push-backs on every message, which is how
-        # one refused `finish` was refused three more times over four messages
-        # while the thing it was refused for never changed.
-        self.state.finish_refused = previous.state.finish_refused
-        self.state.plan_objections = previous.state.plan_objections
-        self.state.preamble_refused = previous.state.preamble_refused
-        self.state.degenerate_refused = previous.state.degenerate_refused
-        self.state.reasks = previous.state.reasks
         self.state.seen_calls = dict(previous.state.seen_calls)
         self.state.reads = dict(previous.state.reads)
         self.state.retrievals = list(previous.state.retrievals)
@@ -4693,60 +2861,12 @@ class AgentLoop:
         self.state.baseline = previous.state.baseline
         self.state.plan = previous.state.plan
         self.state.plan_summary = previous.state.plan_summary
-        # With the plan, because it is a fact *about* the plan. A cursor that
-        # restarted at each developer message would read "turn 1 on this step"
-        # at precisely the moment the run has been stuck on it longest -- the
-        # loop this counter exists to break spanned three messages.
-        self.state.cursor = previous.state.cursor
-        # The question the previous run stopped on. Carried because the whole
-        # point of it is to be read by the *next* message, and `_State` is
-        # built per message: without this it is set and thrown away in the same
-        # breath, and the answer to `ask_developer` is classified from scratch.
-        self.state.awaiting = previous.state.awaiting
-        # And what has already been asked and answered. A question settled on
-        # message two is settled on message five, and a ledger rebuilt per
-        # message cannot tell a second asking from a first -- which is how the
-        # same question reached the developer three times.
-        self.state.asked = list(previous.state.asked)
-        self.state.answered = previous.state.answered
         # Carried with the plan it is about. A forced plan that survived into a
         # follow-up message is still a forced plan, and the follow-up is where
         # it does the most damage: `finish_refused` starts at 0 in a fresh
         # `_State`, so without this the "you planned to write these" refusal
         # fires again on a plan the developer never asked for.
         self.state.plan_forced = previous.state.plan_forced
-        # Still true on the next message: a file deleted and not replaced is
-        # deleted and not replaced whatever the developer types next.
-        self.state.removed = set(previous.state.removed)
-        # And the churn ledger with it. The loop it catches spanned three
-        # developer messages in the field -- a counter that restarted at each
-        # one would have read "no cycles yet" on every turn the run was most
-        # stuck, which is the same mistake `cursor` above exists to avoid.
-        self.state.gone_once = set(previous.state.gone_once)
-        self.state.rewritten = set(previous.state.rewritten)
-        self.state.churn = dict(previous.state.churn)
-        # A file the plan retired stays retired across a developer message:
-        # the step that removed it is still done, and the build error that
-        # tempts the model to put it back is still there.
-        self.state.retired = set(previous.state.retired)
-        # And the route inventory, which is taken once per *migration*, not
-        # once per message: retaking it on message four would record a
-        # half-converted service as the thing to compare the finished one
-        # against, and the comparison would pass by construction.
-        self.state.routes_saved = previous.state.routes_saved
-        self.state.routes_before = previous.state.routes_before
-        # The roadmap, the branch and which phases have closed. A migration is
-        # many messages by construction -- the roadmap is agreed on the first
-        # and phase five lands on the ninth -- so a `MigrationState` rebuilt per
-        # message would re-cut the branch, re-plan phase one, and run the gate
-        # on a service in the middle of being converted. Carried as the object,
-        # not copied field by field, so a field added to it later is carried
-        # without this line having to learn about it.
-        self.state.migration = previous.state.migration
-        # And its history, so a follow-up that revises the plan appends to the
-        # record rather than starting a new one that claims this is the first
-        # plan the session has had.
-        self._plan_record = previous._plan_record
         self.state.dependencies_changed = previous.state.dependencies_changed
         # Read off the Router that is now shared, so the two agree by
         # construction rather than by both being copied and hoping.
@@ -4829,30 +2949,8 @@ class AgentLoop:
         version matched path-shaped tokens in numbered paragraphs, which reported
         a neighbour named as an example as an unwritten target.
         """
-        parts: list[str] = []
-        if missing := self._unwritten_targets():
-            parts.append("The plan named files this run never wrote: " + ", ".join(missing))
-        # Blocked steps are named separately, and they are not the same finding.
-        # "Never written" is a gap; "blocked" is a decision the model made and
-        # gave a reason for, and the developer needs the reason -- it is usually
-        # the thing they have to resolve before the next run can get further.
-        if stuck := self._blocked_steps():
-            parts.append(
-                "Blocked, with the reason given: "
-                + "; ".join(f"{s.file} ({s.note or 'no reason given'})" for s in stuck)
-            )
-        return ". " + ". ".join(parts) if parts else ""
-
-    def _blocked_steps(self) -> list[PlanStep]:
-        """Steps the model declared it cannot do, newest plan first.
-
-        Not an objection. `_why_not_done` deliberately does not read this: a
-        blocked step is the model exercising the exit this plan was missing, and
-        refusing a `finish` over it would rebuild the permanently-unsatisfiable
-        condition the whole status exists to remove. It is reported, not argued
-        with.
-        """
-        return [s for s in self.state.plan if s.status == "blocked"][:STATE_ITEMS]
+        missing = self._unwritten_targets()
+        return ". The plan named files this run never wrote: " + ", ".join(missing) if missing else ""
 
     def _normalise_plan(self, steps: Sequence[PlanStep]) -> tuple[PlanStep, ...]:
         """Put every plan path into the form the change set is recorded in.
@@ -4868,48 +2966,21 @@ class AgentLoop:
         A path that will not resolve is kept verbatim. It is the model's text and
         the developer should see what was planned; it simply will not match, which
         is the same outcome as before and is now the *only* case with that outcome.
-
-        **And a field naming several files becomes several steps.** ``file`` is
-        one path by specification and `PlanStep.covers` compares it as one; a
-        field holding ``"go.work, go.work.sum"`` matched nothing, which cost a
-        field run its whole first phase. `split_paths` has the case and the
-        rule. Splitting happens here, before `plan_objection` sees the plan, so
-        the big-file check measures each path rather than a string that names
-        three of them and resolves to none.
         """
         out: list[PlanStep] = []
         for step in steps:
             if not step.file:
                 out.append(step)
                 continue
-            for path in self._paths_named_by(step.file):
-                out.append(step if path == step.file else replace(step, file=path))
+            try:
+                rel = self.router.workspace.relative(
+                    self.router.workspace.resolve(step.file)
+                )
+            except (PathEscape, ValueError):
+                out.append(step)
+                continue
+            out.append(step if rel == step.file else replace(step, file=rel))
         return tuple(out)
-
-    def _paths_named_by(self, file: str) -> tuple[str, ...]:
-        """The normalised workspace-relative paths one ``file`` field names."""
-        candidates = split_paths(file)
-        if len(candidates) > 1 and self._on_disk(file):
-            # A file that is actually there is never a list, whatever is in its
-            # name. Checked against the disk rather than argued about, for the
-            # reason `_deleted_and_not_replaced` is: the workspace is the only
-            # thing that knows, and a repository holding `a, b.go` is allowed to
-            # have a plan step for it.
-            candidates = (file.strip(),)
-        return tuple(dict.fromkeys(self._relative(path) for path in candidates))
-
-    def _relative(self, path: str) -> str:
-        """``path`` as the change set spells it, or verbatim when it will not resolve."""
-        try:
-            return self.router.workspace.relative(self.router.workspace.resolve(path))
-        except (PathEscape, ValueError, OSError):
-            return path
-
-    def _on_disk(self, path: str) -> bool:
-        try:
-            return self.router.workspace.resolve(path).exists()
-        except (PathEscape, ValueError, OSError):
-            return False
 
     def _unwritten_targets(self) -> list[str]:
         """Plan steps whose file no change reached.
@@ -4920,11 +2991,11 @@ class AgentLoop:
         """
         if not self.state.plan:
             return []
-        touched = self.router.touched
+        touched = set(self.router.touched)
         return [
             s.file
             for s in self.state.plan
-            if s.file and s.open and not any(s.covers(t) for t in touched)
+            if s.file and s.open and s.file not in touched
         ]
 
     def _is_plan_target(self, path: str) -> bool:
@@ -4942,7 +3013,7 @@ class AgentLoop:
         justify skipping. What matters is only that the run was sent here to
         change this file.
         """
-        return any(step.covers(path) for step in self.state.plan)
+        return any(step.file == path for step in self.state.plan)
 
     def _open_targets(self) -> list[str]:
         """Plan targets this run is answerable for not having written.
@@ -4981,148 +3052,6 @@ class AgentLoop:
         if self.state.plan_forced and not self.router.touched:
             return []
         return self._unwritten_targets()
-
-    def _stall_notice(self) -> str:
-        """How a forced turn opens, and what it names as the evidence.
-
-        The first sentence is unchanged and load-bearing -- it is measured, and
-        `test_a_stalled_acting_turn_keeps_its_write_tools` reads it -- so the
-        repetition is added to it rather than swapped for it. Both facts are
-        true at once and they are different: the *call* has been answered
-        before, and the *reply* is a copy of the last one. A model that has lost
-        the thread argues with the first and cannot argue with the second.
-        """
-        notice = (
-            "Stop searching. That call has already been answered and asking it "
-            "again returns the same thing.\n\n"
-        )
-        if self.state.reply_repeats >= REPLY_REPEATS_BEFORE_ANSWER:
-            notice += (
-                f"You have now sent that same reply {self.state.reply_repeats + 1} "
-                "times -- the same text and the same call, word for word. Whatever "
-                "you are waiting to find out, this turn is not going to find it "
-                "out.\n\n"
-            )
-        return notice
-
-    def _note_reply(self, content: str, calls: Sequence[ToolCall]) -> int:
-        """Record this reply and answer how many times it has come back unchanged.
-
-        Zero for a reply that differs from the one before it, which is every
-        reply in a run that is working.
-        """
-        key = _reply_fingerprint(content, calls)
-        if not key:
-            return 0
-        if key != self.state.reply_key:
-            self.state.reply_key = key
-            self.state.reply_repeats = 0
-            return 0
-        self.state.reply_repeats += 1
-        return self.state.reply_repeats
-
-    def _reply_prose(self, content: str, repeats: int, calls: Sequence[ToolCall]) -> str:
-        """What of a reply's prose goes into the working set.
-
-        All of it, until the same reply has come back `REPLY_PROSE_REPEATS`
-        times; a marker after that. The calls always travel -- they carry the
-        ``tool_call_id`` every result that follows refers to -- and only the
-        prose is dropped, because only the prose is already in the context
-        verbatim and only the prose is long.
-
-        Not merely a saving. The duplicate is *read back* as the model's own
-        stated intent, on every turn after it, and a model reading ten copies of
-        "Let me first check the current state" has ten pieces of evidence that
-        checking the current state is what it does next. Replacing them with a
-        count is the only thing in this file that tells a model it is repeating
-        itself in the one place it will certainly look.
-
-        Prose-only replies keep their text. A repeated answer with no call is a
-        `finish`-shaped mistake and `_is_degenerate` is the check for it; a
-        stub there would delete the thing the developer is owed.
-        """
-        if repeats > REPLY_PROSE_REPEATS and content and calls:
-            return (
-                f"(the same reply and the same call as the previous {repeats} turns; "
-                "the text is above)"
-            )
-        return content
-
-    def _outstanding(self) -> list[str]:
-        """Every file this phase still owes work on: unwritten, or written and unclean.
-
-        `_open_targets` answers "what is this run in the wrong for not having
-        *written*", which is the right question for `_why_not_done`'s first
-        objection and the wrong one for a forced turn. A phase whose files have
-        all been written and none of them cleaned has outstanding work and no
-        open target -- so the stall escape took its `else` branch, cut the tool
-        list to the terminals and said "give the developer what you have
-        established now", and `_why_not_done` then refused the `finish` it had
-        just demanded, naming the written-but-unclean steps the same turn had
-        decided were not work.
-
-        Session 6d923ab574ae, turn 114: the one turn of that phase where
-        `patch_file` was the answer is the turn `patch_file` was removed from
-        the request. The two predicates now read the same status the same way;
-        see `_holds_a_phase_open`.
-
-        AGENT only, exactly like `_open_targets` and for its reason: naming
-        files to write at a mode that holds no write tool is an instruction it
-        cannot obey, and PLANNER's way out of a stall is `submit_plan`.
-        """
-        if self.state.mode is not Mode.AGENT:
-            return []
-        unclean = [s.file for s in self.state.plan if s.status == "written" and s.file]
-        return list(dict.fromkeys(self._open_targets() + unclean))
-
-    def _outstanding_ask(self) -> str:
-        """What to ask a forced turn for, when the phase still owes work.
-
-        Two sentences at most plus the exit, and which ones depend on what is
-        outstanding. "Write them now" is wrong about a file that already exists
-        and is merely unclean, and a model told to write a file it has written
-        writes it again -- which is how the churn ledger came to be needed.
-
-        The exit is named every time. A step that cannot be cleaned has one
-        (`revise_plan` to `blocked`) and it is the move the model does not find
-        on its own: three field loops ran to the turn cap with a cursor frozen
-        on a step whose premise was false, and in all three the only status the
-        model could reach was `skipped`, which means "unnecessary" and was not
-        true.
-        """
-        missing = self._open_targets()
-        unclean = [s for s in self.state.plan if s.status == "written" and s.file]
-        parts: list[str] = []
-        if missing:
-            parts.append(
-                "Your plan set out to write " + ", ".join(missing) + ". "
-                + ("Write them now" if len(missing) > 1 else "Write it now")
-                + ", from what you already have."
-            )
-        if unclean:
-            names = ", ".join(dict.fromkeys(s.file for s in unclean))
-            why = next((s.note for s in unclean if s.note), "")
-            plural = len(unclean) > 1
-            parts.append(
-                names
-                + (" have" if plural else " has")
-                + " been written and "
-                + ("are" if plural else "is")
-                + " not clean yet"
-                + (f" ({why})" if why else "")
-                + ". Edit "
-                + ("them" if plural else "it")
-                + " now -- patch the part the finding names. Reading "
-                + ("them" if plural else "it")
-                + " again returns the same bytes and does not move the finding."
-            )
-        parts.append(
-            "If a file genuinely cannot be finished, `revise_plan` that step to "
-            "`blocked` with the reason -- the plan moves past it and the run "
-            "carries on. If none of it can be done, say which and why in one line "
-            "and call `finish`."
-        )
-        return "\n\n".join(parts)
 
     def _retrieval_overlap(self, call: ToolCall, outcome: ToolResult) -> str:
         """What to tell a run that keeps asking the corpus the same thing.
@@ -5171,17 +3100,6 @@ class AgentLoop:
                 "Rewording the question will not reach different sections. Ask about "
                 "something else, or work from what is already above."
             )
-        return self._retrieval_exhausted()
-
-    def _retrieval_exhausted(self) -> str:
-        """What the corpus has left to say once the repeat cap is reached.
-
-        One wording, two callers: the overlap check says it on the search that
-        reaches the cap, and `_tool_calls` says it to every search after --
-        which is what replaced withholding the schema. Sharing the text is the
-        point. A model told one thing by the result and another by the refusal
-        is a model given a reason to try a third phrasing.
-        """
         return (
             f"That is {self.state.retrieval_repeats} searches in a row returning "
             "sections you already have. The knowledge base does not cover this "
@@ -5210,42 +3128,11 @@ class AgentLoop:
         """
         lines = [f"# Current state — turn {self.context.turn}, {self.state.mode} phase"]
 
-        # Above the plan, because it is the frame the plan sits in: the steps
-        # below are one phase of it, and a model that reads them without that
-        # frame is a model that finishes the plan and reports the migration
-        # done. `MigrationState.block` renders a cursor for the same reason
-        # `_plan_block` does.
-        lines.extend(self.state.migration.block(self._plan_phase()))
-        if self.state.migration.active and not self.state.migration.branch:
-            # Two different instructions, because the two modes hold two
-            # different sets of tools and an instruction a mode cannot obey is
-            # the worst thing that can be put in front of a model.
-            #
-            # This said "confirm one with `ask_developer`, then `git_ops`
-            # op=branch" in both. `git_ops` is an acting tool; the Planner was
-            # being told, every turn, in the last position of its prompt, to
-            # make a call its own request did not offer. A field session did
-            # exactly that -- five refused `git_ops` calls, four identical
-            # questions to the developer, and no plan -- because the one move it
-            # had been told to make was the one it could not make, and the move
-            # that would have unblocked it was never named.
-            lines.append(
-                "Migration: no branch yet. "
-                + (
-                    "Cut it before anything else: `git_ops` op=branch "
-                    "message=<name> base=<branch to cut from>. Every write is "
-                    "held until it exists."
-                    if self.state.mode is Mode.AGENT
-                    else "You cannot cut it here — `git_ops` is an acting tool. "
-                    "Settle *which* branch to cut it from (`ask_developer`, if the "
-                    "developer has not already said), then `submit_plan`. Cutting "
-                    "it is the first step of the first phase, and the acting "
-                    "phase does it."
-                )
-            )
-
         if self.state.plan:
-            lines.extend(self._plan_block())
+            lines.append("Plan:")
+            for i, step in enumerate(self.state.plan, 1):
+                note = f" ({step.note})" if step.note else ""
+                lines.append(f"  {i}. [{step.status}] {step.file} — {step.action}{note}")
             if self.state.plan_forced and not self.router.touched:
                 lines.append(
                     "  (this plan was written on a turn that accepted no other call. "
@@ -5280,287 +3167,6 @@ class AgentLoop:
 
         return "\n".join(lines) if len(lines) > 1 else ""
 
-    @property
-    def active_step(self) -> tuple[int, PlanStep] | None:
-        """The step the run is on, as ``(1-based index, step)``, or ``None``.
-
-        The first step that still asks for work, then the first written but
-        unverified one. ``None`` means every step is settled, which is the
-        condition for the phase being over.
-
-        The order matters. A written-but-unverified step is *nearly* finished
-        and the cheapest thing in the plan to close, but a pending step is work
-        that has not started -- and a run that jumped to polishing while three
-        steps had never been attempted is the shape of a run that finishes
-        nothing. Pending first.
-
-        **Never a step whose phase has closed.** `_adopt_plan` keeps settled
-        steps from earlier phases as history, and a phase closed on evidence
-        (`MigrationState.evidenced`) can leave one behind unsettled, so without
-        this the cursor can come to rest inside work the roadmap two lines above
-        it declares finished. It did, for 27 turns of session 6d923ab574ae: the
-        state block said "Migration: phase 4 of 7 — grpc-handlers" and, four
-        lines down, "Now: step 2 of 3 of phase handlers". The model was reading
-        one message that gave two answers, and it kept answering the second.
-
-        Returning ``None`` rather than falling back to that step is the point: a
-        plan whose only unsettled work belongs to a closed phase has nothing for
-        the cursor to sit on, and `_plan_block` renders that honestly.
-        """
-        for index, step in enumerate(self.state.plan, 1):
-            if step.open and not self._phase_closed(step):
-                return index, step
-        for index, step in enumerate(self.state.plan, 1):
-            if step.status == "written" and not self._phase_closed(step):
-                return index, step
-        return None
-
-    def _phase_closed(self, step: PlanStep) -> bool:
-        """Whether this step belongs to a phase the migration has already closed.
-
-        Read straight off the roadmap rather than through `_plan_phase`, which
-        asks `active_step` and would make this a cycle. A step with no phase, or
-        a plan with no migration under it, belongs to whatever is open.
-        """
-        if not (self.state.migration.active and step.phase.strip()):
-            return False
-        phase = self.state.migration.phase_named(step.phase)
-        return phase is not None and phase.status == "done"
-
-    def _plan_block(self) -> list[str]:
-        """The plan as a cursor, not as a checklist.
-
-        This is the ACTIVE PHASE node, and it is a rendering decision with a
-        measured cause. The block used to list every step and its status on
-        every turn. A model handed eight pending items attempts all eight: a
-        field session died with three replies in a row cut off mid-tool-call
-        against the 16,384-token output budget of the time, having written two
-        files out of eight steps, and its own prose was an essay about the
-        remaining six. The budget is 32,768 now and the shape does not change --
-        a checklist is an invitation to spend the whole of whatever it is.
-
-        One step, named, with the criterion it is measured against. What is
-        finished is summarised by number rather than re-listed, because the
-        model does not need to re-read work it cannot change; what is next is
-        named as one line, because the point of a plan is that the model can see
-        it is going somewhere without trying to get there this turn.
-
-        The statuses are still ground truth -- `written` and `done` come from
-        the change set and the inner gate, never from the model saying so -- so
-        this is a smaller view of the same facts, not a softer one.
-
-        **And the cursor has to move.** The first version of this block did not:
-        while step 2 stayed pending it rendered the same bytes every turn, in
-        the last position of the prompt, phrased as an instruction. A field
-        session opened fifteen consecutive replies with a verbatim restatement
-        of it -- "I'll now work on step 2: creating handler/request.go ... Let
-        me first check what already exists" -- and restarted the same
-        reconnaissance each time, because nothing it read said the
-        reconnaissance had already happened. The checklist it replaced was
-        static too and did not do this; the difference is that a checklist is
-        something to consult and this is something to obey.
-
-        So the active line carries how long the cursor has been on this step and
-        what has landed on it. Both are ground truth, both change under the
-        model's own feet, and between them they turn "do step 2" into "you have
-        been doing step 2 for seven turns and nothing has been written".
-        """
-        plan = self.state.plan
-        settled = [
-            f"{i} {s.file}"
-            for i, s in enumerate(plan, 1)
-            if s.status in ("done", "skipped")
-        ]
-        # Named rather than folded into "done", because the cursor has moved
-        # past them and the model has to be able to tell why. A blocked step
-        # that read as finished would invite the run to report the work as
-        # complete; one that read as pending would put the cursor back on it.
-        stuck = [f"{i} {s.file}" for i, s in enumerate(plan, 1) if s.status == "blocked"]
-        active = self.active_step
-
-        lines: list[str] = []
-        if active is None:
-            report = self.state.last_gate
-            if report is not None and not report.ok:
-                # Every step settled and the gate still failing. Saying "all
-                # settled" alone would be the plan contradicting the line under
-                # it, and a plan that declares completion while verification
-                # fails is the exact node this work exists to fix -- MARK PHASE
-                # COMPLETE must not fire ahead of VERIFICATION.
-                #
-                # It happens legitimately: `_note_tried` only marks a step
-                # failed when the blocking stage's output names its file, and a
-                # build error often names a package or another file entirely.
-                where = report.blocked_by.name if report.blocked_by else "the gate"
-                lines.append(
-                    f"Plan: every step is written, but the gate is failing at {where}, "
-                    "so the work is not done. Fix that before finishing."
-                )
-            else:
-                lines.append(f"Plan: all {len(plan)} step(s) settled.")
-            if settled:
-                lines.append("  Done: " + ", ".join(settled[-STATE_ITEMS:]))
-            if stuck:
-                lines.append("  Blocked: " + ", ".join(stuck[-STATE_ITEMS:]))
-            blocked = [f"{i} {s.file}" for i, s in enumerate(plan, 1) if s.status == "failed"]
-            if blocked:
-                lines.append("  Failed: " + ", ".join(blocked[-STATE_ITEMS:]))
-            return lines
-
-        index, step = active
-        state = "" if step.status == "pending" else f" [{step.status}]"
-        where = f" of phase {step.phase}" if step.phase else ""
-        lines.append(
-            f"Now: step {index} of {len(plan)}{where}{state} — {step.file} — {step.action}"
-        )
-        if step.part:
-            lines.append(f"  Part: {step.part}")
-        if same := [i for i, s in enumerate(plan, 1) if s.file == step.file and i != index]:
-            # One of several steps on one file, and the workflow is not obvious.
-            #
-            # A run read "convert handler/paogen.go, lines 1-2000", reasoned that
-            # it had to read 6,571 lines before it could write any of them,
-            # concluded the context budget would not survive it, and reported the
-            # phase blocked. It was right about the arithmetic it did and wrong
-            # about the arithmetic it needed: a step reads *its own range* and
-            # writes that range back, which fits a reply with room to spare.
-            # Nothing had ever said so.
-            lines.append(
-                f"  This is one of {len(same) + 1} steps on {step.file}. Read only "
-                "the range this step names -- `read_file` takes `start` and `end` "
-                "-- and write that range back. Do not read or rewrite the whole "
-                "file; the other steps have the rest."
-            )
-        if step.accepts:
-            lines.append(f"  Accepts: {step.accepts}")
-        if step.note:
-            lines.append(f"  Note: {step.note}")
-        if elapsed := self._cursor_age(step):
-            lines.append(f"  {elapsed}")
-        if settled:
-            lines.append("  Done: " + ", ".join(settled[-STATE_ITEMS:]))
-        if stuck:
-            lines.append("  Blocked: " + ", ".join(stuck[-STATE_ITEMS:]))
-        nxt = next(
-            (
-                f"step {i} — {s.file}"
-                for i, s in enumerate(plan, 1)
-                if i > index and (s.open or s.status == "written")
-            ),
-            "",
-        )
-        lines.append(f"  Next: {nxt}" if nxt else "  Next: nothing — this is the last step.")
-        return lines
-
-    def _cursor_age(self, step: PlanStep) -> str:
-        """How long the cursor has sat on this step, as one line, or ``""``.
-
-        The line that makes the block move. Everything in it is read off the
-        loop rather than off the model: the turn counter, and whether anything
-        in the change set covers the step's file.
-
-        The cursor is reset by the *step* changing, not by the turn advancing,
-        so it survives a follow-up message -- which is where it is needed most.
-        The loop that this exists to break spanned three developer messages, and
-        a counter that restarted at each one would have read "turn 1 on this
-        step" every time the model was most stuck.
-
-        Silent on the turn the cursor lands, because "you have been here for no
-        turns" is noise, and silent with no plan or no turns yet so the
-        rendering tests that build a loop by hand see the block they assert on.
-
-        Writes state from what reads as a rendering path, which is worth one
-        line: `_state_block` has a single call site and runs once a turn, and
-        this is idempotent within a turn anyway -- a second call in the same
-        turn finds the step unchanged and computes an age of zero.
-        """
-        turn = self.context.turn
-        if step.file != self.state.cursor[0]:
-            self.state.cursor = (step.file, turn)
-            return ""
-        since = self.state.cursor[1]
-        turns = turn - since
-        if turns < 1:
-            return ""
-        landed = any(step.covers(path) for path in self.router.touched)
-        if landed:
-            line = (
-                f"On this step since turn {since} — {turns} turn(s) so far, and "
-                f"{step.file} has been written. What is outstanding is its "
-                "verification, not more of the work."
-            )
-            if step.status == "written" and step.note:
-                # "Verification" is the honest word for a step waiting on a gate
-                # it will reach, and the wrong one for a step a check has
-                # already objected to -- the objection is in `note`, and what it
-                # wants is an edit.
-                #
-                # Session 6d923ab574ae had both readings in one block, four
-                # lines apart: this line saying the outstanding thing was
-                # verification, and the migration line above saying "the gate is
-                # deferred until the last phase closes". Between them the
-                # recency slot -- the position the whole design gives to what to
-                # do next -- named a job that could not be done, for 27 turns.
-                line = (
-                    f"On this step since turn {since} — {turns} turn(s) so far. "
-                    f"{step.file} has been written and a check objected to it: "
-                    f"{step.note}. That is an edit, not a wait — no gate later on "
-                    "will clear it, and reading the file again returns the same "
-                    "bytes. Fix what the finding names, or `revise_plan` this step "
-                    "to `blocked` with the reason."
-                )
-            return line
-        line = (
-            f"On this step since turn {since} — {turns} turn(s) so far, and "
-            f"nothing has been written to {step.file} yet. "
-            "Reading more is not what closes it."
-        )
-        if turns >= STUCK_TURNS:
-            # The exit, named, at the point it becomes the likely answer.
-            #
-            # Everything else this block says is a restatement of the order the
-            # model has already failed to carry out, and a restated order is
-            # what it has been looping on. Three field loops ran to the turn cap
-            # with a cursor frozen on one step; in all three the step's premise
-            # was false and the model had no word for that. `skipped` was the
-            # only status it could set and it means "unnecessary", which this is
-            # not -- so it kept trying, and every guard in the loop could only
-            # tell it "not that".
-            line += (
-                f" {turns} turns on one step usually means the step cannot be done "
-                "as written. If that is what has happened, call `revise_plan` and "
-                "set this step's status to `blocked` with the reason in `note` — "
-                "the plan moves past it, the run carries on, and the developer is "
-                "told what stopped it. That is not giving up; it is the difference "
-                "between a run that reports a blocker and one that runs out of turns."
-            )
-        return line
-
-    def _settle_written(self) -> None:
-        """A clean full gate settles every step still sitting at ``written``.
-
-        `_verify_written` is the only other thing that promotes them and it runs
-        only from `_inner_loop`, which runs only after a mutating batch. So a
-        step whose file the run never touched again was stranded at ``written``
-        for the life of the session: ``open`` is false, so `_open_targets` could
-        not ask for it and no push-back ever named it as work; meanwhile
-        `_why_not_done` objected to it on every `finish` and `active_step` kept
-        the cursor pinned to it. Unreachable in both directions at once.
-
-        The gate is a superset of the inner loop's two checks and it has just
-        come back clean over the whole change set, so this is the strongest
-        verdict available about those files -- stronger than the one that would
-        have promoted them. There is nothing left for a ``written`` step to be
-        waiting on.
-        """
-        if not any(step.status == "written" for step in self.state.plan):
-            return
-        self.state.plan = tuple(
-            replace(step, status="done", note="") if step.status == "written" else step
-            for step in self.state.plan
-        )
-        self._save_plan()
-
     def _ruled_out(self) -> list[str]:
         """What this run has established does not work, one line each."""
         out = list(self.state.tried)
@@ -5575,249 +3181,14 @@ class AgentLoop:
             )
         return out
 
-    def _verify_written(self, report: GateReport) -> None:
-        """Promote written steps to done, or say what is holding them.
-
-        Called with the inner loop's verdict, which is scoped to the files this
-        batch touched. A clean verdict means what was written passes the two
-        checks that can be run in under a second — the formatter and the
-        contract linter — and that is the most this node can honestly assert. It
-        is not a build, and a step reaching ``done`` here is not a claim that
-        the run is correct; the gate still has the last word at the end of the
-        phase.
-
-        A dirty verdict leaves the step ``written`` with the blocking stage
-        named. That is the state the plan could not previously express: the file
-        exists, so "you never wrote it" is false, and the work is not finished,
-        so "done" is false too.
-
-        Findings that were already in the file before the run started do not
-        hold a step back. ``_lint_is_old_news`` is the same test the message to
-        the model uses, and a legacy file's pre-existing violations are not this
-        step's failure to fix.
-        """
-        if not self.state.plan:
-            return
-
-        # `report.ok` would make this a no-op: the inner loop's own docstring
-        # says nothing in it blocks, so `ok` -- "no stage blocked and none was
-        # skipped" -- is true of every inner report. Findings arrive as
-        # `warnings`, which is what `_inner_loop` itself checks one line below
-        # the call.
-        #
-        # The old-news test is asked only of `rules_lint`, the stage it is
-        # about: it consults the baseline's `rules_lint` history, so asking it
-        # about a `gofmt` warning would excuse formatting against a
-        # contract-lint record.
-        unclean = [
-            r
-            for r in report.warnings
-            if not (r.name == "rules_lint" and self._lint_is_old_news(r))
-        ]
-
-        promoted = []
-        for step in self.state.plan:
-            if step.status != "written":
-                promoted.append(step)
-                continue
-            # **Per file, not per report.** A stage holds a step open only when
-            # one of its findings names a path that step covers.
-            #
-            # The alternative -- any warning anywhere holds every written step
-            # -- was tried and is worse than not having this node at all. The
-            # inner loop runs `go_diagnostics`, which fails outright on a
-            # machine with no gopls, so on most developer machines every step
-            # would sit at `written` forever. That is defect D2's compounding
-            # failure rebuilt in a new place: a permanently unsatisfiable
-            # condition that spends the completion guard's single push-back and
-            # then silences it.
-            #
-            # `finding_path` returns "" for a stage that failed without keying
-            # a file, which is the honest reading: a tool that could not run
-            # objected to nothing about this step's work.
-            blockers = [
-                r.name
-                for r in unclean
-                if any(step.covers(finding_path(r.name, k)) for k in r.findings)
-            ]
-            blocker = ", ".join(dict.fromkeys(blockers))
-            promoted.append(
-                replace(
-                    step,
-                    status="written" if blocker else "done",
-                    note=f"written; {blocker} is not clean on it yet" if blocker else "",
-                )
-            )
-        self.state.plan = tuple(promoted)
-        self._save_plan()
-
     def _mark_steps(self, path: str, status: str, note: str = "") -> None:
-        """Set the status of the plan step(s) ``path`` belongs to.
-
-        One step when several name the same file, and that is what makes a large
-        file convertible at all.
-
-        A 6,571-line handler cannot be converted in one reply -- the acting
-        phase has 32,768 output tokens and has to read the original as well --
-        so its step is really nine steps over the same path, each naming the
-        methods it converts. Marking *every* covering step on the first write
-        made those nine a single step wearing nine hats: one `patch_file` and
-        the whole file was written, done, and never looked at again. A field run
-        stopped on exactly this, reporting that the volume "exceeds what can be
-        reliably done in a single session" -- which was true, and which the plan
-        had no way to express.
-
-        So a write lands on the step being worked: the cursor's, when the cursor
-        covers the path, and otherwise the first covering step still open. Only
-        when nothing is open does it fall back to marking them all, which is the
-        old behaviour and the right one for a re-touch after the work is done.
-        """
+        """Set the status of every plan step that names ``path``."""
         if not self.state.plan:
             return
-        before = self.state.plan
-        covering = [i for i, step in enumerate(self.state.plan) if step.covers(path)]
-        target: set[int] = set(covering)
-        if len(covering) > 1:
-            active = self.active_step
-            if active is not None and active[0] - 1 in covering:
-                target = {active[0] - 1}
-            elif open_here := [i for i in covering if self.state.plan[i].open]:
-                target = {open_here[0]}
         self.state.plan = tuple(
-            replace(step, status=status, note=note) if i in target else step
-            for i, step in enumerate(self.state.plan)
+            replace(step, status=status, note=note) if step.file == path else step
+            for step in self.state.plan
         )
-        if self.state.plan != before:
-            # A status change is not a new plan, so it updates the record
-            # without adding a revision -- the loop sets `done` from the change
-            # set on every mutation, and recording each of those would bury the
-            # two or three that are actually revisions.
-            self._save_plan()
-
-    def _record_plan(self, cause: str, reason: str = "") -> None:
-        """Write the plan and the revision that produced it.
-
-        Silent when there is no session: a loop driven directly by a test or a
-        CLI has no directory to write to, and inventing one would put files in
-        whatever the working directory happened to be.
-        """
-        if not self.session_id:
-            return
-        self._plan_record = self._plan_record.record(
-            self.state.plan, self.state.plan_summary, cause=cause, reason=reason
-        )
-        self._plan_record.session_id = self.session_id
-        self._plan_record.forced = self.state.plan_forced
-        self._plan_record.migration = self.state.migration
-        self._plan_record.save(self.router.workspace.root)
-        self._save_progress()
-
-    def _line_count(self, path: str) -> int:
-        """How many lines are in a workspace file, or 0.
-
-        Read rather than estimated, and cheap enough to do per plan step: eight
-        steps at most, once per submission. A path that does not resolve, is a
-        directory, is a glob, or is not text answers 0 -- "unknown size" and
-        "small" are the same answer to the only question asked of it, which is
-        whether one step can finish it.
-        """
-        try:
-            target = self.router.workspace.resolve(path)
-        except (PathEscape, ValueError):
-            return 0
-        try:
-            with open(target, "rb") as handle:
-                return sum(1 for _ in handle)
-        except OSError:
-            return 0
-
-    def _save_routes(self) -> None:
-        """Record every route the service serves, before the conversion touches it.
-
-        Taken once, on the way past the branch guard, which is the last moment
-        at which the answer is still *the legacy service's*. A phase later it
-        would be a picture of a half-converted one, and comparing the end of the
-        migration against that would pass by construction -- the routes it had
-        already lost would not be in the baseline to be missed.
-
-        Silent about its own failure, like the journal and the plan record, with
-        one difference that matters: the gate's `routes_check` stage is
-        conditioned on the file *existing*, so a save that did not happen skips
-        the check rather than failing it. That is the right way round -- the
-        alternative is a migration that cannot finish because a check could not
-        be set up -- and it is why the checkpoint says whether the inventory was
-        taken.
-        """
-        if self.state.routes_saved or not self.state.migration.active:
-            return
-        # Marked before the call, not after: a sidecar that is absent raises on
-        # every attempt, and retrying it on each of forty write calls would cost
-        # a subprocess launch apiece to reach the same answer.
-        self.state.routes_saved = True
-        try:
-            # Through the gate path, because that is what this is: a harness
-            # call the model did not make and cannot refuse. `route_inventory`
-            # is gate-only, so an ordinary dispatch would correctly refuse it.
-            outcome = self.router.run_gate_tool("route_inventory", {"save": ROUTES_BEFORE})
-        except Exception:  # noqa: BLE001 - a backup is not a precondition for planning
-            return
-        if not isinstance(outcome, ToolResult) or not outcome.ok:
-            return
-        self.state.routes_before = int(outcome.meta.get("routes") or 0)
-        self._relay(
-            Event(
-                EventType.GATE,
-                {
-                    "kind": "routes",
-                    "saved": ROUTES_BEFORE,
-                    "routes": self.state.routes_before,
-                    "unresolved": int(outcome.meta.get("unresolved") or 0),
-                },
-            )
-        )
-
-    def _save_progress(self) -> None:
-        """Write the migration's progress where the next session can read it.
-
-        Best-effort, like the journal and the plan record: a lost progress file
-        costs a `read_file` on the next session, never the work.
-
-        It is written on every plan change rather than at the end, because the
-        end is the case it is least needed for. A conversion spans sessions --
-        ten thousand lines across seven files is more than one context window --
-        and the question a resumed session opens with is *where did the last one
-        get to*. Before this the answers were the transcript, which compaction
-        eats, and the model's own prose, which a field session wrote by hand and
-        then read back as evidence of work it had not done.
-        """
-        if not self.state.migration.active:
-            return
-        try:
-            target = self.router.workspace.root / PROGRESS_PATH
-            ensure_private(target.parent)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
-                progress_document(
-                    self.state.migration,
-                    self.state.plan,
-                    self.router.touched,
-                    self.state.routes_before,
-                ),
-                encoding="utf-8",
-            )
-        except OSError:
-            return
-
-    def _save_plan(self) -> None:
-        """Write the current step statuses, without recording a revision."""
-        if not self.session_id:
-            return
-        self._plan_record = self._plan_record.with_steps(self.state.plan)
-        self._plan_record.session_id = self.session_id
-        self._plan_record.forced = self.state.plan_forced
-        self._plan_record.migration = self.state.migration
-        self._plan_record.save(self.router.workspace.root)
-        self._save_progress()
 
     def _note_tried(self, report: GateReport) -> None:
         """Record a gate failure after an edit as an attempt that did not work."""
@@ -5868,60 +3239,18 @@ class AgentLoop:
         self._switch(Mode.PLANNER)
 
     def _adopt_plan(self, steps: Sequence[PlanStep], summary: str) -> Iterator[Event]:
-        """Install a plan, carrying forward everything already settled.
-
-        **Re-planning must never un-do work that is on disk.** It did. The rule
-        was "keep a done step only if the incoming plan does not name its file",
-        which is exactly backwards: re-submitting the *same* plan -- the common
-        case, because a follow-up re-enters the Planner and the Planner writes
-        the plan it already wrote -- dropped every finished step and replaced it
-        with a pending one. A field session re-submitted an identical eight-step
-        plan three times, and each time the two files genuinely written stopped
-        counting as done. The phase pointer was erased on every re-plan.
-
-        So a step that is settled -- written, verified, or deliberately skipped
-        -- keeps its status, and the incoming step supplies only the wording.
-        ``pending`` and ``failed`` do not carry: a step the model has just
-        re-stated is one it intends to attempt again, and a stale ``failed``
-        would read as a verdict on an attempt that has not happened yet.
-
-        Settled steps the new plan does not mention are kept at the front. They
-        are history, and dropping them would make the same claim the old rule
-        made: that nothing happened.
-        """
-        # Two sets, because ``blocked`` belongs to one of them and not the
-        # other. A re-plan that *names* a blocked step is the model deciding to
-        # try it again -- re-stating it is the retry -- so its status must not
-        # be carried onto the new step. A re-plan that does not mention it is
-        # not a retraction, and dropping it would lose the reason the developer
-        # needs.
-        settled = {"done", "written", "skipped"}
-        history = settled | {"blocked"}
+        """Install a plan, keeping the steps an earlier plan already finished."""
         incoming = {s.file for s in steps if s.file}
-        prior = {s.file: s for s in self.state.plan if s.file and s.status in settled}
-        merged = tuple(
-            replace(step, status=prior[step.file].status, note=prior[step.file].note)
-            if step.file in prior
-            else step
-            for step in steps
-        )
         kept = tuple(
-            s for s in self.state.plan if s.status in history and s.file not in incoming
+            s for s in self.state.plan if s.status == "done" and s.file not in incoming
         )
-        self.state.plan = kept + merged
+        self.state.plan = kept + tuple(steps)
         if summary:
             self.state.plan_summary = summary
-        # Recorded before it is rendered. A plan was a tuple in a process,
-        # lost on a daemon restart, with no record of how it reached its
-        # current shape -- so a developer who reloads their window at step 4 of
-        # 7 came back to an agent holding the edits and none of the plan that
-        # produced them. See ``plan.py``.
-        self._record_plan("replanned" if self.state.replans else "submitted")
         rendered = "\n".join(step.rendered(i) for i, step in enumerate(self.state.plan, 1))
         if self.state.plan_summary:
             rendered = f"{self.state.plan_summary}\n\n{rendered}"
         self.context.set_plan(rendered)
-        self._note_unrunnable_criteria()
         yield Event(
             EventType.PLAN,
             {
@@ -5971,11 +3300,6 @@ class AgentLoop:
         # it replaces, this one is volunteered.
         self.state.plan_forced = False
         yield from self._adopt_plan(steps, "")
-        # Overwrites the revision `_adopt_plan` just recorded with one that
-        # names the cause and the model's reason. Two entries for one event
-        # would make the history harder to read than no history.
-        self._plan_record.revisions = self._plan_record.revisions[:-1]
-        self._record_plan("revised", reason)
 
     def _overlap(self, call: ToolCall, outcome: ToolResult) -> str:
         """What to tell a run whose search returned only places it already had."""
@@ -6219,13 +3543,7 @@ class AgentLoop:
             "files at once"
         )
 
-    def _compact(
-        self,
-        *,
-        retain_pct: float = 0.35,
-        reason: str = "threshold",
-        strategy: str = "agentic",
-    ) -> Iterator[Event]:
+    def _compact(self, *, retain_pct: float = 0.35, reason: str = "threshold") -> Iterator[Event]:
         """Compact, invalidate the ledgers, and say what it actually freed.
 
         Every compaction goes through here, including the emergency one in
@@ -6237,9 +3555,7 @@ class AgentLoop:
         """
         self.state.compactions.append(self.context.turn)
         before = self.context.usage().total
-        recap = self.context.compact(
-            self._summarise, retain_pct=retain_pct, strategy=strategy
-        )
+        recap = self.context.compact(self._summarise, retain_pct=retain_pct)
         evicted = self.context.last_eviction
         self._forget_evicted(evicted)
         yield Event(
@@ -6247,7 +3563,6 @@ class AgentLoop:
             {
                 "kind": "compaction",
                 "reason": reason,
-                "strategy": strategy,
                 "before": before,
                 "after": self.context.usage().total,
                 "turns": getattr(recap, "turns", None),
@@ -6259,32 +3574,22 @@ class AgentLoop:
         )
 
     def _forget_evicted(self, evicted: Eviction) -> None:
-        """Re-sync the one ledger that is still a copy, and say what was hidden.
+        """Drop every ledger entry that described content compaction removed.
 
-        This used to be a page of invalidation: rebuild the read spans, clear
-        five call ledgers outright, reset two counters. It existed because the
-        context evicted, the loop's ledgers refused, and nothing connected them
-        — the recap told the model "re-read one only if you need a line range
-        you have not seen" while the read intercept answered that same re-read
-        with "those lines are already in context above", two true-sounding
-        messages neither of which could be obeyed (BUG L-10).
+        This is the second half of the prior audit's central finding: the
+        context manager evicts, the loop's ledgers refuse, and nothing connects
+        them. The recap tells the model "re-read one only if you need a line
+        range you have not seen" while the read intercept answers that same
+        re-read with "those lines are already in context above" — two true-
+        sounding messages, neither of which can be obeyed, and the model has no
+        way to recover the content (BUG L-10).
 
-        Almost all of it is gone because the disagreement is gone. Compaction no
-        longer removes anything; it writes a sidecar, the projection applies it,
-        and every "can the model see this" question is answered from the
-        projection on the turn it is asked:
-
-        * the read intercept reads ``context.coverage()`` (see ``_live_reads``);
-        * the cached-result intercept checks ``context.visible_results``;
-        * "has this body been seen" is ``context.visible_bodies``;
-        * repeated answers collapse in the projection, so there is no echo
-          ledger left to clear.
-
-        What remains is the *stored* read ledger, which is not a claim about the
-        context — it is the per-file dispatch budget and the file's length, both
-        facts about the run. Its spans are re-derived here anyway so that a
-        ledger read directly (by ``carry_from``, or by a future persistence
-        path) does not carry coverage the model has lost.
+        The read ledger is *rebuilt* from what the context still holds rather
+        than cleared, so a file with surviving reads keeps its coverage and only
+        the evicted spans become askable again. The call ledgers
+        (``last_results``, ``echoes``, ``truncated_at``) are cleared for evicted
+        ids: they exist to answer a repeat with "you already have this", and
+        after eviction that claim is simply false.
 
         ``seen_calls`` and ``dead_ends`` survive deliberately. A dead end is a
         fact about the world, not about the transcript — the arguments are still
@@ -6296,17 +3601,32 @@ class AgentLoop:
             ledger = self.state.reads.get(path)
             if ledger is None:
                 continue
+            spans = coverage.get(path, [])
+            if not spans:
+                # Nothing of this file is left in context. The dispatch count
+                # stays -- it is a budget against re-reading, and the reads did
+                # happen -- but the run has seen none of it any more.
+                ledger.covered = []
+                continue
             ledger.covered = []
-            for low, high in coverage.get(path, []):
+            for low, high in spans:
                 ledger.add(low, high)
 
         if not evicted.messages:
             return
-        # A search's places are worth re-seeing once after the messages naming
-        # them stop being visible. Unlike the ledgers above, this one is a
-        # record of what a *query* returned rather than of what is in context,
-        # so the projection cannot re-derive it.
-        self.state.reading.forget_searches()
+        # The cached-result ledgers are keyed by fingerprint, not by message, so
+        # they cannot be pruned precisely. Any eviction makes "you already have
+        # this answer above" unreliable, and answering a repeat from a cache of
+        # a message that is gone is exactly the failure this is fixing.
+        self.state.last_results.clear()
+        self.state.partial_results.clear()
+        self.state.truncated_at.clear()
+        self.state.echoes.clear()
+        # A result the context no longer holds is news again when it comes
+        # back, and a search's places are worth re-seeing once.
+        self.state.seen_bodies.clear()
+        self.state.search_hits.clear()
+        self.state.search_repeats = 0
 
     def _summarise(self, messages: Sequence[Message]) -> Recap:
         """Summarise the evicted working set into a structured recap.
@@ -6641,66 +3961,6 @@ def _partial_path(arguments: str) -> str:
     return match.group(1) if match else ""
 
 
-#: What an endpoint says when the request will not fit.
-#:
-#: Matched on the message rather than on a status code, because the status is
-#: 400 for a dozen unrelated things and this is the one that is recoverable.
-#: Several phrasings because the request passes through LiteLLM in front of
-#: vLLM and either may be the one to refuse it; all of them are lower-cased
-#: before matching.
-_CONTEXT_LENGTH_MARKERS = (
-    "context length",
-    "context_length",
-    "maximum context",
-    "too many tokens",
-    "reduce the length",
-    "prompt is too long",
-    "input is too long",
-    "exceeds the maximum",
-)
-
-
-def _context_length_error(exc: BaseException) -> bool:
-    """Whether this failure is the endpoint refusing an over-long request.
-
-    Conservative on purpose. A false positive costs one deterministic
-    compaction and a retry; a false negative costs the run, which is what
-    happens today for every one of these.
-    """
-    message = str(exc).lower()
-    return any(marker in message for marker in _CONTEXT_LENGTH_MARKERS)
-
-
-def _describe(group: Any) -> dict[str, Any]:
-    """One state group, rendered small enough to read every turn.
-
-    A ledger is summarised by its size and its keys, not dumped: `last_results`
-    holds up to 6,000 characters per fingerprint and reading forty of them is
-    not debugging, it is scrolling. What a reader needs from a ledger is whether
-    it has an entry for the call that just misbehaved, which the keys answer.
-
-    Anything scalar is shown as it is, because the scalars are the bounds -- the
-    stall count, the gate failures, the truncation streak -- and those are the
-    numbers a run dies on.
-    """
-    out: dict[str, Any] = {}
-    for field_name, value in vars(group).items():
-        if isinstance(value, dict):
-            out[field_name] = {"n": len(value), "keys": sorted(value)[:8]}
-        elif isinstance(value, (list, tuple, set, frozenset)):
-            items = list(value)
-            out[field_name] = (
-                {"n": len(items), "items": [str(i)[:80] for i in items[:6]]}
-                if len(items) > 6
-                else [str(i)[:80] for i in items]
-            )
-        elif value is None or isinstance(value, (str, int, float, bool)):
-            out[field_name] = value if not isinstance(value, str) else value[:200]
-        else:
-            out[field_name] = str(value)[:200]
-    return out
-
-
 def _body_digest(name: str, body: str) -> str:
     """A key for "the model has seen this result before".
 
@@ -6766,50 +4026,21 @@ def _volume(call: ToolCall) -> int:
     return 0
 
 
-#: How long a fingerprint's argument half may be before it is stored as a
-#: digest of itself.
-#:
-#: A fingerprint is a dictionary *key*, held in four ledgers and carried across
-#: every follow-up in the session by ``carry_from``. Most are a path and a line
-#: range. Two are not: `write_file` carries the whole file it wrote, and
-#: `finish` carries the whole answer -- and `MAX_ANSWER_CHARS` is 24,000. One
-#: field session ended up holding two 24,000-character keys for the rest of its
-#: life, and every debug record of its state printed both in full.
-#:
-#: 400 characters clears every real call -- the longest ordinary one measured is
-#: a `patch_file` anchor at ~200 -- and nothing above it is a question anybody
-#: asks twice by accident.
-FINGERPRINT_CHARS = 400
-
-
 def _fingerprint(call: ToolCall) -> str:
     """What makes two calls the same question.
 
     Falls back to the raw string when the arguments do not parse -- a model that
     resends the same malformed arguments is exactly what the ledgers are for, so
     this must not be the thing that raises on them.
-
-    Long arguments are kept as a digest rather than in full. Identity is all a
-    fingerprint is for: nothing reads the arguments back out of one, and the one
-    thing that does read *into* it takes the tool name from in front of the
-    first colon, which a digest leaves alone.
     """
     try:
         parsed = call.parsed()
     except ValueError:
-        return _key(call.name, call.arguments)
+        return f"{call.name}:{call.arguments}"
     if not isinstance(parsed, dict):
-        return _key(call.name, call.arguments)
+        return f"{call.name}:{call.arguments}"
     kept = {k: v for k, v in parsed.items() if k not in _VOLUME_PARAMS}
-    return _key(call.name, json.dumps(kept, sort_keys=True, separators=(",", ":")))
-
-
-def _key(name: str, arguments: str) -> str:
-    """``tool:arguments``, or ``tool:#digest`` once the arguments are long."""
-    if len(arguments) <= FINGERPRINT_CHARS:
-        return f"{name}:{arguments}"
-    digest = hashlib.sha256(arguments.encode("utf-8", "replace")).hexdigest()[:32]
-    return f"{name}:#{digest}"
+    return f"{call.name}:" + json.dumps(kept, sort_keys=True, separators=(",", ":"))
 
 
 def _slice_path(call: ToolCall, result: ToolResult) -> tuple[str | None, tuple[int, int] | None]:

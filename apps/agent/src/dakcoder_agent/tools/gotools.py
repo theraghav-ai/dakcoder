@@ -501,107 +501,6 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
             ),
         )
 
-    def route_inventory(inv: Invocation) -> ToolResult:
-        args: dict[str, Any] = {}
-        if inv.arg("save"):
-            args["save"] = str(inv.arg("save"))
-        if inv.arg("against"):
-            args["against"] = str(inv.arg("against"))
-
-        def render(payload: Mapping[str, Any]) -> str:
-            result = payload.get("result") or {}
-            rows = list(result.get("routes") or [])
-            legacy = int(result.get("legacy") or 0)
-            template = int(result.get("template") or 0)
-            out = [
-                f"{len(rows)} route(s): {legacy} legacy (gin), {template} template"
-            ]
-            if saved := result.get("saved"):
-                out.append(f"saved to {saved}")
-
-            # The comparison first when there is one, because it is the answer
-            # and the listing is the evidence. A gate reading this needs the
-            # verdict in the first line it can find.
-            if result.get("compared"):
-                missing = list(result.get("missing") or [])
-                out.append("")
-                if missing:
-                    out.append(
-                        f"{len(missing)} route(s) in the saved inventory are no longer "
-                        "registered:"
-                    )
-                    for r in missing[:_MAX_ROWS]:
-                        out.append(
-                            f"  {str(r.get('method','')):6s} {str(r.get('path','')):48s} "
-                            f"was {r.get('file')}:{r.get('line')}"
-                            + (f" ({r['handler']})" if r.get("handler") else "")
-                        )
-                    out.extend(_elided(_MAX_ROWS, len(missing), "all are lost routes"))
-                    out += [
-                        "",
-                        "Each one is an endpoint a client can still call and will now "
-                        "get a 404 from. Register it on the converted handler, with the "
-                        "same method and path.",
-                    ]
-                else:
-                    out.append(
-                        f"OK — all {result.get('before', 0)} route(s) in the saved "
-                        "inventory are still registered."
-                    )
-                return "\n".join(out)
-
-            out.append("")
-            for r in rows[:_MAX_ROWS]:
-                out.append(
-                    f"  {str(r.get('method','')):6s} {str(r.get('path','')):48s} "
-                    f"{r.get('file')}:{r.get('line')}"
-                    + (f" -> {r['handler']}" if r.get("handler") else "")
-                )
-            out.extend(_elided(_MAX_ROWS, len(rows), "all are routes in this service"))
-            if unresolved := list(result.get("unresolved") or []):
-                out += [
-                    "",
-                    f"{len(unresolved)} registration(s) could not be read as a literal "
-                    "path and are NOT in the inventory, so they will not be checked "
-                    "after the migration:",
-                ]
-                out += [f"  {u}" for u in unresolved[:_MAX_ROWS]]
-            return "\n".join(out)
-
-        reply = sidecar.call("route_inventory", args)
-        out = _report(reply, render)
-        if not out.ok:
-            return out
-
-        # A lost route is a failure, not a report.
-        #
-        # `_report` returns success for everything, which is right for an audit
-        # the model reads and wrong for the one question this tool is asked at
-        # the end of a migration. The gate decides a stage by `result.ok`, so a
-        # comparison that found four missing endpoints and came back "ok" would
-        # be a check that runs, prints the problem, and passes anyway.
-        try:
-            result = (json.loads(reply.text) or {}).get("result") or {}
-        except (json.JSONDecodeError, ValueError, TypeError):
-            return out
-        missing = list(result.get("missing") or [])
-        meta = {
-            **out.meta,
-            "routes": len(list(result.get("routes") or [])),
-            "compared": bool(result.get("compared")),
-            "missing": len(missing),
-            "unresolved": len(list(result.get("unresolved") or [])),
-        }
-        if result.get("compared") and missing:
-            return ToolResult.failure(
-                out.content,
-                fix="Register each one on the converted handler's `Routes()`, with the "
-                "same method and path it had. If a route was retired on purpose, say "
-                "which and why -- it is not something to leave unexplained.",
-                meta=meta,
-            )
-        return ToolResult.success(out.content, meta=meta)
-
     def lib_version_check(_inv: Invocation) -> ToolResult:
         def render(payload: Mapping[str, Any]) -> str:
             result = payload.get("result") or {}
@@ -612,35 +511,10 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
                 status = str(r.get("status", ""))
                 if r.get("superseded_by"):
                     status = "SUPERSEDED -> " + str(r["superseded_by"]).rsplit("/", 1)[-1]
-                    # The replacement's own version, which is the one fact a
-                    # conversion needs from this row. Without it the row named
-                    # the module to move to and nothing about which version, and
-                    # a field run filled the gap by carrying this module's
-                    # version across the rename -- into a separate release line
-                    # where it had never existed.
-                    if latest := r.get("superseded_by_latest"):
-                        status += f"@{latest}"
                 if r.get("behind"):
                     status += f" (behind {r['behind']})"
                 out.append(f"  {module:24s} {r.get('current','?'):10s} {status}")
             out.extend(_elided(_MAX_ROWS, len(rows), "all are CEPT modules"))
-            # What the report could not answer, before what it says to do about
-            # it. The CLI has printed `registry_error` since this tool existed
-            # and this path never did, so a run reading the report through the
-            # agent saw blank version columns and no reason for them -- and read
-            # a blank as "nothing published" rather than "not looked up". It
-            # then asked the developer which versions to use, was answered, and
-            # asked again twice.
-            if unresolved := list(result.get("unresolved") or []):
-                short = [str(m).rsplit("/", 1)[-1] for m in unresolved[:_MAX_ROWS]]
-                more = "" if len(unresolved) <= _MAX_ROWS else f", +{len(unresolved) - _MAX_ROWS} more"
-                out.extend([
-                    "",
-                    f"  not looked up: {', '.join(short)}{more} — their version is "
-                    "missing from this report, not missing upstream.",
-                ])
-            if error := str(result.get("registry_error") or "").strip():
-                out.append(f"  first lookup error: {error}")
             if note := str(payload.get("note") or "").strip():
                 out.extend(["", note])
             return "\n".join(line for line in out if line is not None)
@@ -659,7 +533,6 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
         "validation_audit": validation_audit,
         "temporal_audit": temporal_audit,
         "lib_version_check": lib_version_check,
-        "route_inventory": route_inventory,
     }
 
 

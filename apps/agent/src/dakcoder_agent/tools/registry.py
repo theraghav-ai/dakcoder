@@ -33,7 +33,6 @@ from ..modes import Mode
 __all__ = [
     "MAX_DESCRIPTION",
     "MAX_PARAMS",
-    "MAX_STEPS",
     "Approval",
     "Provider",
     "REGISTRY",
@@ -47,29 +46,6 @@ __all__ = [
 #: C1's hard limits.
 MAX_PARAMS = 6
 MAX_DESCRIPTION = 200
-
-#: How many steps one ``submit_plan`` may carry.
-#:
-#: Named rather than written into the two schemas below, because
-#: ``plan_objection`` has to know it. That check demands a file be split into
-#: ``ceil(lines / BIG_FILE)`` steps, and a demand larger than one submission can
-#: hold is a condition no plan can satisfy -- the failure this codebase keeps
-#: rebuilding by accident. The two numbers have to be one number.
-#:
-#: **Eight until the arithmetic was enforced; twelve now.** Eight came from a
-#: field session that died with three replies cut off mid-tool-call, having
-#: written two files out of eight steps: a model handed eight pending items
-#: attempts all eight, and back then the output budget was 16,384. The mitigation for that is
-#: no longer the cap -- ``_plan_block`` stopped rendering the checklist and
-#: renders one step with a cursor, which is what that docstring is about -- and
-#: the cap became the binding constraint on something else. ``handler/paogen.go``
-#: is 6,571 lines, which is nine steps at 800 lines each, and at a cap of eight
-#: the largest handler in the corpus could not be planned at all.
-#:
-#: Twelve covers the worst real conversion with headroom. It is not licence for
-#: twelve-step plans of small files: `plan_objection` still asks for a plan of
-#: one file at a time when the phase's files need more than this between them.
-MAX_STEPS = 12
 
 _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -155,20 +131,6 @@ class ToolSpec:
     #: started -- that are not the model's to assert. Putting them in the schema
     #: would offer the model a way to declare its own violations pre-existing.
     gate_params: frozenset[str] = frozenset()
-    #: Whether this tool may run beside others in the same batch.
-    #:
-    #: Opt-in, and stated per tool rather than inferred, because the inference
-    #: that looks obvious is wrong. "Does not mutate" is not enough: `go_build`
-    #: mutates nothing and spawns the Go toolchain, so four at once contend on
-    #: one build cache; `finish` mutates nothing and ends the phase. Nor is the
-    #: provider enough: `go_build` is a Python tool that shells out, and
-    #: `repo_map` is a sidecar call that the sidecar serialises anyway.
-    #:
-    #: What is marked is the set of pure lookups -- a read, a search, a status
-    #: -- which is the batch shape worth parallelising and the only one whose
-    #: concurrency is obviously safe. A tool author adding a new one has to say
-    #: so, which is the right way round for a flag whose failure mode is a race.
-    parallel: bool = False
 
     def __post_init__(self) -> None:
         if not _NAME.match(self.name):
@@ -290,10 +252,9 @@ _SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="read_file",
-        parallel=True,
         description=(
             "Read a slice of one file. Always pass start and end when you know roughly "
-            "where to look; without `end` you get 800 lines from `start`."
+            "where to look; whole-file reads crowd out everything else in context."
         ),
         parameters=_obj(
             path=_str("Workspace-relative path, e.g. 'handler/user.go'."),
@@ -305,7 +266,6 @@ _SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="search_repo",
-        parallel=True,
         description=(
             "Search file contents by regular expression. Use this instead of grep, and "
             "prefer it over reading files to find something."
@@ -320,7 +280,6 @@ _SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="search_docs",
-        parallel=True,
         description=(
             "Search the n-api-template knowledge base for the contract rule behind a "
             "pattern. Use it before inventing an approach, not after."
@@ -468,56 +427,14 @@ _SPECS: tuple[ToolSpec, ...] = (
             "n-api-*. Reports only — never edit go.mod on it, tell the user."
         ),
         parameters=_obj(),
-        # The surveys, plus the acting phase *during a migration only* --
-        # withheld there otherwise by `AgentLoop._tools`, the same asymmetric
-        # lock `ask_developer` uses.
-        #
-        # The original rule was the surveys alone, because offering a version
-        # tool to a phase that edits invites a library bump in the middle of
-        # unrelated work, which turns a review into a regression hunt. That
-        # still holds for every task that is not a conversion. A migration is
-        # the exception that swallows the rule: its entire first phase *is* a
-        # dependency bump, and denying the acting phase the one tool that knows
-        # what version a library is at left it guessing. A field run guessed the
-        # superseded module's version, carried it across the rename, and spent
-        # thirty-eight turns blocked on six revisions that had never existed.
-        modes=frozenset({_ASK, _PLAN, _AGENT}),
-        provider=Provider.GOTOOLS,
-    ),
-    # The migration's before-and-after. `save` takes the inventory while the
-    # service is still the one being replaced; `against` reports what the
-    # converted one no longer serves.
-    #
-    # Harness-run, like the gate stages, and for their reason: both moments this
-    # is needed at are moments the model does not choose. The inventory is taken
-    # on the way past the migration's branch guard, which is the last turn on
-    # which the answer is still the *legacy* service's; the comparison is a gate
-    # stage, which runs when the last phase closes whether or not anybody
-    # remembered to ask for it. "The model forgot to check" is the failure that
-    # design exists to prevent, and a route nobody notices is missing is the
-    # most expensive version of it.
-    #
-    # Kept out of every schema list as a consequence, which is worth about 140
-    # tokens per turn of every task in the product -- and this one is relevant
-    # to roughly one task in fifty.
-    ToolSpec(
-        name="route_inventory",
-        description=(
-            "Every route the service registers, gin or template, prefixes resolved. "
-            "save= records them before a migration; against= reports which a finished "
-            "one no longer serves."
-        ),
-        parameters=_obj(
-            save=_str("Write the inventory here, e.g. '.dakcoder/routes-before.json'."),
-            against=_str("Compare against a saved inventory and report what is missing."),
-        ),
-        modes=_READERS,
-        gate_only=True,
+        # Planner alone, and for a reason beyond cost: offering this to Coder or
+        # Verifier invites a library bump in the middle of unrelated work, which
+        # turns a review into a regression hunt.
+        modes=_SURVEY,
         provider=Provider.GOTOOLS,
     ),
     ToolSpec(
         name="playbook",
-        parallel=True,
         description=(
             "Get the known-good fix procedure for a failure class or rule id. Consult "
             "this before attempting a fix you have not made before."
@@ -550,12 +467,11 @@ _SPECS: tuple[ToolSpec, ...] = (
         name="submit_plan",
         description=(
             "Submit the plan and start the work. Each step names one file, what "
-            "changes in it, and how it is checked. A whole-service migration also "
-            "sends phases, with steps for the first phase only."
+            "changes in it, and how you will know it worked."
         ),
         parameters=_obj(
             steps=_array(
-                "The steps, in order, at most twelve. One file at a time when they are big.",
+                "The steps, in order. At most eight.",
                 {
                     "type": "object",
                     "properties": {
@@ -572,55 +488,13 @@ _SPECS: tuple[ToolSpec, ...] = (
                         },
                         "accepts": {
                             "type": "string",
-                            # Named tools, because the field was being filled with
-                            # criteria the phase that has to satisfy them cannot
-                            # run: a migration plan wrote "legacy_audit reports no
-                            # findings" on all seven steps, and `legacy_audit`
-                            # belongs to ask and planner. Seven steps with no
-                            # check the acting phase could apply.
-                            "description": (
-                                "How this step is checked once done, with something "
-                                "the acting phase runs: go_build, go_vet, go_test, "
-                                "rules_lint, a read. Not legacy_audit or the audits."
-                            ),
-                        },
-                        "phase": {
-                            "type": "string",
-                            "description": "A name from phases, if the plan has any.",
-                        },
-                        "part": {
-                            "type": "string",
-                            "description": "Which of that phase's parts.",
+                            "description": "How this step is checked once done.",
                         },
                     },
                     "required": ["file", "action", "accepts"],
                     "additionalProperties": False,
                 },
-                maxItems=MAX_STEPS,
-            ),
-            # The roadmap, and the reason it is a second field rather than a
-            # longer `steps`: a migration is forty files and `steps` caps at
-            # eight, so a plan that tried to hold the whole conversion could only
-            # hold it as directories -- which is the plan whose cursor never
-            # advances. Phases are cheap and inert; only the open one becomes
-            # work. See `migration.py`.
-            phases=_array(
-                "Migrations only: the phases in order, at least three. Omit for "
-                "ordinary tasks.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Short name, e.g. handlers."},
-                        "covers": {"type": "string", "description": "What it does, one line."},
-                        "parts": {
-                            "type": "string",
-                            "description": "Its sub-categories, comma-separated, two or more.",
-                        },
-                    },
-                    "required": ["name", "covers", "parts"],
-                    "additionalProperties": False,
-                },
-                maxItems=12,
+                maxItems=8,
             ),
             summary=_str("One sentence on what the whole plan achieves."),
         ),
@@ -642,13 +516,7 @@ _SPECS: tuple[ToolSpec, ...] = (
             assumed=_str("What you inferred rather than asking about."),
         ),
         required=("questions",),
-        # The acting phase too, and shown there only during a migration
-        # (`AgentLoop._tools` withholds it otherwise). A conversion meets its
-        # unknowns while converting -- the field type, the route base, which
-        # branch to cut -- and an acting phase that can only guess or stop is
-        # what turns "ask often" into a sentence in a prompt that nothing can
-        # obey. `_phase_ended` has always handled this call from any mode.
-        modes=frozenset({_PLAN, _AGENT}),
+        modes=frozenset({_PLAN}),
     ),
     # -- ending a turn ------------------------------------------------------
     #
@@ -718,31 +586,24 @@ _SPECS: tuple[ToolSpec, ...] = (
         ),
         parameters=_obj(
             steps=_array(
-                "The remaining steps, in order. At most twelve.",
+                "The remaining steps, in order. At most eight.",
                 {
                     "type": "object",
                     "properties": {
                         "file": {"type": "string", "description": "Path this step changes."},
                         "action": {"type": "string", "description": "What changes in it."},
                         "accepts": {"type": "string", "description": "How it is checked."},
-                        "phase": {"type": "string", "description": "Its phase, if any."},
-                        "part": {"type": "string", "description": "Its part of that phase."},
                         "status": {
                             "type": "string",
-                            # `blocked` is the exit a step with a false premise
-                            # had none of. Without it the only statuses the
-                            # model could set were "do it" and "it was not
-                            # needed", so a step it could not do stayed pending
-                            # and the cursor never moved off it.
-                            "enum": ["pending", "skipped", "blocked"],
-                            "description": "skipped = unnecessary; blocked = cannot be done now.",
+                            "enum": ["pending", "skipped"],
+                            "description": "skipped drops the step; say why in note.",
                         },
-                        "note": {"type": "string", "description": "Why it is skipped or blocked."},
+                        "note": {"type": "string", "description": "Why it is skipped."},
                     },
                     "required": ["file", "action", "accepts"],
                     "additionalProperties": False,
                 },
-                maxItems=MAX_STEPS,
+                maxItems=8,
             ),
             reason=_str("What was tried and why it did not work."),
         ),
@@ -958,14 +819,12 @@ _SPECS: tuple[ToolSpec, ...] = (
     # -- version control ----------------------------------------------------
     ToolSpec(
         name="git_status",
-        parallel=True,
         description="List changed, staged and untracked files. Cheap; use it to confirm what you changed.",
         parameters=_obj(),
         modes=_READERS,
     ),
     ToolSpec(
         name="git_diff",
-        parallel=True,
         description="Show the diff of the working tree, or of one path. Read this before claiming a change is done.",
         parameters=_obj(
             path=_str("Limit the diff to one path."),
@@ -980,7 +839,6 @@ _SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="git_blame",
-        parallel=True,
         description="Show who last changed each line of a file, and when. Use it to date a legacy pattern.",
         parameters=_obj(
             path=_str("Workspace-relative path."),
@@ -1002,12 +860,7 @@ _SPECS: tuple[ToolSpec, ...] = (
                 enum=["branch", "add", "commit"],
             ),
             paths=_str("Comma-separated paths for add. Omit to stage tracked changes."),
-            message=_str("Commit message for commit, or the branch name for branch."),
-            # What the new branch replicates, and the reason `branch` grew a
-            # second argument: without it the branch is cut from wherever HEAD
-            # happened to be. A migration cut from a stale feature branch has to
-            # be redone, and "cut it from development" is the SOP's first line.
-            base=_str("For branch: the branch to cut from, e.g. 'development'."),
+            message=_str("Commit message, for commit."),
         ),
         required=("op",),
         modes=_ACTS,

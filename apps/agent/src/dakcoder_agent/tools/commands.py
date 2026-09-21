@@ -25,7 +25,6 @@ for a new developer, and without a timeout it presents as the agent being broken
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -295,148 +294,7 @@ def _join(*streams: str | bytes | None) -> str:
     return joined
 
 
-#: What a `go get` failure is, read off the toolchain's own words.
-#:
-#: One hint used to be attached to every failure -- "if this is a private
-#: module, GOPRIVATE and a git credential must be configured" -- whatever the
-#: toolchain actually said. A field run hit `unknown revision` on six modules,
-#: was handed the private-module hint, and reported to the developer that their
-#: GitLab credentials were missing. They were not: `go list -m -versions` on the
-#: same machine answered in full. The run ended blocked on a diagnosis the tool
-#: had supplied and the evidence contradicted.
-#:
-#: So the hint is read off the output. The two failures need opposite moves --
-#: one is "that version does not exist, drop it", the other is "this machine
-#: cannot reach the host" -- and handing the model the wrong one costs the task.
-_VERSION_MISS = (
-    "unknown revision",
-    "invalid version",
-    "no matching versions",
-    "unknown import path",
-    "does not contain package",
-)
-_CANNOT_REACH = (
-    "terminal prompts disabled",
-    "could not read username",
-    "could not read password",
-    "authentication required",
-    "dial tcp",
-    "i/o timeout",
-    "connection refused",
-    "no such host",
-    "certificate",
-    "x509",
-    "410 gone",
-    "proxy.golang.org",
-    "tls handshake",
-)
-
-#: A module that has moved, and where it moved to.
-#:
-#: `go get` says this when the path you asked for resolves to a repository whose
-#: own go.mod declares a different module path. No version of the old path can
-#: satisfy it, so "drop the version and take the latest" -- the advice for a
-#: version miss -- is exactly wrong here and sends the run round again. A field
-#: run asked for `github.com/bufbuild/protovalidate-go` and was told the module
-#: now declares itself `buf.build/go/protovalidate`; the hint it got back said
-#: to retry without a version.
-_RENAMED = re.compile(
-    r"module declares its path as:\s*(?P<now>\S+).*?but was required as:\s*(?P<was>\S+)",
-    re.S,
-)
-
-#: Modules the knowledge base pins, and what it pins them to.
-#:
-#: ``@latest`` is the right answer for the n-api-* libraries and the wrong one
-#: here: the reference migration says to pin `protovalidate-go` at v0.9.2
-#: because other versions break interface compatibility with the generated
-#: protobuf validators. Recommending the latest for one of these would be the
-#: tool contradicting the corpus the planner was told to follow.
-#:
-#: **Keep this in step with `references/legacy-migration.md`.** It is a short
-#: list on purpose; a long one belongs in the knowledge base rather than here.
-_PINNED: dict[str, str] = {
-    "github.com/bufbuild/protovalidate-go": "v0.9.2",
-}
-
-
-def _why_get_failed(output: str, pkg: str, version: str) -> tuple[str, str]:
-    """The fix line for a failed ``go get``, and a dead-end reason if it is one.
-
-    The dead end is the half that saves turns. ``go get pkg@v1.0.32`` against a
-    module whose tags stop at ``v0.0.23`` fails identically every time it is
-    asked, so the loop's ledger can answer the repeat instead of the network --
-    and the model is told, in the same breath, the one move that does work.
-    """
-    said = (output or "").lower()
-    if moved := _RENAMED.search(output or ""):
-        now, was = moved.group("now"), moved.group("was")
-        return (
-            f"{was} has moved: the repository now declares itself {now}. No "
-            f"version of {was} can satisfy that, so asking again without a "
-            f"version will fail the same way. Change the import paths to {now} "
-            "and fetch that instead -- or, if this module is only reachable "
-            "through a dependency, leave it alone and fix the dependency that "
-            "requires the old path.",
-            f"{was} was renamed to {now}; the old path resolves to nothing",
-        )
-    if pinned := _PINNED.get(pkg):
-        if version and version != pinned:
-            return (
-                f"{pkg} is pinned to {pinned} by the migration reference, and "
-                f"you asked for {version}. Other versions break interface "
-                "compatibility with the generated protobuf validators. Ask for "
-                f"{pinned} exactly.",
-                f"{pkg} must be {pinned}, not {version}",
-            )
-        if not version:
-            return (
-                f"{pkg} is pinned to {pinned} by the migration reference -- this "
-                "is the one dependency not to take the latest of. Ask for "
-                f"{pinned} exactly. See @skill:legacy-migration.",
-                f"{pkg} must be asked for at {pinned}",
-            )
-    if any(marker in said for marker in _CANNOT_REACH):
-        return (
-            "This machine cannot reach the module host. Check `go env GOPRIVATE` "
-            "covers gitlab.cept.gov.in and that a git credential exists for it "
-            "-- `run_terminal [\"go\",\"env\",\"GOPRIVATE\"]` answers the first "
-            "half. This is an environment problem: report it rather than working "
-            "around it.",
-            "",
-        )
-    if any(marker in said for marker in _VERSION_MISS):
-        if version:
-            return (
-                f"{version} is not a published version of {pkg}. Do not guess "
-                "another one -- call go_mod again with `version` omitted and the "
-                "toolchain resolves the latest for you. The n-api-* libraries are "
-                "a different release line from the api-* ones they replace, so a "
-                "version carried across from the old module never exists.",
-                f"{pkg}@{version} is not a published version; ask without a version",
-            )
-        return (
-            f"The toolchain could not resolve {pkg} at all. Check the module path "
-            "is spelled exactly as the library publishes it; if it is, this is a "
-            "reachability problem rather than a version one.",
-            "",
-        )
-    return (
-        "Read the toolchain's output above -- it names what it could not do. If "
-        "go.mod already requires this module at a version that does not exist, "
-        "fix that line first: go_mod get with `version` omitted rewrites it to "
-        "the latest.",
-        "",
-    )
-
-
-def _result(
-    done: Completed,
-    *,
-    what: str,
-    fix_on_fail: str = "",
-    meta: dict[str, Any] | None = None,
-) -> ToolResult:
+def _result(done: Completed, *, what: str, fix_on_fail: str = "") -> ToolResult:
     if done.timed_out:
         return ToolResult.failure(
             f"{what} did not finish within {int(done.seconds)}s and was stopped.",
@@ -450,12 +308,7 @@ def _result(
     return ToolResult.failure(
         body,
         fix=fix_on_fail,
-        meta={
-            "argv": done.argv,
-            "code": done.code,
-            "seconds": round(done.seconds, 2),
-            **(meta or {}),
-        },
+        meta={"argv": done.argv, "code": done.code, "seconds": round(done.seconds, 2)},
     )
 
 
@@ -677,16 +530,14 @@ def go_mod(inv: Invocation) -> ToolResult:
     pkg = inv.arg("pkg")
     if not pkg:
         return ToolResult.failure("go_mod get needs pkg.", fix="Pass the module path to add.")
-    version = str(inv.arg("version") or "").strip()
-    target = f"{pkg}@{version}" if version else pkg
+    target = f"{pkg}@{inv.arg('version')}" if inv.arg("version") else pkg
     done = run(["go", "get", target], root, timeout=GATE_TIMEOUT)
     if not done.ok:
-        fix, dead_end = _why_get_failed(done.output, pkg, version)
         return _result(
             done,
             what=f"go get {target}",
-            fix_on_fail=fix,
-            meta={"dead_end": dead_end} if dead_end else None,
+            fix_on_fail="If this is a private module, GOPRIVATE and a git credential must "
+            "be configured for gitlab.cept.gov.in.",
         )
     return ToolResult.success(
         done.output or f"added {target}",
@@ -920,29 +771,7 @@ def git_status(inv: Invocation) -> ToolResult:
             done.output or "git status failed",
             fix="This directory may not be a git repository.",
         )
-    body = done.output or "working tree clean"
-
-    # The branch list, appended, because "does `development` exist" is a
-    # question this tool is the natural place to answer and could not.
-    #
-    # A migration cuts its branch from `development` and has to confirm that
-    # with the developer before it does; without this the model's only routes to
-    # the answer were `run_terminal` -- which refuses most of `git` -- or
-    # guessing, and a guess here cuts the conversion from the wrong base. Remote
-    # branches are included because a fresh clone has `origin/development` and
-    # no local one, which is the common case and the one a local-only listing
-    # answers wrongly.
-    branches = run(
-        ["git", "branch", "--all", "--format=%(refname:short)"],
-        inv.workspace.root,
-        timeout=30,
-    )
-    if branches.ok and branches.output.strip():
-        names = [n.strip() for n in branches.output.splitlines() if n.strip()]
-        body += "\n\nbranches: " + ", ".join(names[:40])
-        if len(names) > 40:
-            body += f" and {len(names) - 40} more"
-    return ToolResult.success(body, meta={"branches": True})
+    return ToolResult.success(done.output or "working tree clean")
 
 
 def _has_diff(output: str) -> bool:
@@ -1018,59 +847,9 @@ def git_ops(inv: Invocation) -> ToolResult:
 
     if op == "branch":
         name = inv.arg("message") or "agent/session"
-        base = str(inv.arg("base") or "").strip()
         done = run(["git", "rev-parse", "--verify", name], root, timeout=30)
-        if done.ok:
-            # It exists already; `base` cannot apply and silently ignoring it
-            # would report a branch cut from somewhere it was not.
-            moved = run(["git", "checkout", name], root, timeout=30)
-            out = _result(moved, what=f"git checkout {name}")
-            if not moved.ok:
-                return out
-            note = (
-                f"\n\n{name} already existed, so it was checked out as it is; "
-                f"`base` ({base}) was not applied."
-                if base
-                else ""
-            )
-            return ToolResult.success(
-                (out.content or f"switched to {name}") + note,
-                meta={"argv": moved.argv, "branch": name, "base": "", "existed": True},
-            )
-
-        # A new branch, and `base` is what makes it a *replica* of the branch
-        # the work belongs on rather than a copy of wherever the developer was
-        # standing. A migration cut from a stale feature branch is a migration
-        # that has to be redone.
-        argv = ["git", "checkout", "-b", name]
-        resolved = ""
-        if base:
-            found = run(["git", "rev-parse", "--verify", base], root, timeout=30)
-            remote = f"origin/{base}"
-            if not found.ok:
-                found = run(["git", "rev-parse", "--verify", remote], root, timeout=30)
-                if not found.ok:
-                    return ToolResult.failure(
-                        f"there is no branch {base!r}, and no {remote!r} either.",
-                        fix="Run git_status to see which branches exist, and ask the "
-                        "developer which one to cut from. Do not fall back to the "
-                        "current branch: what the new branch replicates is the point.",
-                        meta={"dead_end": f"{base} does not exist in this repository"},
-                    )
-                resolved = remote
-            else:
-                resolved = base
-            argv.append(resolved)
-
-        made = run(argv, root, timeout=30)
-        out = _result(made, what=f"git checkout -b {name}")
-        if not made.ok:
-            return out
-        return ToolResult.success(
-            (out.content or f"created {name}")
-            + (f"\n\n{name} was cut from {resolved}." if resolved else ""),
-            meta={"argv": made.argv, "branch": name, "base": resolved},
-        )
+        argv = ["git", "checkout", name] if done.ok else ["git", "checkout", "-b", name]
+        return _result(run(argv, root, timeout=30), what=f"git checkout {name}")
 
     if op == "add":
         raw = inv.arg("paths") or ""

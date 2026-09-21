@@ -11,72 +11,9 @@ fetch_when: "converting or migrating a whole legacy api-* service to the n-api t
 
 The migration program's SOP, in execution order: branch, swap the dependencies, convert every handler, wire the bootstrap graph, regenerate validation, modernise the tests, prove the swagger document exists.
 
-The first section says how the programme is run: phased, one phase per run, a branch confirmed before anything is written, a big file split across several steps, progress recorded on disk, every route recorded before the first write and checked against that record at the end, and no verification gate until the last phase closes.
-
 Every rule in here was paid for, and the ones marked CRITICAL each break a service in a way the compiler does not catch. They are collected in the first section below, and repeated in place at the step they belong to. Follow the order, and treat the CRITICAL rules as blocking.
 
 Run `legacy_audit` before starting and after finishing — it should go from a page of findings to none.
-
-## How this migration is run
-
-A conversion is not a large task; it is a task with a different shape, and six
-rules follow from that. The agent enforces them rather than merely advising
-them: a plan that ignores one is sent back before any file changes.
-
-**Plan it in phases, and break each phase down.** `submit_plan` takes `phases` —
-the roadmap, in execution order, at least three, each naming in `parts` the
-sub-categories it contains — and `steps` for the *one phase that is open*. The
-steps below are the default phases: branch, dependencies, handlers, DTOs and
-validation, bootstrap and FX, tests, swagger. A plan that tries to hold the
-whole conversion is a plan whose steps are directories, and a directory step is
-one that nothing can finish.
-
-**Never the whole codebase in one go.** A phase closes, the agent reports what
-landed and what comes next, and the run stops there; the developer says when the
-next phase opens. Ten thousand lines across seven files is more than one context
-window, so a run that sets out to finish the conversion exhausts its budget with
-the work half applied.
-
-**A file bigger than one reply gets more than one step.** A 6,500-line handler
-with fifty methods is eight or nine steps, not one: several steps naming the
-same file, each saying in `action` which methods or which line range it
-converts, with the group in `part`. One step for a file that size is a step that
-can never be finished, and it is discovered only after the file has been read —
-which is also after the budget has gone. Roughly one step per 800 lines.
-
-**The plan is a document, and it is kept current.**
-`.dakcoder/migration/plan.md` is written from the roadmap and the change set —
-every phase with its breakdown and status, every unit with what is planned for
-it and whether it landed, the branch, the route count, and a log of when each
-phase closed. It is rewritten on every change, so it is never behind. Read it
-first when resuming: it answers "where did the last session get to" in a few
-hundred tokens, where a transcript does not survive compaction and a
-hand-written summary is prose. The extension's Migration view reads the same
-file, so the developer is looking at what you are.
-
-Do not write your own plan document beside it. A field session wrote a
-`migration.md` by hand and then read it back as evidence of work it had not
-done.
-
-**Every route is recorded before anything changes, and checked at the end.**
-The agent takes an inventory of every route the service registers — gin groups
-resolved, prefixes applied — into `.dakcoder/routes-before.json`, on the last
-turn before the first write. When the last phase closes, the gate compares it
-against what the converted service registers and blocks on anything that is no
-longer served. A route lost in conversion is the failure nothing else here
-catches: an unregistered handler method is a method nobody calls, which
-compiles, lints and vets clean, and the first thing that notices is a client
-getting a 404. If a route was retired on purpose, say which and why.
-
-**The verification gate does not run until the last phase closes.** Between the
-dependency swap and the last converted handler the service cannot build, and
-that is the plan working rather than a fault — half the packages import
-`api-server` and half import `n-api-server`. A gate run there reports the
-conversion's own middle as a failure and asks for it to be fixed, which cannot
-be done without finishing every remaining phase in one turn. Run `go_build`
-yourself against the package you just converted if you want a check. The full
-gate runs once, when the last phase closes, and without a baseline: a converted
-service that does not build has not been converted.
 
 ## The CRITICAL rules, in one place
 
@@ -120,31 +57,15 @@ rule 1 is the dependency swap's one wrong turn.
 
 Run `legacy_audit` first: it names every file carrying a pre-template pattern, with a line for each. `@skill:legacy-patterns` maps each finding to its replacement, and `@skill:data-access-library` covers the one swap that is import-only.
 
-## Step 1 — an isolated branch, confirmed before it is cut
+## Step 1 — an isolated branch
 
-Work on a `template-conversion` branch cut from `development`, so the conversion
-is reviewable and revertible as one unit and the new branch carries
-`development`'s code rather than whatever happened to be checked out.
-
-**Confirm it first, and cut it from the acting phase.** `git_status` lists the
-branches, so it answers whether `development` exists. Then `ask_developer`:
-which branch to cut, and which to cut it from, naming what you found. The base
-decides what the conversion is built on, and a migration cut from a stale
-feature branch has to be redone — it is not a thing to infer about somebody
-else's repository.
-
-`git_ops` is an acting tool and the planner does not hold it. So while planning,
-settle *which* branch and submit the plan; cutting it is the first step of the
-first phase. A planner that tries to cut the branch is refused by mode, and a
-run that keeps trying never reaches the phase that could have done it. Then:
+Work on a `template-conversion` branch cut from `development`, pushed with `-u` so the migration is reviewable and revertible as one unit:
 
 ```
-git_ops op=branch message=template-conversion base=development
+git checkout development && git pull origin development
+git checkout -b template-conversion
+git push -u origin template-conversion
 ```
-
-which runs `git checkout -b template-conversion development`. Nothing is written
-until that branch exists. The agent never pushes; push it yourself with `-u`
-when you want it reviewable remotely.
 
 ## Step 2 — dependencies: the api-* to n-api-* swap
 
@@ -171,8 +92,6 @@ go mod tidy
 ```
 
 `grpc-server` is only needed by services that expose gRPC or Connect-RPC; the rest of the list is unconditional.
-
-**Run those commands; do not hand-edit the versions into `go.mod`.** This step is `go_mod op=get` once per module with `version` omitted — not one `patch_file` over the require block. The two generations are separate release lines and their numbers have nothing to do with each other: `api-db` is at `v1.0.32` while `n-api-db` has never published past `v0.0.x`. A textual rename that keeps the version therefore writes six revisions that do not exist, and every `go get` and `go mod tidy` after it fails with `unknown revision` for all six at once — which reads exactly like a credentials problem and is not one. `lib_version_check` reports each replacement's current version if you want to see them before starting.
 
 **Critical dependency rules.** Use `n-api-bootstrapper`, never the legacy `api-bootstrapper`: the legacy one injects the old `*api-db.DB` type into Uber FX, which mismatches every repository expecting `*n-api-db.DB`. And pin `github.com/bufbuild/protovalidate-go` to `@v0.9.2` — other versions break interface compatibility with the generated protobuf validators.
 

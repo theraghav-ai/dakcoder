@@ -31,15 +31,7 @@ from dakcoder_shared.paths import glob_match
 
 from .router import Invocation
 
-__all__ = [
-    "READ_WINDOW_LINES",
-    "delete_file",
-    "patch_file",
-    "read_file",
-    "search_repo",
-    "write_file",
-    "HANDLERS",
-]
+__all__ = ["delete_file", "patch_file", "read_file", "search_repo", "write_file", "HANDLERS"]
 
 #: Directories never searched or listed. Everything here is either generated,
 #: vendored, or someone else's code — and all of it is enormous relative to its
@@ -90,32 +82,6 @@ TEXT_SUFFIXES = frozenset(
 
 MAX_FILE_BYTES = 2_000_000
 _BINARY_PROBE = 8192
-
-#: How many lines a ``read_file`` without an explicit ``end`` returns.
-#:
-#: A read with no range used to mean the whole file, however large, and the
-#: projection capped it at 48,000 tokens on the way out -- a *fifth* of the
-#: context window spent on one call, and the transcript kept the uncapped
-#: remainder besides.
-#:
-#: Measured on the field run this bound comes from. `handler/paogen.go` (6,571
-#: lines) cost 46,000 tokens; `handler/transferentry.go` (3,966 lines) cost
-#: 40,000. Nine such reads took one run from 17k to 168k tokens and into a
-#: compaction -- which evicted those same nine files, making every one of them
-#: worth reading again. The run went round that circuit twice and degenerated
-#: at 119k.
-#:
-#: 800 lines is roughly 8,000 tokens of Go, so a run holds a dozen files where
-#: it held four. It is not a compromise on ordinary files: measured over this
-#: repository's own Go corpus the median file is 285 lines, the 90th percentile
-#: 468, and the longest 863 -- **99% arrive whole**. What it bounds is the
-#: legacy 4,000-line handler, which is exactly the artefact a migration meets
-#: and no model reads end to end in one turn anyway.
-#:
-#: An explicit ``end`` is always honoured. This is a default, not a ceiling: a
-#: model that says what it wants gets it, and the header says what was withheld
-#: so it can.
-READ_WINDOW_LINES = 800
 
 
 class BinaryFile(ValueError):
@@ -284,30 +250,9 @@ def read_file(inv: Invocation) -> ToolResult:
     start = max(1, start)
     end = min(total, max(start, end))
 
-    # A read that named no end gets a window, not the rest of the file. See
-    # `READ_WINDOW_LINES`. Applied after the clamp so `end` is already a real
-    # line number, and only when it would actually withhold something.
-    windowed = asked_end is None and end - start + 1 > READ_WINDOW_LINES
-    if windowed:
-        end = start + READ_WINDOW_LINES - 1
-
     body = "\n".join(lines[start - 1 : end])
     span = f"lines {start}-{end} of {total}" if (start, end) != (1, total) else f"{total} lines"
     header = f"{inv.path()} ({span})"
-    # Measured before the note below is appended: `bytes` answers "how much
-    # source did this task need", and the note is not source.
-    carried = len(body)
-    if windowed:
-        # Named on the result, because the alternative is a model that believes
-        # it has read the file. The remedy is in the same sentence as the
-        # shortfall -- the next range to ask for, spelled out -- so acting on it
-        # is a copy rather than an inference.
-        body += (
-            f"\n\n-- {total - end:,} more lines of this file were not returned. "
-            f"Ask for any range of them, e.g. start={end + 1} "
-            f"end={min(total, end + READ_WINDOW_LINES)}. Searching for what you "
-            "need is usually faster than reading the rest."
-        )
     # `span` in meta is the *clamped* range, which is what the context manager's
     # slice ledger compares. Deriving it from the call arguments instead would
     # read `end=99999` on a 200-line file as a range no later whole-file read
@@ -317,7 +262,7 @@ def read_file(inv: Invocation) -> ToolResult:
     # source did this task need" would otherwise measure the cap.
     return ToolResult.success(
         f"{header}\n{body}",
-        meta={"lines": total, "span": [start, end], "bytes": carried},
+        meta={"lines": total, "span": [start, end], "bytes": len(body)},
     )
 
 
@@ -329,9 +274,8 @@ def write_file(inv: Invocation) -> ToolResult:
 
     **Why append exists** (BUG FS-1). A model's whole reply — prose, tool name
     and the entire ``content`` argument, JSON-escaped — has to fit one
-    ``max_tokens`` budget, which was 6,144 for the acting mode when this was
-    found and is 32,768 now. That capped a single ``write_file`` at roughly
-    24 KB of text, and there was no second way
+    ``max_tokens`` budget, which is 6,144 for the acting mode. That caps a
+    single ``write_file`` at roughly 24 KB of text, and there was no second way
     to get bytes into a file: ``write_file`` refused to overwrite and
     ``patch_file`` needs a unique anchor *in a file that already has one*, which
     the first chunk of a new document does not have. So a document larger than
@@ -444,20 +388,6 @@ def patch_file(inv: Invocation) -> ToolResult:
         )
 
     patched = text.replace(old, new, 1)
-
-    if carried := _versions_carried_across_a_rename(rel, text, patched):
-        was, now, version = carried[0]
-        more = f" ({len(carried) - 1} more like it)" if len(carried) > 1 else ""
-        return ToolResult.failure(
-            f"that patch renames {was} to {now} and keeps {version}{more}. "
-            f"{version} is {was}'s version, not {now}'s.",
-            fix="Do not write module versions by hand. Change the imports, then "
-            "`go_mod op=get pkg=" + now + "` with `version` omitted — the "
-            "toolchain resolves the latest and writes go.mod itself. Repeat per "
-            "module, then `go_mod op=tidy`.",
-            meta={"dead_end": f"go.mod cannot carry {version} from {was} to {now}"},
-        )
-
     _write_text(path, _apply_eol(patched, eol))
 
     delta = len(new.split("\n")) - len(old.split("\n"))
@@ -466,58 +396,6 @@ def patch_file(inv: Invocation) -> ToolResult:
         f"patched {rel} ({change})",
         mutations=[Mutation(rel, MutationKind.MODIFY)],
     )
-
-
-#: A `require` line: the module path, then its version.
-_REQUIRE = re.compile(r"^\s*(?:require\s+)?([a-z0-9.\-]+\.[a-z]{2,}/\S+)\s+(v\S+)", re.M)
-
-
-def _requires(text: str) -> dict[str, str]:
-    """Every module ``text`` requires, and at what version."""
-    return {module: version for module, version in _REQUIRE.findall(text)}
-
-
-def _versions_carried_across_a_rename(
-    rel: str, before: str, after: str
-) -> list[tuple[str, str, str]]:
-    """Renames in a ``go.mod`` patch that kept the old module's version.
-
-    Returns ``(was, now, version)`` per offence, empty when the patch is fine.
-
-    **The failure this exists for.** A migration's first step is "replace the
-    api-* dependencies with their n-api-* equivalents", and the obvious way to
-    carry it out is a `patch_file` over the require block. That produces a patch
-    with the same line count and the same version strings -- `api-db v1.0.32`
-    becomes `n-api-db v1.0.32` -- and the two library generations are entirely
-    separate release lines: api-db is at v1.0.32 and n-api-db's tags stop at
-    v0.0.1. So the patch applies cleanly, go.mod now asserts six revisions that
-    have never existed, and every `go get` and `go mod tidy` after it fails with
-    `unknown revision` for all six at once. A field run spent thirty-eight turns
-    on that and reported it to the developer as missing GitLab credentials.
-
-    Refused here rather than diagnosed later because the evidence is *in the
-    patch*: nothing downstream can tell "this version was carried across a
-    rename" from "this version was always wrong", and by the time the toolchain
-    objects the model is reading an error about a file it no longer remembers
-    editing.
-
-    Matched on the version rather than on the names, so it holds for any rename
-    -- there is no list of api-* to n-api- pairs here to fall out of date. Two
-    genuinely different modules published at the same version would trip it; the
-    refusal names the move that is correct for them too, which is to let the
-    toolchain write the line.
-    """
-    if Path(rel).name != "go.mod":
-        return []
-    was_required, now_required = _requires(before), _requires(after)
-    gone = {m: v for m, v in was_required.items() if m not in now_required}
-    added = {m: v for m, v in now_required.items() if m not in was_required}
-    offences: list[tuple[str, str, str]] = []
-    for module, version in added.items():
-        source = next((old for old, v in gone.items() if v == version), "")
-        if source:
-            offences.append((source, module, version))
-    return offences
 
 
 def _why_no_match(text: str, old: str, rel: str) -> str:
@@ -557,37 +435,11 @@ def delete_file(inv: Invocation) -> ToolResult:
         )
     if not path.exists():
         return ToolResult.success(f"{rel} was already gone")
-    lines = 0
-    try:
-        with open(path, "rb") as handle:
-            lines = sum(1 for _ in handle)
-    except OSError:
-        lines = 0
     path.unlink()
-
-    # Said in the result, because a delete is the one mutation whose next step
-    # the model routinely does not take.
-    #
-    # `write_file` refuses to overwrite, so replacing a file means deleting it
-    # and writing it back -- and a field run did the first half to four
-    # handlers, the largest 6,571 lines, and never the second. It moved to the
-    # next step each time. The size is in the message for the same reason the
-    # plan refuses a one-step conversion of a file this big: 6,571 lines will
-    # not come back in one reply, and knowing that before starting is the
-    # difference between `append` and a truncated file.
-    body = f"deleted {rel}"
-    if lines:
-        body += (
-            f" ({lines:,} lines). Nothing is at that path now. If this was to "
-            "rewrite it, write the replacement before you do anything else -- "
-            "`write_file`, then `append=true` for the rest"
-            + (
-                ", which it will need: a file this size does not fit in one reply."
-                if lines > 800
-                else "."
-            )
-        )
-    return ToolResult.success(body, mutations=[Mutation(rel, MutationKind.DELETE)])
+    return ToolResult.success(
+        f"deleted {rel}",
+        mutations=[Mutation(rel, MutationKind.DELETE)],
+    )
 
 
 # ── search ──────────────────────────────────────────────────────────────────

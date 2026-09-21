@@ -35,24 +35,13 @@ class ScriptedClient:
     the turns it actually cares about.
     """
 
-    def __init__(
-        self, turns: Sequence[ChatResult], *, kind: str = "change", migration: bool = False
-    ) -> None:
+    def __init__(self, turns: Sequence[ChatResult], *, kind: str = "change") -> None:
         self.turns = list(turns)
         self.seen_tools: list[list[str]] = []
         self.tool_choices: list[str | None] = []
         self.calls = 0
         #: What the intent classifier answers.
         self.kind = kind
-        #: And whether it calls this a whole-service migration, which is a
-        #: different question with different consequences -- the gate is
-        #: deferred, the plan must be phased, the writes wait for a branch.
-        self.migration = migration
-        #: How many times the intent classifier was asked. Counted separately
-        #: from `calls`, which also holds the turns: "was the classifier run"
-        #: is a question about cost and about routing, and subtracting turns to
-        #: get at it makes a test that breaks when the turn count changes.
-        self.classifications = 0
 
     def chat(
         self, messages, *, tools=None, tool_choice=None, response_format=None, **kwargs
@@ -60,14 +49,8 @@ class ScriptedClient:
         self.calls += 1
         if response_format is not None:
             name = response_format.get("json_schema", {}).get("name")
-            if name == "intent":
-                self.classifications += 1
             body = (
-                {
-                    "kind": self.kind,
-                    "why": f"scripted: {self.kind}",
-                    "migration": self.migration,
-                }
+                {"kind": self.kind, "why": f"scripted: {self.kind}"}
                 if name == "intent"
                 else {"goal": "scripted"}
             )
@@ -131,22 +114,12 @@ def terminal_forces(client: "ScriptedClient") -> list[list[str]]:
 
     What every fence test actually asserts is "this turn could not do anything
     but stop", so that is what this answers.
-
-    **It returns what the turn could produce, not what it was offered**, and
-    those stopped being the same thing when the loop stopped narrowing the tool
-    list for a single-terminal mode. The schemas are serialised into the prompt
-    ahead of the system message, so a narrowed list is a different prefix from
-    position zero and costs two full re-prefills for one turn; naming the tool
-    constrains the reply exactly as hard and leaves the request alone. Both
-    shapes reach here, and under both the answer to "what could this turn do"
-    is the same -- which is the only thing a fence test is about.
     """
     out: list[list[str]] = []
     for choice, offered in zip(client.tool_choices, client.seen_tools):
         if isinstance(choice, dict):
-            named = choice.get("function", {}).get("name", "")
-            if named in TERMINALS:
-                out.append([named])
+            if choice.get("function", {}).get("name", "") in TERMINALS:
+                out.append(list(offered))
         elif choice == "required" and offered and set(offered) <= TERMINALS:
             out.append(list(offered))
     return out
@@ -286,12 +259,11 @@ def build(
     turns: Sequence[ChatResult],
     *,
     kind: str = "change",
-    migration: bool = False,
     max_turns: int = 12,
     approve=lambda _r: True,
     cancelled=lambda: False,
 ) -> tuple[AgentLoop, ScriptedClient]:
-    client = ScriptedClient(turns, kind=kind, migration=migration)
+    client = ScriptedClient(turns, kind=kind)
     context = ContextManager(mode=Mode.ASK, system_prompt="You are dakcoder.")
     loop = AgentLoop(
         context,
