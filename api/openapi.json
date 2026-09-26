@@ -3424,7 +3424,8 @@
             "enum": [
               "python",
               "gotools",
-              "gopls"
+              "gopls",
+              "graphify"
             ],
             "type": "string"
           },

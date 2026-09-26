@@ -43,6 +43,13 @@ same file, each saying in `action` which methods or which line range it
 converts, with the group in `part`. One step for a file that size is a step that
 can never be finished, and it is discovered only after the file has been read —
 which is also after the budget has gone. Roughly one step per 800 lines.
+Take the split from `handler_map path=<file>`: it lists every method with its
+lines, its route and the repository methods it calls, already grouped into
+steps of about 800 lines. Each group is one step -- its methods and their
+repository methods, whose `*gin.Context` parameter becomes `context.Context` (a
+caller not yet converted still compiles, since `*gin.Context` is a
+`context.Context`). Before changing a repository method used elsewhere, `impact`
+names every caller.
 
 **The plan is a document, and it is kept current.**
 `.dakcoder/migration/plan.md` is written from the roadmap and the change set —
@@ -73,8 +80,13 @@ dependency swap and the last converted handler the service cannot build, and
 that is the plan working rather than a fault — half the packages import
 `api-server` and half import `n-api-server`. A gate run there reports the
 conversion's own middle as a failure and asks for it to be fixed, which cannot
-be done without finishing every remaining phase in one turn. Run `go_build`
-yourself against the package you just converted if you want a check. The full
+be done without finishing every remaining phase in one turn. Do not check a
+step with `go_build` either: the package you just converted does not build
+while the rest of the service is half-way, so a step checked that way can
+never be done. A field run refused all seven of its handler steps for exactly
+that reason and stalled. Check a step with `unit_check path=<file>
+methods=<the methods it converted>` -- it reports each method's shape and the
+repository methods it calls, and it works on a package that does not build. The full
 gate runs once, when the last phase closes, and without a baseline: a converted
 service that does not build has not been converted.
 

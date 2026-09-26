@@ -118,6 +118,9 @@ class Provider(StrEnum):
     PYTHON = "python"
     GOTOOLS = "gotools"
     GOPLS = "gopls"
+    #: The code-graph pilot (``tools/codegraph.py``). Absent unless
+    #: ``DAKCODER_CODE_GRAPH=1`` and graphify is installed.
+    GRAPHIFY = "graphify"
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +321,33 @@ _SPECS: tuple[ToolSpec, ...] = (
         required=("pattern",),
         modes=_READERS,
     ),
+    # The code-graph pilot. One tool with an `op` rather than four: every schema
+    # is paid for on every turn of every mode it is offered in, and the four
+    # lookups share their arguments. Only offered when the runtime registers a
+    # handler, which it does only under DAKCODER_CODE_GRAPH=1.
+    ToolSpec(
+        name="code_graph",
+        description=(
+            "Look up the code graph: a symbol's edges, its callers, the path between "
+            "two symbols, or a question. Cheaper than chaining search_repo and read_file."
+        ),
+        # `budget` is not offered: graphify's default of 1500 is what the cap
+        # below is sized for, and the parameter cost ~30 tokens on every turn.
+        parameters=_obj(
+            op=_str(
+                "explain: its edges. callers: what uses it. path: symbol to `to`. "
+                "query: by question.",
+                enum=["explain", "callers", "path", "query"],
+            ),
+            symbol=_str("Bare name, e.g. 'CreateUserHandler'."),
+            to=_str("For path: the target symbol."),
+            question=_str("For query: what to find."),
+        ),
+        required=("op",),
+        modes=_READERS,
+        provider=Provider.GRAPHIFY,
+        instead="use search_repo and read_file",
+    ),
     ToolSpec(
         name="search_docs",
         parallel=True,
@@ -515,6 +545,61 @@ _SPECS: tuple[ToolSpec, ...] = (
         gate_only=True,
         provider=Provider.GOTOOLS,
     ),
+    # ── the migration's call map ────────────────────────────────────────────
+    #
+    # Three questions a conversion asks and nothing else answered: how does
+    # this handler file split into steps, is this step done, and who calls this
+    # repository method. Resolved through struct field types (`uh.svc.X()`),
+    # which a general code graph does not do -- graphify found none of the 163
+    # handler-to-repository calls in pao-back-end-development.
+    #
+    # Shown only while a migration is active (`AgentLoop._tools`), in every
+    # mode: a planner splitting a 6,571-line handler needs `handler_map`, and
+    # the acting phase needs `unit_check` because `go_build` cannot pass until
+    # the last phase -- the step check that failed every step of a field run.
+    ToolSpec(
+        name="handler_map",
+        parallel=True,
+        description=(
+            "Split one handler file into conversion steps: each method's lines, route and the "
+            "repository methods it calls. Plan a migration's handler steps from its groups."
+        ),
+        parameters=_obj(
+            path=_str("The handler file, e.g. 'handler/paogen.go'."),
+        ),
+        required=("path",),
+        modes=_READERS,
+        provider=Provider.GOTOOLS,
+    ),
+    ToolSpec(
+        name="unit_check",
+        parallel=True,
+        description=(
+            "Check a conversion step: the file parses and the named methods, and the repository "
+            "methods they call, have the template shape. The step check while the build is red."
+        ),
+        parameters=_obj(
+            path=_str("The file the step converted."),
+            methods=_str("Comma-separated methods the step converted. Omit for all in the file."),
+        ),
+        required=("path",),
+        modes=_READERS,
+        provider=Provider.GOTOOLS,
+    ),
+    ToolSpec(
+        name="impact",
+        parallel=True,
+        description=(
+            "List who calls a function, two levels up, with the routes that reach it. Use before "
+            "changing a repository method's signature."
+        ),
+        parameters=_obj(
+            symbol=_str("Type.Method, e.g. 'PaogenRepository.GetDDOsRepo'."),
+        ),
+        required=("symbol",),
+        modes=_READERS,
+        provider=Provider.GOTOOLS,
+    ),
     ToolSpec(
         name="playbook",
         parallel=True,
@@ -695,6 +780,15 @@ _SPECS: tuple[ToolSpec, ...] = (
                 maxLength=24000,
             ),
             blocked=_str("What stopped you, if anything did. Omit when nothing did."),
+            # The zero-turn way to keep AGENTS.md current: the lesson rides on
+            # the call that ends the run, so it costs no turn of its own. Saved
+            # by `agents_md.remember` through the same editor, secret check and
+            # caps as `update_agents_md`.
+            remember=_array(
+                "'section: fact' lines for AGENTS.md that a future session needs.",
+                {"type": "string"},
+                maxItems=5,
+            ),
         ),
         required=("answer",),
         # Every mode. `planner` has two terminal actions of its own, and this is
@@ -702,6 +796,35 @@ _SPECS: tuple[ToolSpec, ...] = (
         # needs to say so, and used to do it by falling silent -- which is the
         # non-action this model cannot reliably produce either.
         modes=_READERS,
+    ),
+    # -- project memory -----------------------------------------------------
+    #
+    # AGENTS.md, kept current by the sessions that read it. Every mode, because
+    # the fact worth keeping turns up wherever it turns up -- a question is
+    # where a developer says "we always run make lint first". It writes one
+    # fenced section of one file and nothing the gate judges, so it is not a
+    # write tool in the sense the phase split is about; see `agents_md`.
+    ToolSpec(
+        name="update_agents_md",
+        description=(
+            "Save a one-line fact for future sessions in AGENTS.md, or fix or "
+            "remove a wrong note. Never secrets."
+        ),
+        parameters=_obj(
+            op=_str("Default add.", enum=["add", "replace", "remove"]),
+            text=_str("One line per note."),
+            section=_str(
+                "Heading.",
+                enum=["commands", "conventions", "testing", "architecture", "gotchas", "never"],
+            ),
+            old=_str("The note to replace or remove."),
+            scope=_str("local: AGENTS.local.md, this developer only.", enum=["project", "local"]),
+        ),
+        modes=_READERS,
+        mutates=True,
+        # Conditional, and the condition is the developer's setting: `auto`
+        # never asks, `ask` asks for every edit. See `router._conditional_reason`.
+        approval=Approval.CONDITIONAL,
     ),
     # -- changing course ----------------------------------------------------
     #

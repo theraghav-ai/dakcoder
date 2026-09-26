@@ -168,6 +168,234 @@
       }
     },
     {
+      "name": "handler_map",
+      "description": "One handler file split into conversion steps: every method with its lines, route and the repository methods it calls. Plan a migration's handler steps from this.",
+      "mutates": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "the handler file, e.g. handler/paogen.go",
+            "type": "string"
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          },
+          "step_lines": {
+            "description": "lines per step; omit for 800",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "converted": {
+            "type": "integer"
+          },
+          "file": {
+            "type": "string"
+          },
+          "groups": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "done": {
+                  "type": "boolean"
+                },
+                "end": {
+                  "type": "integer"
+                },
+                "methods": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "repo": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "shared": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "start": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "start",
+                "end",
+                "methods",
+                "done"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "lines": {
+            "type": "integer"
+          },
+          "methods": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "end": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "repo": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "routes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "shape": {
+                  "type": "string"
+                },
+                "start": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "name",
+                "start",
+                "end",
+                "shape"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "report": {
+            "type": "string"
+          },
+          "types": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "file",
+          "types",
+          "lines",
+          "methods",
+          "groups",
+          "converted",
+          "report"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "impact",
+      "description": "Who calls a function, two levels up, with the routes that reach it. Call before changing a repository method's signature.",
+      "mutates": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          },
+          "symbol": {
+            "description": "Type.Method, a bare name, or file.go::Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "callers": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "candidates": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "report": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "unresolved": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "symbol",
+          "callers",
+          "unresolved",
+          "report"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "name": "legacy_audit",
       "description": "Detect pre-template (api-*) patterns in an existing service: routes.go, gin handlers, manual validation, swaggo docs, handleSuccess helpers. Use when planning a migration, not during ordinary edits.",
       "mutates": false,
@@ -1480,6 +1708,137 @@
           "candidates",
           "summary",
           "note"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "unit_check",
+      "description": "Whether a conversion step is done: the file parses and the named methods and the repository methods they call have the template shape. Works while the build is red.",
+      "mutates": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "methods": {
+            "description": "the methods the step converted; omit for every handler method in the file",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "path": {
+            "description": "the file the step converted",
+            "type": "string"
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "methods": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "reasons": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "shape": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "shape"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "parse_error": {
+            "type": "string"
+          },
+          "parses": {
+            "type": "boolean"
+          },
+          "repo": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "reasons": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "shape": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "shape"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "report": {
+            "type": "string"
+          },
+          "unknown": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "file",
+          "parses",
+          "methods",
+          "ok",
+          "report"
         ],
         "type": "object"
       }

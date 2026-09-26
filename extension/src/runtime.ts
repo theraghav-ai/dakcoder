@@ -83,6 +83,13 @@ export interface RuntimeOptions {
   log: vscode.LogOutputChannel;
   pythonPath?: string;
   prewarm?: boolean;
+  /**
+   * Development only: an interpreter that imports the agent from the checkout
+   * (the repo's `.venv`, with `apps/agent` and `apps/shared` installed
+   * editable). Set, it replaces the wheel venv entirely, so a change to the
+   * Python source is live on the next runtime restart with no rebuild.
+   */
+  devPython?: string;
 }
 
 export class Runtime implements vscode.Disposable {
@@ -116,6 +123,19 @@ export class Runtime implements vscode.Disposable {
     return this.announced?.port;
   }
 
+  /**
+   * Whether the running process was spawned with the code-graph pilot on.
+   *
+   * The setting is read at spawn, so after it is switched on the runtime keeps
+   * offering the model no `code_graph` until it restarts. `/graph` compares
+   * this with the setting rather than sending a request the model cannot serve.
+   */
+  get codeGraph(): boolean {
+    return this.running && this.spawnedWithCodeGraph;
+  }
+
+  private spawnedWithCodeGraph = false;
+
   /** Idempotent, and safe to call concurrently — two commands racing is normal. */
   async ensure(): Promise<Announcement> {
     if (this.announced && this.running) return this.announced;
@@ -126,8 +146,15 @@ export class Runtime implements vscode.Disposable {
   }
 
   private async start(): Promise<Announcement> {
-    const python = await this.venvPython();
+    const python = this.opts.devPython ?? (await this.venvPython());
+    if (this.opts.devPython) this.opts.log.info(`development mode: the runtime runs from ${python}`);
     const env = this.childEnv(await this.gotools(), await this.token());
+    this.spawnedWithCodeGraph = env.DAKCODER_CODE_GRAPH === '1';
+    // Only for the runtime's own Python: an explicit `dakcoder.codeGraph.python`
+    // is the developer's interpreter, and not ours to install into.
+    if (this.spawnedWithCodeGraph && !env.DAKCODER_GRAPHIFY_PYTHON) {
+      await this.ensureGraphify(python);
+    }
 
     const args = [
       '-m',
@@ -348,6 +375,10 @@ export class Runtime implements vscode.Disposable {
           .getConfiguration('dakcoder')
           .get<number>('approvalTimeoutSeconds', 0),
       ),
+      // AGENTS.md: whether it is read, whether a session's edit to it waits
+      // for approval, how much of it fits, and which other agents' files stand
+      // in for it. See `tools/agents_md.py` in the runtime.
+      ...agentsMdEnv(vscode.workspace.getConfiguration('dakcoder')),
       // Full-fidelity turn recording, as a setting rather than as an
       // environment variable the developer has to get into this process
       // somehow. `childEnv` inherits `process.env`, so `DAKCODER_DEBUG=1` in a
@@ -370,6 +401,11 @@ export class Runtime implements vscode.Disposable {
       // verified, so the child honours `dakcoder.gotoolsPath` and never sees a
       // binary the manifest refused.
       ...(gotools ? { GOTOOLS_PATH: gotools } : {}),
+      // The code-graph pilot. Off unless asked for. The interpreter setting is
+      // machine-scoped, which VS Code enforces by ignoring it in workspace
+      // settings -- the rule `dakcoder.gotoolsPath` is held to, because a
+      // workspace setting naming an executable is code execution by clone.
+      ...codeGraphEnv(),
       PYTHONUTF8: '1',
       PYTHONIOENCODING: 'utf-8',
     };
@@ -484,6 +520,59 @@ export class Runtime implements vscode.Disposable {
   }
 
   /**
+   * Install the code-graph wheels into the runtime venv, once per build of them.
+   *
+   * Offline, like the runtime itself, from `runtime-graph/` in the `.vsix`.
+   * `--no-deps` because the directory deliberately holds five of graphify's
+   * twenty-five declared grammars (see `scripts/vendor-graphify.py`), and pip
+   * resolving the rest with `--no-index` would fail on the ones left out.
+   *
+   * Never fatal. A failed install leaves the runtime starting without the
+   * graph, and `code_graph` then says graphify is missing -- which the model
+   * answers by searching instead. The pilot being unavailable must not take
+   * the agent down with it.
+   *
+   * Into the existing venv rather than a new one, which is safe where the
+   * runtime venv's own rebuild was not (see `venvPython`): this only adds
+   * packages, and graphify runs in a child process per call, so no live
+   * daemon holds its files open.
+   */
+  private async ensureGraphify(python: string): Promise<void> {
+    const wheels = path.join(this.opts.extensionPath, 'runtime-graph');
+    const wanted = wheelHash(wheels);
+    const stamp = path.join(path.dirname(path.dirname(python)), '.graphify-installed');
+    if (readIfExists(stamp) === wanted) return;
+
+    const files = fs.existsSync(wheels)
+      ? fs.readdirSync(wheels).filter((n) => n.endsWith('.whl')).map((n) => path.join(wheels, n))
+      : [];
+    if (!files.some((f) => path.basename(f).startsWith('graphifyy-'))) {
+      this.opts.log.warn('the code graph is on, but this build carries no graphify wheels');
+      return;
+    }
+
+    this.opts.log.info(`installing the code graph (${files.length} wheels) into the runtime venv`);
+    try {
+      await run(
+        python,
+        [
+          '-m',
+          'pip',
+          'install',
+          '--no-index',
+          '--no-deps',
+          '--disable-pip-version-check',
+          ...files,
+        ],
+        this.opts.log,
+      );
+      fs.writeFileSync(stamp, wanted, 'utf8');
+    } catch (err) {
+      this.opts.log.warn(`the code graph could not be installed: ${String(err)}`);
+    }
+  }
+
+  /**
    * Delete venvs from earlier builds, best effort.
    *
    * Each is ~34 MB, so they are worth reclaiming, but never at the cost of an
@@ -580,6 +669,17 @@ export class Runtime implements vscode.Disposable {
  *
  * 32 bytes, base64url: 256 bits, and nothing to reason about.
  */
+/** `DAKCODER_CODE_GRAPH` and `DAKCODER_GRAPHIFY_PYTHON`, from the settings. */
+function codeGraphEnv(): NodeJS.ProcessEnv {
+  const config = vscode.workspace.getConfiguration('dakcoder');
+  if (!config.get<boolean>('codeGraph.enabled', false)) return {};
+  const python = config.get<string>('codeGraph.python', '').trim();
+  return {
+    DAKCODER_CODE_GRAPH: '1',
+    ...(python ? { DAKCODER_GRAPHIFY_PYTHON: python } : {}),
+  };
+}
+
 function randomToken(): string {
   return randomBytes(32).toString('base64url');
 }
@@ -625,6 +725,27 @@ function firstWheel(dir: string, prefix: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** The `dakcoder.agentsMd.*` settings, as the runtime reads them. */
+export function agentsMdEnv(
+  config: Pick<vscode.WorkspaceConfiguration, 'get'>,
+): Record<string, string> {
+  const fallbacks = config.get<string[]>('agentsMd.fallbackFilenames', [
+    'CLAUDE.md',
+    'GEMINI.md',
+    'AGENT.md',
+  ]);
+  return {
+    DAKCODER_PROJECT_DOCS: config.get<boolean>('agentsMd.enabled', true) ? '1' : '0',
+    DAKCODER_AGENTS_MD_APPROVAL:
+      config.get<string>('agentsMd.approval', 'auto') === 'ask' ? 'ask' : 'auto',
+    DAKCODER_PROJECT_DOC_MAX_BYTES: String(config.get<number>('agentsMd.maxBytes', 32768)),
+    // Bare names only; the runtime drops anything with a path separator.
+    DAKCODER_PROJECT_DOC_FALLBACKS: (Array.isArray(fallbacks) ? fallbacks : [])
+      .filter((n) => typeof n === 'string')
+      .join(','),
+  };
 }
 
 function extensionVersion(extensionPath: string): string {

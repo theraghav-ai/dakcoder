@@ -152,6 +152,7 @@ def as_markdown(version: str = "dev") -> str:
             Provider.PYTHON: "agent",
             Provider.GOTOOLS: "gotools",
             Provider.GOPLS: "gopls",
+            Provider.GRAPHIFY: "graphify",
         }[spec.provider]
         note = f" _(not yet available: {spec.unavailable})_" if spec.unavailable else ""
         lines.append(

@@ -11,6 +11,7 @@
       "repo_map",
       "read_file",
       "search_repo",
+      "code_graph",
       "search_docs",
       "rules_lint",
       "legacy_audit",
@@ -18,8 +19,12 @@
       "validation_audit",
       "temporal_audit",
       "lib_version_check",
+      "handler_map",
+      "unit_check",
+      "impact",
       "playbook",
       "finish",
+      "update_agents_md",
       "git_status",
       "git_diff",
       "git_blame"
@@ -28,6 +33,7 @@
       "repo_map",
       "read_file",
       "search_repo",
+      "code_graph",
       "search_docs",
       "rules_lint",
       "legacy_audit",
@@ -35,10 +41,14 @@
       "validation_audit",
       "temporal_audit",
       "lib_version_check",
+      "handler_map",
+      "unit_check",
+      "impact",
       "playbook",
       "submit_plan",
       "ask_developer",
       "finish",
+      "update_agents_md",
       "git_status",
       "git_diff",
       "git_blame"
@@ -47,12 +57,17 @@
       "repo_map",
       "read_file",
       "search_repo",
+      "code_graph",
       "search_docs",
       "rules_lint",
       "lib_version_check",
+      "handler_map",
+      "unit_check",
+      "impact",
       "playbook",
       "ask_developer",
       "finish",
+      "update_agents_md",
       "revise_plan",
       "write_file",
       "patch_file",
@@ -171,6 +186,50 @@
       "mutates": false,
       "approval": "none",
       "provider": "python"
+    },
+    {
+      "name": "code_graph",
+      "description": "Look up the code graph: a symbol's edges, its callers, the path between two symbols, or a question. Cheaper than chaining search_repo and read_file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "op": {
+            "type": "string",
+            "description": "explain: its edges. callers: what uses it. path: symbol to `to`. query: by question.",
+            "enum": [
+              "explain",
+              "callers",
+              "path",
+              "query"
+            ]
+          },
+          "symbol": {
+            "type": "string",
+            "description": "Bare name, e.g. 'CreateUserHandler'."
+          },
+          "to": {
+            "type": "string",
+            "description": "For path: the target symbol."
+          },
+          "question": {
+            "type": "string",
+            "description": "For query: what to find."
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "agent",
+        "ask",
+        "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "graphify",
+      "instead": "use search_repo and read_file"
     },
     {
       "name": "search_docs",
@@ -403,6 +462,85 @@
       "gate_only": true
     },
     {
+      "name": "handler_map",
+      "description": "Split one handler file into conversion steps: each method's lines, route and the repository methods it calls. Plan a migration's handler steps from its groups.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The handler file, e.g. 'handler/paogen.go'."
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "agent",
+        "ask",
+        "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
+      "name": "unit_check",
+      "description": "Check a conversion step: the file parses and the named methods, and the repository methods they call, have the template shape. The step check while the build is red.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The file the step converted."
+          },
+          "methods": {
+            "type": "string",
+            "description": "Comma-separated methods the step converted. Omit for all in the file."
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "agent",
+        "ask",
+        "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
+      "name": "impact",
+      "description": "List who calls a function, two levels up, with the routes that reach it. Use before changing a repository method's signature.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "description": "Type.Method, e.g. 'PaogenRepository.GetDDOsRepo'."
+          }
+        },
+        "required": [
+          "symbol"
+        ],
+        "additionalProperties": false
+      },
+      "modes": [
+        "agent",
+        "ask",
+        "planner"
+      ],
+      "mutates": false,
+      "approval": "none",
+      "provider": "gotools"
+    },
+    {
       "name": "playbook",
       "description": "Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before.",
       "parameters": {
@@ -558,6 +696,14 @@
           "blocked": {
             "type": "string",
             "description": "What stopped you, if anything did. Omit when nothing did."
+          },
+          "remember": {
+            "type": "array",
+            "description": "'section: fact' lines for AGENTS.md that a future session needs.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5
           }
         },
         "required": [
@@ -572,6 +718,62 @@
       ],
       "mutates": false,
       "approval": "none",
+      "provider": "python"
+    },
+    {
+      "name": "update_agents_md",
+      "description": "Save a one-line fact for future sessions in AGENTS.md, or fix or remove a wrong note. Never secrets.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "op": {
+            "type": "string",
+            "description": "Default add.",
+            "enum": [
+              "add",
+              "replace",
+              "remove"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "description": "One line per note."
+          },
+          "section": {
+            "type": "string",
+            "description": "Heading.",
+            "enum": [
+              "commands",
+              "conventions",
+              "testing",
+              "architecture",
+              "gotchas",
+              "never"
+            ]
+          },
+          "old": {
+            "type": "string",
+            "description": "The note to replace or remove."
+          },
+          "scope": {
+            "type": "string",
+            "description": "local: AGENTS.local.md, this developer only.",
+            "enum": [
+              "project",
+              "local"
+            ]
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [
+        "agent",
+        "ask",
+        "planner"
+      ],
+      "mutates": true,
+      "approval": "conditional",
       "provider": "python"
     },
     {

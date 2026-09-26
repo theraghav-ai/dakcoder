@@ -195,7 +195,7 @@ class Tool(Wire):
     modes: list[str]
     mutates: bool
     approval: Literal["none", "conditional", "always"]
-    provider: Literal["python", "gotools", "gopls"]
+    provider: Literal["python", "gotools", "gopls", "graphify"]
     gate_only: Absent[bool]
     unavailable: Absent[str]
     instead: Absent[str]

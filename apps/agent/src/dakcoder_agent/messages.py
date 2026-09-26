@@ -49,13 +49,19 @@ class Layer(StrEnum):
     #: ``ContextManager.build`` for the measurement that put it there.
     DIRECTIVE = "directive"
     MODE = "mode"
+    #: The repository's own instructions for agents (AGENTS.md). Pinned, and
+    #: placed right under the system prompt: it changes only when the files do,
+    #: so it is a prefix-cache hit for every turn of every run in the repository.
+    PROJECT = "project"
     SYSTEM = "system"
 
 
 #: Layers that are never evicted. The task and the acceptance criteria are what
 #: the whole run is measured against; an agent that compacts away what it was
 #: asked to do will confidently finish something else.
-PINNED_LAYERS = frozenset({Layer.SYSTEM, Layer.MODE, Layer.TASK, Layer.DIRECTIVE})
+PINNED_LAYERS = frozenset(
+    {Layer.SYSTEM, Layer.PROJECT, Layer.MODE, Layer.TASK, Layer.DIRECTIVE}
+)
 
 
 @dataclass(frozen=True, slots=True)

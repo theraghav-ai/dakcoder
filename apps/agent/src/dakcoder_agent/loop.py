@@ -44,6 +44,7 @@ auto-approves is one where the approval layer is decoration.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -52,6 +53,7 @@ import threading
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from dakcoder_shared.envelope import (
@@ -107,9 +109,13 @@ from .migration import (
     PROGRESS_PATH,
     PROTECTED,
     Phase,
+    load_record,
     phases_from_meta,
     plan_objection,
     progress_document,
+    save_record,
+    size_objection,
+    split_files,
     steps_for_phase,
 )
 from .modes import CONTEXT_WINDOW, Intent, Mode, config_for
@@ -121,6 +127,66 @@ from .tools.control import PlanStep, split_paths, steps_from_meta
 from .tools.router import ApprovalRequest, Router
 
 log = logging.getLogger(__name__)
+
+#: What a message says when it is about the migration already under way. Read
+#: only when the workspace has an unfinished migration record to resume.
+_RESUME_WORDS = re.compile(
+    r"\b(?:migrat\w*|conver(?:t|sion)\w*|n-api|template|continue|resume|carry on|"
+    r"next phase|phase \d+)\b",
+    re.IGNORECASE,
+)
+
+
+#: What a task owns and the next task must start without. Everything a
+#: follow-up inherits through ``carry_from`` that describes *the work in hand*
+#: rather than the session: the plan and its cursor, the ledgers about files
+#: that plan wrote, removed and rewrote, the push-back budgets spent on it, the
+#: approaches it tried, the reply it kept repeating, and the gate's verdict on
+#: it. Reset from a fresh ``_State`` by ``AgentLoop._begin_new_task``, so a
+#: field added to the loop state is reset by adding its name here -- and a name
+#: missing here is a field that silently carries one task into the next.
+_TASK_SCOPED: tuple[str, ...] = (
+    "plan",
+    "plan_summary",
+    "plan_forced",
+    "cursor",
+    "removed",
+    "gone_once",
+    "rewritten",
+    "churn",
+    "retired",
+    "phase_left",
+    "awaiting",
+    "finish_refused",
+    "plan_objections",
+    "tried",
+    "reply_key",
+    "reply_repeats",
+    "degenerate_refused",
+    "dependencies_changed",
+    "last_gate",
+    "gate_failures",
+)
+
+#: A follow-up that refers to the task just finished rather than naming a new
+#: one: "try again", "continue", "fix it". Short on purpose -- anything that
+#: says what it wants is a task of its own.
+_CONTINUES = re.compile(
+    r"^\s*(?:please\s+|ok(?:ay)?[,\s]+)?(?:try again|retry|again|redo(?: it| that)?|"
+    r"do (?:it|that) again|continue|carry on|go on|keep going|resume|"
+    r"fix (?:it|that|this|them)|finish (?:it|that|this))\b",
+    re.IGNORECASE,
+)
+
+
+def _git_head(root: Path) -> str:
+    """The branch checked out in ``root``, read off ``.git/HEAD``; ``""`` if unknown."""
+    try:
+        head = (root / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    prefix = "ref: refs/heads/"
+    return head[len(prefix):] if head.startswith(prefix) else ""
 
 __all__ = [
     "AgentLoop",
@@ -268,6 +334,8 @@ _OWNER: dict[str, str] = {
     "retired": "task",
     "routes_saved": "task",
     "routes_before": "task",
+    "phase_left": "task",
+    "previous_outcome": "task",
     "migration": "task",
     "awaiting": "task",
     "asked": "task",
@@ -306,6 +374,7 @@ _OWNER: dict[str, str] = {
     "truncations": "progress",
     "finish_refused": "progress",
     "preamble_refused": "progress",
+    "preamble_last": "progress",
     "plan_objections": "progress",
     "reasks": "progress",
     "reply_key": "progress",
@@ -667,7 +736,14 @@ STATE_ITEMS = 8
 #: sent back. One, and it is cheap to reject: the message says that re-sending
 #: the same text unchanged will be taken as final, so a false positive costs a
 #: turn rather than an argument.
-MAX_PREAMBLE_REFUSALS = 1
+#:
+#: Two since 2026-09-25, with "unchanged" meaning unchanged. The one refusal
+#: used to be spent on the first preamble and any second answer accepted, so a
+#: model that reworded its opening line -- "Here is the complete breakdown:"
+#: became "Here is the complete breakdown of the codebase structure, layers,
+#: and functionality based on all files I have read." -- delivered it. What is
+#: honoured now is the *same* text sent again, which is what the refusal says.
+MAX_PREAMBLE_REFUSALS = 2
 
 #: How long an answer can be and still be a preamble. Generous: what is being
 #: caught is an answer that *announces* findings and then stops, and the two
@@ -691,17 +767,57 @@ _PROMISES_MORE = re.compile(
 )
 
 
+#: An answer that announces the next step instead of taking it.
+#:
+#: The same failure in the first person: "I've already established the
+#: structure from the repo_map and code_graph queries. Let me now explain the
+#: most connected types to complete the outline." -- delivered as the whole
+#: answer, with the explaining never done. The verbs are the ones a reading turn
+#: announces; "let me know" is excluded because it is how a finished answer
+#: often ends.
+_ANNOUNCES_NEXT = re.compile(
+    r"\b(?:let me|i(?:'ll| will| am going to|'m going to)|next,? i(?:'ll| will)?|now i(?:'ll| will))"
+    r"\s+(?:now\s+|next\s+|then\s+|also\s+|first\s+)?"
+    r"(?:explain|call|read|check|look|search|run|query|examine|inspect|get|fetch|open|"
+    r"review|analy[sz]e|trace|continue|complete|finish|go through|walk|summari[sz]e|"
+    r"outline|describe|list|map|dig|cover|detail|break)",
+    re.IGNORECASE,
+)
+
+
 def _is_preamble(answer: str) -> bool:
     """Whether this answer reads as the opening of something longer.
 
-    Two signals, either alone enough, both bounded by length. An answer that
+    Three signals, any alone enough, all bounded by length. An answer that
     *ends* on a colon is incomplete by construction. An answer that says
     findings follow -- and is short enough that they plainly did not -- is the
-    same failure with different punctuation.
+    same failure with different punctuation. And an answer that announces the
+    next thing it will do is a turn that stopped before doing it.
     """
     if not answer or len(answer) > PREAMBLE_CHARS:
         return False
-    return answer.rstrip().endswith((":", "：")) or bool(_PROMISES_MORE.search(answer))
+    return (
+        answer.rstrip().endswith((":", "："))
+        or bool(_PROMISES_MORE.search(answer))
+        or bool(_ANNOUNCES_NEXT.search(answer))
+    )
+
+
+#: A `blocked` that is an intention rather than an obstacle.
+_WANTS_TO = re.compile(
+    r"\bI (?:still )?(?:need|have|want|would need) to (?:call|run|read|use|check|look|query|explain|write)",
+    re.IGNORECASE,
+)
+
+
+def _ends_open(answer: str) -> bool:
+    """Whether the answer ends on the punctuation that introduces what follows."""
+    return answer.rstrip().rstrip("*_` ").endswith((":", "："))
+
+
+def _same_answer(a: str, b: str) -> bool:
+    """Equal once whitespace is ignored: a resend, not a rewrite."""
+    return " ".join(a.split()) == " ".join(b.split())
 
 
 #: Below this an answer is too short for a repetition ratio to mean anything,
@@ -901,6 +1017,14 @@ def _asked_fingerprint(questions: Sequence[Any]) -> str:
 #: criterion in a message about verification.
 _CONTROL_TOOLS = frozenset({"submit_plan", "revise_plan", "ask_developer", "finish"})
 
+#: Shown only while a migration is active, in every mode (`AgentLoop._tools`).
+#: `handler_map` is how a planner splits a large handler into steps, and
+#: `unit_check` is the step check the acting phase can pass while the service
+#: does not build -- which, between the dependency swap and the last phase, it
+#: never does. A field run's plan checked every step with `go_build`, the acting
+#: phase correctly refused all seven as unsatisfiable, and the run stalled.
+MIGRATION_TOOLS = frozenset({"handler_map", "unit_check", "impact"})
+
 
 def _unrunnable_checks() -> frozenset[str]:
     """Tools an ``accepts`` may cite that the acting phase cannot call.
@@ -1021,6 +1145,7 @@ class AgentLoop:
         winding_down: Callable[[], bool] = lambda: False,
         max_turns: int = 40,
         session_id: str = "",
+        project_docs: Callable[[], Any] | None = None,
     ) -> None:
         self.context = context
         self.client = client
@@ -1046,6 +1171,11 @@ class AgentLoop:
         self.winding_down = winding_down
         self.max_turns = max_turns
         self.session_id = session_id
+        #: Reads the repository's AGENTS.md files and returns an
+        #: ``agents_md.Instructions``. Called at the top of every run, so an
+        #: edit made between two messages -- by the developer or by a session
+        #: -- is pinned from the next one. ``None`` pins nothing.
+        self.project_docs = project_docs
         self.state = _State()
         #: The before/after seam around a tool call. Empty by default, and
         #: cheap when empty -- the loop's fast path is a length check.
@@ -1065,6 +1195,9 @@ class AgentLoop:
         #: deterministic compaction to 15% is not a estimate that drifted, it is
         #: a context that cannot be made to fit, and retrying it is a bill.
         self._overflow_recovered = False
+        #: Handler method names per file, from `handler_map`, for matching a
+        #: split step's text to the methods it converts. See `_step_methods`.
+        self._method_names: dict[str, list[str]] = {}
         #: Full-fidelity turn recording, or None. See `debug.py`: off by
         #: default, one `is None` check per seam when off, and it hangs off the
         #: four places that already funnel rather than being sprinkled through
@@ -1141,13 +1274,22 @@ class AgentLoop:
         statement of intent, not a mode any more -- a caller asking for "coder"
         is asking for work to be done, which is what ``Intent.AGENT`` means.
         """
-        if continued:
+        # A new task in an old conversation gets what a first message gets --
+        # its own pinned task, plan and change set -- and keeps what the session
+        # has learned. `continued` stays true: the classifier still reads the
+        # conversation, because "do it" means something only after what it
+        # answers. `new_task` is what the task-shaped decisions below read.
+        new_task = continued and self._starts_new_task(task)
+        if new_task:
+            self._begin_new_task(task, acceptance)
+        elif continued:
             self.context.append_user(task)
             # And pinned, because the working-set copy is the first thing the
             # next compaction evicts.
             self.context.pin_directive(task)
         else:
             self.context.set_task(task, acceptance=acceptance)
+        self._refresh_project_docs()
 
         # What this run is for, in order of how much the loop actually knows.
         #
@@ -1181,7 +1323,7 @@ class AgentLoop:
             decided, source = self._classify(task, continued=continued), "classified"
         elif (
             decided is Intent.AGENT
-            and not continued
+            and (not continued or new_task)
             and not self.state.migration.active
         ):
             # The kind is settled and the *shape* is not, and they are different
@@ -1202,6 +1344,10 @@ class AgentLoop:
             self._classify(task, continued=continued, kind_known=True)
         self.state.intent = decided
         self.state.intent_source = source
+        # Before the baseline: a resumed migration defers the gate, and a
+        # baseline of a half-converted service is exactly what must not be taken.
+        if not continued or new_task:
+            self._resume_migration(task)
 
         self._switch(self._opening_mode(decided, continued=continued))
         # Only a run that may write needs to know what was already broken.
@@ -1266,6 +1412,93 @@ class AgentLoop:
         yield Event(EventType.FINISH, self.result.as_dict())
         yield from self._metrics()
         yield Event(EventType.END, self.result.as_dict())
+
+    def _starts_new_task(self, task: str) -> bool:
+        """Whether this follow-up is a new task rather than more of the last one.
+
+        A session is a conversation, and a conversation holds several tasks.
+        Nothing used to say where one ended: every follow-up was a directive
+        under the *first* message's pinned task, and every ledger, the plan and
+        the change set carried on. Session 256a4ac40856 is what that costs. It
+        wrote AGENTS.md, answered three questions, and was then asked for an
+        employee CRUD API -- and the model, still pinned to "Create or improve
+        AGENTS.md", answered the new request with the AGENTS.md summary three
+        times; the adopted plan put the finished AGENTS.md step in front of the
+        new work; and every result listed AGENTS.md as changed by it.
+
+        A new task, then, when the last one is *over*: its run ended ``done``
+        (or there is no record of it and nothing is outstanding), no step is
+        still open or written, the agent is not waiting on an answer to its own
+        question, and no migration is under way -- a migration is many messages
+        by construction and has its own resume rules. Anything else is the same
+        task continuing, which is also what "try again" and "continue" mean
+        whatever came before them.
+        """
+        state = self.state
+        if state.migration.active:
+            return False
+        if state.awaiting is not Intent.AUTO:
+            return False
+        if any(_holds_a_phase_open(step) for step in state.plan):
+            return False
+        if state.previous_outcome and state.previous_outcome != str(Outcome.DONE):
+            return False
+        if _CONTINUES.match(task or ""):
+            return False
+        return True
+
+    def _begin_new_task(self, task: str, acceptance: Sequence[str]) -> None:
+        """Close the last task and open this one, keeping what the session knows.
+
+        **Reset:** the pinned task, criteria, directives and plan text in the
+        context; every ledger in ``_TASK_SCOPED``; and the Router's change set,
+        which the gate scopes itself to and results report -- a file the last
+        task wrote is not this task's work. The finished plan is archived as a
+        revision, never deleted.
+
+        **Kept:** the conversation itself (the new message is appended to it as
+        well as pinned, so it is also the latest thing said), what has been
+        read and asked, questions already answered, the route inventory, the
+        migration record, the undo snapshots and the mutation counters -- all
+        facts about the session and the workspace, not about a task.
+        """
+        fresh = _State()
+        for name in _TASK_SCOPED:
+            setattr(self.state, name, copy.copy(getattr(fresh, name)))
+        if self._plan_record.steps or self._plan_record.summary:
+            first = next((ln.strip() for ln in task.splitlines() if ln.strip()), "")
+            self._plan_record = self._plan_record.record(
+                (), "", cause="new task", reason=first[:160]
+            )
+            if self.session_id:
+                self._plan_record.session_id = self.session_id
+                self._plan_record.save(self.router.workspace.root)
+        before = (self.context.directives or (self.context.task_text,))[-1]
+        self.router.begin_task()
+        self.context.start_task(task, acceptance=acceptance, after=before)
+        self.context.append_user(task)
+        log.info("session %s: new task, previous plan closed", self.session_id or "-")
+
+    def _refresh_project_docs(self) -> None:
+        """Pin the current AGENTS.md block, once per run.
+
+        Best-effort, like the journal: an unreadable file costs the run its
+        project instructions, never the run. Logged when the block changes, so
+        "did it read our AGENTS.md" has an answer in the runtime log.
+        """
+        if self.project_docs is None:
+            return
+        try:
+            docs = self.project_docs()
+        except Exception:  # noqa: BLE001 - instructions are advice, not a dependency
+            log.warning("could not read the project instructions", exc_info=True)
+            return
+        if self.context.set_project(getattr(docs, "text", "") or ""):
+            summary = docs.summary() if hasattr(docs, "summary") else {}
+            log.info(
+                "project instructions pinned: %s",
+                ", ".join(s["file"] for s in summary.get("sources", [])) or "none found",
+            )
 
     def _metrics(self) -> Iterator[Event]:
         """One record of what this run cost and where it ran out of room.
@@ -1342,11 +1575,12 @@ class AgentLoop:
         in a diff. So an unavailable or unparseable classifier answers with the
         cheap mistake.
         """
-        conversation = "\n".join(
-            f"- {line}" for line in self.context.directives[-4:]
-        ) or "(this is the first message)"
-        if continued and self.context.task_text:
-            conversation = f"- {self.context.task_text}\n{conversation}"
+        # The conversation, not the directives: a new task clears those, and
+        # a follow-up is read against everything the developer has said.
+        said = self.context.said if continued else ()
+        conversation = "\n".join(f"- {line}" for line in said[-5:]) or (
+            "(this is the first message)"
+        )
         # And what the agent last said, which is half of what the newest
         # message means. `directives` is the developer's side only, so "do it,
         # and don't run the gates until the end" arrived with no trace that the
@@ -2060,6 +2294,10 @@ class AgentLoop:
         if self.state.mode is Mode.AGENT and not self.state.migration.active:
             withheld = {"ask_developer", "lib_version_check"}
             tools = [t for t in tools if t["function"]["name"] not in withheld]
+        # The call map, in every mode: a conversion's tools, worth ~400 prompt
+        # tokens a turn that no other task should pay. See `MIGRATION_TOOLS`.
+        if not self.state.migration.active:
+            tools = [t for t in tools if t["function"]["name"] not in MIGRATION_TOOLS]
         return tools
 
     def _migration_guard(self, call: ToolCall) -> ToolResult | None:
@@ -2104,6 +2342,20 @@ class AgentLoop:
         if not (self.router.workspace.root / ".git").is_dir():
             return None
         self._save_routes()
+        if migration.expected_branch:
+            # A resumed migration whose branch exists and is not checked out.
+            # Cutting a new one would fork the conversion; switching back is one
+            # call, and `git_ops op=branch` checks out a branch that exists.
+            return ToolResult.failure(
+                f"{call.name} was not run: this migration's work is on "
+                f"`{migration.expected_branch}` and the workspace is on another branch.",
+                fix=(
+                    f"Switch back first: `git_ops` op=branch "
+                    f"message={migration.expected_branch}. It checks out the existing "
+                    "branch; nothing is cut or lost. Then repeat this call."
+                ),
+                meta={"migration": "needs its branch"},
+            )
         on = (
             f" It is on {migration.branch}, which is a shared branch."
             if migration.branch
@@ -2707,7 +2959,13 @@ class AgentLoop:
             # only statement about the repository that cannot be wrong.
             if call.name == "git_ops" and outcome.ok and outcome.meta.get("branch"):
                 self.state.migration.branch = str(outcome.meta["branch"])
-                self.state.migration.base = str(outcome.meta.get("base") or "")
+                # A switch back to a branch that already exists reports no
+                # base; the one recorded when it was cut is still the truth.
+                self.state.migration.base = (
+                    str(outcome.meta.get("base") or "") or self.state.migration.base
+                )
+                if self.state.migration.branch == self.state.migration.expected_branch:
+                    self.state.migration.expected_branch = ""
                 # Written now rather than at the next plan change: the branch is
                 # the fact a developer opening the document first wants, and the
                 # next change to the plan may be several turns away.
@@ -3442,16 +3700,20 @@ class AgentLoop:
                 json.dumps(list(tools), sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest()[:16],
             hashlib.sha256(system_prompt().encode("utf-8")).hexdigest()[:16],
+            # The AGENTS.md block sits between the system message and the mode
+            # overlay. It can move only at a run boundary, and only when the
+            # files changed -- a real break, and reported as one.
+            hashlib.sha256(self.context.project_text.encode("utf-8")).hexdigest()[:16],
             hashlib.sha256(
                 mode_instruction(self.state.mode).encode("utf-8")
             ).hexdigest()[:16],
         )
         was, self.state.prefix_key = self.state.prefix_key, key
-        if was == ("", "", ""):
+        if was == ("", "", "", ""):
             # The first turn of a run writes the cache rather than breaking it.
             self.state.prefix_break = ""
             return ""
-        for part, before, now in zip(("tools", "system", "mode"), was, key):
+        for part, before, now in zip(("tools", "system", "project", "mode"), was, key):
             if before != now:
                 self.state.prefix_break = part
                 return part
@@ -3529,6 +3791,69 @@ class AgentLoop:
         """
         tools = [s for s in self._tools() if s["function"]["name"] in _TERMINAL]
         return tools or self._tools()
+
+    def _preamble_refusal(
+        self, answer: str, blocked: str, *, resent: bool, open_ended: bool
+    ) -> str:
+        """What a preamble is sent back with.
+
+        Concrete, because the general version did not move the model. "Call
+        `finish` again with the whole thing" was answered twice in one field
+        session with the same 301 characters, 84 tokens each time -- the model
+        stopping at the colon as if the sections were someone else's job. What
+        the same model did when it did write them (11,359 characters, a message
+        later) was start from the first section. So that is what is asked: no
+        introduction, the first heading first, and a length that is allowed to
+        be long.
+        """
+        tail = " ".join(answer.split())[-80:]
+        if resent:
+            return (
+                "That is the same opening line again, and it still stops before its "
+                "content. Leave the introduction out completely this time: start "
+                "`answer` with `## ` and the first section's title, then write every "
+                "section under it. Several thousand characters is expected and fine."
+            )
+        return (
+            f'Your `answer` stops where its content should start -- it ends "...{tail}"\n\n'
+            + self._not_really_blocked(blocked)
+            + "The developer sees `answer` and nothing after it; there is no reply "
+            "after `finish`. Call `finish` again and write the whole answer: begin "
+            "with the first section or finding, not with an introduction, and include "
+            "every part you were about to list. A long answer is expected -- several "
+            "thousand characters is fine."
+            + (
+                ""
+                if open_ended
+                else "\n\nIf that really was the whole answer, send it again unchanged "
+                "and it will be taken as final."
+            )
+        )
+
+    def _not_really_blocked(self, blocked: str) -> str:
+        """The line for a `blocked` that names a call the model can make itself.
+
+        "I need to call code_graph op=explain" is not a block when code_graph is
+        in this turn's tool list; it is the next step, written down instead of
+        taken. Saying so, with the tool named, is what turns the refusal into a
+        call rather than a reworded preamble.
+        """
+        if not blocked:
+            return ""
+        offered = [
+            s["function"]["name"]
+            for s in self.router.schemas_for(self.state.mode)
+            if s["function"]["name"] not in _CONTROL_TOOLS
+        ]
+        named = [name for name in offered if name in blocked]
+        if not named and not _WANTS_TO.search(blocked):
+            return ""
+        tools = ", ".join(f"`{n}`" for n in named) if named else "the read tools"
+        return (
+            f"`blocked` says what you still mean to do, and nothing stops you: "
+            f"{tools} {'is' if len(named) == 1 else 'are'} available in this turn. "
+            "Make those calls now, then call `finish` with the complete answer.\n\n"
+        )
 
     def _phase_ended(self, tool: str, outcome: ToolResult) -> Iterator[Event]:
         """Act on the tool call that ends a phase.
@@ -3689,23 +4014,45 @@ class AgentLoop:
             # Cheap to reject on purpose. Re-sending the same text unchanged is
             # accepted as final, so a wrong guess costs one turn rather than an
             # argument with a model that is right.
+            #
+            # Not skipped when `blocked` is set, which it used to be. Three of
+            # the four field preambles carried one: a caveat ("I did not read
+            # every file"), or a "blocker" that was only the next tool call ("I
+            # need to call code_graph op=explain on the most connected types").
+            # Neither completes an answer that stops at its opening line, and
+            # the second is not a block at all when the tool is in hand.
+            #
+            # **Except an answer that ends on a colon.** That escape is for a
+            # detector that guessed wrong, and "...structured from the code
+            # graph and file reads:" is not a guess: it is incomplete by its
+            # own punctuation. Session c286592309d1 sent exactly that, was
+            # refused, resent it byte for byte, and had it accepted -- and the
+            # full 11,359-character answer arrived one message later, when the
+            # developer typed "explain". The model could write it; the escape
+            # let it not.
+            preamble = not self.router.touched and _is_preamble(answer)
+            open_ended = _ends_open(answer)
+            resent = _same_answer(answer, self.state.preamble_last)
             if (
-                not blocked
-                and not self.router.touched
-                and _is_preamble(answer)
+                preamble
+                and (open_ended or not resent)
                 and self.state.preamble_refused < MAX_PREAMBLE_REFUSALS
             ):
                 self.state.preamble_refused += 1
+                self.state.preamble_last = answer
                 self.context.append_user(
-                    "Your `answer` reads as the opening of something longer: it says "
-                    "what is coming and then stops.\n\n"
-                    "The developer sees `answer` and nothing else -- there is no reply "
-                    "after it. Whatever you were about to write next has to be inside "
-                    "it. Call `finish` again with the whole thing.\n\n"
-                    "If that really was the whole answer, send it again unchanged and "
-                    "it will be taken as final."
+                    self._preamble_refusal(answer, blocked, resent=resent, open_ended=open_ended)
                 )
                 return
+            if preamble and open_ended:
+                # Both refusals spent and still only the introduction. Delivered
+                # -- a run must end -- but never as though it were complete: a
+                # developer shown a colon and silence reads it as the answer.
+                answer = (
+                    answer.rstrip()
+                    + "\n\n_The answer stopped after its introduction. Reply "
+                    "**continue** for the rest._"
+                )
 
             # Emitted as the assistant's own words, because that is what it is:
             # the developer reads this, and a `finish` whose answer only appeared
@@ -3773,9 +4120,21 @@ class AgentLoop:
         # classifier is the weaker witness of the two.
         if phases and len(phases) >= MIN_PHASES:
             self.state.migration.active = True
+        if self.state.migration.active:
+            # Every file a plan names is a file its phase covers, whether or not
+            # this plan is adopted: a plan refused as too big for one submission
+            # is the only complete list of the phase's files the loop ever sees,
+            # and the narrower plan that follows names one of them.
+            for step in steps:
+                if step.phase and step.file:
+                    self.state.migration.note_planned(step.phase, [step.file])
         if self.state.migration.active and (
             objection := plan_objection(
-                self.state.migration, phases, steps, lines=self._line_count
+                self.state.migration,
+                phases,
+                steps,
+                lines=self._line_count,
+                groups=self._groups,
             )
         ):
             # Sent back rather than adopted, and *only* for a migration. The
@@ -3807,8 +4166,30 @@ class AgentLoop:
             # just thought about seven phases sends the steps for two of them,
             # and that is a good plan in the wrong shape -- see
             # `migration.steps_for_phase`.
-            kept, deferred = steps_for_phase(self.state.migration.phases, steps)
+            migration = self.state.migration
+            closed = {p.name.strip().lower() for p in migration.phases if p.status == "done"}
+            finished = [s for s in steps if s.phase.strip().lower() in closed]
+            if finished and len(finished) < len(steps):
+                steps = tuple(s for s in steps if s.phase.strip().lower() not in closed)
+                self.context.append_user(
+                    f"{len(finished)} step(s) in that plan belong to a phase that has "
+                    "already closed ("
+                    + ", ".join(dict.fromkeys(s.phase for s in finished))
+                    + ") and were dropped. That work is done and on disk."
+                )
+            kept, deferred = steps_for_phase(migration.phases, steps)
             steps = tuple(kept)
+            for step in (*kept, *deferred):
+                if step.phase and step.file:
+                    migration.note_planned(step.phase, [step.file])
+            by_phase: dict[str, list[PlanStep]] = {}
+            for step in kept:
+                by_phase.setdefault(step.phase, []).append(step)
+            for name, group in by_phase.items():
+                migration.note_split(name, split_files(group, self._line_count))
+            migration.record_steps(kept)
+            # This session has a plan of its own now; the resume view is done.
+            migration.resumed = False
         replanned = bool(self.state.plan) and self.state.replans > 0
         yield from self._adopt_plan(steps, str(outcome.meta.get("summary") or ""))
         if deferred:
@@ -4115,10 +4496,19 @@ class AgentLoop:
             headline = f"phase {closed} is complete and it was the last one"
         elif here is not None:
             index, phase = here
-            open_steps = [s.file for s in self.state.plan if s.open][:STATE_ITEMS]
+            open_steps = list(dict.fromkeys(s.file for s in self.state.plan if s.open))[:STATE_ITEMS]
+            left = [f for f in self.state.phase_left if f not in open_steps][:STATE_ITEMS]
             headline = (
                 f"phase {index} of {total} — {phase.name} — is still open"
                 + (": " + ", ".join(open_steps) + " not done yet" if open_steps else "")
+                + (
+                    ("; " if open_steps else ": ")
+                    + "still to plan and convert in it: "
+                    + ", ".join(left)
+                    + " — the next message (or /migrate) plans the next of them"
+                    if left
+                    else ""
+                )
             )
         else:
             headline = "the migration has no phases recorded yet"
@@ -4222,8 +4612,26 @@ class AgentLoop:
         steps = scoped or list(self.state.plan)
         if any(_holds_a_phase_open(step) for step in steps) and not evidenced:
             return ""
+        # **The plan in hand is not the phase.** A phase too big for one plan is
+        # planned a file at a time -- `size_objection` asks for exactly that --
+        # and judging it by the plan in hand closed "handlers" the moment the
+        # first file's steps settled. Every plan for the other files was then
+        # refused as belonging to a closed phase, and the conversion could not
+        # go on. The phase closes when every file it has ever been planned to
+        # cover is finished, and a split file only when the code agrees.
+        migration.record_steps(self.state.plan, self.router.touched)
+        if not evidenced and (left := migration.outstanding(phase.name, self._converted)):
+            self.state.phase_left = tuple(left)
+            self._save_plan()
+            return ""
+        self.state.phase_left = ()
         if not migration.close(phase.name):
             return ""
+        # A new phase is a new plan, and its objections are its own. The budget
+        # was shared across the whole session, so the roadmap's two refusals in
+        # phase one left none for the handlers phase -- the one whose large
+        # files most need splitting -- and its plans were adopted unsplit.
+        self.state.plan_objections = 0
         self._save_plan()
         return phase.name
 
@@ -4611,6 +5019,18 @@ class AgentLoop:
         # roadmap restored without the steps resumes a phase with no work in it.
         # They are one atomic file for exactly this reason.
         self.state.migration = record.migration
+        if record.migration.phases:
+            # The session file carries the roadmap in its contract shape; the
+            # workspace record carries it with the ledger -- which files each
+            # phase covers, every session's units -- and is written on every
+            # change, so it is never older. Same roadmap, the record wins.
+            workspace = load_record(self.router.workspace.root)
+            names = [p.name.strip().lower() for p in record.migration.phases]
+            if workspace is not None and [p.name.strip().lower() for p in workspace.phases] == names:
+                workspace.active = True
+                self.state.migration = workspace
+                self.state.routes_before = self.state.routes_before or workspace.routes
+                self.state.routes_saved = self.state.routes_saved or bool(workspace.routes)
         rendered = "\n".join(step.rendered(i) for i, step in enumerate(record.steps, 1))
         if record.summary:
             rendered = f"{record.summary}\n\n{rendered}"
@@ -4658,6 +5078,10 @@ class AgentLoop:
         the undo snapshots are the session's, not the message's.
         """
         self.router = previous.router
+        # How the last message's run ended, for `_starts_new_task`: a finished
+        # task is one the next message does not have to be about.
+        ended = getattr(previous, "result", None)
+        self.state.previous_outcome = str(ended.outcome) if ended is not None else ""
         # The reply ledger, and it is the one thing here that *ends* a run
         # rather than informing one. Every other bound in `_Progress` is built
         # per message on purpose -- a developer who types again is entitled to a
@@ -4679,7 +5103,10 @@ class AgentLoop:
         # while the thing it was refused for never changed.
         self.state.finish_refused = previous.state.finish_refused
         self.state.plan_objections = previous.state.plan_objections
-        self.state.preamble_refused = previous.state.preamble_refused
+        # Not `preamble_refused`: it is about one answer, and a new message is
+        # a new answer. Carried, one bounce early in a session spent the
+        # budget for every message after it, and every later preamble went
+        # straight to the developer.
         self.state.degenerate_refused = previous.state.degenerate_refused
         self.state.reasks = previous.state.reasks
         self.state.seen_calls = dict(previous.state.seen_calls)
@@ -4921,11 +5348,21 @@ class AgentLoop:
         if not self.state.plan:
             return []
         touched = self.router.touched
-        return [
+        # A file split across several steps is touched by the first of them, so
+        # "a change reached the file" says nothing about the steps after it --
+        # and reading it that way let a run `finish` with six of nine groups of
+        # a handler unconverted. Those steps count on their own status.
+        shared = {
+            s.file for s in self.state.plan
+            if s.file and sum(1 for o in self.state.plan if o.file == s.file) > 1
+        }
+        return list(dict.fromkeys(
             s.file
             for s in self.state.plan
-            if s.file and s.open and not any(s.covers(t) for t in touched)
-        ]
+            if s.file
+            and s.open
+            and (s.file in shared or not any(s.covers(t) for t in touched))
+        ))
 
     def _is_plan_target(self, path: str) -> bool:
         """Whether ``path`` is a file the current plan sets out to change.
@@ -5216,7 +5653,18 @@ class AgentLoop:
         # done. `MigrationState.block` renders a cursor for the same reason
         # `_plan_block` does.
         lines.extend(self.state.migration.block(self._plan_phase()))
-        if self.state.migration.active and not self.state.migration.branch:
+        if self.state.migration.expected_branch:
+            lines.append(
+                f"Migration: its branch `{self.state.migration.expected_branch}` exists "
+                "and is not checked out. "
+                + (
+                    "Switch back before any write: `git_ops` op=branch "
+                    f"message={self.state.migration.expected_branch}."
+                    if self.state.mode is Mode.AGENT
+                    else "The acting phase switches back first; plan as if it is."
+                )
+            )
+        elif self.state.migration.active and not self.state.migration.branch:
             # Two different instructions, because the two modes hold two
             # different sets of tools and an instruction a mode cannot obey is
             # the worst thing that can be put in front of a model.
@@ -5425,14 +5873,35 @@ class AgentLoop:
             # about the arithmetic it needed: a step reads *its own range* and
             # writes that range back, which fits a reply with room to spare.
             # Nothing had ever said so.
+            # By method, not by line range: the ranges a plan was written with
+            # move with the first patch above them, so "lines 1601-2400" names
+            # somebody else's code by step three.
             lines.append(
-                f"  This is one of {len(same) + 1} steps on {step.file}. Read only "
-                "the range this step names -- `read_file` takes `start` and `end` "
-                "-- and write that range back. Do not read or rewrite the whole "
-                "file; the other steps have the rest."
+                f"  This is one of {len(same) + 1} steps on {step.file}. Convert "
+                "only the methods this step names, one `patch_file` per method with "
+                "the method's own signature line as the anchor; several patches in "
+                "one reply is fine. Find each with `search_repo` (line numbers shift "
+                "as earlier steps land) and read just that method -- `read_file` takes "
+                "`start` and `end`. Do not read or rewrite the whole file. The step "
+                "advances when `unit_check` finds all of its methods converted."
             )
         if step.accepts:
             lines.append(f"  Accepts: {step.accepts}")
+        migration = self.state.migration
+        current = migration.current if migration.active else None
+        if current is not None and current[0] < len(migration.phases) and step.file.endswith(".go"):
+            # Said on the step, every turn, because the plan may predate the
+            # objection that now refuses build checks mid-migration -- and the
+            # field run that needed this had exactly such a plan: seven steps
+            # checked by go_build, all seven refused as unsatisfiable. The build
+            # is the last phase's question; this step's is its own methods.
+            lines.append(
+                "  Mid-migration the service does not build, by design: the rest of "
+                "this file and its neighbours stay on the old libraries until their "
+                "own steps. This step is done when `unit_check path="
+                f"{step.file} methods=<this step's methods>` says DONE -- not when "
+                "go_build passes. Convert its methods; leave the others as they are."
+            )
         if step.note:
             lines.append(f"  Note: {step.note}")
         if elapsed := self._cursor_age(step):
@@ -5677,14 +6146,49 @@ class AgentLoop:
         before = self.state.plan
         covering = [i for i, step in enumerate(self.state.plan) if step.covers(path)]
         target: set[int] = set(covering)
-        if len(covering) > 1:
+        split = len(covering) > 1
+        if split:
             active = self.active_step
             if active is not None and active[0] - 1 in covering:
                 target = {active[0] - 1}
             elif open_here := [i for i in covering if self.state.plan[i].open]:
                 target = {open_here[0]}
+        verdicts: dict[int, tuple[str, str]] = {}
+        if split and status == "written":
+            # **A write is not a step.** Converting a group is one `patch_file`
+            # per method, and each of those is a mutation. Marking the step
+            # written on the first one moved the cursor to the next step with
+            # seven of eight methods still on gin -- a nine-step file "finished"
+            # after nine patches, most of them landing on the wrong step. So a
+            # split step advances only when `unit_check` says the methods it
+            # names are converted, and until then it stays where it is and says
+            # what is left. A step naming no method the map knows, or a run with
+            # no sidecar, keeps the old rule.
+            for i in target:
+                step = self.state.plan[i]
+                methods = self._step_methods(step)
+                if not methods:
+                    continue
+                verdict = self._unit_state(step.file, methods)
+                if verdict is None:
+                    continue
+                converted, left = verdict
+                if not converted:
+                    done_n = len(methods) - len(left)
+                    verdicts[i] = (
+                        "pending",
+                        f"{done_n} of {len(methods)} methods converted; still to do: "
+                        + ", ".join(left[:8])
+                        + (f" +{len(left) - 8} more" if len(left) > 8 else ""),
+                    )
         self.state.plan = tuple(
-            replace(step, status=status, note=note) if i in target else step
+            (
+                replace(step, status=verdicts[i][0], note=verdicts[i][1])
+                if i in verdicts
+                else replace(step, status=status, note=note)
+            )
+            if i in target
+            else step
             for i, step in enumerate(self.state.plan)
         )
         if self.state.plan != before:
@@ -5792,21 +6296,149 @@ class AgentLoop:
         """
         if not self.state.migration.active:
             return
+        migration = self.state.migration
+        root = self.router.workspace.root
+        # The plan in hand folded into the migration's own ledger first, so the
+        # document and the record describe every session's work, not this one's.
+        migration.record_steps(self.state.plan, self.router.touched)
+        if self.state.routes_before:
+            migration.routes = self.state.routes_before
         try:
-            target = self.router.workspace.root / PROGRESS_PATH
-            ensure_private(target.parent)
+            # The workspace root: `ensure_private` writes `<root>/.dakcoder/.gitignore`.
+            ensure_private(root)
+            target = root / PROGRESS_PATH
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(
                 progress_document(
-                    self.state.migration,
+                    migration,
                     self.state.plan,
                     self.router.touched,
-                    self.state.routes_before,
+                    self.state.routes_before or migration.routes,
                 ),
                 encoding="utf-8",
             )
         except OSError:
-            return
+            pass
+        # And the record the next session resumes from. See `migration.RECORD_PATH`.
+        save_record(root, migration)
+
+    def _resume_migration(self, task: str) -> bool:
+        """Pick up the workspace's unfinished migration, if this run is one.
+
+        `/migrate` opens a new session every time, and a session used to start
+        with an empty roadmap: every run re-planned phase one, re-cut the
+        branch, retook the route inventory on a half-converted service, and its
+        first save overwrote the plan document. The record is keyed by the
+        workspace alone, so the migration is resumed whichever session opens.
+
+        Only for a run that is about the migration -- the classifier said so,
+        or the message says "migrate", "continue" and the like. A bug fix asked
+        in the middle of a conversion is not the conversion.
+        """
+        migration = self.state.migration
+        if migration.phases:
+            return False  # restored with this session's own plan already
+        if not (migration.active or _RESUME_WORDS.search(task or "")):
+            return False
+        root = self.router.workspace.root
+        record = load_record(root)
+        if record is None or record.complete:
+            return False
+        record.active = True
+        record.resumed = True
+        head = _git_head(root)
+        if record.branch and head and head != record.branch:
+            # Recorded, and not where the workspace is. Writes are held until
+            # the migration's branch is checked out again (`_migration_guard`).
+            record.expected_branch = record.branch
+            record.branch = ""
+        self.state.migration = record
+        # The inventory is taken once per *migration*: retaking it now would
+        # record a half-converted service as the thing to compare against.
+        self.state.routes_before = record.routes
+        self.state.routes_saved = bool(record.routes) or (root / ROUTES_BEFORE).is_file()
+        self.state.plan_objections = 0
+        log.info(
+            "resumed the workspace migration: %d of %d phase(s) closed",
+            sum(1 for p in record.phases if p.status == "done"),
+            len(record.phases),
+        )
+        return True
+
+    def _handler_map(self, path: str) -> dict[str, Any] | None:
+        """``handler_map`` for one file, as data, or ``None`` when it cannot be taken.
+
+        Through the gate path: it is the harness asking, not the model, and a
+        run whose sidecar is absent simply falls back to the step statuses.
+        """
+        try:
+            outcome = self.router.run_gate_tool("handler_map", {"path": path})
+        except Exception:  # noqa: BLE001 - advice, never a precondition
+            return None
+        if not isinstance(outcome, ToolResult) or not outcome.ok:
+            return None
+        data = outcome.meta.get("callmap")
+        return data if isinstance(data, dict) else None
+
+    def _groups(self, path: str) -> list[dict[str, Any]] | None:
+        data = self._handler_map(path)
+        groups = data.get("groups") if data else None
+        return [g for g in groups if isinstance(g, dict)] if isinstance(groups, list) else None
+
+    def _converted(self, path: str) -> bool | None:
+        """Whether every handler method in ``path`` has the template shape."""
+        data = self._handler_map(path)
+        if not data:
+            return None
+        methods = data.get("methods")
+        if not isinstance(methods, list) or not methods:
+            return None
+        return all(isinstance(m, dict) and m.get("shape") == "converted" for m in methods)
+
+    def _step_methods(self, step: PlanStep) -> list[str]:
+        """The handler methods a step names, checked against the file's real ones.
+
+        Read off the step's own ``part`` and ``action`` -- the fields the model
+        filled in to say what the step converts -- and kept only where they
+        name a method ``handler_map`` actually finds, so prose cannot invent
+        one. Cached per file for the run: conversion changes a method's shape,
+        never its name.
+        """
+        cache = self.__dict__.setdefault("_method_names", {})
+        names = cache.get(step.file)
+        if names is None:
+            data = self._handler_map(step.file)
+            found = data.get("methods") if data else None
+            names = (
+                [str(m.get("name")) for m in found if isinstance(m, dict) and m.get("name")]
+                if isinstance(found, list)
+                else []
+            )
+            cache[step.file] = names
+        if not names:
+            return []
+        said = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", f"{step.part} {step.action}"))
+        return [n for n in names if n in said]
+
+    def _unit_state(self, path: str, methods: Sequence[str]) -> tuple[bool, list[str]] | None:
+        """``unit_check`` on a step's methods: (all converted, the ones that are not)."""
+        try:
+            outcome = self.router.run_gate_tool(
+                "unit_check", {"path": path, "methods": ",".join(methods)}
+            )
+        except Exception:  # noqa: BLE001 - advice, never a precondition
+            return None
+        if not isinstance(outcome, ToolResult) or not outcome.ok:
+            return None
+        data = outcome.meta.get("callmap")
+        if not isinstance(data, dict) or not isinstance(data.get("methods"), list):
+            return None
+        left = [
+            str(m.get("name"))
+            for m in data["methods"]
+            if isinstance(m, dict) and m.get("shape") != "converted"
+        ]
+        return bool(data.get("ok")) and not left, left
 
     def _save_plan(self) -> None:
         """Write the current step statuses, without recording a revision."""
@@ -5967,10 +6599,30 @@ class AgentLoop:
         self.state.tried.append(f"turn {self.context.turn}: plan revised: {reason}")
         del self.state.tried[:-STATE_ITEMS * 2]
         steps = self._normalise_plan(steps_from_meta(dict(outcome.meta)))
+        if self.state.migration.active:
+            # Held to the same size rule as `submit_plan`. A revision was the one
+            # route around it: after a failed step, the model merged nine groups
+            # of a 6,500-line handler back into three, and those three could not
+            # be finished either. Steps already done still count for their file;
+            # a skipped one is not work and does not.
+            kept = [s for s in self.state.plan if s.status == "done"]
+            live = [s for s in steps if s.status != "skipped"]
+            if objection := size_objection([*kept, *live], self._line_count, self._groups):
+                self.context.append_user(
+                    f"That revision was not adopted: {objection}.\n\nThe plan stands "
+                    "as it was. Send `revise_plan` again with the file split that far, "
+                    "or carry on with the current steps."
+                )
+                return
+            for step in steps:
+                if step.phase and step.file:
+                    self.state.migration.note_planned(step.phase, [step.file])
         # `revise_plan` is the model's own pivot, so whatever produced the plan
         # it replaces, this one is volunteered.
         self.state.plan_forced = False
         yield from self._adopt_plan(steps, "")
+        if self.state.migration.active:
+            self.state.migration.record_steps(self.state.plan)
         # Overwrites the revision `_adopt_plan` just recorded with one that
         # names the cause and the model's reason. Two entries for one event
         # would make the history harder to read than no history.

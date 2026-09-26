@@ -28,6 +28,12 @@
   const inputLabel = document.getElementById('input-label');
   const popup = document.getElementById('popup');
   const sendBtn = document.getElementById('send');
+  const slashBtn = document.getElementById('slash-menu');
+  const mentionBtn = document.getElementById('mention-btn');
+  const modeChip = document.getElementById('mode-chip');
+  const approvalChip = document.getElementById('approval-chip');
+  const settingsBtn = document.getElementById('settings-btn');
+  const askingEl = document.getElementById('asking');
   const stopBtn = document.getElementById('stop');
   const windBtn = document.getElementById('wind-down');
   const skipBtn = document.getElementById('skip');
@@ -418,6 +424,11 @@
 
   const GLYPHS = {
     cube: ['M3 7.5 12 3l9 4.5v9L12 21l-9-4.5z', 'M3 7.5 12 12l9-4.5M12 12v9'],
+    send: ['M12 19V5', 'M6 11l6-6 6 6'],
+    stop: ['M7 7h10v10H7z'],
+    windDown: ['M7 6l8 6-8 6z', 'M18 6v12'],
+    // Sliders: "settings" without the gear, which reads as a sun at 14px.
+    gear: ['M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1', [15, 7, 2], [9, 12, 2], [17, 17, 2]],
     check: ['m5 13 4 4 10-10'],
     cross: ['M6 6l12 12M18 6 6 18'],
     pencil: ['M4 20h4l10-10-4-4L4 16z'],
@@ -2066,6 +2077,8 @@
        */
       case 'user': {
         const text = String(d.text || '');
+        // A reply is on record: the question it answered is no longer waiting.
+        hideAsking();
         dropEcho(text);
         put({ key: keyFor('user', event.id), kind: 'user', text: text, steering: false });
         return;
@@ -2144,6 +2157,11 @@
         paint(row);
         save();
         say(fmt(S.sayTool, row.name, d.ok ? S.toolOk : S.toolFailed), !d.ok);
+        // The run ends on these questions; put them where they get answered.
+        const meta = d.meta && typeof d.meta === 'object' ? d.meta : null;
+        if (row.name === 'ask_developer' && d.ok && meta && Array.isArray(meta.questions) && meta.questions.length) {
+          showAsking(meta.questions.map(String), String(meta.assumed || ''));
+        }
         return;
       }
 
@@ -2597,9 +2615,31 @@
 
       case 'clear':
         clearAll();
+        hideAsking();
+        return;
+
+      case 'settings':
+        if (message.settings && typeof message.settings === 'object') {
+          composerSettings = {
+            mode: String(message.settings.mode || 'auto'),
+            approval: String(message.settings.approval || 'write_side'),
+          };
+          paintChips();
+        }
         return;
 
       case 'focus':
+        input.focus();
+        return;
+
+      // The host's command picker choosing a slash command: put it in the
+      // composer, ready for its argument, rather than sending it -- most take
+      // one, and a command sent with none does something different.
+      case 'compose':
+        input.value = String(message.text || '');
+        input.setSelectionRange(input.value.length, input.value.length);
+        autosize();
+        refresh();
         input.focus();
         return;
 
@@ -2632,11 +2672,36 @@
     transcript.setAttribute('aria-label', S.transcript || '');
     inputLabel.textContent = S.placeholder || '';
     popup.setAttribute('aria-label', S.suggestions || '');
-    sendBtn.textContent = S.send || '';
-    stopBtn.textContent = S.stop || '';
-    stopBtn.title = S.stopHint || '';
-    windBtn.textContent = S.windDown || '';
-    windBtn.title = S.windDownHint || '';
+    if (slashBtn) {
+      slashBtn.textContent = '/';
+      slashBtn.title = S.slashMenu || '';
+      slashBtn.setAttribute('aria-label', S.slashMenu || '');
+    }
+    if (mentionBtn) {
+      mentionBtn.title = S.mentionButton || '';
+      mentionBtn.setAttribute('aria-label', S.mentionButton || '');
+    }
+    if (settingsBtn) {
+      settingsBtn.textContent = '';
+      settingsBtn.appendChild(icon(GLYPHS.gear, 14, 1.7));
+      settingsBtn.title = S.settingsButton || '';
+      settingsBtn.setAttribute('aria-label', S.settingsButton || '');
+    }
+    // Send is an arrow in a circle, as the box's one filled control; the word
+    // is its label for screen readers and its tooltip.
+    sendBtn.textContent = '';
+    sendBtn.appendChild(icon(GLYPHS.send, 14, 2.2));
+    sendBtn.title = S.sendLabel || S.send || '';
+    sendBtn.setAttribute('aria-label', S.send || '');
+    paintChips();
+    stopBtn.textContent = '';
+    stopBtn.appendChild(icon(GLYPHS.stop, 12, 2));
+    stopBtn.title = (S.stop || '') + ' — ' + (S.stopHint || '');
+    stopBtn.setAttribute('aria-label', S.stop || '');
+    windBtn.textContent = '';
+    windBtn.appendChild(icon(GLYPHS.windDown, 13, 2));
+    windBtn.title = (S.windDown || '') + ' — ' + (S.windDownHint || '');
+    windBtn.setAttribute('aria-label', S.windDown || '');
     if (jumpBtn) {
       jumpBtn.textContent = S.jumpToLatest || '';
       jumpBtn.title = S.jumpToLatest || '';
@@ -2776,9 +2841,241 @@
       workingEl.textContent = S.waitingDecision || '';
       return;
     }
-    const base = run.tool ? fmt(S.workingTool, run.tool) : S.working;
     const seconds = run.startedAt ? Math.round((Date.now() - run.startedAt) / 1000) : null;
-    workingEl.textContent = seconds === null ? base : base + ' · ' + fmt(S.elapsed, seconds);
+    const parts = [];
+    if (run.tool) parts.push(run.tool);
+    if (seconds !== null) parts.push(fmt(S.elapsed, seconds));
+    parts.push(escArmed ? S.escAgain || '' : S.escToStop || '');
+
+    // Rebuilt only when the verb changes, so the dots' animation is not
+    // restarted every second by the elapsed counter.
+    const verb = workingVerb(seconds);
+    if (workingEl.dataset.verb !== verb) {
+      workingEl.textContent = '';
+      workingEl.dataset.verb = verb;
+      workingEl.appendChild(el('span', 'star', '✻'));
+      workingEl.appendChild(el('span', 'verb', verb));
+      const dots = el('span', 'dots');
+      dots.setAttribute('aria-hidden', 'true');
+      for (let i = 0; i < 3; i += 1) dots.appendChild(el('span', null, '.'));
+      workingEl.appendChild(dots);
+      workingEl.appendChild(el('span', 'detail'));
+    }
+    const detail = workingEl.querySelector('.detail');
+    if (detail) detail.textContent = parts.filter(Boolean).join(' · ');
+  }
+
+  /**
+   * The word on the working line. It changes every four seconds, so a long
+   * turn visibly moves; picked by elapsed time rather than at random, so two
+   * repaints in the same second agree.
+   */
+  function workingVerb(seconds) {
+    const verbs = String(S.workingVerbs || S.working || '').split('|').filter(Boolean);
+    if (!verbs.length) return '';
+    const i = Math.floor((seconds || 0) / 4) % verbs.length;
+    return verbs[i];
+  }
+
+  // ── Esc, twice, to stop ─────────────────────────────────────────────────────
+  //
+  // Escape stays non-destructive (see the keydown handler): one press never
+  // stops a run. A second press within two seconds, with nothing else for it to
+  // close, is a deliberate act -- and the working line says so after the first.
+  let escArmed = false;
+  let escTimer = null;
+
+  function armEsc() {
+    if (escArmed) {
+      escArmed = false;
+      clearTimeout(escTimer);
+      post({ type: 'stop' });
+      paintWorking();
+      return;
+    }
+    escArmed = true;
+    paintWorking();
+    escTimer = setTimeout(function () {
+      escArmed = false;
+      paintWorking();
+    }, 2000);
+  }
+
+  // ── the footer chips ────────────────────────────────────────────────────────
+
+  let composerSettings = { mode: 'auto', approval: 'write_side' };
+  const MODES = ['auto', 'ask', 'agent'];
+  const APPROVALS = ['write_side', 'destructive', 'none', 'all'];
+
+  function paintChips() {
+    if (!modeChip || !approvalChip) return;
+    modeChip.textContent = S['chip.' + composerSettings.mode] || composerSettings.mode;
+    modeChip.title = S.modeLabel || '';
+    modeChip.dataset.value = composerSettings.mode;
+    approvalChip.textContent = S['approval.' + composerSettings.approval] || composerSettings.approval;
+    approvalChip.title = S.approvalLabel || '';
+    approvalChip.dataset.value = composerSettings.approval;
+  }
+
+  function cycleMode() {
+    const next = MODES[(MODES.indexOf(composerSettings.mode) + 1) % MODES.length];
+    composerSettings = { mode: next, approval: composerSettings.approval };
+    paintChips();
+    post({ type: 'set-setting', key: 'defaultMode', value: next });
+  }
+
+  function cycleApproval() {
+    if (composerSettings.approval === 'custom') {
+      post({ type: 'open-settings' });
+      return;
+    }
+    const i = APPROVALS.indexOf(composerSettings.approval);
+    const next = APPROVALS[(i + 1) % APPROVALS.length];
+    composerSettings = { mode: composerSettings.mode, approval: next };
+    paintChips();
+    post({ type: 'set-setting', key: 'requireApproval', value: next });
+  }
+
+  if (modeChip) modeChip.addEventListener('click', cycleMode);
+  if (approvalChip) approvalChip.addEventListener('click', cycleApproval);
+  if (settingsBtn) {
+    settingsBtn.addEventListener('click', function () {
+      post({ type: 'open-settings' });
+    });
+  }
+  if (mentionBtn) {
+    mentionBtn.addEventListener('click', function () {
+      const caret = input.selectionStart;
+      const before = input.value.slice(0, caret);
+      const lead = before && !/\s$/.test(before) ? ' ' : '';
+      input.value = before + lead + '@' + input.value.slice(caret);
+      const at = caret + lead.length + 1;
+      input.focus();
+      input.setSelectionRange(at, at);
+      autosize();
+      refresh();
+    });
+  }
+
+  // ── the question card ───────────────────────────────────────────────────────
+  //
+  // `ask_developer` ends a run on questions. They used to sit in the
+  // transcript as an ordinary tool row, answered only if someone noticed them
+  // and typed a reply that happened to cover all four. The card puts each
+  // question beside its own answer box, and one button sends the lot as the
+  // reply the run is waiting for.
+
+  function showAsking(questions, assumed) {
+    if (!askingEl) return;
+    askingEl.textContent = '';
+    const head = el('div', 'ask-head');
+    const title = el('span', 'ask-title', S.askTitle || '');
+    title.id = 'asking-title';
+    head.appendChild(title);
+    askingEl.appendChild(head);
+
+    const boxes = [];
+    questions.forEach(function (q, i) {
+      const item = el('label', 'ask-q');
+      item.appendChild(el('span', 'ask-n', String(i + 1)));
+      const body = el('span', 'ask-body');
+      body.appendChild(el('span', 'ask-text', String(q)));
+      const box = document.createElement('textarea');
+      box.className = 'ask-answer';
+      box.rows = 1;
+      box.placeholder = S.askPlaceholder || '';
+      box.addEventListener('input', function () {
+        box.style.height = 'auto';
+        box.style.height = Math.min(box.scrollHeight, 120) + 'px';
+      });
+      box.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+          event.preventDefault();
+          submitAsking();
+        }
+      });
+      body.appendChild(box);
+      item.appendChild(body);
+      askingEl.appendChild(item);
+      boxes.push(box);
+    });
+
+    if (assumed) {
+      const row = el('div', 'ask-assumed');
+      row.appendChild(el('span', 'ask-text', fmt(S.askAssumed, assumed)));
+      const use = el('button', 'small', S.askUseAssumed || '');
+      use.type = 'button';
+      use.addEventListener('click', function () {
+        sendReply(fmt(S.askUseAssumedReply || 'Go with what you assumed: {0}', assumed));
+      });
+      row.appendChild(use);
+      askingEl.appendChild(row);
+    }
+
+    const foot = el('div', 'ask-foot');
+    foot.appendChild(el('span', 'spacer'));
+    const inChat = el('button', 'secondary', S.askInChat || '');
+    inChat.type = 'button';
+    inChat.addEventListener('click', function () {
+      hideAsking();
+      input.focus();
+    });
+    const sendAll = el('button', 'primary', S.askSend || '');
+    sendAll.type = 'button';
+    sendAll.addEventListener('click', submitAsking);
+    foot.appendChild(inChat);
+    foot.appendChild(sendAll);
+    askingEl.appendChild(foot);
+    // The keys on their own line: beside the buttons they were squeezed into
+    // a one-word column at sidebar width.
+    askingEl.appendChild(el('div', 'ask-keys', S.askKeys || ''));
+
+    askingEl.questions = questions;
+    askingEl.boxes = boxes;
+    askingEl.hidden = false;
+    // Focus follows only if the panel already has it: a run ending must not
+    // pull focus out of the editor, which is the one rule broken by accident.
+    if (document.hasFocus() && boxes[0]) boxes[0].focus();
+    say(S.askTitle || '', true);
+  }
+
+  function hideAsking() {
+    if (!askingEl) return;
+    askingEl.hidden = true;
+    askingEl.textContent = '';
+    askingEl.questions = null;
+    askingEl.boxes = null;
+  }
+
+  function submitAsking() {
+    if (!askingEl) return;
+    const questions = askingEl.questions || [];
+    const boxes = askingEl.boxes || [];
+    const answers = boxes.map(function (b) {
+      return b.value.trim();
+    });
+    if (!answers.some(Boolean)) {
+      if (boxes[0]) boxes[0].focus();
+      return;
+    }
+    // Numbered to match the questions, each answer under the question it
+    // answers, so the reply reads correctly in the transcript as well as to
+    // the model.
+    const reply =
+      questions.length === 1
+        ? answers[0]
+        : questions
+            .map(function (q, i) {
+              return String(i + 1) + '. ' + q + '\n   ' + (answers[i] || S.askNoAnswer || '');
+            })
+            .join('\n');
+    sendReply(reply);
+  }
+
+  function sendReply(text) {
+    hideAsking();
+    input.value = text;
+    send();
   }
 
   /**
@@ -2812,6 +3109,9 @@
      * mode the next task will start in, so it names it the way
      * `dakcoder.defaultMode` does.
      */
+    // The footer's mode chip names the *next* task's mode, so it steps aside
+    // while one runs -- and gives the toolbar the room Stop needs.
+    if (modeChip) modeChip.hidden = running;
     const showMode = !off && !running && Boolean(run.mode);
     modePill.hidden = !showMode;
     modePill.textContent = showMode ? run.mode : '';
@@ -3094,6 +3394,20 @@
     refresh();
   });
 
+  // Opens the command list with nothing typed. Whatever is already in the
+  // composer is kept, after the command, as its argument.
+  if (slashBtn) {
+    slashBtn.addEventListener('click', function () {
+      if (input.value.charAt(0) !== '/') {
+        input.value = '/' + (input.value.trim() ? ' ' + input.value.trim() : '');
+      }
+      input.focus();
+      input.setSelectionRange(1, 1);
+      autosize();
+      refresh();
+    });
+  }
+
   input.addEventListener('keydown', function (event) {
     const open = !popup.hidden && options.length > 0;
 
@@ -3110,6 +3424,12 @@
     if ((event.key === 'Enter' || event.key === 'Tab') && open) {
       event.preventDefault();
       accept(active);
+      return;
+    }
+    // Shift+Tab cycles the mode for the next task, as it does in Claude Code.
+    if (event.key === 'Tab' && event.shiftKey && !open) {
+      event.preventDefault();
+      cycleMode();
       return;
     }
     /*
@@ -3172,9 +3492,22 @@
       input.focus();
       return;
     }
+    if (askingEl && !askingEl.hidden) {
+      event.preventDefault();
+      hideAsking();
+      input.focus();
+      return;
+    }
     if (document.activeElement !== input) {
       event.preventDefault();
       input.focus();
+      return;
+    }
+    // Nothing left to close, focus already in the composer, and a run in
+    // flight: arm the stop, and a second press within two seconds makes it.
+    if (run.phase !== 'idle') {
+      event.preventDefault();
+      armEsc();
     }
   });
 

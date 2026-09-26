@@ -1,0 +1,6 @@
+# The knowledge base is committed twice -- packages/knowledge and the copy
+# packaged inside the agent wheel -- and test_knowledge.py compares the two
+# byte for byte. Pinned to LF so core.autocrlf=true on Windows cannot give one
+# copy CRLF on checkout and fail the release build.
+packages/knowledge/** text eol=lf
+apps/agent/src/dakcoder_agent/knowledge/** text eol=lf

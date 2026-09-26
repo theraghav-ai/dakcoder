@@ -1292,6 +1292,13 @@ button.icon {
   cursor: pointer;
 }
 
+/* The slash button sits in the composer's action row, left of the mode pill. */
+button.icon.slash-menu {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-weight: 600;
+  color: var(--dak-fg-2, var(--dak-fg-3));
+}
+
 button.icon:hover {
   background: var(--dak-line);
   color: var(--dak-fg-hi);
@@ -2427,11 +2434,16 @@ button.changeset-row:hover .file {
 .composer .field {
   display: flex;
   flex-direction: column;
-  gap: 9px;
-  padding: 10px 11px 8px;
+  gap: 8px;
+  padding: 10px 10px 6px 12px;
   border: 1px solid var(--dak-edge);
-  border-radius: var(--dak-r-lg);
+  border-radius: 12px;
   background: var(--dak-input);
+  transition: border-color 120ms ease;
+}
+
+.composer .field:focus-within {
+  border-color: var(--dak-strong);
 }
 
 .composer.running .field {
@@ -2496,13 +2508,277 @@ button.changeset-row:hover .file {
   flex: 1 1 auto;
 }
 
-/* "Working - read_file - 4s" names a tool and counts seconds; both belong in
-   the font the panel's other identifiers and figures use. */
+/*
+ * The working line, above the box: "✻ Franking... read_file · 12s · esc to
+ * stop". The verb is the one thing in the panel allowed to be playful; the
+ * detail after it is figures and identifiers, so it takes the code font.
+ */
 .working {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 4px;
+  font-size: var(--dak-body-2);
+  color: var(--dak-fg-3);
+}
+
+.working .star {
+  color: var(--dak-amber);
+  animation: dak-spin 3s linear infinite;
+  display: inline-block;
+}
+
+.working .verb {
+  color: var(--dak-amber);
+  font-weight: 600;
+}
+
+.working .dots {
+  display: inline-flex;
+  margin-left: -5px;
+  color: var(--dak-amber);
+}
+
+.working .dots span {
+  animation: dak-dot 1.2s infinite;
+  opacity: 0.2;
+}
+
+.working .dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.working .dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+.working .detail {
   font-family: var(--dak-code-font);
   font-size: var(--dak-meta);
   color: var(--dak-fg-4);
   font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes dak-dot {
+  0%, 80%, 100% { opacity: 0.2; }
+  40% { opacity: 1; }
+}
+
+@keyframes dak-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Motion is decoration here; the words say the same thing without it. */
+@media (prefers-reduced-motion: reduce) {
+  .working .star,
+  .working .dots span {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* ── the toolbar inside the box ──────────────────────────────────────────── */
+
+.toolbar {
+  gap: 4px;
+}
+
+button.tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 6px;
+  font: inherit;
+  font-family: var(--dak-code-font);
+  font-size: var(--dak-body-2);
+  font-weight: 600;
+  color: var(--dak-fg-3);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+button.tool-btn:hover {
+  background: var(--dak-line);
+  color: var(--dak-fg-hi);
+}
+
+/* The two settings a task most depends on, as chips that cycle on click. */
+button.chip {
+  height: 24px;
+  padding: 0 9px;
+  font: inherit;
+  font-size: var(--dak-meta);
+  color: var(--dak-fg-3);
+  background: transparent;
+  border: 1px solid var(--dak-line);
+  border-radius: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button.chip:hover {
+  border-color: var(--dak-strong);
+  color: var(--dak-fg-hi);
+}
+
+/* Auto-approve is the one setting worth a second look before sending. */
+button.chip[data-value='none'] {
+  color: var(--dak-amber);
+  border-color: var(--dak-amber-tint-edge);
+  background: var(--dak-amber-tint);
+}
+
+/* Stop and stop-after-this-turn: icons, so the toolbar stays one line. */
+button.danger-icon {
+  color: var(--dak-bad-soft);
+}
+
+button.danger-icon:hover {
+  background: var(--dak-bad-bg);
+  color: var(--dak-bad-soft);
+}
+
+.toolbar {
+  flex-wrap: nowrap;
+}
+
+/* The chips give way first when the sidebar is narrow. */
+button.chip {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+}
+
+/* Send: the box's one filled control, an arrow in a circle. */
+button.send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--dak-amber);
+  color: var(--dak-on-amber);
+  cursor: pointer;
+}
+
+button.send:hover:not(:disabled) {
+  background: var(--dak-amber-hi);
+}
+
+/* ── the question card ───────────────────────────────────────────────────── */
+
+.asking {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--dak-amber-tint-edge);
+  border-radius: 12px;
+  background: var(--dak-card);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
+}
+
+.asking[hidden] {
+  display: none;
+}
+
+.asking .ask-title {
+  font-size: var(--dak-body);
+  font-weight: 600;
+  color: var(--dak-fg-hi);
+}
+
+.asking .ask-q {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+}
+
+.asking .ask-n {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: var(--dak-amber-tint);
+  color: var(--dak-amber);
+  font-size: var(--dak-meta);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.asking .ask-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.asking .ask-text {
+  font-size: var(--dak-body-2);
+  line-height: 1.5;
+  color: var(--dak-fg);
+}
+
+.asking .ask-answer {
+  width: 100%;
+  resize: none;
+  padding: 6px 8px;
+  font-family: var(--dak-sans);
+  font-size: var(--dak-body-2);
+  line-height: 1.45;
+  color: var(--dak-fg);
+  background: var(--dak-input);
+  border: 1px solid var(--dak-edge);
+  border-radius: 8px;
+}
+
+.asking .ask-answer:focus {
+  outline: none;
+  border-color: var(--dak-amber);
+}
+
+.asking .ask-assumed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--dak-meta);
+  color: var(--dak-fg-3);
+}
+
+.asking .ask-assumed .ask-text {
+  flex: 1 1 auto;
+}
+
+.asking .ask-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.asking .ask-keys {
+  font-size: var(--dak-meta);
+  color: var(--dak-fg-4);
+}
+
+.asking .ask-foot .spacer {
+  flex: 1 1 auto;
 }
 
 /* The mode pill, shown while idle — the design's `coder` chip. */

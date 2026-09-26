@@ -96,6 +96,17 @@
       <ul id="popup" class="popup" role="listbox" hidden></ul>
 
       <!--
+        The agent's questions, when ask_developer ends a run on them. A card
+        above the composer rather than a row in the transcript, because the run
+        is waiting on it: it is the next thing to do, and a row scrolled away is
+        a question nobody answers.
+      -->
+      <section id="asking" class="asking" role="dialog" aria-labelledby="asking-title" hidden></section>
+
+      <!-- What the run is doing, above the box: "Franking… · read_file · 12s". -->
+      <div id="working" class="working" role="status" hidden></div>
+
+      <!--
         The field and its actions are one bordered block, so the send button
         reads as part of the thing being typed rather than as a toolbar under
         it. The border is what carries composer state.
@@ -117,14 +128,24 @@
           aria-labelledby="input-label"
         ></textarea>
 
-        <div class="actions">
+        <!--
+          The toolbar lives inside the box, under the text: commands and
+          context on the left with the two settings a task most depends on,
+          stop and send on the right. The mode pill is kept, hidden, for the
+          older renderer paths that still address it.
+        -->
+        <div class="actions toolbar">
+          <button id="slash-menu" class="tool-btn slash-menu" type="button" aria-haspopup="listbox"></button>
+          <button id="mention-btn" class="tool-btn" type="button" aria-haspopup="listbox">@</button>
+          <button id="mode-chip" class="chip" type="button"></button>
+          <button id="approval-chip" class="chip" type="button"></button>
           <span id="mode-pill" class="mode-pill" hidden></span>
-          <div id="working" class="working" hidden></div>
           <span id="keys" class="hint-keys" hidden></span>
           <span class="spacer"></span>
-          <button id="wind-down" class="secondary" type="button" hidden></button>
-          <button id="stop" class="danger" type="button" hidden></button>
-          <button id="send" class="primary" type="button"></button>
+          <button id="settings-btn" class="tool-btn" type="button"></button>
+          <button id="wind-down" class="tool-btn icon-stop" type="button" hidden></button>
+          <button id="stop" class="tool-btn icon-stop danger-icon" type="button" hidden></button>
+          <button id="send" class="send" type="button"></button>
         </div>
       </div>
     </footer>

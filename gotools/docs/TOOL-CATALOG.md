@@ -14,6 +14,8 @@ C1 limits: at most **6 parameters** per tool, description at most **200 characte
 |---|---|---|---|
 | [`db_roundtrip_audit`](#db_roundtrip_audit) |  | 1 | Per repository method: database calls, whether any is in a loop, batched, in a transaction, plus a verdict. Worst first. Call before optimising by eye. |
 | [`fx_wire`](#fx_wire) | ✓ | 4 | Register a repository or handler in bootstrap/bootstrapper.go with the correct annotation. Never hand-edit it: an unannotated handler serves no routes. |
+| [`handler_map`](#handler_map) |  | 3 | One handler file split into conversion steps: every method with its lines, route and the repository methods it calls. Plan a migration's handler steps from this. |
+| [`impact`](#impact) |  | 2 | Who calls a function, two levels up, with the routes that reach it. Call before changing a repository method's signature. |
 | [`legacy_audit`](#legacy_audit) |  | 3 | Detect pre-template (api-*) patterns in an existing service: routes.go, gin handlers, manual validation, swaggo docs, handleSuccess helpers. Use when planning a migration, not during ordinary edits. |
 | [`lib_version_check`](#lib_version_check) |  | 1 | CEPT library drift: which are behind, which are superseded by the n-api-* generation. Reports only — never edit go.mod on it; tell the user. Call when asked about versions or migration. |
 | [`list_rules`](#list_rules) |  | 1 | List the rule ids, severities and citations. Call this before explaining a violation so you quote the real rule id and its source. |
@@ -23,6 +25,7 @@ C1 limits: at most **6 parameters** per tool, description at most **200 characte
 | [`route_inventory`](#route_inventory) |  | 3 | Every HTTP route the service registers, gin or template, prefixes resolved. `save` records them before a migration; `against` reports which a finished one no longer serves. |
 | [`rules_lint`](#rules_lint) |  | 3 | Check Go against the n-api-template contract: layer boundaries, handler signature, repository contract, DTO envelopes, FX wiring. Run after each edit batch, passing `paths` with the files you changed. |
 | [`temporal_audit`](#temporal_audit) |  | 1 | Inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only, no recommendation. Call when asked about async or Temporal. |
+| [`unit_check`](#unit_check) |  | 3 | Whether a conversion step is done: the file parses and the named methods and the repository methods they call have the template shape. Works while the build is red. |
 | [`validation_audit`](#validation_audit) |  | 1 | Every request field, its validate tag, and what the tag leaves unbounded. Call when writing or reviewing request DTOs: `required` alone means only 'not empty', so a 10MB string passes. |
 
 A tool marked **Mutates** writes to the workspace and passes through the
@@ -230,6 +233,275 @@ Register a repository or handler in bootstrap/bootstrapper.go with the correct a
     "path",
     "changed",
     "written"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+---
+
+## handler_map
+
+One handler file split into conversion steps: every method with its lines, route and the repository methods it calls. Plan a migration's handler steps from this.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | the handler file, e.g. handler/paogen.go |
+| `root` | string |  | workspace root; omit to use the server's default |
+| `step_lines` | integer |  | lines per step; omit for 800 |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "path": {
+      "description": "the handler file, e.g. handler/paogen.go",
+      "type": "string"
+    },
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    },
+    "step_lines": {
+      "description": "lines per step; omit for 800",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "converted": {
+      "type": "integer"
+    },
+    "file": {
+      "type": "string"
+    },
+    "groups": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "done": {
+            "type": "boolean"
+          },
+          "end": {
+            "type": "integer"
+          },
+          "methods": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "repo": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "shared": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "start": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "start",
+          "end",
+          "methods",
+          "done"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "lines": {
+      "type": "integer"
+    },
+    "methods": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "end": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "repo": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "routes": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "shape": {
+            "type": "string"
+          },
+          "start": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "start",
+          "end",
+          "shape"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "report": {
+      "type": "string"
+    },
+    "types": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    }
+  },
+  "required": [
+    "file",
+    "types",
+    "lines",
+    "methods",
+    "groups",
+    "converted",
+    "report"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+---
+
+## impact
+
+Who calls a function, two levels up, with the routes that reach it. Call before changing a repository method's signature.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `symbol` | string | yes | Type.Method, a bare name, or file.go::Name |
+| `root` | string |  | workspace root; omit to use the server's default |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    },
+    "symbol": {
+      "description": "Type.Method, a bare name, or file.go::Name",
+      "type": "string"
+    }
+  },
+  "required": [
+    "symbol"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "callers": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "candidates": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "report": {
+      "type": "string"
+    },
+    "symbol": {
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    },
+    "unresolved": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "symbol",
+    "callers",
+    "unresolved",
+    "report"
   ],
   "type": "object"
 }
@@ -1735,6 +2007,158 @@ Inline work that may belong off the request path: uploads, SMS, email, reports, 
     "candidates",
     "summary",
     "note"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+---
+
+## unit_check
+
+Whether a conversion step is done: the file parses and the named methods and the repository methods they call have the template shape. Works while the build is red.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | the file the step converted |
+| `methods` | null or array |  | the methods the step converted; omit for every handler method in the file |
+| `root` | string |  | workspace root; omit to use the server's default |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "methods": {
+      "description": "the methods the step converted; omit for every handler method in the file",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "path": {
+      "description": "the file the step converted",
+      "type": "string"
+    },
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "file": {
+      "type": "string"
+    },
+    "methods": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "shape": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "shape"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "parse_error": {
+      "type": "string"
+    },
+    "parses": {
+      "type": "boolean"
+    },
+    "repo": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "shape": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "shape"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "report": {
+      "type": "string"
+    },
+    "unknown": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    }
+  },
+  "required": [
+    "file",
+    "parses",
+    "methods",
+    "ok",
+    "report"
   ],
   "type": "object"
 }

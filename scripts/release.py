@@ -221,6 +221,16 @@ def build_wheels(python: str, no_isolation: bool) -> None:
         shutil.rmtree(leftover, ignore_errors=True)
 
 
+def vendor_graphify(python: str) -> None:
+    """Fill `extension/runtime-graph` for the code-graph pilot.
+
+    Downloads only what is missing, so a release on a machine that already has
+    them touches the network not at all. See `scripts/vendor-graphify.py`.
+    """
+    step("Vendoring the code-graph wheels")
+    run([python, str(ROOT / "scripts" / "vendor-graphify.py")])
+
+
 def run_python_tests(python: str, full: bool) -> None:
     step("Running the Python test suite")
     if full:
@@ -395,6 +405,7 @@ def main() -> None:
     if not args.skip_tests:
         run_python_tests(python, args.full_tests)
     snapshot_contract(python, version)
+    vendor_graphify(python)
     package_extension()
     vsix = verify(version)
     update_gitignore(version, untrack=not args.keep_tracked_vsix)

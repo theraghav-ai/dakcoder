@@ -32,7 +32,7 @@ import shutil
 import subprocess
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -647,7 +647,66 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
 
         return _report(sidecar.call("lib_version_check", {}), render)
 
+    # The migration's call map. The sidecar renders each report itself, next to
+    # the data it describes, so the wording and the numbers cannot drift apart;
+    # this side only passes the arguments and hands the report over. A step that
+    # is not done is a finding, not a tool failure -- `ok=False` here would make
+    # the loop retry a check that ran correctly.
+    def _rendered(payload: dict[str, Any]) -> str:
+        return str(payload.get("report") or "").rstrip() or json.dumps(payload)
+
+    def handler_map(inv: Invocation) -> ToolResult:
+        return _callmap(sidecar.call("handler_map", {"path": inv.arg("path")}))
+
+    def unit_check(inv: Invocation) -> ToolResult:
+        args: dict[str, Any] = {"path": inv.arg("path")}
+        if inv.arg("methods"):
+            args["methods"] = _list(inv.arg("methods"))
+        return _callmap(sidecar.call("unit_check", args))
+
+    def _callmap(reply: Reply) -> ToolResult:
+        """A call-map report, with its facts kept as data beside the text.
+
+        The loop reads them: which groups a large file splits into (the size
+        objection quotes them), which methods a step names, and whether a split
+        step's methods are converted -- the evidence a split step advances on.
+        Parsing that back out of the rendered report would be the prose-reading
+        this bridge exists to avoid. Trimmed to what those questions need.
+        """
+        result = _report(reply, _rendered)
+        if reply.is_error or not result.ok:
+            return result
+        try:
+            payload = json.loads(reply.text)
+        except (json.JSONDecodeError, TypeError):
+            return result
+        if not isinstance(payload, Mapping):
+            return result
+        facts: dict[str, Any] = {}
+        for key in ("file", "lines", "converted", "ok", "parses", "unknown"):
+            if key in payload:
+                facts[key] = payload[key]
+        if isinstance(payload.get("methods"), list):
+            facts["methods"] = [
+                {k: m.get(k) for k in ("name", "shape", "start", "end") if k in m}
+                for m in payload["methods"]
+                if isinstance(m, Mapping)
+            ]
+        if isinstance(payload.get("groups"), list):
+            facts["groups"] = [
+                {k: g.get(k) for k in ("start", "end", "methods", "done") if k in g}
+                for g in payload["groups"]
+                if isinstance(g, Mapping)
+            ]
+        return replace(result, meta={**result.meta, "callmap": facts})
+
+    def impact(inv: Invocation) -> ToolResult:
+        return _report(sidecar.call("impact", {"symbol": inv.arg("symbol")}), _rendered)
+
     return {
+        "handler_map": handler_map,
+        "unit_check": unit_check,
+        "impact": impact,
         "repo_map": repo_map,
         "rules_lint": rules_lint,
         "legacy_audit": legacy_audit,

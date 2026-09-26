@@ -51,8 +51,14 @@ the last session got to has to be on disk.
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import tempfile
+
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .tools.registry import MAX_STEPS
@@ -66,6 +72,10 @@ __all__ = [
     "MigrationState",
     "PROGRESS_PATH",
     "PROTECTED",
+    "RECORD_PATH",
+    "SETTLED",
+    "load_record",
+    "save_record",
     "Phase",
     "phases_from_meta",
     "plan_objection",
@@ -190,6 +200,36 @@ class MigrationState:
     #: What has happened, newest last. Appended by `close`, so the document
     #: can say when each phase finished rather than only that it did.
     log: tuple[str, ...] = ()
+    #: Every file each phase has been planned to cover, by phase key.
+    #:
+    #: What a phase *is*, as opposed to what the plan open right now holds. A
+    #: phase too big for one plan is planned a file at a time -- that is what
+    #: `plan_objection` asks for -- and a phase judged by the plan in hand
+    #: closed the moment the first file's steps settled, after which every plan
+    #: naming the rest was refused as belonging to a closed phase. Recorded from
+    #: every plan submitted for the phase, adopted or refused, and from the
+    #: steps trimmed off into a later phase, so none of them can be forgotten.
+    backlog: dict[str, list[str]] = field(default_factory=dict)
+    #: Of those, the files split across several conversion steps, by phase key.
+    #: Their completion is asked of the code (``handler_map``), not only of the
+    #: step statuses: a step can settle with methods still on gin.
+    split: dict[str, list[str]] = field(default_factory=dict)
+    #: Every step any session has planned for this migration, with the status
+    #: it last had, keyed by phase, file and part. The plan in hand is one
+    #: session's; this is the migration's, and it is what a new session reads
+    #: to know that three of paogen.go's nine groups are already done.
+    units: dict[str, dict[str, str]] = field(default_factory=dict)
+    #: Every file the migration has changed, across sessions.
+    files: tuple[str, ...] = ()
+    #: Routes the legacy service served before the conversion started.
+    routes: int = 0
+    #: Set when this state was restored from an earlier session's record
+    #: rather than built by this one. Not persisted: it is a fact about the run.
+    resumed: bool = False
+    #: The migration's branch, when the workspace is currently on another one.
+    #: ``branch`` is cleared in that case so the write guard holds, and this is
+    #: what the state block names. Not persisted separately.
+    expected_branch: str = ""
 
     # -- where it is ------------------------------------------------------
 
@@ -324,6 +364,8 @@ class MigrationState:
             # a question that gets migration advice is a question whose answer
             # is now competing for the last position in the prompt.
             return []
+        if self.phases and self.resumed and not named:
+            return self.resume_block()
         if not self.phases:
             # The instruction lives here, not in the mode overlay, and the
             # difference is what it costs: an overlay is paid on every turn of
@@ -352,6 +394,13 @@ class MigrationState:
         lines = [head]
         if parts := phase.part_list:
             lines.append("  Parts: " + ", ".join(parts))
+        planned_now = {u.get("file") for u in self.units.values() if u.get("phase_key") == _key(phase.name)}
+        if later := [f for f in self.backlog.get(_key(phase.name), []) if f not in planned_now]:
+            lines.append(
+                f"  Also in this phase, not in this plan ({len(later)}): {_clip(later)}. "
+                "Finish this plan first; the phase stays open until they are done. One "
+                "that needs no change: `revise_plan` it in as a skipped step, saying why."
+            )
         nxt = next(
             (
                 (i, p)
@@ -375,16 +424,175 @@ class MigrationState:
         )
         return lines
 
+    def resume_block(self) -> list[str]:
+        """What a session that picks up an earlier session's migration is told.
+
+        Rendered until the session adopts a plan of its own. Everything in it is
+        read off the record -- phases closed by the loop, unit statuses set from
+        the change set -- so "where did the last session get to" is answered
+        from evidence, not from anyone's summary.
+        """
+        total = len(self.phases)
+        done = [p.name for p in self.phases if p.status == "done"]
+        lines = [
+            f"Migration: RESUMING — {len(done)} of {total} phase(s) closed in earlier "
+            "sessions" + (f" ({', '.join(done)})" if done else "") + ". Do not re-plan "
+            "or redo a closed phase.",
+        ]
+        here = self.current
+        if here is None:
+            lines.append("  Every phase has closed — the gate runs now.")
+            return lines
+        index, phase = here
+        key = _key(phase.name)
+        mine = [u for u in self.units.values() if u.get("phase_key") == key]
+
+        def label(unit: Mapping[str, str]) -> str:
+            return unit["file"] + (f" [{unit['part']}]" if unit.get("part") else "")
+
+        lines.append(
+            f"  Open: phase {index} of {total} — {phase.name}"
+            + (f" ({phase.covers})" if phase.covers else "")
+        )
+        if settled := list(dict.fromkeys(label(u) for u in mine if u.get("status") in SETTLED)):
+            lines.append(f"  Already done in it ({len(settled)}): " + _clip(settled))
+        if pending := list(dict.fromkeys(label(u) for u in mine if u.get("status") not in SETTLED)):
+            lines.append(f"  Planned, not finished ({len(pending)}): " + _clip(pending))
+        planned = {u.get("file") for u in mine}
+        if untouched := [f for f in self.backlog.get(key, []) if f not in planned]:
+            lines.append(f"  Not planned yet ({len(untouched)}): " + _clip(untouched))
+        lines.append(
+            "  `submit_plan` with the same `phases` (same names, so the closed ones "
+            f"stay closed) and `steps` for what is left of {phase.name} only. For a "
+            "split file run `handler_map` first: a group it marks done needs no step."
+        )
+        if self.expected_branch:
+            lines.append(
+                f"  Branch: the conversion is on `{self.expected_branch}` and the "
+                "workspace is not. The acting phase switches back first "
+                f"(`git_ops` op=branch message={self.expected_branch}); writes are "
+                "held until then."
+            )
+        elif self.branch:
+            lines.append(f"  Branch: {self.branch}")
+        lines.append(f"  Record: {PROGRESS_PATH}")
+        return lines
+
+    # -- the migration's own ledger ---------------------------------------
+
+    def note_planned(self, phase: str, files: Sequence[str]) -> None:
+        """Remember that ``phase`` covers ``files``, whatever happens to the plan.
+
+        Keyed by the phase's name even before the roadmap naming it is adopted:
+        the first submission is often refused, and it is the one that lists
+        every file.
+        """
+        if not _key(phase):
+            return
+        known = self.backlog.setdefault(_key(phase), [])
+        for path in files:
+            if path and path not in known:
+                known.append(path)
+
+    def note_split(self, phase: str, files: Sequence[str]) -> None:
+        """Remember that these files are converted across several steps of ``phase``."""
+        if not _key(phase):
+            return
+        known = self.split.setdefault(_key(phase), [])
+        for path in files:
+            if path and path not in known:
+                known.append(path)
+
+    def record_steps(self, steps: Sequence[Any], touched: Sequence[str] = ()) -> None:
+        """Fold the plan in hand into the migration's ledger.
+
+        A step keeps its unit across sessions by key -- phase, file, part (or
+        action when there is no part) -- so re-planning the same group in a
+        later session updates its row rather than adding a second one.
+        """
+        for step in steps:
+            path = str(getattr(step, "file", "") or "").strip()
+            if not path:
+                continue
+            phase = str(getattr(step, "phase", "") or "").strip()
+            if not phase and (current := self.current) is not None:
+                phase = current[1].name
+            part = str(getattr(step, "part", "") or "").strip()
+            action = str(getattr(step, "action", "") or "").strip()
+            key = _unit_key(phase, path, part or action)
+            status = str(getattr(step, "status", "") or "pending")
+            was = self.units.get(key)
+            if was is not None and was.get("status") in SETTLED and status not in SETTLED:
+                # A later plan re-listing finished work does not reopen it: the
+                # change set that settled it is still on disk.
+                continue
+            self.units[key] = {
+                "phase": phase,
+                "phase_key": _key(phase),
+                "file": path,
+                "part": part,
+                "action": action[:200],
+                "status": status,
+                "note": str(getattr(step, "note", "") or "")[:200],
+            }
+            self.note_planned(phase, [path])
+        if touched:
+            self.files = tuple(dict.fromkeys((*self.files, *touched)))
+
+    def outstanding(
+        self, phase: str, converted: "Callable[[str], bool | None] | None" = None
+    ) -> list[str]:
+        """Files ``phase`` still has to finish before it may close.
+
+        A file is finished when every unit recorded for it in this phase has
+        settled -- and, for a file split across conversion steps, when the code
+        agrees: ``converted`` answers from ``handler_map``, and ``None`` means
+        it could not say, in which case the step statuses stand.
+        """
+        key = _key(phase)
+        left: list[str] = []
+        for path in self.backlog.get(key, []):
+            units = [
+                u for u in self.units.values()
+                if u.get("phase_key") == key and u.get("file") == path
+            ]
+            if not units or any(u.get("status") not in SETTLED for u in units):
+                left.append(path)
+            elif (
+                converted is not None
+                and path in self.split.get(key, [])
+                and converted(path) is False
+            ):
+                left.append(path)
+        return left
+
     # -- disk -------------------------------------------------------------
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
+    def as_dict(self, *, ledger: bool = True) -> dict[str, Any]:
+        """The state as JSON. ``ledger=False`` is the shape under REST contract.
+
+        ``GET /v1/sessions/{id}/plan`` serves a session's plan with its
+        migration, and that shape is contract C3; the ledger (backlog, units,
+        files, routes) lives in the workspace record, which is the migration's
+        and not any one session's.
+        """
+        core = {
             "active": self.active,
-            "branch": self.branch,
+            "branch": self.branch or self.expected_branch,
             "base": self.base,
             "closed": self.closed,
             "log": list(self.log),
             "phases": [p.as_dict() for p in self.phases],
+        }
+        if not ledger:
+            return core
+        return {
+            **core,
+            "backlog": {k: list(v) for k, v in self.backlog.items()},
+            "split": {k: list(v) for k, v in self.split.items()},
+            "units": {k: dict(v) for k, v in self.units.items()},
+            "files": list(self.files),
+            "routes": self.routes,
         }
 
     @classmethod
@@ -392,6 +600,30 @@ class MigrationState:
         phases = tuple(
             Phase.from_dict(p) for p in raw.get("phases") or () if isinstance(p, Mapping)
         )
+
+        def lists(value: Any) -> dict[str, list[str]]:
+            if not isinstance(value, Mapping):
+                return {}
+            return {
+                str(k): [str(x) for x in v if x]
+                for k, v in value.items()
+                if isinstance(v, (list, tuple))
+            }
+
+        units_raw = raw.get("units")
+        units = (
+            {
+                str(k): {str(a): str(b) for a, b in v.items()}
+                for k, v in units_raw.items()
+                if isinstance(v, Mapping)
+            }
+            if isinstance(units_raw, Mapping)
+            else {}
+        )
+        try:
+            routes = int(raw.get("routes") or 0)
+        except (TypeError, ValueError):
+            routes = 0
         return cls(
             active=bool(raw.get("active")) or bool(phases),
             phases=phases,
@@ -399,7 +631,74 @@ class MigrationState:
             base=str(raw.get("base") or ""),
             closed=int(raw.get("closed") or 0),
             log=tuple(str(x) for x in raw.get("log") or ()),
+            backlog=lists(raw.get("backlog")),
+            split=lists(raw.get("split")),
+            units=units,
+            files=tuple(str(x) for x in raw.get("files") or () if x),
+            routes=routes,
         )
+
+
+#: The step statuses that settle a unit. ``written`` is not one of them -- see
+#: ``AgentLoop._close_phase``.
+SETTLED = frozenset({"done", "skipped", "blocked"})
+
+
+def _key(name: str) -> str:
+    return " ".join(str(name or "").split()).lower()
+
+
+def _unit_key(phase: str, path: str, part: str) -> str:
+    return f"{_key(phase)}|{path.strip()}|{_key(part)[:120]}"
+
+
+def _clip(names: Sequence[str], limit: int = 8) -> str:
+    shown = ", ".join(names[:limit])
+    return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
+#: The migration's own record, workspace-relative, beside the plan document.
+#:
+#: A migration outlives a session as well as a context window. `/migrate` opens
+#: a new session every time, and the roadmap used to live only in that
+#: session's `plan.json` -- so every run began at phase one, and its first save
+#: overwrote the plan document with "0 of 7 closed". This file is keyed by
+#: nothing but the workspace, so whichever session opens next finds it.
+RECORD_PATH = ".dakcoder/migration/state.json"
+
+
+def load_record(root: Path) -> MigrationState | None:
+    """The workspace's migration record, or ``None`` when there is none."""
+    try:
+        raw = json.loads((Path(root) / RECORD_PATH).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    state = MigrationState.from_dict(raw)
+    return state if state.phases else None
+
+
+def save_record(root: Path, state: MigrationState) -> None:
+    """Write the record atomically. Best-effort: a lost record costs the resume, not the run."""
+    if not state.phases:
+        return
+    target = Path(root) / RECORD_PATH
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=str(target.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({**state.as_dict(), "updated": _now()}, fh, indent=1, sort_keys=True)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        return
 
 
 def _now() -> str:
@@ -441,6 +740,14 @@ _BOUNDED_EDITS = (
 )
 
 
+#: A step check that is the build: `go_build`, `go vet`, `go test`, "compiles",
+#: "builds clean". What `plan_objection` refuses before the last phase.
+_BUILD_CHECK = re.compile(
+    r"\bgo[_ ]?(?:build|vet|test)\b|\bcompiles?\b|\bbuilds?\b(?: clean| pass| succeed)",
+    re.IGNORECASE,
+)
+
+
 def _is_bounded_edit(action: str) -> bool:
     """Whether this step's own description says it is an edit, not a rewrite.
 
@@ -457,11 +764,172 @@ def _is_bounded_edit(action: str) -> bool:
     return any(marker in said for marker in _BOUNDED_EDITS)
 
 
+#: What ``handler_map`` says about one file's conversion groups: a list of
+#: ``{"methods": [...], "start": int, "end": int, "done": bool}``, or ``None``
+#: when the map could not be taken (no sidecar, not a handler file).
+Groups = Callable[[str], "list[Mapping[str, Any]] | None"]
+
+
+def split_files(steps: Sequence[Any], lines: Callable[[str], int]) -> list[str]:
+    """The files in ``steps`` that are converted across several steps.
+
+    Over ``BIG_FILE`` lines and not exempt as a bounded edit -- the same test
+    the size objection applies, so the loop and the objection agree on which
+    files' completion has to be asked of the code.
+    """
+    bounded: dict[str, bool] = {}
+    for step in steps:
+        path = str(getattr(step, "file", "") or "")
+        if path:
+            bounded[path] = bounded.get(path, True) and _is_bounded_edit(
+                str(getattr(step, "action", "") or "")
+            )
+    return [p for p, b in bounded.items() if not b and lines(p) > BIG_FILE]
+
+
+def _groups_text(path: str, groups: Sequence[Mapping[str, Any]], limit: int = MAX_STEPS) -> str:
+    """The open groups of one file, one line each, for an objection to quote."""
+    rows = []
+    for index, group in enumerate(groups[:limit], 1):
+        methods = [str(m) for m in group.get("methods") or ()]
+        shown = ", ".join(methods[:8]) + (f" +{len(methods) - 8} more" if len(methods) > 8 else "")
+        rows.append(
+            f"  {index}. lines {group.get('start', '?')}-{group.get('end', '?')}: {shown}"
+        )
+    if len(groups) > limit:
+        rows.append(
+            f"  ...and {len(groups) - limit} more group(s) -- the next plan, once these are done."
+        )
+    return f"Open groups in {path}, from handler_map:\n" + "\n".join(rows)
+
+
+def _open_groups(groups: Groups | None, path: str) -> list[Mapping[str, Any]] | None:
+    if groups is None:
+        return None
+    try:
+        found = groups(path)
+    except Exception:  # noqa: BLE001 - advice from a sidecar, never a precondition
+        return None
+    if not found:
+        return None
+    return [g for g in found if not g.get("done")]
+
+
+def size_objection(
+    steps: Sequence[Any],
+    lines: Callable[[str], int],
+    groups: Groups | None = None,
+) -> str:
+    """Why a plan gives some large file too few steps to finish, or ``""``.
+
+    The size half of ``plan_objection``, on its own so ``revise_plan`` is held
+    to it too: a revision that merged nine groups back into three was the one
+    route around it.
+
+    **The groups, when the map can be taken, are the measure** -- not
+    ``ceil(lines / BIG_FILE)``. The arithmetic counted helpers and types, which
+    no step converts, and could not see that a single 900-line method is one
+    group however long it is, so a plan that followed ``handler_map`` exactly
+    could be refused for it. It also could not see that half a file was
+    already converted by an earlier session, and asked for steps for that too.
+    """
+    counted: dict[str, int] = {}
+    bounded: dict[str, bool] = {}
+    for step in steps:
+        path = str(getattr(step, "file", "") or "")
+        if path:
+            counted[path] = counted.get(path, 0) + 1
+            # A file is exempt only if *every* step on it is a bounded edit.
+            # One conversion step among three import swaps is still a
+            # conversion step, and it is the one that cannot finish.
+            was = bounded.get(path, True)
+            bounded[path] = was and _is_bounded_edit(str(getattr(step, "action", "") or ""))
+
+    # **Enough steps, not merely more than one.** A plan that followed the old
+    # advice was accepted at three steps for a 6,571-line handler -- ~2,190
+    # lines each, against an acting phase that can emit about 1,200 -- and the
+    # run discovered it thirty turns later.
+    short: list[tuple[str, int, int, int, list[Mapping[str, Any]] | None]] = []
+    for path, given in counted.items():
+        if bounded.get(path, False):
+            continue
+        n = lines(path)
+        if n <= BIG_FILE:
+            continue
+        open_groups = _open_groups(groups, path)
+        if open_groups is not None:
+            needed = len(open_groups)
+            if needed == 0:
+                continue  # already converted: any step on it is a re-check
+        else:
+            needed = -(-n // BIG_FILE)  # ceil, without importing math for it
+        # One plan carries MAX_STEPS. A file needing more is planned a plan's
+        # worth at a time; the phase stays open on it until the code says it
+        # is converted, so the rest cannot be forgotten.
+        needed = min(needed, MAX_STEPS)
+        if given < needed:
+            short.append((path, n, given, needed, open_groups))
+
+    # **The demand has to fit in a submission.** When the phase's big files
+    # need more steps between them than one plan holds, ask for a *narrower*
+    # plan instead of a longer one: one file, finished, then the next.
+    total = sum(needed for _, _, _, needed, _ in short)
+    if short and total > MAX_STEPS:
+        # The smallest file in the *plan*, not the smallest oversized one: a
+        # 695-line file is one step and finishes in a turn, which is what turns
+        # a blocked phase into a moving one.
+        sizes = {path: lines(path) for path in counted if path and not bounded.get(path, False)}
+        path = min(sizes, key=lambda p: (sizes[p], p))
+        n = sizes[path]
+        open_groups = _open_groups(groups, path) if n > BIG_FILE else None
+        needed = (
+            min(len(open_groups), MAX_STEPS)
+            if open_groups
+            else max(1, min(MAX_STEPS, -(-n // BIG_FILE)))
+        )
+        listing = f"\n\n{_groups_text(path, open_groups)}" if open_groups else ""
+        return (
+            "this phase is bigger than one plan can hold: its large files need "
+            f"{total} steps between them and a plan carries {MAX_STEPS}. Plan one "
+            f"file at a time. Send the steps for {path} ({n:,} lines, {needed} "
+            f"step{'' if needed == 1 else 's'}) and nothing else -- it is the "
+            "smallest, so it finishes first. The other files stay in this phase "
+            "and are planned next; the phase does not close without them. One step "
+            "per group: `action` naming the group's methods and the repository "
+            "methods they call, `part` the group, `accepts` "
+            f"`unit_check path={path} methods=<those methods>`" + listing
+        )
+    if short:
+        path, n, given, needed, open_groups = max(short, key=lambda item: item[1])
+        had = "one step" if given == 1 else f"{given} steps"
+        listing = f"\n\n{_groups_text(path, open_groups)}" if open_groups else (
+            f"\n\nSplit it with `handler_map path={path}`: one step per group it lists."
+        )
+        return (
+            f"{path} is {n:,} lines and the plan gives it {had}; it needs at least {needed}. "
+            "One reply converts about one group, so fewer steps cannot be finished. "
+            "One step per group, each naming in `action` the group's methods and "
+            "the repository methods they call, the group in `part`, and `accepts` "
+            f"`unit_check path={path} methods=<those methods>`. Each step reads and "
+            "patches only its own methods, one `patch_file` per method -- the whole "
+            "file is never read or written at once."
+            + listing
+            + (
+                "\n\nAlso short: "
+                + ", ".join(f"{p} ({ln:,} lines, {g} of {nd})" for p, ln, g, nd, _ in short if p != path)
+                if len(short) > 1
+                else ""
+            )
+        )
+    return ""
+
+
 def plan_objection(
     state: "MigrationState",
     phases: Sequence[Phase],
     steps: Sequence[Any],
     lines: "Callable[[str], int] | None" = None,
+    groups: Groups | None = None,
 ) -> str:
     """Why this plan is not a migration plan, or ``""``.
 
@@ -524,120 +992,50 @@ def plan_objection(
     # A plan that spans phases is *trimmed*, not refused. See `steps_for_phase`.
     spread = {str(s.phase).strip().lower() for s in steps}
 
-    # A file bigger than one reply is bigger than one step.
+    # A file bigger than one reply is bigger than one step. See
+    # `size_objection`, which `revise_plan` is held to as well.
+    if lines is not None and (objection := size_objection(steps, lines, groups)):
+        return objection
+
+    # A step checked by the build, before the phase in which the build can pass.
     #
-    # This is the objection that would have changed the field run: it converted
-    # four things and then stopped, correctly, because its plan had one step for
-    # `handler/paogen.go` and that file is 6,571 lines. A step is a unit of work
-    # that has to fit in a reply; a whole-file step on a file that size is a
-    # step nothing can finish, and the run discovers it only after reading the
-    # file. Split at plan time and each piece is a reply, a checkpoint and a
-    # line in the progress record that says it is done.
-    if lines is not None:
-        counted: dict[str, int] = {}
-        bounded: dict[str, bool] = {}
-        for step in steps:
-            path = str(getattr(step, "file", "") or "")
-            if path:
-                counted.setdefault(path, 0)
-                counted[path] += 1
-                # A file is exempt only if *every* step on it is a bounded edit.
-                # One conversion step among three import swaps is still a
-                # conversion step, and it is the one that cannot finish.
-                was = bounded.get(path, True)
-                bounded[path] = was and _is_bounded_edit(str(getattr(step, "action", "") or ""))
-        # **Enough steps, not merely more than one.**
-        #
-        # This asked `counted[path] == 1`, so any split at all satisfied it
-        # however much each step carried -- while the message it printed said
-        # "roughly one step per 800 lines". The check and its own advice
-        # disagreed, and the plan that followed the advice was accepted at three
-        # steps for a 6,571-line handler: ~2,190 lines each, against an acting
-        # phase that can emit about 1,200. The run discovered that thirty turns
-        # later and reported the whole phase blocked, correctly.
-        #
-        # The point of an objection at plan time is that the cost is paid here.
-        # An objection that accepts an unworkable plan is worse than none: it
-        # spends the round trip and certifies the result.
-        short = []
-        for path, given in counted.items():
-            if bounded.get(path, False):
-                continue
-            n = lines(path)
-            if n <= BIG_FILE:
-                continue
-            needed = -(-n // BIG_FILE)  # ceil, without importing math for it
-            if given < needed:
-                short.append((path, n, given, needed))
-        # **The demand has to fit in a submission.**
-        #
-        # `paogen.go` at 6,571 lines needs nine steps by the arithmetic above,
-        # and `submit_plan` carries eight. Asking for nine would be a condition
-        # no plan could satisfy -- and this file's whole history is the cost of
-        # building one of those by accident. So when the phase's big files need
-        # more steps than one plan can hold, the objection asks for a *narrower*
-        # plan instead of a longer one: one file, finished, then the next.
-        #
-        # It is also the answer the run reached on its own and could not act on:
-        # "I need to start with the smallest file to make progress, but the plan
-        # does not include it as the first step."
-        total = sum(needed for _, _, _, needed in short)
-        if short and total > MAX_STEPS:
-            # The smallest file in the *plan*, not the smallest oversized one.
-            #
-            # A file under the threshold is not in `short` at all, and it is
-            # exactly the one to start with: `publicacct.go` at 695 lines is one
-            # step and finishes in a turn, which is what turns a blocked phase
-            # into a moving one. Naming the smallest *large* file instead would
-            # have sent the run at a 3,966-line handler while a 695-line one sat
-            # there -- and "start with the smallest" was the run's own
-            # conclusion, which it could not act on.
-            sizes = {
-                path: lines(path)
-                for path in counted
-                if path and not bounded.get(path, False)
-            }
-            path = min(sizes, key=lambda p: (sizes[p], p))
-            n = sizes[path]
-            needed = max(1, -(-n // BIG_FILE))
-            return (
-                "this phase is bigger than one plan can hold: its large files need "
-                f"{total} steps between them and a plan carries {MAX_STEPS}. Plan "
-                "one file at a time. Send the steps for "
-                f"{path} ({n:,} lines, {needed} step{'' if needed == 1 else 's'}) and nothing "
-                "else -- it is the "
-                "smallest, so it finishes first and the next plan is written against "
-                "a service that is already part-converted. Each step names its own "
-                "line range in `action`, reads only that range (`read_file` takes "
-                "`start` and `end`) and writes it back"
-            )
-        if short:
-            worst = max(short, key=lambda item: item[1])
-            path, n, given, needed = worst
-            had = "one step" if given == 1 else f"{given} steps"
-            return (
-                f"{path} is {n:,} lines and the plan gives it {had}. One reply "
-                f"writes about {BIG_FILE:,} lines, so those steps cannot be "
-                f"finished; it needs at least {needed}. Split it that far: "
-                "several steps naming the same file, each saying in `action` "
-                "which methods or which line range it converts, and put the "
-                "group in `part`. Each step then reads only its own range "
-                "(`read_file` takes `start` and `end`) and writes that range "
-                "back -- the whole file is never read or written at once."
-                + (
-                    "\n\nAlso short: "
-                    + ", ".join(
-                        f"{p} ({ln:,} lines, {g} of {nd})"
-                        for p, ln, g, nd in short
-                        if p != path
-                    )
-                    if len(short) > 1
-                    else ""
-                )
-            )
+    # Session e3edb2434936: the handlers phase split paogen.go into seven steps
+    # and checked every one with "go_build passes for the handler package". The
+    # acting phase read the first, saw that converting lines 1-800 leaves 5,700
+    # lines on gin, concluded -- correctly -- that the package cannot build after
+    # any single step, refused all seven as unsatisfiable and stalled until the
+    # run was cut off. Nothing in it was wrong except the check.
+    #
+    # After the dependency swap nothing compiles until every phase is done, so
+    # the build is the gate's question, asked once at the end. A step's question
+    # is whether *its* methods were converted, and `unit_check` answers that on
+    # a package that does not build.
+    last = roadmap[-1].name.strip().lower()
+    built = [
+        s for s in steps
+        if str(getattr(s, "phase", "") or "").strip().lower() != last
+        and _BUILD_CHECK.search(str(getattr(s, "accepts", "") or ""))
+    ]
+    if built:
+        files = sorted({str(getattr(s, "file", "") or "") for s in built} - {""})
+        return (
+            f"{len(built)} step(s) are checked with the build ("
+            + ", ".join(files[:3])
+            + "). The build cannot pass until the migration's last phase: after the "
+            "dependency swap the service does not compile until every handler is "
+            "converted, so a step checked that way can never be done. Check each "
+            "conversion step with `unit_check path=<file> methods=<the methods it "
+            "converts>` instead -- it passes on a file whose package does not build. "
+            "A half-converted file is the plan working, not a fault. Keep go_build "
+            "for the last phase"
+        )
 
     closed = {p.name.strip().lower() for p in state.phases if p.status == "done"}
-    if spread & closed:
+    # Only when *nothing* in the plan is still open. A plan re-sending a closed
+    # phase beside the open one is the ordinary shape of a resumed session --
+    # the model re-plans from the roadmap it was given -- and the loop drops
+    # the closed steps with a note instead of spending a round trip.
+    if spread and spread <= closed:
         return (
             "these steps belong to "
             + next(iter(spread & closed))
@@ -796,23 +1194,39 @@ def progress_document(
         out.append("")
 
     # -- the units, in the shape the view reads --------------------------
-    if plan:
+    #
+    # Every session's, from the migration's ledger, with the plan in hand
+    # folded in first -- not only this session's steps. Rendering the plan in
+    # hand alone is what made the document forget the work of every earlier
+    # session the moment a new one planned anything.
+    rows: list[tuple[str, str, str, str]] = []
+    if state.units:
+        for unit in state.units.values():
+            rows.append(
+                (
+                    unit.get("file", ""),
+                    unit.get("part") or unit.get("phase") or "",
+                    unit.get("status", "pending"),
+                    unit.get("note") or unit.get("action") or "",
+                )
+            )
+    else:
+        for step in plan:
+            rows.append((step.file, step.part or step.phase or "", step.status, step.note or step.action or ""))
+    if rows:
         out += [
             "## Units",
             "",
             "| Unit | Kind | Classification | Status | Rules | Commit |",
             "|---|---|---|---|---|---|",
         ]
-        for step in plan:
-            kind = step.part or step.phase or ""
+        for path, kind, status, note in rows:
             # SKIP is the view's word for "deliberately excluded", which is
             # exactly what a skipped step is. Everything else is work.
-            classification = "SKIP" if step.status == "skipped" else "MIGRATE"
-            note = (step.note or step.action or "").replace("|", "/")
-            out.append(
-                f"| {step.file} | {kind} | {classification} | {step.status} | "
-                f"{note[:90]} | |"
-            )
+            classification = "SKIP" if status == "skipped" else "MIGRATE"
+            note = note.replace("|", "/").replace("\n", " ")
+            kind = kind.replace("|", "/")
+            out.append(f"| {path} | {kind} | {classification} | {status} | {note[:90]} | |")
         out.append("")
 
     # -- what is left ----------------------------------------------------
@@ -821,6 +1235,8 @@ def progress_document(
         out += ["## Still to do", ""]
         for phase in remaining:
             out.append(f"- **{phase.name}** — {phase.covers or 'no summary'}")
+            if left := state.outstanding(phase.name):
+                out.append(f"  - files not finished: {_clip(left, 12)}")
         out += [
             "",
             "Each phase is planned when it opens, against the workspace the phase",
@@ -837,11 +1253,12 @@ def progress_document(
             "",
         ]
 
-    if touched:
-        out += ["## Files changed this session", ""]
-        out += [f"- `{path}`" for path in touched[:60]]
-        if len(touched) > 60:
-            out.append(f"- ...and {len(touched) - 60} more")
+    changed = list(dict.fromkeys((*state.files, *touched)))
+    if changed:
+        out += ["## Files changed by the migration", ""]
+        out += [f"- `{path}`" for path in changed[:60]]
+        if len(changed) > 60:
+            out.append(f"- ...and {len(changed) - 60} more")
         out.append("")
 
     if state.log:

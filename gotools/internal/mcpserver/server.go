@@ -108,6 +108,7 @@ func NewServer(root, version string) (*mcp.Server, error) {
 	addRepoMapTool(s, abs)
 	addRouteInventoryTool(s, abs)
 	addAuditTools(s, abs)
+	addCallMapTools(s, abs)
 	return s, nil
 }
 

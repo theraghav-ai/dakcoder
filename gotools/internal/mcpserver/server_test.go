@@ -173,6 +173,9 @@ func TestToolNamesAreStable(t *testing.T) {
 		// The four audits, added deliberately. They reproduce the sheets the
 		// manual review of 41 services was assembled by hand.
 		"db_roundtrip_audit", "validation_audit", "temporal_audit", "lib_version_check",
+		// The migration's call map: what a handler file splits into, whether a
+		// step is done, and who calls a repository method.
+		"handler_map", "unit_check", "impact",
 	}
 	for _, name := range want {
 		if !got[name] {
