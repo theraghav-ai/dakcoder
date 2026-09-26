@@ -133,6 +133,10 @@ __all__ = [
 #: oldest is dropped first, and every one of them is also in the transcript.
 MAX_DIRECTIVES = 6
 
+#: How many developer messages the conversation record keeps for reading a
+#: follow-up. Not pinned and not sent: only the classifier reads it.
+MAX_SAID = 12
+
 #: How many mode instructions the pinned head may carry at once.
 #:
 #: **One.** The head carries the instruction that is in force and nothing else.
@@ -231,6 +235,11 @@ class ContextManager:
         # roughly 2.4k tokens that never need prefilling again.
         self._system = Message(Role.SYSTEM, system_prompt, Layer.SYSTEM, source="system")
         self._tool_schema_tokens = tool_schema_tokens
+        #: The repository's AGENTS.md files, rendered. Pinned directly under the
+        #: system message and above the mode overlay, so a mode switch never
+        #: moves it and it is re-prefilled only when the files themselves
+        #: change. ``None`` until the loop loads them. See ``set_project``.
+        self._project: Message | None = None
 
         self._mode_messages: list[Message] = []
         #: The last raw mode instruction, for the dedupe in `switch_mode`.
@@ -240,6 +249,11 @@ class ContextManager:
         #: like the task, but never part of the cacheable head.
         self._directive_message: Message | None = None
         self._task_text = ""
+        #: The developer's previous request, when this task was opened in a
+        #: conversation that already had one. See ``start_task``.
+        self._prior = ""
+        #: Everything the developer has said, for reading a follow-up. See ``said``.
+        self._said: list[str] = []
         self._plan_text = ""
         self._acceptance: tuple[str, ...] = ()
         #: Follow-ups and corrections, pinned. See ``pin_directive``.
@@ -362,6 +376,8 @@ class ContextManager:
 
     def _head(self) -> list[Message]:
         out: list[Message] = [self._system]
+        if self._project is not None:
+            out.append(self._project)
         out.extend(self._mode_messages)
         if self._task is not None:
             out.append(self._task)
@@ -394,7 +410,7 @@ class ContextManager:
 
         The only builder. Order is fixed, and the head is stable:
 
-            system -> mode -> task -> recap -> working set -> plan & directives
+            system -> project -> mode -> task -> recap -> working set -> plan & directives
 
         **Why the last layer is last** (BUG L-18). Everything a steer or a plan
         submission mutates lives at the end. It used to live in the ``task``
@@ -463,6 +479,32 @@ class ContextManager:
 
     # ── the pinned head ─────────────────────────────────────────────────────
 
+    def set_project(self, text: str) -> bool:
+        """Pin the repository's instructions for agents (its AGENTS.md files).
+
+        Called by the loop at the start of every run rather than once, so an
+        edit to AGENTS.md -- the developer's, or one a session made with
+        ``update_agents_md`` -- is in force from the next message on. Never
+        mid-run: the block sits in the cacheable head, and rewriting it between
+        two turns would re-prefill everything below it for a note the model
+        already has in its working set.
+
+        Identical text is a no-op, which is what keeps a run over an unchanged
+        repository byte-stable. Returns whether the head changed.
+        """
+        text = text.strip()
+        current = self._project.content if self._project is not None else ""
+        if text == current:
+            return False
+        self._project = (
+            Message(Role.USER, text, Layer.PROJECT, source="project") if text else None
+        )
+        return True
+
+    @property
+    def project_text(self) -> str:
+        return self._project.content if self._project is not None else ""
+
     def set_task(self, task: str, *, plan: str = "", acceptance: Sequence[str] = ()) -> None:
         """Pin the task, the plan and the acceptance criteria.
 
@@ -473,7 +515,46 @@ class ContextManager:
         self._task_text = task.strip()
         self._plan_text = plan.strip()
         self._acceptance = tuple(acceptance)
+        if not self._said and self._task_text:
+            self._said.append(self._task_text)
         self._rebuild_task()
+
+    def start_task(
+        self, task: str, *, acceptance: Sequence[str] = (), after: str = ""
+    ) -> None:
+        """Pin a new task in a conversation that already had one.
+
+        ``set_task`` keeps the plan text, and the directives were never
+        touched by it -- right for the first message, and wrong for the second
+        task of a session, where both belong to the task that just finished.
+        Left in place, the model reads the new request under the old task's
+        plan and the old corrections, and works on the old task.
+
+        ``after`` is what the developer asked just before, kept as a labelled
+        reference: "do it" and "add delete to it" mean something only after it,
+        and otherwise it survives only in a working set compaction eats.
+        """
+        self._directives = []
+        self._state_text = ""
+        self._prior = " ".join(after.split())[:300]
+        self._note_said(task)
+        self.set_task(task, plan="", acceptance=acceptance)
+
+    def _note_said(self, text: str) -> None:
+        text = text.strip()
+        if text:
+            self._said.append(text)
+            del self._said[:-MAX_SAID]
+
+    @property
+    def said(self) -> tuple[str, ...]:
+        """Everything the developer has said in this conversation, oldest first.
+
+        Not the directives. Those are what the *current task* is steered by and
+        are cleared when a new task opens; this is the conversation, which is
+        what a follow-up has to be read against whichever task it belongs to.
+        """
+        return tuple(self._said)
 
     def set_plan(self, plan: str) -> None:
         """Pin the plan the Planner produced, keeping the task and criteria.
@@ -526,6 +607,7 @@ class ContextManager:
         — and this copy keeps the instruction alive.
         """
         directive = text.strip()
+        self._note_said(directive)
         if not directive or directive in self._directives:
             return
         self._directives.append(directive)
@@ -554,6 +636,8 @@ class ContextManager:
         tokens it contains rather than every token above it. See ``build``.
         """
         parts = [f"# Task\n{self._task_text}"]
+        if self._prior:
+            parts.append(f"\n# Asked just before this (finished; context only)\n{self._prior}")
         if self._acceptance:
             criteria = "\n".join(f"- {c}" for c in self._acceptance)
             parts.append(f"\n# Accepts\n{criteria}")
@@ -1091,6 +1175,7 @@ class ContextManager:
         overhead = (
             self._tool_schema_tokens
             + self._message_cost(self._system)
+            + (self._message_cost(self._project) if self._project else 0)
             + sum(self._message_cost(m) for m in self._mode_messages)
             + (self._message_cost(self._task) if self._task else 0)
             # The recap is about to be replaced, so budget for a full-sized one

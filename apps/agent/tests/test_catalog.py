@@ -93,7 +93,7 @@ def test_the_json_is_a_usable_contract() -> None:
 
     for tool in payload["tools"]:
         assert tool["approval"] in {"none", "conditional", "always"}
-        assert tool["provider"] in {"python", "gotools", "gopls"}
+        assert tool["provider"] in {"python", "gotools", "gopls", "graphify"}
         assert isinstance(tool["mutates"], bool)
         assert "parameters" in tool
 

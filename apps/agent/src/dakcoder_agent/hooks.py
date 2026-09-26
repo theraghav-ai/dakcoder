@@ -76,7 +76,7 @@ MAX_PARALLEL_CALLS = 4
 #: Providers whose work is already serialised somewhere else. Running several
 #: at once queues them, and queueing them inside a thread pool makes the
 #: failure modes harder to read without making anything faster.
-_SERIAL_PROVIDERS = frozenset({"gotools", "gopls"})
+_SERIAL_PROVIDERS = frozenset({"gotools", "gopls", "graphify"})
 
 #: Attribute values in a hook context block are sanitised to this, so a hook
 #: cannot close the tag and write markup of its own into the prompt.

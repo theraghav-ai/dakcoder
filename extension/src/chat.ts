@@ -117,7 +117,9 @@ export type SlashCommand =
   | 'test'
   | 'wire'
   | 'compact'
-  | 'rule';
+  | 'rule'
+  | 'graph'
+  | 'init';
 
 /** What the panel knows about the run. Everything here comes from the host. */
 export interface RunState {
@@ -176,7 +178,7 @@ export interface ChatHost {
 
 // ── the wire between host and webview ───────────────────────────────────────
 
-interface SlashSpec {
+export interface SlashSpec {
   name: SlashCommand;
   hint: string;
 }
@@ -212,6 +214,8 @@ type HostMessage =
   | { type: 'run'; state: RunState }
   | { type: 'offline'; reason?: string }
   | { type: 'queued'; count: number }
+  | { type: 'compose'; text: string }
+  | { type: 'settings'; settings: ComposerSettings }
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; text: string }
   | { type: 'mentions'; token: number; items: MentionItem[] }
   | { type: 'approval-resolved'; id: string; decision: ApprovalDecision }
@@ -429,6 +433,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.post({ type: 'focus' });
   }
 
+  /** Put `text` in the composer, ready to edit and send. For the command picker. */
+  compose(text: string): void {
+    this.post({ type: 'compose', text });
+  }
+
   /**
    * Candidates for an `@` mention.
    *
@@ -519,6 +528,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const bound: vscode.Disposable[] = [
       view.webview.onDidReceiveMessage((raw: unknown) => {
         void this.onMessage(raw);
+      }),
+      // The footer's mode and approval chips mirror two settings. Changed from
+      // the Settings editor, the settings picker or another window, the chips
+      // must follow -- a chip that disagrees with the setting it names is a
+      // control that lies about what the next task will do.
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (COMPOSER_KEYS.some((k) => e.affectsConfiguration(`dakcoder.${k}`))) {
+          this.post({ type: 'settings', settings: composerSettings() });
+        }
       }),
     ];
     bound.push(
@@ -623,6 +641,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           await vscode.env.clipboard.writeText(stringOr(message['text'], ''));
           return;
 
+        case 'set-setting':
+          await setComposerSetting(stringOr(message['key'], ''), stringOr(message['value'], ''));
+          return;
+
+        case 'open-settings':
+          await vscode.commands.executeCommand('dakcoder.quickSettings');
+          return;
+
         default:
           // Additive in this direction too: a newer webview asset in a stale
           // host must degrade, not throw.
@@ -648,6 +674,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    */
   private replay(lastSeq: number): void {
     this.post(initMessage());
+    this.post({ type: 'settings', settings: composerSettings() });
     this.post({ type: 'run', state: this.run });
     this.post({ type: 'offline', ...(this.offline === undefined ? {} : { reason: this.offline }) });
     if (this.queued) this.post({ type: 'queued', count: this.queued });
@@ -855,6 +882,38 @@ function strings(): Record<string, string> {
     offlineDefault: vscode.l10n.t('The agent needs the IT 2.0 gateway to reach the model. Reconnecting.'),
     working: vscode.l10n.t('Working'),
     workingTool: vscode.l10n.t('Working · {0}'),
+    // The rotating verb while a turn is in flight. One string, split on "|",
+    // so a translation can carry a different number of verbs. The post office
+    // is the joke: dak is post.
+    workingVerbs: vscode.l10n.t(
+      'Sorting|Franking|Stamping|Dispatching|Routing|Delivering|Sealing|Postmarking|Pondering|Tinkering',
+    ),
+    escToStop: vscode.l10n.t('esc to stop'),
+    escAgain: vscode.l10n.t('press esc again to stop'),
+    mentionButton: vscode.l10n.t('Add context (@)'),
+    settingsButton: vscode.l10n.t('Settings'),
+    sendLabel: vscode.l10n.t('Send (Enter)'),
+    // The footer chips. Each names what the next task will do, not the setting.
+    modeLabel: vscode.l10n.t('Mode for the next task — click or Shift+Tab to change'),
+    'chip.auto': vscode.l10n.t('Auto'),
+    'chip.ask': vscode.l10n.t('Ask'),
+    'chip.agent': vscode.l10n.t('Agent'),
+    approvalLabel: vscode.l10n.t('Which tool calls wait for you — click to change'),
+    'approval.write_side': vscode.l10n.t('Ask before edits'),
+    'approval.destructive': vscode.l10n.t('Ask before deletes'),
+    'approval.all': vscode.l10n.t('Ask before every tool'),
+    'approval.none': vscode.l10n.t('Auto-approve'),
+    'approval.custom': vscode.l10n.t('Custom approvals'),
+    // The ask_developer card.
+    askTitle: vscode.l10n.t('dakcoder needs your input'),
+    askPlaceholder: vscode.l10n.t('Your answer'),
+    askAssumed: vscode.l10n.t('It would otherwise assume: {0}'),
+    askUseAssumed: vscode.l10n.t('Go with that'),
+    askUseAssumedReply: vscode.l10n.t('Go with what you assumed: {0}'),
+    askSend: vscode.l10n.t('Send answers'),
+    askInChat: vscode.l10n.t('Answer in chat'),
+    askKeys: vscode.l10n.t('Ctrl+Enter to send · Esc to answer in chat'),
+    askNoAnswer: vscode.l10n.t('(no answer — use your judgement)'),
     waitingDecision: vscode.l10n.t('Waiting on your decision'),
     popupKeys: vscode.l10n.t('↑↓ to choose · ⏎ to run'),
 
@@ -895,6 +954,7 @@ function strings(): Record<string, string> {
     protectedSchema: vscode.l10n.t('schema — apply the migration yourself'),
     protectedStructural: vscode.l10n.t('structural'),
     elapsed: vscode.l10n.t('{0}s'),
+    elapsedLong: vscode.l10n.t('{0}m {1}s'),
 
     // structure
     transcript: vscode.l10n.t('Conversation transcript'),
@@ -1112,12 +1172,61 @@ function strings(): Record<string, string> {
     cmdWire: vscode.l10n.t('Register with FX'),
     cmdCompact: vscode.l10n.t('Compact the context now'),
     cmdRule: vscode.l10n.t('Explain a rule by id'),
+    cmdInit: vscode.l10n.t('Create or improve AGENTS.md for this repository'),
+    cmdGraph: vscode.l10n.t('Ask the code graph: a symbol, its callers, or a path A -> B'),
+    slashMenu: vscode.l10n.t('Slash commands'),
     memFile: vscode.l10n.t('A workspace file, by path'),
     memSymbol: vscode.l10n.t('A Go symbol, found through gopls'),
     memPackage: vscode.l10n.t('A package API surface'),
     memBuild: vscode.l10n.t('The last go build output'),
     memDiag: vscode.l10n.t('Diagnostics for the active file'),
   };
+}
+
+/** The two settings the composer footer shows and changes. */
+export interface ComposerSettings {
+  mode: string;
+  approval: string;
+}
+
+const COMPOSER_KEYS = ['defaultMode', 'requireApproval'] as const;
+const MODES = ['auto', 'ask', 'agent'];
+const APPROVALS = ['write_side', 'destructive', 'none', 'all'];
+
+function composerSettings(): ComposerSettings {
+  const config = vscode.workspace.getConfiguration('dakcoder');
+  const mode = config.get<string>('defaultMode', 'auto');
+  const approval = config.get<string | string[]>('requireApproval', 'write_side');
+  return {
+    mode: MODES.includes(mode) ? mode : 'auto',
+    // A list of tool names is a policy the chip cannot cycle through; it is
+    // shown as custom and the click opens the Settings editor instead.
+    approval: typeof approval === 'string' && APPROVALS.includes(approval) ? approval : 'custom',
+  };
+}
+
+/**
+ * Change one footer setting, from the webview. Only these two keys and only
+ * their known values: the message comes from a webview, and a webview that
+ * could write any setting could set `dakcoder.gotoolsPath`.
+ *
+ * Written where the value already lives, so a workspace that overrides the mode
+ * is changed in the workspace rather than shadowed from user settings -- where
+ * the change would appear to do nothing.
+ */
+async function setComposerSetting(key: string, value: string): Promise<void> {
+  const allowed = key === 'defaultMode' ? MODES : key === 'requireApproval' ? APPROVALS : undefined;
+  if (!allowed || !allowed.includes(value)) return;
+  const config = vscode.workspace.getConfiguration('dakcoder');
+  const where = config.inspect(key)?.workspaceValue !== undefined
+    ? vscode.ConfigurationTarget.Workspace
+    : vscode.ConfigurationTarget.Global;
+  await config.update(key, value, where);
+}
+
+/** Every slash command with its hint, for surfaces outside the panel. */
+export function slashCatalog(): SlashSpec[] {
+  return slashCommands(strings());
 }
 
 function slashCommands(s: Record<string, string>): SlashSpec[] {
@@ -1134,6 +1243,8 @@ function slashCommands(s: Record<string, string>): SlashSpec[] {
     { name: 'wire', hint: s['cmdWire']! },
     { name: 'compact', hint: s['cmdCompact']! },
     { name: 'rule', hint: s['cmdRule']! },
+    { name: 'graph', hint: s['cmdGraph']! },
+    { name: 'init', hint: s['cmdInit']! },
   ];
 }
 
@@ -1230,6 +1341,8 @@ const SLASH: ReadonlySet<string> = new Set<SlashCommand>([
   'wire',
   'compact',
   'rule',
+  'graph',
+  'init',
 ]);
 
 function isSlashCommand(value: unknown): value is SlashCommand {

@@ -201,6 +201,18 @@ class Router:
         #: looked" have to subtract them (BUG L-29).
         self.gate_mutations: int = 0
 
+    def begin_task(self) -> None:
+        """Start a new task's change set, in the same session.
+
+        ``touched`` is what the gate scopes itself to and what a result reports
+        as this task's work, so a file an earlier task in the conversation wrote
+        must not be in it. The mutation *counters* are left alone: they are
+        compared against the loop's own snapshots to ask "has anything changed
+        since", and a counter that went backwards would answer that wrongly.
+        The session's full list of changed files lives on the session.
+        """
+        self.touched = []
+
     def register(self, name: str, handler: ToolHandler) -> None:
         if name not in registry.REGISTRY:
             raise KeyError(f"{name} is not in the registry; add a ToolSpec first")
@@ -573,7 +585,7 @@ class Router:
                 # tool will fail the same way, so "try something else" wastes
                 # the rest of the run.
                 return ToolResult.failure(
-                    f"{spec.name} needs the gotools sidecar, which is not installed "
+                    f"{spec.name} needs the {spec.provider} sidecar, which is not installed "
                     f"on this machine: {exc}",
                     fix="This is an environment problem, not a code problem. Say so "
                     "plainly and stop; no other tool can substitute for it.",
@@ -777,6 +789,17 @@ def _conditional_reason(
 
     if spec.name == "run_terminal":
         return f"Run: {args.get('argv', '?')}"
+
+    if spec.name == "update_agents_md":
+        # Imported here: `agents_md` imports this module for `Invocation`.
+        from .agents_md import approval_required
+
+        if not approval_required():
+            return None
+        op = args.get("op") or "add"
+        target = "AGENTS.local.md" if args.get("scope") == "local" else "AGENTS.md"
+        detail = args.get("text") or args.get("old") or ""
+        return f"{target} ({op}): {detail}".strip()
 
     return None
 

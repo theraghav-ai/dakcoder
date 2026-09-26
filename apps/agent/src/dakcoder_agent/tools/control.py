@@ -40,6 +40,7 @@ for the one call a run cannot afford to get wrong.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
@@ -432,6 +433,60 @@ def ask_developer(inv: Invocation) -> ToolResult:
     )
 
 
+#: Below this an answer with no line breaks is just a paragraph.
+FLAT_ANSWER_CHARS = 600
+
+_HEADING = re.compile(r"\s*(?<![#\n])(#{1,6} )")
+#: `| a | b || c | d |` -- two pipes with nothing between are a row boundary.
+_ROW = re.compile(r"\|\s*\|(?=\s*[-:A-Za-z0-9`*_ ])")
+_HEADING_THEN_TABLE = re.compile(r"(\n#{1,6} [^\n|]*?)\s*(\|)")
+#: `**Critical (contract violations):**` -- a bold label, which starts a block.
+_BOLD_LABEL = re.compile(r"\s*(\*\*[A-Z][^*\n]{1,80}:\*\*)\s*")
+_ITEM = re.compile(r"(?<![\d.])(\d{1,2})\. (?=[`*\"'A-Z(])")
+
+
+def _restore_breaks(answer: str) -> str:
+    """Put back the line breaks a long markdown answer arrived without.
+
+    The endpoint intermittently returns a `finish` whose answer has no newline
+    at all -- measured on four long answers across the field sessions, 5,800 to
+    13,900 characters each and zero line breaks, while every other long answer
+    had hundreds. Headings, tables and lists then render as one paragraph: "...
+    quality issues.## Handler-to-Repository Mapping### 1. Office/PAO/DDO
+    Lookup Handlers| Handler | Repo Function |...". Asking again costs a
+    four-thousand-token turn and can fail the same way.
+
+    What is restored is only what is unambiguous: a heading marker, a table row
+    boundary, a bold label, and a numbered item -- recognised as one only when
+    it continues the count (1, 2, 3), which prose that happens to contain "2."
+    does not. Anything that already has a line break is left exactly as sent.
+    """
+    if "\n" in answer or len(answer) < FLAT_ANSWER_CHARS:
+        return answer
+    if not any(mark in answer for mark in ("## ", "| ", "**", "1. ")):
+        return answer
+
+    text = _HEADING.sub(lambda m: "\n\n" + m.group(1), answer)
+    text = _ROW.sub("|\n|", text)
+    text = _HEADING_THEN_TABLE.sub(r"\1\n\n\2", text)
+    text = _BOLD_LABEL.sub(lambda m: "\n\n" + m.group(1) + "\n", text)
+
+    out, cursor, expected = [], 0, 1
+    for m in _ITEM.finditer(text):
+        number = int(m.group(1))
+        if text[: m.start()].rstrip(" ").endswith("#"):
+            # `### 10. dblib.CopyFrom usage` is a numbered heading, not an item.
+            continue
+        if number == 1 or number == expected:
+            out.append(text[cursor : m.start()].rstrip(" "))
+            out.append("\n")
+            cursor = m.start()
+            expected = number + 1
+    out.append(text[cursor:])
+    text = "".join(out)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def finish(inv: Invocation) -> ToolResult:
     """End the turn with an answer.
 
@@ -442,7 +497,7 @@ def finish(inv: Invocation) -> ToolResult:
     The answer is echoed straight back rather than summarised. It is what the
     developer reads, and a tool that paraphrased it would be editing the reply.
     """
-    answer = str(inv.arg("answer") or "").strip()
+    answer = _restore_breaks(str(inv.arg("answer") or "").strip())
     if not answer:
         return ToolResult.failure(
             "finish was called with no answer.",
@@ -476,9 +531,29 @@ def finish(inv: Invocation) -> ToolResult:
         body += f" The last {cut:,} characters did not fit and were cut."
     if blocked:
         body += f" Recorded as blocked on: {blocked}"
+    # What the run learned, into AGENTS.md. Never fails the finish: a note that
+    # is refused is reported beside it, and the answer stands.
+    remembered = ""
+    notes = inv.arg("remember") or []
+    if isinstance(notes, list) and notes:
+        from .agents_md import remember
+
+        remembered = remember(inv.workspace.root, [str(n) for n in notes])
+        if remembered.startswith("Suggested"):
+            # Approval is on and `finish` has no card to hang it on, so the
+            # suggestions go where the developer reads: the answer.
+            answer = f"{answer}\n\n{remembered}"
+        elif remembered:
+            body += f" {remembered}"
     return ToolResult.success(
         body,
-        meta={"control": "finish", "answer": answer, "blocked": blocked, "answer_cut": cut},
+        meta={
+            "control": "finish",
+            "answer": answer,
+            "blocked": blocked,
+            "answer_cut": cut,
+            **({"agents_md": remembered} if remembered else {}),
+        },
     )
 
 

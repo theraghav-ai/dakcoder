@@ -2,7 +2,7 @@
 
 Usage
 
-python scripts/release.py 0.3.7
+python scripts/release.py 0.4.11
 
 You choose the version; it's validated as major.minor.patch (VS Code rejects anything else). Written in Python rather than shell because scripts/ is already Python by convention, and it runs identically from PowerShell or Git Bash.
 
@@ -124,6 +124,38 @@ prompt is prefix-stable by design: turn 1 stores the assembled request whole and
 every turn after stores only the messages that changed, so replay is exact
 rather than approximate. `apps/agent/src/dakcoder_agent/debug.py` has the
 reasoning.
+
+### AGENTS.md: the repository's instructions, kept current
+
+Every run starts from the workspace's [AGENTS.md](https://agents.md), the
+instruction file Codex, Copilot, Cursor, Jules and Claude Code also read. It is
+pinned under the system prompt, so it is a prefix-cache hit and never compacted
+away. What is read, general first (later wins):
+
+- `~/.dakcoder/AGENTS.md` (`$DAKCODER_HOME`): yours, every repository.
+- One file per directory from the git root down to the workspace:
+  `AGENTS.override.md`, else `AGENTS.md`, else `CLAUDE.md` / `GEMINI.md` /
+  `AGENT.md` (and `.github/copilot-instructions.md` at the root), then a
+  personal `AGENTS.local.md` (keep it out of git).
+- `@path/to/file.md` imports, four deep, never outside the repository.
+- 32 KiB altogether. Anything cut is named in the prompt.
+- `AGENTS.md` files _below_ the workspace root are shown beside a tool result
+  the first time the agent works in their directory, and again after a
+  compaction.
+
+Sessions keep it current. `update_agents_md` adds, fixes or removes one-line
+notes, and `finish`'s `remember` field saves a run's lesson without spending a
+turn on it. Notes go only inside the fenced `dakcoder:notes` section.
+Everything else in the file belongs to the developers and is never edited.
+Anything shaped like a credential is refused, and the section is capped.
+`/init` in the chat writes or improves the whole file from a survey of the
+repository.
+
+Settings: `dakcoder.agentsMd.enabled`, `.approval` (`auto`, or `ask` to review
+every edit), `.maxBytes` and `.fallbackFilenames`. The runtime reads them as
+`DAKCODER_PROJECT_DOCS`, `DAKCODER_AGENTS_MD_APPROVAL`,
+`DAKCODER_PROJECT_DOC_MAX_BYTES` and `DAKCODER_PROJECT_DOC_FALLBACKS`.
+`apps/agent/src/dakcoder_agent/tools/agents_md.py` has the reasoning.
 
 ## What is built
 

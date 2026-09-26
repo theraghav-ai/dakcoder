@@ -44,7 +44,7 @@ from .modes import Mode
 from . import toolchain
 from .callers import gateway_forwarded
 from .prompts import system_prompt
-from .tools import commands, control, fs, knowledge
+from .tools import agents_md, codegraph, commands, control, fs, knowledge
 from .tools.catalog import as_json
 from .tools.gotools import GoTools, handlers_for
 from .tools.router import Router
@@ -98,8 +98,15 @@ def build(
         # phase. Ordinary handlers on purpose, so they get the same argument
         # validation and the same result envelope as everything else.
         **control.HANDLERS,
+        # AGENTS.md upkeep. See `tools/agents_md.py`; off with the rest of the
+        # feature under DAKCODER_PROJECT_DOCS=0, which also hides the schema.
+        **(agents_md.HANDLERS if agents_md.enabled() else {}),
         **handlers_for(sidecar),
     }
+    # The code-graph pilot, opt-in. Unregistered, `Router.schemas_for` hides the
+    # spec, so a runtime without the flag offers the model nothing new.
+    if codegraph.enabled():
+        handlers.update(codegraph.handlers_for(codegraph.CodeGraph(space.root)))
 
     # The credential invariant, checked here rather than trusted. `local_config`
     # raises if any model key is in the environment — including one a developer
@@ -132,14 +139,24 @@ def build(
         # HEAD has (BUG L-11).
         router = Router(space, handlers, undo=UndoStore(space.root, session.id))
         context = ContextManager(mode=Mode.ASK, system_prompt=system_prompt())
-        return AgentLoop(
+        loop = AgentLoop(
             context,
             client,
             router,
             approve=approve,
             cancelled=session.cancel.is_set,
             max_turns=turns,
+            # Re-read at the top of every run: the root AGENTS.md chain, pinned
+            # under the system prompt.
+            project_docs=lambda: agents_md.load(space.root),
         )
+        # And the ones below the root, on first touch of their directory.
+        # Asks the loop's *current* context, because a follow-up can swap it.
+        nested = agents_md.NestedInstructions(
+            space.root, compactions=lambda: loop.context.compactions
+        )
+        loop.hooks.after(nested.after)
+        return loop
 
     runtime = Loopback(
         space.root,

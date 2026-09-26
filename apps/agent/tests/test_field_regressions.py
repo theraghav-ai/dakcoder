@@ -31,7 +31,7 @@ from pathlib import Path
 import pytest
 
 from dakcoder_agent.context import ContextManager, Recap
-from dakcoder_agent.loop import AgentLoop, Intent, Outcome
+from dakcoder_agent.loop import MAX_PREAMBLE_REFUSALS, AgentLoop, Intent, Outcome
 from dakcoder_agent.modes import Mode
 from dakcoder_agent.tools import control
 from dakcoder_agent.tools.router import Router
@@ -812,12 +812,17 @@ def test_an_answer_that_is_only_its_opening_line_is_sent_back(planning_router, g
 
     sent_back = [
         m.content for m in loop.context.build()
-        if str(m.role) == "user" and "opening of something longer" in m.content
+        if str(m.role) == "user" and "stops where its content should start" in m.content
     ]
     assert len(sent_back) == 1, "the preamble was not sent back exactly once"
     said = [e.data["text"] for e in events if e.type is EventType.ASSISTANT]
     assert any("gin.Context" in t for t in said), "the real answer never arrived"
     assert loop.result is not None and loop.result.outcome is Outcome.DONE
+
+
+#: Trips the detector ("here is my ...") without ending on a colon, so it may
+#: be a complete answer the detector misread -- the case the escape is for.
+SOFT_PREAMBLE = "I checked every step of the plan. Here is my assessment: all seven are sound."
 
 
 def test_the_same_answer_sent_again_is_taken_as_final(planning_router, gated):
@@ -826,15 +831,124 @@ def test_the_same_answer_sent_again_is_taken_as_final(planning_router, gated):
     A short answer that trips the detector and *is* the whole answer costs one
     turn: the message says so, and the second identical call is honoured.
     """
-    loop, _ = build(planning_router, [_finish(PREAMBLE), _finish(PREAMBLE)], max_turns=8)
+    loop, _ = build(planning_router, [_finish(SOFT_PREAMBLE), _finish(SOFT_PREAMBLE)], max_turns=8)
     events = list(loop.run("validate the plan", intent=Intent.ASK))
 
     assert loop.state.preamble_refused == 1, "the bound is one, not a loop"
     said = [e.data["text"] for e in events if e.type is EventType.ASSISTANT]
-    assert any(t.startswith("I have validated") for t in said), (
+    assert any(t.startswith("I checked every step") for t in said), (
         "the answer was refused twice and never reached the developer"
     )
     assert loop.result is not None and loop.result.outcome is Outcome.DONE
+
+
+def _finish_blocked(answer: str, blocked: str):
+    return calls(("finish", json.dumps({"answer": answer, "blocked": blocked})))
+
+
+#: Session 793852b2e937, verbatim: the next step announced, and put in
+#: `blocked` as if it were an obstacle.
+ANNOUNCED = (
+    "I've already established the structure from the repo_map and code_graph "
+    "queries. Let me now explain the most connected types to complete the outline."
+)
+
+
+def test_an_answer_that_announces_its_next_step_is_sent_back(planning_router, gated):
+    """"Let me now explain..." as the whole answer, the explaining never done."""
+    full = "Three layers: handler, repository, domain. PaogenHandler is the hub."
+    loop, _ = build(planning_router, [_finish(ANNOUNCED), _finish(full)], max_turns=8)
+    events = list(loop.run("outline the service", intent=Intent.ASK))
+
+    said = [e.data["text"] for e in events if e.type is EventType.ASSISTANT]
+    assert any("PaogenHandler is the hub" in t for t in said)
+    assert not any(t.startswith("I've already established") for t in said)
+
+
+def test_a_blocked_note_does_not_let_a_preamble_through(planning_router, gated):
+    """Three of four field preambles carried a `blocked`, and the check skipped
+    all three: a caveat, or the next tool call written down instead of made."""
+    loop, _ = build(
+        planning_router,
+        [
+            _finish_blocked(ANNOUNCED, "I need to call search_repo on the most connected types."),
+            _finish("Three layers: handler, repository, domain."),
+        ],
+        max_turns=8,
+    )
+    list(loop.run("outline the service", intent=Intent.ASK))
+
+    sent_back = [
+        m.content for m in loop.context.build()
+        if str(m.role) == "user" and "stops where its content should start" in m.content
+    ]
+    assert len(sent_back) == 1
+    assert "`search_repo` is available in this turn" in sent_back[0], (
+        "a 'blocker' that is a tool the model holds must be named as such"
+    )
+
+
+def test_a_reworded_preamble_is_sent_back_again(planning_router, gated):
+    """Session 018aa888e937: refused once, reworded, delivered. Only the same
+    text resent counts as "that really was the whole answer"."""
+    first = "This is a Go microservice. Here is the complete breakdown:"
+    second = (
+        "This is a Go microservice. Here is the complete breakdown of the codebase "
+        "structure, layers, and functionality based on all files I have read."
+    )
+    full = "It has three layers; handlers call repositories through FX-injected fields."
+    loop, _ = build(
+        planning_router, [_finish(first), _finish(second), _finish(full)], max_turns=10
+    )
+    events = list(loop.run("explain the codebase", intent=Intent.ASK))
+
+    said = [e.data["text"] for e in events if e.type is EventType.ASSISTANT]
+    assert loop.state.preamble_refused == 2
+    assert said and "three layers" in said[-1]
+
+
+def test_the_preamble_budget_is_per_message(planning_router, gated):
+    """Carried across messages, one bounce early in a session spent the budget
+    for every message after it."""
+    first, _ = build(planning_router, [say("noop")])
+    first.state.preamble_refused = MAX_PREAMBLE_REFUSALS
+    second, _ = build(planning_router, [say("noop")])
+    second.carry_from(first)
+
+    assert second.state.preamble_refused == 0
+
+
+def test_an_answer_ending_on_a_colon_is_not_final_when_resent(planning_router, gated):
+    """Session c286592309d1: refused, resent byte for byte, accepted -- and the
+    full answer came a message later when the developer typed "explain". A colon
+    is not a guess the escape should protect."""
+    full = "## Routes\n\nFetchOfficenameHandler serves GET /office-names/:id."
+    loop, _ = build(
+        planning_router, [_finish(PREAMBLE), _finish(PREAMBLE), _finish(full)], max_turns=10
+    )
+    events = list(loop.run("explain the paogen handler", intent=Intent.ASK))
+
+    sent_back = [
+        m.content for m in loop.context.build()
+        if str(m.role) == "user" and "same opening line again" in m.content
+    ]
+    assert len(sent_back) == 1, "the identical resend was not refused a second time"
+    said = [e.data["text"] for e in events if e.type is EventType.ASSISTANT]
+    assert said and said[-1].startswith("## Routes")
+
+
+def test_an_introduction_that_never_gets_its_content_says_so(planning_router, gated):
+    """Both refusals spent: delivered, because a run must end -- but marked, so
+    a colon and silence are not read as the answer."""
+    loop, _ = build(
+        planning_router,
+        [_finish(PREAMBLE), _finish(PREAMBLE), _finish(PREAMBLE)],
+        max_turns=10,
+    )
+    events = list(loop.run("validate the plan", intent=Intent.ASK))
+
+    said = [e.data["text"] for e in events if e.type is EventType.ASSISTANT]
+    assert said and "Reply **continue** for the rest" in said[-1]
 
 
 def test_a_short_answer_from_a_run_that_wrote_something_is_not_bounced(

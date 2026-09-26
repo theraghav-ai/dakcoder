@@ -640,6 +640,11 @@ button.skip:focus {
   flex: 1 1 auto;
   min-width: 0;
   overflow-y: auto;
+  /* `overflow-y: auto` alone makes the x axis auto too, and one long tool
+     argument put a scrollbar under the whole conversation. Wide content --
+     code, diffs, tables -- scrolls inside its own block instead. */
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
   padding: 14px 16px 18px;
   background: var(--dak-surface);
   scroll-behavior: smooth;
@@ -862,7 +867,6 @@ button.skip:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  border-bottom: 1px dashed var(--dak-fg-5);
 }
 
 /*
@@ -886,7 +890,7 @@ button.skip:focus {
 }
 
 .row .toggle:hover .toggle-label {
-  border-bottom-color: var(--dak-fg-3);
+  color: var(--dak-fg-hi);
 }
 
 .row .toggle:hover .caret {
@@ -1290,6 +1294,13 @@ button.icon {
   background: none;
   color: var(--dak-fg-3);
   cursor: pointer;
+}
+
+/* The slash button sits in the composer's action row, left of the mode pill. */
+button.icon.slash-menu {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-weight: 600;
+  color: var(--dak-fg-2, var(--dak-fg-3));
 }
 
 button.icon:hover {
@@ -2427,11 +2438,18 @@ button.changeset-row:hover .file {
 .composer .field {
   display: flex;
   flex-direction: column;
-  gap: 9px;
-  padding: 10px 11px 8px;
+  gap: 10px;
+  padding: 12px 8px 8px 14px;
   border: 1px solid var(--dak-edge);
-  border-radius: var(--dak-r-lg);
+  border-radius: 14px;
   background: var(--dak-input);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.02) inset, 0 6px 20px -12px rgba(0, 0, 0, 0.6);
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.composer .field:focus-within {
+  border-color: var(--dak-strong);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.035), 0 6px 20px -12px rgba(0, 0, 0, 0.6);
 }
 
 .composer.running .field {
@@ -2496,13 +2514,355 @@ button.changeset-row:hover .file {
   flex: 1 1 auto;
 }
 
-/* "Working - read_file - 4s" names a tool and counts seconds; both belong in
-   the font the panel's other identifiers and figures use. */
+/*
+ * The working line, above the box: "✻ Franking... read_file · 12s · esc to
+ * stop". The verb is the one thing in the panel allowed to be playful; the
+ * detail after it is figures and identifiers, so it takes the code font.
+ */
 .working {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 4px;
+  font-size: var(--dak-body-2);
+  color: var(--dak-fg-3);
+}
+
+.working .star {
+  color: var(--dak-amber);
+  animation: dak-spin 3s linear infinite;
+  display: inline-block;
+}
+
+.working .verb {
+  color: var(--dak-amber);
+  font-weight: 600;
+}
+
+.working .dots {
+  display: inline-flex;
+  margin-left: -5px;
+  color: var(--dak-amber);
+}
+
+.working .dots span {
+  animation: dak-dot 1.2s infinite;
+  opacity: 0.2;
+}
+
+.working .dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.working .dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+.working .detail {
   font-family: var(--dak-code-font);
   font-size: var(--dak-meta);
   color: var(--dak-fg-4);
   font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes dak-dot {
+  0%, 80%, 100% { opacity: 0.2; }
+  40% { opacity: 1; }
+}
+
+@keyframes dak-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Motion is decoration here; the words say the same thing without it. */
+@media (prefers-reduced-motion: reduce) {
+  .working .star,
+  .working .dots span {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* ── the toolbar inside the box ────────────────────────────────────────────
+ *
+ * One family of controls. Ghost icon buttons on a 28px square, the two chips
+ * as quiet pills, and a single filled primary on the right that is Send or
+ * Stop depending on what the box can do right now. Every control has the same
+ * hover, press and keyboard-focus treatment, so none of them reads as an
+ * afterthought beside the others.
+ */
+
+.toolbar {
+  gap: 2px;
+  flex-wrap: nowrap;
+  margin-left: -4px;
+}
+
+button.tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font: inherit;
+  color: var(--dak-fg-4);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease, transform 80ms ease;
+}
+
+button.tool-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--dak-fg-hi);
+}
+
+button.tool-btn:active {
+  transform: scale(0.94);
+}
+
+button.tool-btn svg,
+button.send svg {
+  display: block;
+}
+
+/* Stop and stop-after-this-turn: quiet until pointed at, then unmistakable. */
+button.danger-icon:hover,
+button.icon-stop:hover {
+  background: var(--dak-bad-bg);
+  color: var(--dak-bad-soft);
+}
+
+/* The two settings a task most depends on, as pills that cycle on click. */
+button.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  min-width: 0;
+  flex: 0 1 auto;
+  margin-left: 4px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: var(--dak-meta);
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--dak-fg-3);
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--dak-line);
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: border-color 120ms ease, color 120ms ease, background-color 120ms ease;
+}
+
+button.chip:hover {
+  border-color: var(--dak-strong);
+  color: var(--dak-fg-hi);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* Auto-approve is the one setting worth a second look before sending: a
+   status dot and amber text, not a filled amber slab. */
+button.chip[data-value='none'] {
+  color: var(--dak-amber-hi);
+  border-color: var(--dak-amber-tint-edge);
+  background: rgba(232, 163, 61, 0.06);
+}
+
+button.chip[data-value='none']::before {
+  content: '';
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dak-amber);
+  box-shadow: 0 0 0 3px rgba(232, 163, 61, 0.16);
+}
+
+button.chip[data-value='none']:hover {
+  border-color: var(--dak-amber-dim);
+  background: rgba(232, 163, 61, 0.1);
+}
+
+/* The primary: Send, or Stop while a run is in flight and the box is empty. */
+button.send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  margin-left: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--dak-amber);
+  color: var(--dak-on-amber);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.25) inset, 0 2px 8px -2px rgba(232, 163, 61, 0.45);
+  cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease,
+    transform 80ms ease, opacity 140ms ease;
+}
+
+button.send:hover:not(:disabled) {
+  background: var(--dak-amber-hi);
+}
+
+button.send:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+/* Nothing to send: present, clearly inactive, and not asking to be clicked. */
+button.send:disabled {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--dak-fg-5);
+  box-shadow: none;
+  cursor: default;
+}
+
+button.send.is-stop {
+  background: var(--dak-fg);
+  color: var(--dak-bg);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.4) inset, 0 2px 8px -3px rgba(0, 0, 0, 0.6);
+}
+
+button.send.is-stop:hover:not(:disabled) {
+  background: var(--dak-bad-soft);
+  color: #1a0b0a;
+}
+
+/* Keyboard focus, the same ring on every control in the box. */
+button.tool-btn:focus-visible,
+button.chip:focus-visible,
+button.send:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder, var(--dak-amber-dim));
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button.tool-btn,
+  button.chip,
+  button.send {
+    transition: none;
+  }
+
+  button.tool-btn:active,
+  button.send:active:not(:disabled) {
+    transform: none;
+  }
+}
+
+/* ── the question card ───────────────────────────────────────────────────── */
+
+.asking {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--dak-amber-tint-edge);
+  border-radius: 12px;
+  background: var(--dak-card);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
+}
+
+.asking[hidden] {
+  display: none;
+}
+
+.asking .ask-title {
+  font-size: var(--dak-body);
+  font-weight: 600;
+  color: var(--dak-fg-hi);
+}
+
+.asking .ask-q {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+}
+
+.asking .ask-n {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: var(--dak-amber-tint);
+  color: var(--dak-amber);
+  font-size: var(--dak-meta);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.asking .ask-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.asking .ask-text {
+  font-size: var(--dak-body-2);
+  line-height: 1.5;
+  color: var(--dak-fg);
+}
+
+.asking .ask-answer {
+  width: 100%;
+  resize: none;
+  padding: 6px 8px;
+  font-family: var(--dak-sans);
+  font-size: var(--dak-body-2);
+  line-height: 1.45;
+  color: var(--dak-fg);
+  background: var(--dak-input);
+  border: 1px solid var(--dak-edge);
+  border-radius: 8px;
+}
+
+.asking .ask-answer:focus {
+  outline: none;
+  border-color: var(--dak-amber);
+}
+
+.asking .ask-assumed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--dak-meta);
+  color: var(--dak-fg-3);
+}
+
+.asking .ask-assumed .ask-text {
+  flex: 1 1 auto;
+}
+
+.asking .ask-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.asking .ask-keys {
+  font-size: var(--dak-meta);
+  color: var(--dak-fg-4);
+}
+
+.asking .ask-foot .spacer {
+  flex: 1 1 auto;
 }
 
 /* The mode pill, shown while idle — the design's `coder` chip. */
@@ -2706,4 +3066,39 @@ button:disabled {
   .plan dt {
     margin-top: 4px;
   }
+}
+
+
+/* ── scrollbars ─────────────────────────────────────────────────────────────
+ * Thin and quiet, in the panel's own greys; the workbench default is a wide
+ * light slab that reads as a different application at a 340px sidebar width.
+ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--dak-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--dak-edge);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--dak-fg-5);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
 }

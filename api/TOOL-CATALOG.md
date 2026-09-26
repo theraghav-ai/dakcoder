@@ -15,9 +15,9 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 
 | Mode | Tools | Schema cost |
 |---|---|---|
-| **ask** | 15 | ~1,680 tokens |
-| **planner** | 17 | ~2,266 tokens |
-| **agent** | 26 | ~3,385 tokens |
+| **ask** | 20 | ~2,441 tokens |
+| **planner** | 22 | ~3,028 tokens |
+| **agent** | 31 | ~4,146 tokens |
 
 ## The catalogue
 
@@ -26,6 +26,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `repo_map` | ask, planner, agent |  |  | gotools | Get the module path, package tree, exported symbols and FX providers. Call this first in an unfamiliar repository. Pass package to see one directory in full. |
 | `read_file` | ask, planner, agent |  |  | agent | Read a slice of one file. Always pass start and end when you know roughly where to look; without `end` you get 800 lines from `start`. |
 | `search_repo` | ask, planner, agent |  |  | agent | Search file contents by regular expression. Use this instead of grep, and prefer it over reading files to find something. |
+| `code_graph` | ask, planner, agent |  |  | graphify | Look up the code graph: a symbol's edges, its callers, the path between two symbols, or a question. Cheaper than chaining search_repo and read_file. |
 | `search_docs` | ask, planner, agent |  |  | agent | Search the n-api-template knowledge base for the contract rule behind a pattern. Use it before inventing an approach, not after. |
 | `go_symbols` | ask, planner, agent |  |  | gopls | Find a symbol's definition, references or package API through gopls. Use this rather than searching for a name textually. _(not yet available: gopls is not yet wired (Part A section 8.3). Use search_repo, or go_build for type errors.)_ |
 | `go_diagnostics` | agent |  |  | gopls | Type-check the workspace incrementally and report errors. This is the fast inner-loop signal; run it after every edit batch. _(not yet available: gopls is not yet wired (Part A section 8.3). Use go_build, which is authoritative but takes about four seconds.)_ |
@@ -36,10 +37,14 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `temporal_audit` | ask, planner |  |  | gotools | List inline work that may belong off the request path: uploads, SMS, email, reports, outbound calls. Candidates only — it makes no recommendation. |
 | `lib_version_check` | ask, planner, agent |  |  | gotools | Report CEPT library drift: which are behind, which are superseded by n-api-*. Reports only — never edit go.mod on it, tell the user. |
 | `route_inventory` | gate |  |  | gotools | Every route the service registers, gin or template, prefixes resolved. save= records them before a migration; against= reports which a finished one no longer serves. |
+| `handler_map` | ask, planner, agent |  |  | gotools | Split one handler file into conversion steps: each method's lines, route and the repository methods it calls. Plan a migration's handler steps from its groups. |
+| `unit_check` | ask, planner, agent |  |  | gotools | Check a conversion step: the file parses and the named methods, and the repository methods they call, have the template shape. The step check while the build is red. |
+| `impact` | ask, planner, agent |  |  | gotools | List who calls a function, two levels up, with the routes that reach it. Use before changing a repository method's signature. |
 | `playbook` | ask, planner, agent |  |  | agent | Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before. |
 | `submit_plan` | planner |  |  | agent | Submit the plan and start the work. Each step names one file, what changes in it, and how it is checked. A whole-service migration also sends phases, with steps for the first phase only. |
 | `ask_developer` | planner, agent |  |  | agent | Stop and ask, when something cannot be inferred. Use only for what you genuinely cannot decide: field types, a table name, a route base. |
 | `finish` | ask, planner, agent |  |  | agent | End your turn and hand the developer your answer. Call this when the work is done, or when going further will not help. |
+| `update_agents_md` | ask, planner, agent | ✓ | if protected | agent | Save a one-line fact for future sessions in AGENTS.md, or fix or remove a wrong note. Never secrets. |
 | `revise_plan` | agent |  |  | agent | Replace the remaining plan steps after an approach failed. Say what was tried and why it did not work; steps already done are kept. |
 | `write_file` | agent | ✓ | if protected | agent | Create a new file, or append=true to add to the end — the way to write a file too big for one reply. Refuses to overwrite. Write complete, compiling Go, not a sketch. |
 | `patch_file` | agent | ✓ | if protected | agent | Replace an exact unique string in a file. Include enough surrounding lines to make old unique; the call fails rather than guessing. |
@@ -94,6 +99,17 @@ Search file contents by regular expression. Use this instead of grep, and prefer
 | `pattern` | string | yes | Regular expression, e.g. 'func .*Handler.*Routes'. |
 | `glob` | string |  | Restrict to matching paths, e.g. 'handler/**/*.go'. |
 | `max` | integer |  | Maximum matches to return. Defaults to 40. |
+
+### `code_graph`
+
+Look up the code graph: a symbol's edges, its callers, the path between two symbols, or a question. Cheaper than chaining search_repo and read_file.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `op` | string (explain \| callers \| path \| query) | yes | explain: its edges. callers: what uses it. path: symbol to `to`. query: by question. |
+| `symbol` | string |  | Bare name, e.g. 'CreateUserHandler'. |
+| `to` | string |  | For path: the target symbol. |
+| `question` | string |  | For query: what to find. |
 
 ### `search_docs`
 
@@ -170,6 +186,31 @@ Every route the service registers, gin or template, prefixes resolved. save= rec
 | `save` | string |  | Write the inventory here, e.g. '.dakcoder/routes-before.json'. |
 | `against` | string |  | Compare against a saved inventory and report what is missing. |
 
+### `handler_map`
+
+Split one handler file into conversion steps: each method's lines, route and the repository methods it calls. Plan a migration's handler steps from its groups.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | The handler file, e.g. 'handler/paogen.go'. |
+
+### `unit_check`
+
+Check a conversion step: the file parses and the named methods, and the repository methods they call, have the template shape. The step check while the build is red.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | The file the step converted. |
+| `methods` | string |  | Comma-separated methods the step converted. Omit for all in the file. |
+
+### `impact`
+
+List who calls a function, two levels up, with the routes that reach it. Use before changing a repository method's signature.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `symbol` | string | yes | Type.Method, e.g. 'PaogenRepository.GetDDOsRepo'. |
+
 ### `playbook`
 
 Get the known-good fix procedure for a failure class or rule id. Consult this before attempting a fix you have not made before.
@@ -205,6 +246,19 @@ End your turn and hand the developer your answer. Call this when the work is don
 |---|---|---|---|
 | `answer` | string | yes | What you found or did, in full -- the developer reads this and nothing after it. A sentence for a finished edit, the findings for a review. |
 | `blocked` | string |  | What stopped you, if anything did. Omit when nothing did. |
+| `remember` | array |  | 'section: fact' lines for AGENTS.md that a future session needs. |
+
+### `update_agents_md`
+
+Save a one-line fact for future sessions in AGENTS.md, or fix or remove a wrong note. Never secrets.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `op` | string (add \| replace \| remove) |  | Default add. |
+| `text` | string |  | One line per note. |
+| `section` | string (commands \| conventions \| testing \| architecture \| gotchas \| never) |  | Heading. |
+| `old` | string |  | The note to replace or remove. |
+| `scope` | string (project \| local) |  | local: AGENTS.local.md, this developer only. |
 
 ### `revise_plan`
 

@@ -231,13 +231,29 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 #: module's version across the rename into a separate release line, put six
 #: revisions that had never existed into go.mod, and spent thirty-eight turns
 #: blocked on the result while reporting the cause as missing credentials.
-#: Every mode moved by 60 for the rule that code pasted into the message counts
-#: as opened. A caller with no repository gets a scratch workspace, and on it
-#: "never describe code you have not opened" read as "decline": a field run was
-#: handed a Go function with three syntax errors, found an empty tree, and
-#: listed the errors instead of fixing them, asking for a repository it did not
-#: need.
-PREFIX_CEILING = {Mode.ASK: 2_860, Mode.PLANNER: 3_440, Mode.AGENT: 4_560}
+#: Every mode moved by about 185 tokens for `code_graph`, and this is the pilot
+#: case, not the default one: the tool is only offered when the runtime
+#: registers its handler, which it does under DAKCODER_CODE_GRAPH=1 alone, so a
+#: runtime without the flag still pays the old prefix. With it, one graph lookup
+#: stands in for the search_repo-then-read_file chain that answers "what calls
+#: this" today, which is several turns at ~100,000 prompt tokens each. The
+#: schema's own cost is held at 200 by `test_codegraph.py`.
+#: And by about 340 more for the migration's call map -- `handler_map`,
+#: `unit_check`, `impact` -- which is again the looser case: `AgentLoop._tools`
+#: withholds all three from every turn that is not a migration, so an ordinary
+#: task still pays the prefix above. On a migration they are the difference
+#: between a plan whose steps can finish and one whose every step was checked
+#: by a build that cannot pass until the last phase (session e3edb2434936).
+#: Every mode moved by about 230 tokens for AGENTS.md: `update_agents_md`
+#: (~195) and `finish`'s `remember` (~40). The tripwire fired and both were cut
+#: to enum-carried descriptions. It is every mode because the fact worth keeping
+#: -- "we run make lint first" -- turns up in a question as often as in an edit.
+#: What it buys is the one thing a session cannot otherwise leave behind: the
+#: build command, the convention, the trap it spent ten turns finding, pinned
+#: for the next session instead of rediscovered at ~100,000 prompt tokens a turn.
+#: `remember` rides on the call that ends the run, so keeping the file current
+#: costs no turn of its own.
+PREFIX_CEILING = {Mode.ASK: 3_560, Mode.PLANNER: 4_150, Mode.AGENT: 5_270}
 
 
 @pytest.mark.parametrize("mode", list(Mode))

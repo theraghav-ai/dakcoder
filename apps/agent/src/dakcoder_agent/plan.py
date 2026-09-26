@@ -200,7 +200,7 @@ class PlanRecord:
             "summary": self.summary,
             "forced": self.forced,
             "updated_at": self.updated_at,
-            "migration": self.migration.as_dict(),
+            "migration": self.migration.as_dict(ledger=False),
             "steps": [
                 {"file": s.file, "action": s.action, "accepts": s.accepts,
                  "phase": s.phase, "part": s.part,
@@ -241,7 +241,7 @@ class PlanRecord:
             return
         target = self.path_for(root, self.session_id)
         try:
-            ensure_private(root / ".dakcoder")
+            ensure_private(root)
             target.parent.mkdir(parents=True, exist_ok=True)
             tmp = target.with_suffix(".json.tmp")
             tmp.write_text(
@@ -432,7 +432,7 @@ class AgendaStore:
         """
         ordered = _bounded(tasks)
         try:
-            ensure_private(self.root / ".dakcoder")
+            ensure_private(self.root)
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix(".json.tmp")
             tmp.write_text(

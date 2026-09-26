@@ -11,6 +11,7 @@ one turn is dispatched.
 
 from __future__ import annotations
 
+import logging
 import time as _time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -23,6 +24,14 @@ from .context import ContextManager, OverBudgetError
 from .modes import Mode, config_for
 
 __all__ = ["TurnResult", "complete", "make_client"]
+
+log = logging.getLogger(__name__)
+
+#: How long a call may wait for its first byte before the runtime log says where
+#: the time went. A cold 115k-token prefill measured 24.5s on production, so
+#: this flags the long prefills too -- which is the point: a developer watching
+#: a silent panel wants to know whether it is prefill, a queue, or a fault.
+SLOW_START_SECONDS = 10.0
 
 
 def make_client(config: LLMConfig, **kwargs: Any) -> LLMClient:
@@ -166,6 +175,26 @@ def complete(
         ),
     )
 
+    if result.wait_seconds >= SLOW_START_SECONDS:
+        # Where a long silence went, in the runtime's own log: the gateway's
+        # quota reservation, the model endpoint's queue and prefill, and what
+        # neither accounts for (the network, or a gateway too old to say).
+        upstream = (result.upstream_first_ms or 0) / 1000
+        reserve = (result.gateway_reserve_ms or 0) / 1000
+        known = result.upstream_first_ms is not None
+        log.warning(
+            "turn %d: the model took %.1fs to start%s",
+            context.turn,
+            result.wait_seconds,
+            (
+                f" -- {upstream:.1f}s at the model endpoint (queue and prefill), "
+                f"{reserve:.1f}s in the gateway's quota, "
+                f"{max(0.0, result.wait_seconds - upstream - reserve):.1f}s in transit"
+            )
+            if known
+            else " (the gateway did not report where)",
+        )
+
     if debug is not None:
         debug.response(
             turn=context.turn,
@@ -178,6 +207,12 @@ def complete(
                 "reasoning_tokens": result.usage.reasoning_tokens,
             },
             seconds=_time.monotonic() - started,
+            timing={
+                "wait": round(result.wait_seconds, 3),
+                "upstream_first_ms": result.upstream_first_ms,
+                "gateway_reserve_ms": result.gateway_reserve_ms,
+                "attempts": result.attempts,
+            },
         )
 
     if result.usage.prompt_tokens > 0:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dakcoder-agentsvc"
-version = "0.4.8"
+version = "0.4.15"
 description = "The dakcoder control plane: workspace leases, runners and delivery (host-plan §3)"
 requires-python = ">=3.11"
 # SERVER ONLY, like the gateway. It holds the GitLab credential that clones and

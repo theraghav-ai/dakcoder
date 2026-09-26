@@ -15,6 +15,7 @@
  */
 
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 
 import * as approvals from './approvals';
 import * as auth from './auth';
@@ -25,6 +26,9 @@ import * as doctor from './doctor';
 import { API_VERSION, isResumable, type Intent, type SessionSummary } from './protocol';
 import { Runtime, RuntimeError } from './runtime';
 import { RunState, readGateEvent } from './session-state';
+import { devPython } from './devmode';
+import { graphTask } from './graph';
+import { pickSlashCommand, quickSettings } from './quickpicks';
 import { StatusBar } from './statusbar';
 import { capped, unified } from './textdiff';
 import * as trees from './trees';
@@ -86,6 +90,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // background thread costs nothing a developer can perceive and moves cold
     // start off the first request — the one they are watching.
     prewarm: true,
+    devPython: devPython(context, log),
   });
   context.subscriptions.push(runtime);
 
@@ -750,6 +755,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return;
     }
 
+    // AGENTS.md, written from the repository. Its own session, like `/migrate`.
+    if (command === 'init') {
+      void startInit(argument.trim());
+      return;
+    }
+
+    // The code-graph pilot. Its own function because the tool behind it may not
+    // be there: the setting can be off, or on but newer than the runtime.
+    if (command === 'graph') {
+      void askGraph(argument);
+      return;
+    }
+
     // Asked of the agent, not of a command. `/explain` opened a *rule document*
     // - so asking "explain this handler" got the text of a lint rule, or
     // nothing when the argument matched no rule id. `/rule` above is the one
@@ -777,6 +795,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   /**
+   * `/graph`, once the runtime can actually serve it.
+   *
+   * The `code_graph` tool exists only in a runtime spawned with the pilot on,
+   * and the setting is read at spawn. Sending the request anyway would have the
+   * model told to use a tool it was never offered -- it falls back to searching,
+   * and the developer never learns why the graph did nothing. So the two
+   * mismatches are resolved first, each with one button.
+   */
+  async function askGraph(argument: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration('dakcoder');
+    if (!config.get<boolean>('codeGraph.enabled', false)) {
+      const enable = vscode.l10n.t('Enable and restart');
+      const pick = await vscode.window.showInformationMessage(
+        vscode.l10n.t(
+          '/graph needs the code graph pilot, which is off. It builds a local graph of this workspace under .dakcoder/graphify and needs graphifyy installed.',
+        ),
+        enable,
+      );
+      if (pick !== enable) return;
+      await config.update('codeGraph.enabled', true, vscode.ConfigurationTarget.Global);
+      await vscode.commands.executeCommand('dakcoder.restartRuntime');
+    }
+    if (!(await ready())) return;
+    if (!runtime.codeGraph) {
+      const restart = vscode.l10n.t('Restart runtime');
+      const pick = await vscode.window.showInformationMessage(
+        vscode.l10n.t('The code graph was enabled after the runtime started. Restart it to use /graph.'),
+        restart,
+      );
+      if (pick !== restart) return;
+      await vscode.commands.executeCommand('dakcoder.restartRuntime');
+      if (!runtime.codeGraph) return;
+    }
+    await submit(graphTask(argument), false);
+  }
+
+  /**
    * Start a migration, as its own conversation.
    *
    * `intent: 'agent'` explicitly, not the configured default: `/migrate` is a
@@ -789,17 +844,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * every message in it, and appending it to a conversation about something
    * else buries all three.
    */
+  /**
+   * How a migration's steps are checked, said in the task itself.
+   *
+   * A field run's plan checked every handler step with go_build, and after the
+   * dependency swap nothing builds until the last phase -- so the acting phase
+   * refused all seven steps as unsatisfiable, correctly, and stalled. The plan
+   * check now refuses that; this says it before the plan is written.
+   */
+  const MIGRATION_CHECKS = [
+    'The service does not build between the dependency swap and the last phase;',
+    'that is expected. Check each conversion step with unit_check path=<file>',
+    'methods=<its methods>, not go_build. Before changing a repository method',
+    'another handler also calls, run impact on it.',
+  ];
+
   async function startMigration(target: string): Promise<void> {
     if (!(await ready())) return;
 
     // Not localised: this is the instruction to the model, not UI. A translated
     // prompt changes what the agent is asked to do. See diagnostics.ts's header.
-    const task = target
+    // A migration already under way is resumed, not restarted. The runtime
+    // restores its roadmap from `.dakcoder/migration/state.json` either way;
+    // this keeps the task text from contradicting it with "plan the first
+    // phase" and "cut the branch first" -- the words that sent every earlier
+    // `/migrate` back to phase one.
+    const resuming = !target ? recordedMigration() : undefined;
+    const task = resuming
+      ? [
+          'Continue migrating this service to the n-api-template.',
+          '',
+          `An earlier session started it: ${resuming.closed} of ${resuming.total} phase(s)`,
+          `are closed and the open one is ${resuming.open}. The runtime has restored the`,
+          'roadmap and what is done; the state block shows it. Do not re-plan or redo a',
+          'closed phase and do not cut a new branch. Send `submit_plan` with the same',
+          'phases and steps for what is left of the open phase only.',
+          '',
+          'For each handler file still to convert, plan from handler_map path=<file>:',
+          "one step per group it lists that is not done, naming the group's methods.",
+          '',
+          ...MIGRATION_CHECKS,
+        ].join('\n')
+      : target
       ? [
           `Migrate ${target} to the n-api-template contract.`,
           '',
           'Read @skill:legacy-migration first. Plan it in phases even for one unit,',
-          'and split any file too large to rewrite in a single reply.',
+          'and split any file too large to rewrite in a single reply: handler_map',
+          'path=<file> gives the split, one step per group it lists.',
+          '',
+          ...MIGRATION_CHECKS,
         ].join('\n')
       : [
           'Migrate this service from the legacy api-* libraries to the n-api-template.',
@@ -817,12 +911,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           'Cutting the branch is the first step of the first phase, and the acting',
           'phase does it. While planning, settle only which branch to cut it from —',
           'ask if the developer has not said. Do not try to cut it from the planner.',
+          '',
+          'For each handler file, plan its steps from handler_map path=<file>: one',
+          "step per group it lists, naming the group's methods and the repository",
+          'methods they call.',
+          '',
+          ...MIGRATION_CHECKS,
         ].join('\n');
 
     try {
       const session = await runtime.client.startTask(task, {
         intent: 'agent',
-        acceptance: ['gotools legacy-audit reports no violations'],
+        // What the final gate checks, rather than a legacy_audit run the acting
+        // phase is not allowed to make: that criterion could never be met by
+        // the phase judged against it.
+        acceptance: [
+          'go build passes once the last phase closes',
+          'every route in .dakcoder/routes-before.json is still served',
+        ],
       });
       chatView.showSession(session.id);
       state.hydrate(session);
@@ -835,6 +941,85 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // Never silent. The whole point of this change is that a developer who
       // typed something gets an answer, including when the answer is a failure.
       reportRunError(err, log, chatView);
+    }
+  }
+
+  /**
+   * `/init`: survey the repository and write, or improve, its AGENTS.md.
+   *
+   * The agent does it with its ordinary tools rather than a template, because
+   * the file is only worth reading if it says what is true of *this*
+   * repository. An existing file is improved, never replaced: the developers'
+   * text is theirs, and the notes section sessions keep is left alone.
+   *
+   * `intent: 'agent'` for the same reason as `/migrate`: a window left on
+   * `defaultMode: ask` would otherwise answer it read-only.
+   */
+  async function startInit(focus: string): Promise<void> {
+    if (!(await ready())) return;
+    // Not localised: this is the instruction to the model, not UI.
+    const task = [
+      'Create or improve AGENTS.md at the repository root: the instructions every',
+      'coding agent reads before working here (https://agents.md).',
+      '',
+      'Survey first: repo_map, the Makefile or build scripts, go.mod, CI config,',
+      'linter config, README, and any CLAUDE.md, GEMINI.md, .cursor/rules or',
+      '.github/copilot-instructions.md. Then write short, concrete sections:',
+      '- Project overview: what the service is, in two or three lines.',
+      '- Commands: the exact build, test, lint and run commands, as they work here.',
+      '- Code style and conventions that are not obvious from the code.',
+      '- Testing: how tests are laid out and run, and what must pass before done.',
+      '- Commit and PR rules, if the repository shows any.',
+      '- Security and no-go areas: generated files, DDL, secrets, paths never edited.',
+      '',
+      'Only what an agent cannot work out quickly from the code, and nothing it',
+      'can: no file listings, no dependency lists. Aim for under 150 lines.',
+      'If AGENTS.md exists, keep what the developers wrote and improve it; never',
+      'touch the section between the dakcoder:notes markers. If another agent file',
+      'holds the rules, import it with a line `@CLAUDE.md` rather than copying it.',
+      'Never write a credential. Finish with a summary of what you wrote.',
+      ...(focus ? ['', `Focus on: ${focus}`] : []),
+    ].join('\n');
+    try {
+      const session = await runtime.client.startTask(task, {
+        intent: 'agent',
+        acceptance: ['AGENTS.md exists at the repository root and names the real build and test commands'],
+      });
+      chatView.showSession(session.id);
+      state.hydrate(session);
+      state.attach(session.id);
+      void approvalService.discover();
+      treeSet.sessions.refresh();
+      void statusBar.refresh(true);
+      await focusPanel();
+    } catch (err) {
+      reportRunError(err, log, chatView);
+    }
+  }
+
+  /**
+   * The workspace's unfinished migration, as the runtime recorded it, or
+   * undefined. Read-only and best-effort: a missing or unreadable record means
+   * a fresh migration, which is what `/migrate` did before there was one.
+   */
+  function recordedMigration(): { closed: number; total: number; open: string } | undefined {
+    const root = workspaceRoot();
+    if (!root) return undefined;
+    try {
+      const file = vscode.Uri.joinPath(root, '.dakcoder', 'migration', 'state.json').fsPath;
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+        phases?: Array<{ name?: string; status?: string }>;
+      };
+      const phases = Array.isArray(raw.phases) ? raw.phases : [];
+      const open = phases.find((p) => p && p.status !== 'done');
+      if (!phases.length || !open) return undefined;
+      return {
+        closed: phases.filter((p) => p && p.status === 'done').length,
+        total: phases.length,
+        open: String(open.name ?? 'the next phase'),
+      };
+    } catch {
+      return undefined;
     }
   }
 
@@ -907,6 +1092,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   command('dakcoder.showOutput', () => log.show());
+  // The chat view's title-bar pickers: every slash command, every setting.
+  command('dakcoder.slashCommands', () =>
+    pickSlashCommand(chat.slashCatalog(), (text) => chatView.compose(text)),
+  );
+  command('dakcoder.quickSettings', () => quickSettings(context.extension));
+  // Beside New Session in the chat title bar: the conversations it starts are
+  // listed in the Sessions view, which is where an earlier one is reopened.
+  command('dakcoder.openHistory', () => vscode.commands.executeCommand('dakcoder.sessions.focus'));
   // Declared in the manifest by the chat module, which owns the behaviour but
   // not the activation. A command in the palette with no registration throws
   // when invoked, and the palette is exactly where someone finds it.

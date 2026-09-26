@@ -2,7 +2,7 @@
   "name": "dakcoder-go",
   "displayName": "dakcoder",
   "description": "The India Post IT 2.0 backend coding agent for Go services on the n-api-template contract.",
-  "version": "0.4.8",
+  "version": "0.4.15",
   "publisher": "dop",
   "license": "UNLICENSED",
   "private": true,
@@ -29,8 +29,8 @@
     "compile": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build:test": "tsc --outDir dist-test --module CommonJS --moduleResolution Node --target ES2022 --lib ES2022,DOM --skipLibCheck --rootDir src --esModuleInterop --types node,vscode src/test/protocol.test.ts src/test/state.test.ts src/test/migration-plan.test.ts src/test/textdiff.test.ts",
-    "test": "npm run build:test && node --test dist-test/test/protocol.test.js dist-test/test/state.test.js dist-test/test/migration-plan.test.js dist-test/test/textdiff.test.js src/test/renderer.test.mjs",
+    "build:test": "tsc --outDir dist-test --module CommonJS --moduleResolution Node --target ES2022 --lib ES2022,DOM --skipLibCheck --rootDir src --esModuleInterop --types node,vscode src/test/protocol.test.ts src/test/state.test.ts src/test/migration-plan.test.ts src/test/textdiff.test.ts src/test/graph.test.ts",
+    "test": "npm run build:test && node --test dist-test/test/protocol.test.js dist-test/test/state.test.js dist-test/test/migration-plan.test.js dist-test/test/textdiff.test.js dist-test/test/graph.test.js src/test/renderer.test.mjs",
     "verify": "npm run check:contract && npm run typecheck && npm run test && npm run compile && npm run check:credentials && npm run check:commands && npm run check:l10n && npm run check:gotools",
     "package": "npm run verify && npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository",
     "check:credentials": "node scripts/check-no-credentials.mjs",
@@ -156,6 +156,34 @@
           "maximum": 400,
           "markdownDescription": "How many turns one run may spend before it stops with `exhausted`. The default suits a single vertical slice; raise it (100–200) for whole-service work such as a template migration. An exhausted session is never lost — **Resume** continues it on the same transcript with a fresh budget. Takes effect when the runtime restarts."
         },
+        "dakcoder.agentsMd.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Read the repository's `AGENTS.md` (the shared instruction file for coding agents, see [agents.md](https://agents.md)) into every run, and let sessions keep it current. Also reads `AGENTS.override.md`, a personal `AGENTS.local.md`, `~/.dakcoder/AGENTS.md`, and the directory's `AGENTS.md` below the root when the agent first works there. Takes effect when the runtime restarts."
+        },
+        "dakcoder.agentsMd.approval": {
+          "type": "string",
+          "enum": ["auto", "ask"],
+          "enumDescriptions": [
+            "Sessions add, fix and remove their notes in AGENTS.md without asking. Every edit shows in the chat and in git diff.",
+            "Every edit a session makes to AGENTS.md waits for your approval."
+          ],
+          "default": "auto",
+          "markdownDescription": "Whether the agent asks before it edits the notes section of `AGENTS.md`. It never edits the rest of the file. Takes effect when the runtime restarts."
+        },
+        "dakcoder.agentsMd.maxBytes": {
+          "type": "number",
+          "default": 32768,
+          "minimum": 0,
+          "maximum": 262144,
+          "markdownDescription": "The most instruction text, in bytes, read into a run from `AGENTS.md` files and their `@imports`, general files first. Anything past it is cut and named in the prompt. Takes effect when the runtime restarts."
+        },
+        "dakcoder.agentsMd.fallbackFilenames": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["CLAUDE.md", "GEMINI.md", "AGENT.md"],
+          "markdownDescription": "Read in a directory that has no `AGENTS.md`, first match wins, so a repository set up for another agent is not a blank page. Empty turns it off. Takes effect when the runtime restarts."
+        },
         "dakcoder.approvalTimeoutSeconds": {
           "type": "number",
           "default": 0,
@@ -201,6 +229,17 @@
           "default": "",
           "scope": "machine",
           "description": "Override the gotools analyser. Empty uses the checksum-verified binary bundled with the extension, then any gotools on PATH. Machine-scoped: a workspace cannot choose which binary the extension executes, because a cloned repository's .vscode/settings.json is untrusted input and Workspace Trust was the only thing between it and code execution."
+        },
+        "dakcoder.codeGraph.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "**Pilot.** Offer the agent a `code_graph` tool backed by [graphify](https://github.com/safishamsi/graphify): a symbol's edges, its callers, or the path between two symbols, from a graph built locally under `.dakcoder/graphify/`. Code only — nothing is sent to a model to build it. Needs `graphifyy` installed (see `dakcoder.codeGraph.python`). Adds about 185 tokens to every turn while on. Takes effect when the runtime restarts."
+        },
+        "dakcoder.codeGraph.python": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "A Python interpreter with `graphifyy` installed, for `dakcoder.codeGraph.enabled`. Empty uses the runtime's own Python. Machine-scoped for the reason `dakcoder.gotoolsPath` is: a workspace must not choose what the extension executes. Takes effect when the runtime restarts."
         },
         "dakcoder.lintOnSave": {
           "type": "boolean",
@@ -501,9 +540,27 @@
       },
       {
         "command": "dakcoder.clearChat",
-        "title": "Clear Chat",
+        "title": "New Session",
         "category": "dakcoder",
-        "icon": "$(clear-all)"
+        "icon": "$(add)"
+      },
+      {
+        "command": "dakcoder.openHistory",
+        "title": "Session History",
+        "category": "dakcoder",
+        "icon": "$(history)"
+      },
+      {
+        "command": "dakcoder.slashCommands",
+        "title": "Slash Commands",
+        "category": "dakcoder",
+        "icon": "$(symbol-keyword)"
+      },
+      {
+        "command": "dakcoder.quickSettings",
+        "title": "Settings",
+        "category": "dakcoder",
+        "icon": "$(gear)"
       },
       {
         "command": "dakcoder.focusComposer",
@@ -842,6 +899,16 @@
           "command": "dakcoder.clearChat",
           "when": "view == dakcoder.chat",
           "group": "navigation@1"
+        },
+        {
+          "command": "dakcoder.openHistory",
+          "when": "view == dakcoder.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dakcoder.quickSettings",
+          "when": "view == dakcoder.chat",
+          "group": "navigation@2"
         },
         {
           "command": "dakcoder.migration.run",

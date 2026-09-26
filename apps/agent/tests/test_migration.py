@@ -555,7 +555,9 @@ def test_a_file_too_big_for_one_reply_may_not_have_one_step(tmp_path: Path) -> N
     # its own message said "roughly one step per 800 lines", and a plan that
     # followed the message was accepted at three (~2,190 lines a step).
     assert "at least 9" in objection
-    assert "line range" in objection
+    # The split comes from handler_map, which lists the methods in groups of
+    # about 800 lines -- a line range alone does not say which methods move.
+    assert "handler_map path=handler/paogen.go" in objection
 
 
 def test_splitting_that_file_across_steps_is_accepted(tmp_path: Path) -> None:
@@ -2116,8 +2118,10 @@ def _sized(**sizes: int):
 
 def test_an_import_swap_on_a_big_file_is_allowed() -> None:
     steps = (
+        # Checked by a read, not the build: mid-migration the build cannot
+        # pass, and plan_objection now refuses a step checked by it.
         PlanStep("repo/postgres/paogen.go", "Replace api-log imports with n-api-log",
-                 "go build", phase="deps"),
+                 "a read shows the n-api-log import", phase="deps"),
     )
     said = plan_objection(
         MigrationState(active=True, phases=_phases()), _phases(), steps,
@@ -2155,7 +2159,7 @@ def test_one_conversion_step_among_import_swaps_is_still_refused() -> None:
 
 
 def test_a_small_file_is_unaffected_either_way() -> None:
-    steps = (PlanStep("main.go", "Rewrite the bootstrap", "go build", phase="deps"),)
+    steps = (PlanStep("main.go", "Rewrite the bootstrap", "unit_check path=main.go", phase="deps"),)
     said = plan_objection(
         MigrationState(active=True, phases=_phases()), _phases(), steps,
         lines=_sized(**{"main.go": 53}),

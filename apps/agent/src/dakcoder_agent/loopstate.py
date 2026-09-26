@@ -131,6 +131,14 @@ class TaskState:
     #: apiece to learn it again.
     routes_saved: bool = False
     routes_before: int = 0
+    #: Files the open migration phase still has to finish, when its plan has
+    #: settled and the phase has not closed. Named by the phase checkpoint.
+    phase_left: tuple[str, ...] = ()
+    #: How the previous message's run in this session ended (``Outcome``), or
+    #: "" when there was none in this process. What decides whether the next
+    #: message continues that task or starts a new one -- see
+    #: ``AgentLoop._starts_new_task``.
+    previous_outcome: str = ""
     #: Files this session deleted that nothing has written again.
     #:
     #: `write_file` refuses to overwrite, so replacing a file means deleting it
@@ -390,6 +398,9 @@ class Progress:
     #: mistakes -- one is work not done, the other is work done and not
     #: delivered -- and a run may honestly make both.
     preamble_refused: int = 0
+    #: The answer last sent back as a preamble. Sending it again unchanged is
+    #: what "take it as final" means; a reworded one is a new preamble.
+    preamble_last: str = ""
     #: How many times an answer that had stopped being language was sent back.
     #: The third of the same family, and the one with a cost the other two do
     #: not have: a `finish` answer travels as the assistant's tool-call
@@ -437,7 +448,7 @@ class Progress:
     #: Three parts rather than one hash, because they invalidate in order --
     #: tools, then system, then mode -- and knowing which moved is the
     #: difference between a number and a thing to fix.
-    prefix_key: tuple[str, str, str] = ("", "", "")
+    prefix_key: tuple[str, str, str, str] = ("", "", "", "")
     #: Why the prefix moved this turn, or ``""``. Reported on the usage event.
     prefix_break: str = ""
     #: Loop-initiated returns to the Planner this run. See ``_replan``.

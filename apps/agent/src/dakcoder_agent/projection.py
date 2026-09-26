@@ -111,6 +111,15 @@ TOOL_CAPS: dict[str, ToolCap] = {
     "rules_lint": ToolCap(8_000, "head", "pass `paths` to scope the lint to what you changed"),
     "legacy_audit": ToolCap(8_000, "head", "pass `paths` to scope the audit"),
     "go_diagnostics": ToolCap(8_000, "head", "narrow to one file with `path`"),
+    # graphify caps `query` itself at `budget`; this bounds the other three ops,
+    # whose output grows with a symbol's degree. Head, because both renderings
+    # put the node and its nearest edges first.
+    "code_graph": ToolCap(6_000, "head", "use op=explain on one symbol, or a smaller budget"),
+    # The call map. `handler_map` of a 6,571-line handler is ~2,300 tokens;
+    # head, because the steps come first and are the part a plan is made from.
+    "handler_map": ToolCap(6_000, "head", "the steps are listed first"),
+    "unit_check": ToolCap(3_000, "head", "pass `methods` to check one step"),
+    "impact": ToolCap(3_000, "head", "name one Type.Method"),
     # The review audits. `head` rather than the default `tail` for all four:
     # they are rendered worst-first, so the head is the part worth keeping —
     # and the default of tail-truncating a ranked report keeps the least

@@ -1,6 +1,6 @@
 // Generated from api/contract.json and api/openapi.json by scripts/gen-contract.mjs.
 // Do not edit. Run `make contract` at the repository root and commit the result.
-// openapi.json digest: c0c17e60d2f0603b
+// openapi.json digest: 8994f4248b401d54
 
 /**
  * The runtime API this build speaks. A mismatch with `/v1/health` is refused
@@ -622,7 +622,7 @@ export interface Tool {
   modes: string[];
   mutates: boolean;
   approval: 'none' | 'conditional' | 'always';
-  provider: 'python' | 'gotools' | 'gopls';
+  provider: 'python' | 'gotools' | 'gopls' | 'graphify';
   gate_only?: boolean;
   unavailable?: string;
   instead?: string;

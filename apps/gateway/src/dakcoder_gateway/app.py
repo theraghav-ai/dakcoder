@@ -416,9 +416,11 @@ def create_app(gateway: Gateway) -> FastAPI:
         estimated = _tokens(request.headers.get("X-Estimated-Tokens")) or _estimate(body)
         lane = _lane(request.headers.get("X-Lane"))
 
+        timing: dict[str, float] = {}
         stream = gateway.proxy.stream(
             path,
             body,
+            timing=timing,
             sub=claims.sub,
             estimated=estimated,
             session_id=request.headers.get("X-Session-Id", "")[:128],
@@ -455,6 +457,19 @@ def create_app(gateway: Gateway) -> FastAPI:
                 # every chunk until the stream ended — turning a streaming
                 # endpoint into a slow non-streaming one, silently.
                 "X-Accel-Buffering": "no",
+                # Where the wait before the first byte went: the gateway's own
+                # quota reservation, and the model endpoint's queue and prefill.
+                # The response starts only once the first line exists, so a
+                # caller that waited minutes can tell a busy model endpoint
+                # from a fault here without anyone reading a server log.
+                **{
+                    name: str(int(timing[key]))
+                    for key, name in (
+                        ("reserve_ms", "X-Dakcoder-Reserve-Ms"),
+                        ("upstream_first_ms", "X-Dakcoder-Upstream-First-Ms"),
+                    )
+                    if key in timing
+                },
             },
         )
 

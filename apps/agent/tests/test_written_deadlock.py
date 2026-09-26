@@ -181,7 +181,7 @@ def test_a_plan_to_clean_the_unclean_work_is_now_adoptable() -> None:
     loop = _mid_migration()
     steps = [
         PlanStep(
-            "handler/objection.go", "split it under the 600-line cap", "go_build", phase="handlers"
+            "handler/objection.go", "split it under the 600-line cap", "unit_check path=handler/objection.go", phase="handlers"
         )
     ]
 
