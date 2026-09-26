@@ -954,6 +954,7 @@ function strings(): Record<string, string> {
     protectedSchema: vscode.l10n.t('schema — apply the migration yourself'),
     protectedStructural: vscode.l10n.t('structural'),
     elapsed: vscode.l10n.t('{0}s'),
+    elapsedLong: vscode.l10n.t('{0}m {1}s'),
 
     // structure
     transcript: vscode.l10n.t('Conversation transcript'),

@@ -36,6 +36,8 @@
   const askingEl = document.getElementById('asking');
   const stopBtn = document.getElementById('stop');
   const windBtn = document.getElementById('wind-down');
+  /** What the primary button does right now: 'send' or 'stop'. See `syncPrimary`. */
+  let primaryRole = '';
   const skipBtn = document.getElementById('skip');
   const offlineEl = document.getElementById('offline');
   const queuedEl = document.getElementById('queued');
@@ -130,6 +132,24 @@
    *  persisted server-side either, and a restored webview waits for the real
    *  `assistant` event rather than inventing a partial one. */
   let openAssistant = null;
+  /**
+   * An answer streamed out of a `finish` call before the loop has accepted it.
+   *
+   * The runtime streams `finish`'s `answer` as it is written, so a long answer
+   * types out instead of appearing whole at the end. But the loop can still
+   * send a `finish` back ("not yet: step 3 is open"), and then no `assistant`
+   * event follows -- so the row stays provisional until one does: the
+   * `assistant` event replaces its text in place, and a turn that starts
+   * without one removes it.
+   */
+  let provisionalAnswer = null;
+
+  function dropProvisional() {
+    if (provisionalAnswer) {
+      removeRow(provisionalAnswer.key);
+      provisionalAnswer = null;
+    }
+  }
   /**
    * Numbers the rows this panel invents — the optimistic echo of a message the
    * developer just typed, and host notices. Restored rather than reset, because
@@ -413,6 +433,16 @@
         svg.appendChild(path);
         return;
       }
+      if (shape && !Array.isArray(shape) && shape.d) {
+        // A solid shape: the stop square. Filled, no stroke, so it sits as a
+        // mark inside its button instead of an outline competing with it.
+        const solid = document.createElementNS(SVG_NS, 'path');
+        solid.setAttribute('d', shape.d);
+        solid.setAttribute('fill', 'currentColor');
+        solid.setAttribute('stroke', 'none');
+        svg.appendChild(solid);
+        return;
+      }
       const circle = document.createElementNS(SVG_NS, 'circle');
       circle.setAttribute('cx', String(shape[0]));
       circle.setAttribute('cy', String(shape[1]));
@@ -424,11 +454,30 @@
 
   const GLYPHS = {
     cube: ['M3 7.5 12 3l9 4.5v9L12 21l-9-4.5z', 'M3 7.5 12 12l9-4.5M12 12v9'],
-    send: ['M12 19V5', 'M6 11l6-6 6 6'],
-    stop: ['M7 7h10v10H7z'],
-    windDown: ['M7 6l8 6-8 6z', 'M18 6v12'],
+    // The composer's set. One family -- a 24-unit grid, round caps and joins,
+    // drawn to one weight -- so the toolbar reads as designed rather than
+    // collected: the old set mixed a text "/", a text "@", a bare outline
+    // square and a triangle-and-bar, at four different sizes and weights.
+    send: ['M12 19V5', 'M5.5 11.5 12 5l6.5 6.5'],
+    stop: [{ d: 'M9 7h6a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z' }],
+    // "Stop after this turn": a pause, because that is what it is -- the turn
+    // in flight finishes and nothing starts after it.
+    windDown: [[12, 12, 9], 'M10 9.5v5M14 9.5v5'],
+    // The quiet Stop beside Send: a stop mark in a ring, the pair of the pause.
+    stopCircle: [[12, 12, 9], { d: 'M10 8.8h4a1.2 1.2 0 0 1 1.2 1.2v4a1.2 1.2 0 0 1-1.2 1.2h-4A1.2 1.2 0 0 1 8.8 14v-4A1.2 1.2 0 0 1 10 8.8z' }],
+    // Commands: a slash in a rounded key, the way a keyboard shortcut is drawn.
+    command: [
+      'M7 3.5h10A3.5 3.5 0 0 1 20.5 7v10a3.5 3.5 0 0 1-3.5 3.5H7A3.5 3.5 0 0 1 3.5 17V7A3.5 3.5 0 0 1 7 3.5z',
+      'M10 15.5 14 8.5',
+    ],
+    mention: [[12, 12, 3.6], 'M15.6 8.4v4.8a2.6 2.6 0 0 0 5.2 0V12a8.8 8.8 0 1 0-3.5 7'],
     // Sliders: "settings" without the gear, which reads as a sun at 14px.
-    gear: ['M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1', [15, 7, 2], [9, 12, 2], [17, 17, 2]],
+    gear: [
+      'M4 6.5h9M17.5 6.5H20M4 12h2.5M11 12h9M4 17.5h10M18.5 17.5H20',
+      [15.2, 6.5, 2.2],
+      [8.8, 12, 2.2],
+      [16.3, 17.5, 2.2],
+    ],
     check: ['m5 13 4 4 10-10'],
     cross: ['M6 6l12 12M18 6 6 18'],
     pencil: ['M4 20h4l10-10-4-4L4 16z'],
@@ -2086,6 +2135,8 @@
 
       case 'turn_start': {
         attempt = typeof d.attempt === 'number' ? d.attempt : 1;
+        // A `finish` the loop sent back: its streamed answer was never given.
+        dropProvisional();
         openAssistant = null;
         foldable = null;
         put({
@@ -2108,9 +2159,13 @@
       }
 
       case 'assistant': {
-        // The authoritative text replaces whatever the deltas folded together.
+        // The authoritative text replaces whatever the deltas folded together --
+        // including an answer streamed out of `finish`, which it confirms.
         const row =
-          openAssistant || put({ key: keyFor('assistant', event.id), kind: 'assistant', text: '' });
+          openAssistant ||
+          provisionalAnswer ||
+          put({ key: keyFor('assistant', event.id), kind: 'assistant', text: '' });
+        provisionalAnswer = null;
         row.text = String(d.text || '');
         paint(row);
         openAssistant = null;
@@ -2120,6 +2175,11 @@
       }
 
       case 'tool_call': {
+        if (String(d.name || '') === 'finish' && openAssistant) {
+          // The text streamed so far was this call's answer. Held, not closed:
+          // the loop's `assistant` event confirms it or the next turn drops it.
+          provisionalAnswer = openAssistant;
+        }
         openAssistant = null;
         put({
           key: keyFor('tool', d.id),
@@ -2318,6 +2378,8 @@
         return;
 
       case 'finish': {
+        // A run can end straight after a `finish` the loop refused.
+        dropProvisional();
         openAssistant = null;
         // A failing run usually states its cause twice: once as `error`, and
         // again as the summary it finishes with. The finish row carries the
@@ -2673,33 +2735,33 @@
     inputLabel.textContent = S.placeholder || '';
     popup.setAttribute('aria-label', S.suggestions || '');
     if (slashBtn) {
-      slashBtn.textContent = '/';
+      slashBtn.textContent = '';
+      slashBtn.appendChild(icon(GLYPHS.command, 16, 1.75));
       slashBtn.title = S.slashMenu || '';
       slashBtn.setAttribute('aria-label', S.slashMenu || '');
     }
     if (mentionBtn) {
+      mentionBtn.textContent = '';
+      mentionBtn.appendChild(icon(GLYPHS.mention, 16, 1.75));
       mentionBtn.title = S.mentionButton || '';
       mentionBtn.setAttribute('aria-label', S.mentionButton || '');
     }
     if (settingsBtn) {
       settingsBtn.textContent = '';
-      settingsBtn.appendChild(icon(GLYPHS.gear, 14, 1.7));
+      settingsBtn.appendChild(icon(GLYPHS.gear, 16, 1.75));
       settingsBtn.title = S.settingsButton || '';
       settingsBtn.setAttribute('aria-label', S.settingsButton || '');
     }
     // Send is an arrow in a circle, as the box's one filled control; the word
     // is its label for screen readers and its tooltip.
-    sendBtn.textContent = '';
-    sendBtn.appendChild(icon(GLYPHS.send, 14, 2.2));
-    sendBtn.title = S.sendLabel || S.send || '';
-    sendBtn.setAttribute('aria-label', S.send || '');
+    primaryRole = '';
     paintChips();
     stopBtn.textContent = '';
-    stopBtn.appendChild(icon(GLYPHS.stop, 12, 2));
+    stopBtn.appendChild(icon(GLYPHS.stopCircle, 16, 1.75));
     stopBtn.title = (S.stop || '') + ' — ' + (S.stopHint || '');
     stopBtn.setAttribute('aria-label', S.stop || '');
     windBtn.textContent = '';
-    windBtn.appendChild(icon(GLYPHS.windDown, 13, 2));
+    windBtn.appendChild(icon(GLYPHS.windDown, 16, 1.75));
     windBtn.title = (S.windDown || '') + ' — ' + (S.windDownHint || '');
     windBtn.setAttribute('aria-label', S.windDown || '');
     if (jumpBtn) {
@@ -2801,10 +2863,10 @@
   function applyRunState() {
     applyConsole();
     const running = run.phase !== 'idle';
-    stopBtn.hidden = !running;
     // Winding down already means "stop after this turn"; offering it again
     // would be a button whose only effect is to say what is already true.
     windBtn.hidden = run.phase !== 'running' || pendingApprovals.size > 0;
+    syncPrimary();
     input.placeholder = running ? S.placeholderRunning || '' : S.placeholder || '';
     workingEl.hidden = !running;
     applyComposerState();
@@ -2844,7 +2906,13 @@
     const seconds = run.startedAt ? Math.round((Date.now() - run.startedAt) / 1000) : null;
     const parts = [];
     if (run.tool) parts.push(run.tool);
-    if (seconds !== null) parts.push(fmt(S.elapsed, seconds));
+    if (seconds !== null) {
+      parts.push(
+        seconds < 60
+          ? fmt(S.elapsed, seconds)
+          : fmt(S.elapsedLong, Math.floor(seconds / 60), String(seconds % 60).padStart(2, '0')),
+      );
+    }
     parts.push(escArmed ? S.escAgain || '' : S.escToStop || '');
 
     // Rebuilt only when the verb changes, so the dots' animation is not
@@ -3157,7 +3225,7 @@
     // reach the model without the gateway, by design, and a queued message that
     // silently dies is worse than a composer that says why it is closed.
     input.disabled = off;
-    sendBtn.disabled = off;
+    syncPrimary();
     applyComposerState();
     if (off && !wasOffline) say(fmt(S.sayOffline, what), true);
     if (!off && wasOffline) say(S.sayOnline, true);
@@ -3213,6 +3281,7 @@
     remember(text);
     input.value = '';
     autosize();
+    syncPrimary();
     closePopup();
     // Sending is an explicit "show me the new thing", so it always returns to
     // the live edge even if the reader had scrolled back.
@@ -3220,7 +3289,44 @@
     syncJump();
   }
 
-  sendBtn.addEventListener('click', send);
+  /*
+   * The box's one filled control, and what it does right now.
+   *
+   * Idle: Send, and *inactive* until there is something to send -- a bright
+   * button that does nothing when pressed is a control that lies about itself.
+   * Running with an empty box: Stop, in the same place, because that is the
+   * one thing worth doing to a run from here. Running with text typed: Send
+   * again -- a correction the run reads before its next turn -- and Stop steps
+   * aside to a quiet icon beside it, so it is never out of reach.
+   */
+  function syncPrimary() {
+    const off = offlineReason !== null;
+    const running = run.phase !== 'idle';
+    const typed = String(input.value || '').trim().length > 0;
+    const role = running && !typed ? 'stop' : 'send';
+    if (role !== primaryRole) {
+      primaryRole = role;
+      sendBtn.textContent = '';
+      sendBtn.classList.toggle('is-stop', role === 'stop');
+      if (role === 'stop') {
+        sendBtn.appendChild(icon(GLYPHS.stop, 14, 1.75));
+        sendBtn.title = (S.stop || '') + ' — ' + (S.stopHint || '');
+        sendBtn.setAttribute('aria-label', S.stop || '');
+      } else {
+        sendBtn.appendChild(icon(GLYPHS.send, 16, 2));
+        sendBtn.title = S.sendLabel || S.send || '';
+        sendBtn.setAttribute('aria-label', S.send || '');
+      }
+    }
+    sendBtn.disabled = off || (role === 'send' && !typed);
+    // The secondary stop only while the primary is busy being Send.
+    stopBtn.hidden = !(running && role === 'send');
+  }
+
+  sendBtn.addEventListener('click', function () {
+    if (primaryRole === 'stop') post({ type: 'stop' });
+    else send();
+  });
   stopBtn.addEventListener('click', function () {
     post({ type: 'stop' });
   });
@@ -3391,6 +3497,7 @@
 
   input.addEventListener('input', function () {
     autosize();
+    syncPrimary();
     refresh();
   });
 

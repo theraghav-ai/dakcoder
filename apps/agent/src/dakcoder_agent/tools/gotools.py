@@ -402,12 +402,34 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
     def legacy_audit(inv: Invocation) -> ToolResult:
         args = {"paths": _list(inv.arg("paths"))} if inv.arg("paths") else {}
         scoped = _list(inv.arg("paths"))
-        return _report(
-            sidecar.call("legacy_audit", args),
+        reply = sidecar.call("legacy_audit", args)
+        result = _report(
+            reply,
             lambda p: _render_lint(
                 p, scope_hint="pass paths= to scope the audit", scope=scoped
             ),
         )
+        if reply.is_error or not result.ok:
+            return result
+        # Per file, as data: how many legacy findings and which rules. The
+        # migration's scope inventory is built from this -- which handlers,
+        # repositories, DTOs and wiring still use the old libraries -- and
+        # `violation_keys` is capped, so it cannot answer that for a service
+        # with more than a few hundred findings.
+        payload = _json(reply.text)
+        by_file: dict[str, dict[str, Any]] = {}
+        for v in payload.get("violations") or ():
+            if not isinstance(v, Mapping):
+                continue
+            path = str(v.get("path") or "")
+            if not path:
+                continue
+            entry = by_file.setdefault(path, {"count": 0, "rules": []})
+            entry["count"] += 1
+            rule = str(v.get("rule") or "")
+            if rule and rule not in entry["rules"]:
+                entry["rules"].append(rule)
+        return replace(result, meta={**result.meta, "by_file": by_file})
 
     def fx_wire(inv: Invocation) -> ToolResult:
         reply = sidecar.call("fx_wire", {"kind": inv.arg("kind"), "ctor": inv.arg("ctor")})

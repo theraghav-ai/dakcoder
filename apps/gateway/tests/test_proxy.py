@@ -430,3 +430,16 @@ def test_no_report_is_distinguished_from_zero_tokens() -> None:
     teed.observe({"usage": {"prompt_tokens": 0, "completion_tokens": 0}})
     assert teed.saw_usage
     assert teed.prompt_tokens == 0
+
+
+# ── where the wait before the first byte went ───────────────────────────────
+
+
+async def test_the_call_reports_its_reservation_and_upstream_wait(proxy: ModelProxy) -> None:
+    """A developer who waited eight minutes for 66 tokens could not tell a busy
+    model endpoint from a fault in the gateway. The timing travels back as
+    response headers; this is the half that measures it."""
+    timing: dict[str, float] = {}
+    await consume(proxy, timing=timing)
+    assert set(timing) == {"reserve_ms", "upstream_first_ms"}
+    assert all(value >= 0 for value in timing.values())

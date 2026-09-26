@@ -179,6 +179,16 @@ _CONTINUES = re.compile(
 )
 
 
+def _routes_on_file(path: Path) -> int:
+    """How many routes the saved pre-migration inventory holds, or 0."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    routes = raw.get("routes") if isinstance(raw, dict) else raw
+    return len(routes) if isinstance(routes, list) else 0
+
+
 def _git_head(root: Path) -> str:
     """The branch checked out in ``root``, read off ``.git/HEAD``; ``""`` if unknown."""
     try:
@@ -2966,6 +2976,21 @@ class AgentLoop:
                 )
                 if self.state.migration.branch == self.state.migration.expected_branch:
                     self.state.migration.expected_branch = ""
+                # The branch phase is finished the moment the branch exists, and
+                # it is closed *now*, not at `finish`. Left for `finish`, a run
+                # stopped or cut off after the cut left it open, and the next
+                # session was sent to ask which branch to cut from and to cut it
+                # again -- on the branch it was already standing on.
+                if self.state.migration.active and (
+                    closed := self.state.migration.close_evidenced()
+                ):
+                    self.state.plan_objections = 0
+                    self.context.append_user(
+                        f"The {', '.join(closed)} phase is complete: the migration is on "
+                        f"`{self.state.migration.branch}`. It is recorded and will not be "
+                        "redone. Carry on with the next phase's work; if this plan holds "
+                        "none, call `finish` and the next phase is planned from here."
+                    )
                 # Written now rather than at the next plan change: the branch is
                 # the fact a developer opening the document first wants, and the
                 # next change to the plan may be several turns away.
@@ -4160,6 +4185,10 @@ class AgentLoop:
                 return
         if phases:
             self.state.migration.adopt(phases)
+            if not self.state.migration.scope:
+                # The first roadmap: take the inventory the phases will be
+                # measured against, while every file is still legacy.
+                self._refresh_scope()
         deferred: list[PlanStep] = []
         if self.state.migration.active and self.state.migration.phases:
             # Trimmed to the open phase rather than refused. A model that has
@@ -4187,7 +4216,7 @@ class AgentLoop:
                 by_phase.setdefault(step.phase, []).append(step)
             for name, group in by_phase.items():
                 migration.note_split(name, split_files(group, self._line_count))
-            migration.record_steps(kept)
+            migration.record_steps(kept, methods=self._step_methods)
             # This session has a plan of its own now; the resume view is done.
             migration.resumed = False
         replanned = bool(self.state.plan) and self.state.replans > 0
@@ -4619,14 +4648,16 @@ class AgentLoop:
         # refused as belonging to a closed phase, and the conversion could not
         # go on. The phase closes when every file it has ever been planned to
         # cover is finished, and a split file only when the code agrees.
-        migration.record_steps(self.state.plan, self.router.touched)
+        migration.record_steps(self.state.plan, self.router.touched, methods=self._step_methods)
         if not evidenced and (left := migration.outstanding(phase.name, self._converted)):
+            self._refresh_scope()
             self.state.phase_left = tuple(left)
             self._save_plan()
             return ""
         self.state.phase_left = ()
         if not migration.close(phase.name):
             return ""
+        self._refresh_scope()
         # A new phase is a new plan, and its objections are its own. The budget
         # was shared across the whole session, so the roadmap's two refusals in
         # phase one left none for the handlers phase -- the one whose large
@@ -6300,9 +6331,11 @@ class AgentLoop:
         root = self.router.workspace.root
         # The plan in hand folded into the migration's own ledger first, so the
         # document and the record describe every session's work, not this one's.
-        migration.record_steps(self.state.plan, self.router.touched)
+        migration.record_steps(self.state.plan, self.router.touched, methods=self._step_methods)
         if self.state.routes_before:
             migration.routes = self.state.routes_before
+        elif not migration.routes:
+            migration.routes = _routes_on_file(root / ROUTES_BEFORE)
         try:
             # The workspace root: `ensure_private` writes `<root>/.dakcoder/.gitignore`.
             ensure_private(root)
@@ -6352,7 +6385,15 @@ class AgentLoop:
             # the migration's branch is checked out again (`_migration_guard`).
             record.expected_branch = record.branch
             record.branch = ""
+        # A phase already finished on evidence is closed before anyone is told
+        # it is open -- the branch phase of a record written by a run that was
+        # stopped after cutting the branch. See `close_evidenced`.
+        record.close_evidenced()
         self.state.migration = record
+        self._refresh_scope()
+        # Written at once: a record imported from an older session's plan file
+        # becomes the workspace's, so the next `/migrate` finds it directly.
+        save_record(root, record)
         # The inventory is taken once per *migration*: retaking it now would
         # record a half-converted service as the thing to compare against.
         self.state.routes_before = record.routes
@@ -6364,6 +6405,29 @@ class AgentLoop:
             len(record.phases),
         )
         return True
+
+    def _refresh_scope(self) -> None:
+        """Re-take the migration's scope inventory from a whole-service ``legacy_audit``.
+
+        Through the gate path, as the harness. Best-effort: a runtime with no
+        sidecar keeps the inventory it had, and the migration goes on without
+        it. Cheap enough for the few points it runs at -- the first roadmap, a
+        resume, a phase closing -- and never per turn.
+        """
+        migration = self.state.migration
+        if not migration.active:
+            return
+        try:
+            outcome = self.router.run_gate_tool("legacy_audit", {})
+        except Exception:  # noqa: BLE001 - an inventory, never a precondition
+            return
+        if not isinstance(outcome, ToolResult) or not outcome.ok:
+            return
+        by_file = outcome.meta.get("by_file")
+        if not isinstance(by_file, dict):
+            return
+        root = self.router.workspace.root
+        migration.update_scope(by_file, lambda path: (root / path).exists())
 
     def _handler_map(self, path: str) -> dict[str, Any] | None:
         """``handler_map`` for one file, as data, or ``None`` when it cannot be taken.
@@ -6622,7 +6686,7 @@ class AgentLoop:
         self.state.plan_forced = False
         yield from self._adopt_plan(steps, "")
         if self.state.migration.active:
-            self.state.migration.record_steps(self.state.plan)
+            self.state.migration.record_steps(self.state.plan, methods=self._step_methods)
         # Overwrites the revision `_adopt_plan` just recorded with one that
         # names the cause and the model's reason. Two entries for one event
         # would make the history harder to read than no history.

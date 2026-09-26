@@ -26,6 +26,7 @@ comment.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 import time
@@ -36,6 +37,8 @@ from typing import Any
 import httpx
 
 from .config import Deployment, LLMConfig
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "LLMClient",
@@ -238,6 +241,15 @@ class ChatResult:
     model: str = ""
     #: How many HTTP attempts this turn cost, for telemetry.
     attempts: int = 1
+    #: Seconds from sending the request to the response headers. The gateway
+    #: starts its response only once the model's first line exists, so this is
+    #: the whole wait before anything could stream.
+    wait_seconds: float = 0.0
+    #: Of that wait, what the gateway reports it spent: its quota reservation,
+    #: and the model endpoint's queue and prefill (``X-Dakcoder-*`` headers).
+    #: ``None`` when the gateway did not say -- an older one, or a direct call.
+    gateway_reserve_ms: int | None = None
+    upstream_first_ms: int | None = None
     #: True when the turn was retried with thinking off after an empty
     #: completion. Counted, because §18 wants zero of these.
     recovered_from_empty: bool = False
@@ -595,6 +607,14 @@ class LLMClient:
                 last = exc
 
             delay = BACKOFF_SECONDS[min(attempt - 1, len(BACKOFF_SECONDS) - 1)]
+            # Said, because a retry is otherwise invisible: the turn simply
+            # takes longer, and "the gateway is slow" is the conclusion drawn.
+            log.warning(
+                "model call attempt %d of %d failed (%s); retrying",
+                attempt,
+                self._config.max_attempts,
+                str(last)[:200],
+            )
             # A server asking us to wait *longer* is obeyed; one asking for less
             # does not get to shorten a backoff chosen against a thundering
             # herd. The case this exists for is `quota_unavailable`, where the
@@ -622,13 +642,19 @@ class LLMClient:
         headers: dict[str, str] | None = None,
         on_delta: Callable[[str], None] | None = None,
     ) -> ChatResult:
+        started = time.monotonic()
         with self._client.stream(
             "POST", "/chat/completions", json=body, headers=self._auth(headers)
         ) as response:
+            waited = time.monotonic() - started
             if response.status_code >= 400:
                 response.read()
                 raise self._error_for(response)
-            return _consume_stream(response.iter_lines(), on_delta)
+            result = _consume_stream(response.iter_lines(), on_delta)
+            result.wait_seconds = waited
+            result.gateway_reserve_ms = _int_header(response, "x-dakcoder-reserve-ms")
+            result.upstream_first_ms = _int_header(response, "x-dakcoder-upstream-first-ms")
+            return result
 
     @staticmethod
     def _error_for(response: httpx.Response) -> UpstreamError:
@@ -700,6 +726,9 @@ def _consume_stream(
     content: list[str] = []
     reasoning: list[str] = []
     calls: dict[int, dict[str, str]] = {}
+    # The answer inside a `finish` call, decoded as its argument fragments
+    # arrive. See `_ArgumentStream`.
+    streams: dict[Any, _ArgumentStream] = {}
     saw_content_key = False
     done = False
 
@@ -806,6 +835,19 @@ def _consume_stream(
                     slot["name"] = fn["name"]
                 if fn.get("arguments"):
                     slot["arguments"] += fn["arguments"]
+                    # **The answer streams too.** Most answers are not content at
+                    # all: a turn ends by calling `finish`, and the text the
+                    # developer reads is its `answer` argument -- which arrives
+                    # as JSON fragments, not as content, so it reached the panel
+                    # in one piece when the call completed, however long the
+                    # model took to write it. Decoded as it arrives and offered
+                    # through the same sink, it types out like any other reply.
+                    if on_delta is not None and slot["name"] in STREAMED_ARGUMENTS:
+                        stream = streams.get(key)
+                        if stream is None:
+                            stream = streams[key] = _ArgumentStream(STREAMED_ARGUMENTS[slot["name"]])
+                        if text := stream.feed(slot["arguments"]):
+                            on_delta(text)
 
     result.content = "".join(content)
     result.reasoning = "".join(reasoning)
@@ -853,6 +895,107 @@ def _consume_stream(
         raise EmptyCompletionError(result.finish_reason, result.usage.reasoning_tokens)
 
     return result
+
+
+#: Tool calls whose string argument *is* the reply, streamed as it is written.
+#: ``finish`` ends every answering turn, and its ``answer`` is the text the
+#: developer reads.
+STREAMED_ARGUMENTS: dict[str, str] = {"finish": "answer"}
+
+_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+class _ArgumentStream:
+    """Decodes one string field of a tool call's JSON arguments as they arrive.
+
+    Incremental on purpose: it keeps its place in the raw text and in the
+    string, so each fragment costs its own length. Re-parsing the prefix on
+    every fragment would be quadratic in an answer that can run to 24,000
+    characters, on the thread that is reading the stream.
+
+    Conservative at the edges. It emits only text it has fully decoded -- an
+    escape or a ``\\u`` sequence split across two fragments waits for the
+    second -- and it stops at the closing quote, so nothing after the field
+    (``blocked``, ``remember``) is ever shown as part of the answer. What it
+    shows is a preview: the loop still sends the authoritative text when the
+    call completes, and the panel replaces the preview with it.
+    """
+
+    __slots__ = ("key", "scan", "inside", "closed")
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        #: How far into the raw arguments this has read.
+        self.scan = 0
+        #: Whether the scan is inside the field's string value.
+        self.inside = False
+        self.closed = False
+
+    def feed(self, raw: str) -> str:
+        if self.closed:
+            return ""
+        if not self.inside:
+            start = _value_start(raw, self.key)
+            if start < 0:
+                return ""
+            self.inside = True
+            self.scan = start
+        out: list[str] = []
+        i, n = self.scan, len(raw)
+        while i < n:
+            ch = raw[i]
+            if ch == '"':
+                self.closed = True
+                i += 1
+                break
+            if ch != "\\":
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 >= n:
+                break  # the escape's second half is in the next fragment
+            code = raw[i + 1]
+            if code == "u":
+                if i + 6 > n:
+                    break
+                try:
+                    out.append(chr(int(raw[i + 2 : i + 6], 16)))
+                except ValueError:
+                    out.append(raw[i : i + 6])
+                i += 6
+                continue
+            out.append(_ESCAPES.get(code, code))
+            i += 2
+        self.scan = i
+        return "".join(out)
+
+
+def _value_start(raw: str, key: str) -> int:
+    """Where ``key``'s string value begins in partial JSON, or -1 if not yet."""
+    needle = f'"{key}"'
+    at = raw.find(needle)
+    if at < 0:
+        return -1
+    i = at + len(needle)
+    n = len(raw)
+    while i < n and raw[i] in " \t\r\n":
+        i += 1
+    if i >= n or raw[i] != ":":
+        return -1
+    i += 1
+    while i < n and raw[i] in " \t\r\n":
+        i += 1
+    if i >= n or raw[i] != '"':
+        return -1
+    return i + 1
+
+
+def _int_header(response: Any, name: str) -> int | None:
+    try:
+        value = response.headers.get(name)
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def _ordered(calls: dict[Any, dict[str, str]]) -> list[tuple[Any, dict[str, str]]]:

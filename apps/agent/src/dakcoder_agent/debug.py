@@ -238,13 +238,16 @@ class DebugLog:
         self._last_wire = current
 
     def response(self, *, turn: int, content: str, tool_calls: Sequence[Any],
-                 finish_reason: str, usage: Mapping[str, Any], seconds: float) -> None:
+                 finish_reason: str, usage: Mapping[str, Any], seconds: float,
+                 timing: Mapping[str, Any] | None = None) -> None:
         self._write(
             "response",
             {
                 "turn": turn,
                 "finish_reason": finish_reason,
                 "seconds": round(seconds, 3),
+                # Where the wait before the first byte went. See ChatResult.
+                **({"timing": dict(timing)} if timing else {}),
                 "usage": dict(usage),
                 "content": _clip(content),
                 "tool_calls": [

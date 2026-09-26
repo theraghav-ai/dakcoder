@@ -237,8 +237,15 @@ class ModelProxy:
         mode: str = "coder",
         lane: Lane = Lane.INTERACTIVE,
         idempotency_key: str | None = None,
+        timing: dict[str, float] | None = None,
     ) -> AsyncIterator[bytes]:
         """Reserve, relay, tee, settle.
+
+        ``timing``, when given, is filled in as the call goes: ``reserve_ms``
+        (the quota reservation, which is the gateway's own work) and
+        ``upstream_first_ms`` (from sending upstream to its first line -- queue
+        and prefill at the model endpoint). The app returns both as response
+        headers, so a caller that waited minutes can say *where* it waited.
 
         The reservation is taken before a byte is sent and released if the call
         never happens. Settlement is *scheduled* — on the usage chunk, with the
@@ -249,9 +256,12 @@ class ModelProxy:
         right and is not.
         """
         outgoing, route = self.prepare(path, body, sub)
+        reserving = time.monotonic()
         reservation = await self.quota.reserve(
             sub, estimated, lane=lane, idempotency_key=idempotency_key, body=body
         )
+        if timing is not None:
+            timing["reserve_ms"] = (time.monotonic() - reserving) * 1000
 
         teed = TeedUsage()
         started = time.monotonic()
@@ -261,6 +271,23 @@ class ModelProxy:
 
         try:
             async for chunk in self._relay(path, outgoing, route):
+                if not opened:
+                    waited = time.monotonic() - started
+                    if timing is not None:
+                        timing["upstream_first_ms"] = waited * 1000
+                    if waited >= SLOW_UPSTREAM_SECONDS:
+                        # The one number that tells a queue at the model endpoint
+                        # from a fault here, logged where an operator looks.
+                        log.warning(
+                            "slow upstream start: %s (%s) took %.1fs to its first line; "
+                            "session %s turn %d, ~%d prompt tokens",
+                            route.role,
+                            route.model,
+                            waited,
+                            session_id or "-",
+                            turn,
+                            estimated,
+                        )
                 opened = True
                 _observe(chunk, teed)
                 if teed.saw_usage and not scheduled:
@@ -501,6 +528,12 @@ class ModelProxy:
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
         )
+
+
+#: How long an upstream may take to its first line before the gateway logs it.
+#: A cold 115k-token prefill measured 24.5s on the production endpoint; past
+#: this, the wait is worth an operator's attention.
+SLOW_UPSTREAM_SECONDS = 30.0
 
 
 def _observe(chunk: bytes, teed: TeedUsage) -> None:

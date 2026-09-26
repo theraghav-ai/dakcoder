@@ -223,6 +223,9 @@ class MigrationState:
     files: tuple[str, ...] = ()
     #: Routes the legacy service served before the conversion started.
     routes: int = 0
+    #: Every file the migration has to convert, from ``legacy_audit``, with its
+    #: kind, its legacy finding count and a status. See ``update_scope``.
+    scope: dict[str, dict[str, str]] = field(default_factory=dict)
     #: Set when this state was restored from an earlier session's record
     #: rather than built by this one. Not persisted: it is a fact about the run.
     resumed: bool = False
@@ -310,7 +313,31 @@ class MigrationState:
         said = f"{phase.name} {phase.covers}".lower()
         if "branch" not in said:
             return False
-        return bool(self.branch) and self.branch.strip().lower() not in PROTECTED
+        # The branch counts when it exists, checked out or not: a resumed run
+        # on another branch is told to switch back to it, never to cut another.
+        branch = (self.branch or self.expected_branch).strip().lower()
+        return bool(branch) and branch not in PROTECTED
+
+    def close_evidenced(self) -> list[str]:
+        """Close every leading open phase that is finished on evidence. Their names.
+
+        Only the branch phase has such evidence (see ``evidenced``), and it is
+        the phase that kept being redone: it used to close only when a run
+        reached `finish`, so a run stopped or cut off after the branch was cut
+        left it open -- and every later session was told, in its state block,
+        to ask which branch to cut from and to cut it again, on a branch it was
+        already standing on.
+        """
+        closed: list[str] = []
+        while (
+            (here := self.current) is not None
+            and self.evidenced(here[1].name)
+            and _branch_only(here[1])
+        ):
+            if not self.close(here[1].name):
+                break
+            closed.append(here[1].name)
+        return closed
 
     def close(self, name: str) -> bool:
         """Mark one phase done. ``True`` if that changed anything."""
@@ -394,6 +421,17 @@ class MigrationState:
         lines = [head]
         if parts := phase.part_list:
             lines.append("  Parts: " + ", ".join(parts))
+        if self.scope:
+            counts: dict[str, list[int]] = {}
+            for entry in self.scope.values():
+                seen = counts.setdefault(entry.get("kind", "other"), [0, 0])
+                seen[1] += 1
+                seen[0] += entry.get("status") != "legacy"
+            lines.append(
+                "  Scope converted: "
+                + ", ".join(f"{k} {c[0]}/{c[1]}" for k in KINDS if (c := counts.get(k)))
+                + f" (still-legacy files listed in {PROGRESS_PATH})"
+            )
         planned_now = {u.get("file") for u in self.units.values() if u.get("phase_key") == _key(phase.name)}
         if later := [f for f in self.backlog.get(_key(phase.name), []) if f not in planned_now]:
             lines.append(
@@ -461,6 +499,9 @@ class MigrationState:
         planned = {u.get("file") for u in mine}
         if untouched := [f for f in self.backlog.get(key, []) if f not in planned]:
             lines.append(f"  Not planned yet ({len(untouched)}): " + _clip(untouched))
+        if summary := self.scope_summary():
+            lines.append("  Scope, from legacy_audit:")
+            lines.extend(f"    {line}" for line in summary)
         lines.append(
             "  `submit_plan` with the same `phases` (same names, so the closed ones "
             f"stay closed) and `steps` for what is left of {phase.name} only. For a "
@@ -491,7 +532,7 @@ class MigrationState:
             return
         known = self.backlog.setdefault(_key(phase), [])
         for path in files:
-            if path and path not in known:
+            if path and path not in known and not _bookkeeping(path):
                 known.append(path)
 
     def note_split(self, phase: str, files: Sequence[str]) -> None:
@@ -503,23 +544,58 @@ class MigrationState:
             if path and path not in known:
                 known.append(path)
 
-    def record_steps(self, steps: Sequence[Any], touched: Sequence[str] = ()) -> None:
+    def record_steps(
+        self,
+        steps: Sequence[Any],
+        touched: Sequence[str] = (),
+        methods: "Callable[[Any], Sequence[str]] | None" = None,
+    ) -> None:
         """Fold the plan in hand into the migration's ledger.
 
-        A step keeps its unit across sessions by key -- phase, file, part (or
-        action when there is no part) -- so re-planning the same group in a
-        later session updates its row rather than adding a second one.
+        A step keeps its unit across sessions by key, so re-planning the same
+        group in a later session updates its row rather than adding a second.
+        The key is the phase, the file, and what the step converts:
+
+        * the handler methods it names, when ``methods`` can say (a split file);
+        * else its ``part``, when no other step on the file shares it;
+        * else ``part`` and ``action`` together.
+
+        ``part`` alone was the key, and a planner that labels every step of
+        paogen.go ``part: "paogen"`` -- which it did -- collapsed nine groups
+        into one row: each overwrote the last, and the record showed group 9
+        pending and nothing about the eight before it.
         """
+        shared: dict[tuple[str, str, str], int] = {}
+        for step in steps:
+            ident = (
+                _key(str(getattr(step, "phase", "") or "")),
+                str(getattr(step, "file", "") or "").strip(),
+                _key(str(getattr(step, "part", "") or "")),
+            )
+            shared[ident] = shared.get(ident, 0) + 1
         for step in steps:
             path = str(getattr(step, "file", "") or "").strip()
             if not path:
                 continue
-            phase = str(getattr(step, "phase", "") or "").strip()
+            raw_phase = str(getattr(step, "phase", "") or "").strip()
+            phase = raw_phase
             if not phase and (current := self.current) is not None:
                 phase = current[1].name
             part = str(getattr(step, "part", "") or "").strip()
             action = str(getattr(step, "action", "") or "").strip()
-            key = _unit_key(phase, path, part or action)
+            names: Sequence[str] = ()
+            if methods is not None:
+                try:
+                    names = tuple(methods(step) or ())
+                except Exception:  # noqa: BLE001 - a key hint, never a failure
+                    names = ()
+            if names:
+                what = "methods:" + ",".join(sorted(names))
+            elif part and shared.get((_key(raw_phase), path, _key(part)), 0) <= 1:
+                what = part
+            else:
+                what = f"{part} {action}".strip()
+            key = _unit_key(phase, path, what)
             status = str(getattr(step, "status", "") or "pending")
             was = self.units.get(key)
             if was is not None and was.get("status") in SETTLED and status not in SETTLED:
@@ -534,10 +610,72 @@ class MigrationState:
                 "action": action[:200],
                 "status": status,
                 "note": str(getattr(step, "note", "") or "")[:200],
+                **({"methods": ",".join(names)} if names else {}),
             }
             self.note_planned(phase, [path])
         if touched:
-            self.files = tuple(dict.fromkeys((*self.files, *touched)))
+            self.files = tuple(
+                dict.fromkeys((*self.files, *(t for t in touched if not _bookkeeping(t))))
+            )
+
+    def update_scope(self, by_file: Mapping[str, Any], exists: "Callable[[str], bool]") -> None:
+        """Refresh the scope inventory from a ``legacy_audit`` of the whole service.
+
+        The migration's scope is what the *code* says still uses the legacy
+        libraries -- every handler, repository, DTO, bootstrap and test file --
+        not what some plan happened to name. The record knew only the files a
+        plan had listed, so the repository files each handler group calls, the
+        bootstrapper and the DTOs appeared nowhere until something wrote them.
+
+        A file seen once stays in the inventory. When the audit stops reporting
+        it, it is ``converted`` if it is still there and ``removed`` if not; a
+        file never silently drops out of the record.
+        """
+        now = _now()
+        for path, facts in by_file.items():
+            if not path or _bookkeeping(path):
+                continue
+            if isinstance(facts, Mapping):
+                count = int(facts.get("count") or 0)
+                rules = [str(r) for r in facts.get("rules") or []][:6]
+            else:
+                count, rules = int(facts or 0), []
+            entry = self.scope.setdefault(
+                path, {"kind": kind_of(path), "first": str(count), "seen": now}
+            )
+            entry.update(
+                {
+                    "findings": str(count),
+                    "rules": ",".join(rules),
+                    "status": "legacy" if count else "converted",
+                }
+            )
+        for path, entry in self.scope.items():
+            if path not in by_file:
+                entry["findings"] = "0"
+                entry["status"] = "converted" if exists(path) else "removed"
+
+    def scope_summary(self) -> list[str]:
+        """One line per kind of file: how many are in scope and which are still legacy."""
+        by_kind: dict[str, list[dict[str, str]]] = {}
+        for path, entry in self.scope.items():
+            by_kind.setdefault(entry.get("kind", "other"), []).append({"path": path, **entry})
+        lines = []
+        for kind in KINDS:
+            entries = by_kind.get(kind)
+            if not entries:
+                continue
+            left = sorted(
+                (e for e in entries if e.get("status") == "legacy"),
+                key=lambda e: -int(e.get("findings") or 0),
+            )
+            line = f"{kind}: {len(entries) - len(left)} of {len(entries)} converted"
+            if left:
+                line += " — still legacy: " + _clip(
+                    [f"{e['path']} ({e.get('findings', '?')})" for e in left], 6
+                )
+            lines.append(line)
+        return lines
 
     def outstanding(
         self, phase: str, converted: "Callable[[str], bool | None] | None" = None
@@ -593,6 +731,7 @@ class MigrationState:
             "units": {k: dict(v) for k, v in self.units.items()},
             "files": list(self.files),
             "routes": self.routes,
+            "scope": {k: dict(v) for k, v in self.scope.items()},
         }
 
     @classmethod
@@ -610,6 +749,16 @@ class MigrationState:
                 if isinstance(v, (list, tuple))
             }
 
+        scope_raw = raw.get("scope")
+        scope = (
+            {
+                str(k): {str(a): str(b) for a, b in v.items()}
+                for k, v in scope_raw.items()
+                if isinstance(v, Mapping)
+            }
+            if isinstance(scope_raw, Mapping)
+            else {}
+        )
         units_raw = raw.get("units")
         units = (
             {
@@ -636,12 +785,84 @@ class MigrationState:
             units=units,
             files=tuple(str(x) for x in raw.get("files") or () if x),
             routes=routes,
+            scope=scope,
         )
 
 
 #: The step statuses that settle a unit. ``written`` is not one of them -- see
 #: ``AgentLoop._close_phase``.
 SETTLED = frozenset({"done", "skipped", "blocked"})
+
+
+#: Words that say a phase does more than cut the branch. Earlier roadmaps had
+#: "branch-and-deps"; closing that one because a branch exists would skip the
+#: dependency swap it also holds.
+_NOT_ONLY_BRANCH = ("depend", "deps", "go.mod", "swap", "module", "import", "handler", "convert")
+
+
+def _branch_only(phase: Phase) -> bool:
+    said = f"{phase.name} {phase.covers} {phase.parts}".lower()
+    return "branch" in said and not any(word in said for word in _NOT_ONLY_BRANCH)
+
+
+#: What a file in the migration's scope is, by where it lives in the layout
+#: the SOP converts. In the order a reviewer reads the conversion.
+KINDS = (
+    "module", "handler", "repository", "dto", "response", "domain",
+    "bootstrap", "entry", "routes", "grpc", "test", "config", "docs", "other",
+)
+
+
+def kind_of(path: str) -> str:
+    """The layer a workspace file belongs to, for the scope inventory."""
+    p = path.replace("\\", "/").lower()
+    name = p.rsplit("/", 1)[-1]
+    if name in ("go.mod", "go.sum", "go.work", "go.work.sum"):
+        return "module"
+    if name.endswith("_test.go") or p.startswith("tests/") or "/tests/" in p:
+        return "test"
+    if "grpc" in name or p.endswith(".proto") or p.startswith("pb/") or "/pb/" in p:
+        return "grpc"
+    if p.startswith("handler/request") or name.startswith("request") or "validator" in name:
+        return "dto"
+    if p.startswith("handler/response"):
+        return "response"
+    if p.startswith("handler/"):
+        return "handler"
+    if p.startswith("repo/") or "/repo/" in p:
+        return "repository"
+    if p.startswith("core/"):
+        return "domain"
+    if p.startswith("bootstrap/"):
+        return "bootstrap"
+    if name == "main.go":
+        return "entry"
+    if p.startswith("routes/") or name == "routes.go":
+        return "routes"
+    if p.startswith("configs/") or p.startswith("config/"):
+        return "config"
+    if p.startswith("docs/"):
+        return "docs"
+    return "other"
+
+
+def _bookkeeping(path: str) -> bool:
+    """The agent's own record and instruction files, never migration work.
+
+    A branch-cut step has no file of its own, so planners fill the field with
+    whatever is at hand -- ``AGENTS.md``, ``.dakcoder/routes-before.json`` --
+    and those then sat in every phase's backlog as work it had to finish.
+    """
+    p = path.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    name = p.rsplit("/", 1)[-1]
+    return p.startswith(".dakcoder/") or name in (
+        "AGENTS.md",
+        "AGENTS.local.md",
+        "AGENTS.override.md",
+        "CLAUDE.md",
+    )
 
 
 def _key(name: str) -> str:
@@ -668,15 +889,59 @@ RECORD_PATH = ".dakcoder/migration/state.json"
 
 
 def load_record(root: Path) -> MigrationState | None:
-    """The workspace's migration record, or ``None`` when there is none."""
+    """The workspace's migration record, or ``None`` when there is none.
+
+    Falls back to the sessions' own plan files. Until the record existed the
+    roadmap, the branch and the closed phases lived only in each session's
+    ``plan.json``, so a workspace whose migration began before it has its
+    progress there and nowhere else -- and reading only the record is what sent
+    the first run after the upgrade back to "which branch should I cut from?".
+    """
     try:
         raw = json.loads((Path(root) / RECORD_PATH).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
+        return _from_sessions(Path(root))
     if not isinstance(raw, Mapping):
-        return None
+        return _from_sessions(Path(root))
     state = MigrationState.from_dict(raw)
-    return state if state.phases else None
+    state.backlog = {
+        k: [f for f in v if not _bookkeeping(f)] for k, v in state.backlog.items()
+    }
+    state.files = tuple(f for f in state.files if not _bookkeeping(f))
+    return state if state.phases else _from_sessions(Path(root))
+
+
+def _from_sessions(root: Path) -> MigrationState | None:
+    """The newest unfinished migration in any session's ``plan.json``, as a record."""
+    sessions = root / ".dakcoder" / "sessions"
+    try:
+        plans = sorted(
+            (p for p in sessions.glob("*/plan.json") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for path in plans:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("migration"), Mapping):
+            continue
+        state = MigrationState.from_dict(raw["migration"])
+        if not state.phases or state.complete:
+            continue
+
+        class _Step:
+            def __init__(self, item: Mapping[str, Any]) -> None:
+                for key in ("file", "action", "phase", "part", "status", "note"):
+                    setattr(self, key, str(item.get(key) or ""))
+
+        steps = [_Step(s) for s in raw.get("steps") or () if isinstance(s, Mapping)]
+        state.record_steps(steps)
+        return state
+    return None
 
 
 def save_record(root: Path, state: MigrationState) -> None:
@@ -1228,6 +1493,33 @@ def progress_document(
             kind = kind.replace("|", "/")
             out.append(f"| {path} | {kind} | {classification} | {status} | {note[:90]} | |")
         out.append("")
+
+    # -- the scope, from the code ----------------------------------------
+    #
+    # A list, never a table: the Migration view reads the *first* table with a
+    # path-like column as the units, and this must not be mistaken for it.
+    if state.scope:
+        out += ["## Scope", ""]
+        out += [f"- {line}" for line in state.scope_summary()]
+        out += [
+            "",
+            "From `legacy_audit`: every file that still uses the legacy libraries,",
+            "by layer, refreshed when a run starts, resumes, or closes a phase.",
+            "",
+        ]
+        legacy = sorted(
+            ((p, e) for p, e in state.scope.items() if e.get("status") == "legacy"),
+            key=lambda item: (KINDS.index(item[1].get("kind", "other")) if item[1].get("kind", "other") in KINDS else 99, item[0]),
+        )
+        if legacy:
+            out += ["### Still on the legacy libraries", ""]
+            for path, entry in legacy:
+                rules = entry.get("rules") or ""
+                out.append(
+                    f"- `{path}` — {entry.get('kind', 'other')}, {entry.get('findings', '?')} finding(s)"
+                    + (f" ({rules})" if rules else "")
+                )
+            out.append("")
 
     # -- what is left ----------------------------------------------------
     remaining = [p for p in state.phases if p.status != "done"]

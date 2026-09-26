@@ -528,3 +528,264 @@ def test_a_second_session_plans_the_next_phase_not_phase_one(gated, planning_rou
     assert two.state.plan and {s.phase for s in two.state.plan} == {"deps"}
     doc = (root / PROGRESS_PATH).read_text(encoding="utf-8")
     assert "1 of 4 closed" in doc, "the second session overwrote the record with phase one"
+
+
+# ── the branch phase is not redone ──────────────────────────────────────────
+
+
+def test_a_branch_phase_closes_the_moment_the_branch_exists() -> None:
+    state = MigrationState(active=True)
+    state.adopt(ROADMAP)
+    assert state.close_evidenced() == []
+    state.branch = "migrate-to-n-api"
+    assert state.close_evidenced() == ["branch"]
+    assert state.current[1].name == "deps"
+
+
+def test_a_combined_branch_and_deps_phase_is_not_closed_by_the_branch_alone() -> None:
+    state = MigrationState(active=True, branch="migrate-to-n-api")
+    state.adopt((Phase("branch-and-deps", "cut the branch, swap api-* deps", "cut, go get"), *ROADMAP[2:]))
+    assert state.close_evidenced() == []
+
+
+def test_a_shared_branch_is_not_evidence() -> None:
+    state = MigrationState(active=True, branch="main")
+    state.adopt(ROADMAP)
+    assert state.close_evidenced() == []
+
+
+def test_a_record_left_by_a_run_stopped_after_the_cut_resumes_past_the_branch(tmp_path: Path) -> None:
+    """The field report: the branch was cut and recorded, the run was stopped
+    before `finish`, and every later /migrate asked which branch to cut from."""
+    state = MigrationState(active=True, branch="migrate-to-n-api", base="main")
+    state.adopt(ROADMAP)
+    save_record(tmp_path, state)
+    _git(tmp_path, "migrate-to-n-api")
+    loop = _loop(tmp_path)
+    assert loop._resume_migration("Continue migrating this service")
+    assert loop.state.migration.phase_named("branch").status == "done"
+    assert loop.state.migration.current[1].name == "deps"
+    assert load_record(tmp_path).phase_named("branch").status == "done", "written back at once"
+    block = "\n".join(loop.state.migration.block(""))
+    assert "Open: phase 2 of 4 — deps" in block
+
+
+def test_off_its_branch_the_phase_stays_closed_and_the_run_switches_back(tmp_path: Path) -> None:
+    state = MigrationState(active=True, branch="migrate-to-n-api", base="main")
+    state.adopt(ROADMAP)
+    save_record(tmp_path, state)
+    _git(tmp_path, "main")
+    loop = _loop(tmp_path)
+    loop._resume_migration("continue the migration")
+    migration = loop.state.migration
+    assert migration.phase_named("branch").status == "done", "the branch exists; it is not re-cut"
+    assert migration.expected_branch == "migrate-to-n-api"
+
+
+def test_the_git_ops_result_closes_the_branch_phase_mid_run(planning_router, gated) -> None:
+    from scripted import build, calls
+
+    (planning_router.workspace.root / ".git").mkdir(exist_ok=True)
+    planning_router.handlers["git_ops"] = lambda inv: ToolResult.success(
+        "Switched to a new branch 'migrate-to-n-api'",
+        meta={"branch": "migrate-to-n-api", "base": "main"},
+    )
+    loop, _ = build(
+        planning_router,
+        [calls(("git_ops", json.dumps({"op": "branch", "message": "migrate-to-n-api", "base": "main"})))],
+        max_turns=1,
+    )
+    loop.state.migration = MigrationState(active=True)
+    loop.state.migration.adopt(ROADMAP)
+    loop.state.mode = Mode.AGENT
+    list(loop._turn())
+    assert loop.state.migration.phase_named("branch").status == "done"
+    assert any("phase is complete" in (m.content or "") for m in loop.context.build())
+
+
+def test_a_migration_from_before_the_record_is_imported_from_its_session(tmp_path: Path) -> None:
+    """Workspaces whose migration began before the record existed have their
+    progress only in a session's plan.json."""
+    old = MigrationState(active=True, branch="migrate-to-n-api-template", base="development")
+    old.adopt(ROADMAP)
+    old.close("branch")
+    PlanRecord(
+        session_id="e3edb2434936",
+        steps=(PlanStep("go.mod", "swap the api-* modules", "unit_check", phase="deps", status="done"),),
+        migration=old,
+    ).save(tmp_path)
+    loaded = load_record(tmp_path)
+    assert loaded is not None
+    assert loaded.branch == "migrate-to-n-api-template"
+    assert loaded.phase_named("branch").status == "done"
+    assert any(u["file"] == "go.mod" and u["status"] == "done" for u in loaded.units.values())
+
+
+# ── the record holds the whole migration, not only what plans named ─────────
+
+
+def test_steps_sharing_a_part_label_do_not_overwrite_each_other() -> None:
+    """The field record: every paogen step had `part: "paogen"`, and nine
+    groups collapsed into one row holding group 9."""
+    state = MigrationState(active=True)
+    state.adopt(ROADMAP)
+    state.record_steps(
+        [
+            PlanStep("handler/paogen.go", "Convert group 1 methods GetA, GetB", "", phase="handlers", part="paogen", status="done"),
+            PlanStep("handler/paogen.go", "Convert group 2 methods GetC", "", phase="handlers", part="paogen"),
+        ]
+    )
+    rows = [u for u in state.units.values() if u["file"] == "handler/paogen.go"]
+    assert len(rows) == 2
+    assert sorted(u["status"] for u in rows) == ["done", "pending"]
+
+
+def test_split_steps_are_keyed_by_the_methods_they_convert() -> None:
+    state = MigrationState(active=True)
+    state.adopt(ROADMAP)
+    methods = lambda step: ["GetA", "GetB"] if "GetA" in step.action else ["GetC"]  # noqa: E731
+    state.record_steps(
+        [PlanStep("handler/paogen.go", "convert GetA, GetB", "", phase="handlers", part="g1", status="done")],
+        methods=methods,
+    )
+    # A later session re-plans the same group in other words; same row.
+    state.record_steps(
+        [PlanStep("handler/paogen.go", "port GetB and GetA to the template", "", phase="handlers", part="first")],
+        methods=methods,
+    )
+    rows = [u for u in state.units.values() if u["file"] == "handler/paogen.go"]
+    assert len(rows) == 1 and rows[0]["status"] == "done" and rows[0]["methods"] == "GetA,GetB"
+
+
+def test_the_agents_own_files_are_never_phase_work() -> None:
+    state = MigrationState(active=True)
+    state.adopt(ROADMAP)
+    state.record_steps(
+        [
+            PlanStep("AGENTS.md", "cut the branch", "", phase="branch"),
+            PlanStep(".dakcoder/routes-before.json", "record the routes", "", phase="branch"),
+            PlanStep("go.mod", "swap modules", "", phase="deps"),
+        ],
+        touched=[".dakcoder/migration/plan.md", "go.mod"],
+    )
+    assert state.backlog.get("branch", []) == []
+    assert state.backlog["deps"] == ["go.mod"]
+    assert state.files == ("go.mod",)
+    assert state.outstanding("branch") == []
+
+
+def test_an_old_record_is_cleaned_on_load(tmp_path: Path) -> None:
+    state = MigrationState(active=True, branch="b")
+    state.adopt(ROADMAP)
+    state.backlog = {"branch": ["AGENTS.md", ".dakcoder/routes-before.json"], "deps": ["AGENTS.md", "go.mod"]}
+    state.files = (".dakcoder/migration/plan.md", "go.mod")
+    save_record(tmp_path, state)
+    loaded = load_record(tmp_path)
+    assert loaded.backlog == {"branch": [], "deps": ["go.mod"]}
+    assert loaded.files == ("go.mod",)
+
+
+def _audit(**counts: int) -> dict:
+    return {path.replace("__", "/").replace("_go", ".go"): {"count": n, "rules": ["legacy-gin-handler"]} for path, n in counts.items()}
+
+
+def test_the_scope_is_every_legacy_file_by_layer(tmp_path: Path) -> None:
+    state = MigrationState(active=True)
+    state.adopt(ROADMAP)
+    by_file = {
+        "handler/paogen.go": {"count": 33, "rules": ["legacy-gin-handler"]},
+        "repo/postgres/paogen.go": {"count": 3, "rules": ["legacy-db"]},
+        "bootstrap/bootstrapper.go": {"count": 1, "rules": ["legacy-fx"]},
+        "handler/validator.go": {"count": 2, "rules": []},
+        "main.go": {"count": 2, "rules": []},
+    }
+    state.update_scope(by_file, lambda p: True)
+    kinds = {p: e["kind"] for p, e in state.scope.items()}
+    assert kinds == {
+        "handler/paogen.go": "handler",
+        "repo/postgres/paogen.go": "repository",
+        "bootstrap/bootstrapper.go": "bootstrap",
+        "handler/validator.go": "dto",
+        "main.go": "entry",
+    }
+    summary = "\n".join(state.scope_summary())
+    assert "repository: 0 of 1 converted" in summary and "repo/postgres/paogen.go (3)" in summary
+
+
+def test_a_file_the_audit_stops_reporting_is_converted_or_removed_never_forgotten() -> None:
+    state = MigrationState(active=True)
+    state.adopt(ROADMAP)
+    state.update_scope(
+        {"handler/a.go": {"count": 4}, "go.work": {"count": 1}, "repo/a.go": {"count": 2}}, lambda p: True
+    )
+    state.update_scope({"repo/a.go": {"count": 1}}, lambda p: p != "go.work")
+    assert state.scope["handler/a.go"]["status"] == "converted"
+    assert state.scope["go.work"]["status"] == "removed"
+    assert state.scope["repo/a.go"]["status"] == "legacy" and state.scope["repo/a.go"]["findings"] == "1"
+    assert state.scope["repo/a.go"]["first"] == "2"
+
+
+def test_the_scope_is_in_the_record_and_the_document_but_not_as_a_units_table(tmp_path: Path) -> None:
+    state = MigrationState(active=True, branch="b")
+    state.adopt(ROADMAP)
+    state.update_scope({"repo/postgres/paogen.go": {"count": 3, "rules": ["legacy-db"]}}, lambda p: True)
+    state.record_steps([PlanStep("handler/paogen.go", "convert", "", phase="handlers")])
+    save_record(tmp_path, state)
+    assert load_record(tmp_path).scope["repo/postgres/paogen.go"]["kind"] == "repository"
+    doc = progress_document(state, [])
+    assert "## Scope" in doc and "`repo/postgres/paogen.go` — repository, 3 finding(s)" in doc
+    # The Migration view reads the first table with a path column as the units.
+    first_table = doc.index("| Unit |")
+    assert first_table < doc.index("## Scope")
+    assert sum(1 for line in doc.splitlines() if line.startswith("|---")) == 1
+
+
+def test_the_turn_block_carries_the_scope_as_counts() -> None:
+    state = MigrationState(active=True, branch="b")
+    state.adopt(ROADMAP)
+    state.close("branch")
+    state.update_scope({"handler/a.go": {"count": 2}, "repo/a.go": {"count": 1}}, lambda p: True)
+    block = "\n".join(state.block("deps"))
+    assert "Scope converted: handler 0/1, repository 0/1" in block
+
+
+def test_the_route_count_is_read_from_the_saved_inventory(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.state.migration = MigrationState(active=True, branch="b")
+    loop.state.migration.adopt(ROADMAP)
+    target = tmp_path / ROUTES_BEFORE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"routes": [{"path": "/a"}, {"path": "/b"}, {"path": "/c"}]}), encoding="utf-8")
+    loop._save_progress()
+    assert load_record(tmp_path).routes == 3
+
+
+def test_the_loop_takes_the_scope_from_the_audit(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.state.migration = MigrationState(active=True)
+    loop.state.migration.adopt(ROADMAP)
+    loop.router.handlers["legacy_audit"] = lambda inv: ToolResult.success(
+        "26 findings", meta={"by_file": {"repo/postgres/x.go": {"count": 2, "rules": ["legacy-db"]}}}
+    )
+    loop._refresh_scope()
+    assert loop.state.migration.scope["repo/postgres/x.go"]["kind"] == "repository"
+
+
+def test_the_audit_bridge_reports_findings_per_file(tmp_path: Path) -> None:
+    from dakcoder_agent.tools import registry
+    from dakcoder_agent.tools.router import Invocation
+
+    payload = {
+        "count": 3,
+        "violations": [
+            {"rule": "legacy-gin-handler", "path": "handler/a.go", "line": 3, "message": "m"},
+            {"rule": "legacy-db", "path": "handler/a.go", "line": 9, "message": "n"},
+            {"rule": "legacy-db", "path": "repo/a.go", "line": 1, "message": "o"},
+        ],
+    }
+    handler = handlers_for(_Sidecar(json.dumps(payload)))["legacy_audit"]
+    result = handler(Invocation(spec=registry.REGISTRY["legacy_audit"], arguments={}, workspace=Workspace(tmp_path)))
+    assert result.meta["by_file"] == {
+        "handler/a.go": {"count": 2, "rules": ["legacy-gin-handler", "legacy-db"]},
+        "repo/a.go": {"count": 1, "rules": ["legacy-db"]},
+    }
