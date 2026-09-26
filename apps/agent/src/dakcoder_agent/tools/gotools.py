@@ -38,6 +38,7 @@ from typing import Any
 
 from dakcoder_shared.envelope import Mutation, MutationKind, ToolResult
 
+from .fs import EMPTY_WORKSPACE, workspace_empty
 from .router import Invocation
 
 __all__ = ["GoTools", "Reply", "SidecarError", "handlers_for"]
@@ -380,7 +381,12 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
             args["package"] = inv.arg("package")
         if inv.arg("max_tokens"):
             args["max_tokens"] = inv.arg("max_tokens")
-        return _plain(sidecar.call("repo_map", args))
+        result = _plain(sidecar.call("repo_map", args))
+        if result.ok and workspace_empty(inv.workspace.root):
+            # `{"files":0,"packages":[]}` is true and reads as "the code is
+            # missing". See `EMPTY_WORKSPACE` for the run that took it that way.
+            return ToolResult.success(f"{result.content}\n\n{EMPTY_WORKSPACE}")
+        return result
 
     def rules_lint(inv: Invocation) -> ToolResult:
         args: dict[str, Any] = {}

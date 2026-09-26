@@ -31,7 +31,7 @@ from .credentials import Credentials
 from .gitlab import GitLab, GitLabError
 from .repos import Allowlist, Git, GitError, NotAllowed, project_path
 from .runners import Runner, RunnerFailed, Runners
-from .store import Delivery, Lease, SessionRow, Store
+from .store import SCRATCH_REPO, Delivery, Lease, SessionRow, Store
 
 __all__ = ["Refused", "Service"]
 
@@ -155,6 +155,46 @@ class Service:
         log.info("lease %s: %s@%s for %s", lease_id, repo_url, ref, sub)
         return lease
 
+    async def lease_scratch(self, sub: str) -> Lease:
+        """A workspace with no repository: an empty directory.
+
+        For a caller who asked a question rather than naming a repository. The
+        knowledge base ships inside the agent, so ``search_docs`` and
+        ``playbook`` answer without a checkout; the repository-shaped tools
+        simply find an empty tree and say so.
+
+        One per caller, reused. A question is not worth a second directory, and
+        a caller who asks ten of them in a row should not exhaust their lease
+        allowance — which is also why this does not count against it: an empty
+        directory is not the resource that limit exists to ration.
+        """
+        for held in self.store.leases(sub):
+            if held.scratch:
+                self.store.touch_lease(held.id, self.clock())
+                return held
+
+        lease_id = uuid.uuid4().hex[:12]
+        lease_dir = self.settings.leases_dir / lease_id
+        # Only the worktree. A scratch lease has no mirror, which is what
+        # `_settle` and `deliver` test for before they reach for one.
+        await asyncio.to_thread(
+            lambda: Git.worktree(lease_dir).mkdir(parents=True, exist_ok=True)
+        )
+        now = self.clock()
+        lease = Lease(
+            id=lease_id,
+            owner=sub,
+            repo_url=SCRATCH_REPO,
+            ref="",
+            path=str(lease_dir),
+            created_at=now,
+            expires_at=now + self.settings.lease_ttl.total_seconds(),
+            last_used_at=now,
+        )
+        self.store.add_lease(lease)
+        log.info("lease %s: scratch (no repository) for %s", lease_id, sub)
+        return lease
+
     def owned_lease(self, sub: str, lease_id: str) -> Lease:
         lease = self.store.lease(lease_id, sub)
         if lease is None:
@@ -255,6 +295,12 @@ class Service:
 
     def _settle(self, lease: Lease) -> None:
         """Commit what the previous session left to its branch, and reset the tree."""
+        if lease.scratch:
+            # No mirror, so no base to diff against and no branch to keep. Runs
+            # on a scratch lease share one directory and leave nothing behind
+            # worth committing. Reaching for `git.base` here would fail every
+            # run on it, before the agent was ever asked anything.
+            return
         lease_dir = self._dir(lease)
         base = self.git.base(lease_dir, lease.ref)
         if not self.git.changed(lease_dir, base):
@@ -344,6 +390,12 @@ class Service:
         self, sub: str, session_id: str, *, title: str, description: str, override: str = ""
     ) -> dict[str, Any]:
         row, lease = self.owned_session(sub, session_id)
+        if lease.scratch:
+            raise Refused(
+                409,
+                "that session ran on a scratch workspace, which has no repository to "
+                "deliver to. Lease a repository with `repo_url` and run it there",
+            )
         if not title.strip():
             raise Refused(400, "a delivery needs a title: it becomes the merge request's")
         async with self._lock(lease.id):

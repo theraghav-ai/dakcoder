@@ -129,6 +129,15 @@ def create_app(
 
     @app.post("/v1/workspaces", status_code=201)
     async def lease(body: dict[str, Any], who: Caller = Depends(caller)) -> dict[str, Any]:
+        """Lease a repository, or `{"scratch": true}` for a workspace with none.
+
+        A scratch workspace is an empty directory. It is what a caller wants
+        when the task is a question rather than a change: the knowledge base
+        ships inside the agent and answers without a checkout. One per caller,
+        reused, and nothing can be delivered from it.
+        """
+        if body.get("scratch"):
+            return (await service.lease_scratch(who.sub)).public()
         leased = await service.lease(who.sub, str(body.get("repo_url") or ""), str(body.get("ref") or ""))
         return leased.public()
 

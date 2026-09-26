@@ -166,6 +166,18 @@ The message's `metadata` chooses the workspace. Give **one** of:
 |---|---|
 | `workspace_id` | A workspace you already hold. Also accepted as the message's `contextId`. |
 | `repo_url` (+ `ref`) | Lease this repository now. Reuses your existing lease of the same repo if you have one. |
+| *neither* | You get a **scratch workspace**: an empty directory, no repository. |
+
+**A question does not need a repository.** If you name neither, the run happens
+on a scratch workspace. The agent's knowledge base — the template
+documentation and the playbooks — ships inside the agent and needs no checkout,
+so "what does the template say about the repository pattern?" is answered
+normally. The repository-shaped tools simply find an empty tree and say so.
+
+One scratch workspace per caller, reused across questions, and it does not count
+against your workspace allowance. Nothing can be delivered from it: there is no
+repository to push to, so `deliver` answers `409`. When the task needs a
+codebase — reading real handlers, making a change — name a `repo_url`.
 
 Other metadata:
 
@@ -317,11 +329,12 @@ anyone else.
 
 ### 4.1 Workspaces
 
-A workspace is a server-side clone of an allowlisted repository, leased to you.
+A workspace is a server-side clone of an allowlisted repository, leased to you
+— or, for a question, an empty directory with no repository at all.
 
 | Route | Scope | Does |
 |---|---|---|
-| `POST /v1/runtime/v1/workspaces` | `workspaces:write` | Lease one. Body: `{"repo_url": "...", "ref": "main"}`. Returns `201` and the workspace. |
+| `POST /v1/runtime/v1/workspaces` | `workspaces:write` | Lease one. Body: `{"repo_url": "...", "ref": "main"}`, or `{"scratch": true}` for one with no repository. Returns `201` and the workspace. |
 | `GET /v1/runtime/v1/workspaces` | `sessions:read` | List the ones you hold. |
 | `DELETE /v1/runtime/v1/workspaces/{id}` | `workspaces:write` | Release it. Sessions are archived, the clone deleted. |
 
@@ -339,6 +352,12 @@ A workspace is a server-side clone of an allowlisted repository, leased to you.
 Leasing clones the repository, so the first call on a large repo takes a while —
 allow a generous client timeout. A repository must be on the operator's
 allowlist; otherwise `403`.
+
+A **scratch** workspace (`{"scratch": true}`) clones nothing and is immediate.
+It comes back with `"repo_url": "scratch"` and an empty `ref`. Use it when the
+task is a question rather than a change. There is one per caller — asking again
+returns the same one — it is exempt from the workspace allowance, and nothing
+can be delivered from it.
 
 Release what you finish with. Leases are capped per caller, and expire on their
 own after 7 days.
@@ -462,7 +481,7 @@ ending with an `artifact-update` frame carrying the changed files.
 | `401` | No token, expired, or bad. | Get a new token and retry once. |
 | `403` | Scope missing, or the repository is not allowlisted for you. | Read the message. Neither is retryable. |
 | `404` | No such session, workspace or approval — or not yours. | — |
-| `409` | A run is already going on that workspace; or you asked to deliver a run that did not finish cleanly. | Wait, lease again, or pass `override`. |
+| `409` | A run is already going on that workspace; you asked to deliver a run that did not finish cleanly; or you asked to deliver a run from a scratch workspace. | Wait, lease again, pass `override`, or run it on a real repository. |
 | `410` | The approval is gone. | Stop waiting on it. |
 | `413` | The clone is larger than the server allows. | — |
 | `429` | You hit a per-caller limit. | Back off and retry. |

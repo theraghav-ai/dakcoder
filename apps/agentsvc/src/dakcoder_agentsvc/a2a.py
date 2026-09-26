@@ -13,7 +13,10 @@ other.
 A task is a session; its ``contextId`` is the workspace it runs on. Which
 workspace is the caller's to say, in the message's ``metadata``: a
 ``workspace_id`` they already hold, or a ``repo_url`` (and ``ref``) to lease,
-reusing a lease of the same repository if they have one. ``skill`` picks one of
+reusing a lease of the same repository if they have one. Naming neither is a
+question rather than a mistake, and gets a scratch workspace — an empty
+directory, where the knowledge base still answers and there is nothing to
+deliver. ``skill`` picks one of
 the card's skills; ``approval_policy`` defaults to ``auto_safe``, because an
 agent has nobody to answer an approval (§10).
 
@@ -232,11 +235,15 @@ class A2A:
                 return str(candidate)
         repo_url = str(meta.get("repo_url") or "")
         if not repo_url:
-            raise RpcError(
-                INVALID_PARAMS,
-                "say which repository: metadata.workspace_id for one you hold, or "
-                "metadata.repo_url (and ref) to lease one",
-            )
+            # No repository named. A question about the template or the
+            # playbooks is answerable from the knowledge base that ships inside
+            # the agent, so this is a scratch workspace rather than a refusal:
+            # an agent that asks "what does the SOP say about step 3" should
+            # not have to invent a repo_url to be answered.
+            try:
+                return (await self.service.lease_scratch(sub)).id
+            except Refused as exc:
+                raise _rpc(exc) from None
         ref = str(meta.get("ref") or "")
         for lease in self.service.store.leases(sub):
             if lease.repo_url == repo_url and (not ref or lease.ref == ref):

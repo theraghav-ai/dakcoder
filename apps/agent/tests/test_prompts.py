@@ -231,7 +231,13 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 #: module's version across the rename into a separate release line, put six
 #: revisions that had never existed into go.mod, and spent thirty-eight turns
 #: blocked on the result while reporting the cause as missing credentials.
-PREFIX_CEILING = {Mode.ASK: 2_800, Mode.PLANNER: 3_380, Mode.AGENT: 4_500}
+#: Every mode moved by 60 for the rule that code pasted into the message counts
+#: as opened. A caller with no repository gets a scratch workspace, and on it
+#: "never describe code you have not opened" read as "decline": a field run was
+#: handed a Go function with three syntax errors, found an empty tree, and
+#: listed the errors instead of fixing them, asking for a repository it did not
+#: need.
+PREFIX_CEILING = {Mode.ASK: 2_860, Mode.PLANNER: 3_440, Mode.AGENT: 4_560}
 
 
 @pytest.mark.parametrize("mode", list(Mode))

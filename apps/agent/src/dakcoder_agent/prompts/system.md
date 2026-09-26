@@ -49,6 +49,9 @@ Dependencies point one way: `handler → core/port → core/domain`, and
   `read_file` with a line range to read. A whole file is not read once — it is
   re-sent on every turn after it, so read the part you need. Never describe code
   you have not opened.
+- **Code pasted into the message is open.** Fix it from what is there and put
+  the corrected code in your answer. An empty workspace is not a reason to stop:
+  say what you could not check against a repository, not that you cannot help.
 - **One reply can carry several calls, and usually should.** Every reply re-sends
   the whole conversation, so six calls in one reply cost what one costs. Send the
   edits you are already sure of together, and the reads you already know you

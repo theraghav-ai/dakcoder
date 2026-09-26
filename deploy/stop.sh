@@ -18,5 +18,9 @@ tmux kill-session -t "$SESSION" 2>/dev/null && echo "tmux session '$SESSION' kil
 # Whatever is left belongs to a control plane that died rather than stopped.
 _runners="$(docker ps -aq --filter name=dakcoder-runner- 2>/dev/null)"
 [[ -n "$_runners" ]] && docker rm -f $_runners >/dev/null && echo "runner containers removed"
+# The same for process runners (DAKCODER_RUNNER_BACKEND=process): one that
+# outlives its control plane keeps serving the code it was started with, so a
+# redeploy that leaves it running has not redeployed the agent.
+pkill -f 'bin/dakcoderd --hosted' && echo "runner processes stopped"
 [[ "${1:-}" == "--all" ]] && docker stop dakcoder-postgres >/dev/null && echo "postgres stopped"
 exit 0

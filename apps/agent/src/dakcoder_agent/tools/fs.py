@@ -32,14 +32,32 @@ from dakcoder_shared.paths import glob_match
 from .router import Invocation
 
 __all__ = [
+    "EMPTY_WORKSPACE",
     "READ_WINDOW_LINES",
     "delete_file",
     "patch_file",
     "read_file",
     "search_repo",
     "write_file",
+    "workspace_empty",
     "HANDLERS",
 ]
+
+#: What the model is told when the workspace holds nothing: a scratch lease, for
+#: a caller who pasted code or asked a question without naming a repository.
+#:
+#: Said plainly, because every signal the model had on such a run pointed the
+#: wrong way. ``repo_map`` said zero files, ``search_repo`` said "it is not in
+#: this workspace", and a field run handed a Go function with three syntax
+#: errors read that as the code being missing -- it asked for a repository and
+#: fixed nothing, with the rule that pasted code counts as opened sitting in its
+#: system prompt the whole time.
+EMPTY_WORKSPACE = (
+    "This workspace is empty: no repository was attached, and none is needed. "
+    "Any code in the developer's message is the code to work on -- answer from "
+    "it and put the corrected code in your answer. Do not ask for a repository; "
+    "say instead what you could not check without one (the build, the linter)."
+)
 
 #: Directories never searched or listed. Everything here is either generated,
 #: vendored, or someone else's code — and all of it is enormous relative to its
@@ -664,6 +682,12 @@ def search_repo(inv: Invocation) -> ToolResult:
                 meta={"scanned": 0, "empty_glob": glob, "hits": 0},
             )
 
+        if not glob and scanned == 0 and workspace_empty(root):
+            return ToolResult.success(
+                f"nothing was searched for {pattern!r}. {EMPTY_WORKSPACE}",
+                meta={"scanned": 0, "hits": 0, "empty_workspace": True},
+            )
+
         where = (
             f"the {scanned} file(s) matching {glob!r}" if glob else f"all {scanned} files"
         )
@@ -696,6 +720,19 @@ def search_repo(inv: Invocation) -> ToolResult:
         truncated=truncated,
         meta={"scanned": scanned, "hits": len(hits), "match_keys": keys},
     )
+
+
+def workspace_empty(root: Path) -> bool:
+    """Whether the workspace holds nothing but dakcoder's own state.
+
+    ``.dakcoder`` is where sessions are journaled, so it is present on every
+    workspace that has run anything, a scratch one included; ``.git`` is not
+    code either.
+    """
+    try:
+        return not any(entry.name not in {".dakcoder", ".git"} for entry in root.iterdir())
+    except OSError:
+        return False
 
 
 def _top_level(root: Path) -> list[str]:
