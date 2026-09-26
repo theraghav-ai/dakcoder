@@ -212,3 +212,29 @@ def test_the_classifier_still_reads_the_whole_conversation(planning_router, gate
         "do it for the handlers too",
     )
     assert second.state.mode in (Mode.ASK, Mode.PLANNER, Mode.AGENT)
+
+
+# ── a constrained reply that came back as padding ───────────────────────────
+
+
+def test_after_padding_under_a_named_choice_the_run_stops_forcing() -> None:
+    from types import SimpleNamespace
+
+    from dakcoder_agent.context import ContextManager
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.state = _State()
+    loop.context = ContextManager(mode=Mode.ASK, system_prompt="s")
+    named = {"type": "function", "function": {"name": "finish"}}
+
+    fine = SimpleNamespace(chat=SimpleNamespace(degenerate=False, truncated=False))
+    loop._note_constraint(named, fine)
+    assert not loop.state.constraint_failed
+
+    unforced_cut = SimpleNamespace(chat=SimpleNamespace(degenerate=False, truncated=True))
+    loop._note_constraint(None, unforced_cut)
+    assert not loop.state.constraint_failed, "an unforced reply that ran long is a different problem"
+
+    padded = SimpleNamespace(chat=SimpleNamespace(degenerate=True, truncated=False))
+    loop._note_constraint(named, padded)
+    assert loop.state.constraint_failed

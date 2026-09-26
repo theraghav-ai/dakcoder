@@ -253,6 +253,9 @@ class ChatResult:
     #: True when the turn was retried with thinking off after an empty
     #: completion. Counted, because §18 wants zero of these.
     recovered_from_empty: bool = False
+    #: True when the stream was cut short because the model fell into emitting
+    #: whitespace between JSON tokens. See ``RUNAWAY_WHITESPACE``.
+    degenerate: bool = False
 
     @property
     def truncated(self) -> bool:
@@ -731,6 +734,7 @@ def _consume_stream(
     streams: dict[Any, _ArgumentStream] = {}
     saw_content_key = False
     done = False
+    runaway = False
 
     for line in lines:
         line = line.strip()
@@ -848,6 +852,29 @@ def _consume_stream(
                             stream = streams[key] = _ArgumentStream(STREAMED_ARGUMENTS[slot["name"]])
                         if text := stream.feed(slot["arguments"]):
                             on_delta(text)
+                    if _runaway(slot["arguments"]):
+                        runaway = True
+        if runaway:
+            # Stop reading. Closing the response is what lets the gateway, and
+            # the endpoint behind it, stop generating padding nobody will read.
+            break
+
+    if runaway:
+        # The call is often whole under the padding: the model closed the value
+        # it was writing and then could not stop emitting the whitespace JSON
+        # allows before the next token. Trimmed, and closed when it was left
+        # open between members, it is exactly the call the model meant.
+        salvaged = True
+        for slot in calls.values():
+            fixed = _salvage(slot["arguments"])
+            if fixed is None:
+                salvaged = False
+                slot["arguments"] = slot["arguments"].rstrip()
+            else:
+                slot["arguments"] = fixed
+        result.degenerate = True
+        result.finish_reason = "tool_calls" if salvaged else "length"
+        done = True
 
     result.content = "".join(content)
     result.reasoning = "".join(reasoning)
@@ -988,6 +1015,38 @@ def _value_start(raw: str, key: str) -> int:
     if i >= n or raw[i] != '"':
         return -1
     return i + 1
+
+
+#: Consecutive whitespace in a tool call's arguments that means the model has
+#: fallen into padding rather than writing.
+#:
+#: Forced to a named tool, the endpoint constrains output to that tool's JSON
+#: schema, and JSON allows unlimited whitespace between tokens. Qwen at
+#: temperature 0.1 can fall into emitting only that: session 12444d171543 wrote
+#: one sentence of a `finish` answer, closed the string, and produced 8,000
+#: tokens of spaces and tabs -- three times, 23 seconds each, until the run
+#: ended on "3 replies in a row were cut off". Raw tabs are not even legal
+#: inside a JSON string, so a run this long is never content.
+RUNAWAY_WHITESPACE = 256
+
+
+def _runaway(arguments: str) -> bool:
+    # The tail only: this runs on every fragment of every call, and an answer
+    # can be 24,000 characters long.
+    tail = arguments[-RUNAWAY_WHITESPACE:]
+    return len(tail) == RUNAWAY_WHITESPACE and not tail.strip(" \t\r\n")
+
+
+def _salvage(arguments: str) -> str | None:
+    """Arguments that parse once the padding is removed, or ``None``."""
+    trimmed = arguments.rstrip(" \t\r\n")
+    for candidate in (trimmed, trimmed.rstrip(",").rstrip(" \t\r\n") + "}"):
+        try:
+            if isinstance(json.loads(candidate), dict):
+                return candidate
+        except ValueError:
+            continue
+    return None
 
 
 def _int_header(response: Any, name: str) -> int | None:

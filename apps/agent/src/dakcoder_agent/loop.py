@@ -386,6 +386,7 @@ _OWNER: dict[str, str] = {
     "preamble_refused": "progress",
     "preamble_last": "progress",
     "plan_objections": "progress",
+    "constraint_failed": "progress",
     "reasks": "progress",
     "reply_key": "progress",
     "reply_repeats": "progress",
@@ -1948,6 +1949,15 @@ class AgentLoop:
             tool_choice = forced_choice or self._terminal_choice()
             if forced_choice is None:
                 offered, tool_choice = self._terminal_request(tools, tool_choice)
+            if self.state.constraint_failed and tool_choice is not None:
+                # A constrained reply has already failed this run -- padding, or
+                # cut off -- and the same request fails the same way: session
+                # 12444d171543 sent the identical named `finish` three times and
+                # got 8,192 tokens of whitespace each time, then an unforced
+                # turn answered in 651. So the rest of this run asks plainly,
+                # with every tool; the instruction to finish is already in the
+                # conversation, and in ASK a prose answer is an answer.
+                offered, tool_choice = tools, None
 
         # Measured on what is actually sent, not on what `_tools` returned: the
         # narrowing above is a prefix break, and hashing the unnarrowed list
@@ -1967,6 +1977,7 @@ class AgentLoop:
         if outcome is None:
             return
         result = outcome
+        self._note_constraint(tool_choice, result)
 
         # A mode that must end with a tool call and did not is re-asked with the
         # call made mandatory.
@@ -1989,6 +2000,7 @@ class AgentLoop:
             yield from self._report_wire_repairs()
             if forced is None:
                 return
+            self._note_constraint("required", forced)
             if forced.chat.tool_calls:
                 # The prose the model actually said travels with the forced
                 # reply, because it has already been streamed to the panel: the
@@ -2419,6 +2431,30 @@ class AgentLoop:
             )
         return False
 
+    def _note_constraint(self, choice: Any, result: TurnResult) -> None:
+        """Remember that a constrained request came back broken, for the rest of the run.
+
+        A named or ``required`` tool choice makes the endpoint decode against
+        the tool's JSON schema, and on this model that can collapse into
+        padding: a sentence, then whitespace to the output limit. The client
+        cuts that short (``ChatResult.degenerate``); a reply cut off by the limit
+        under a constraint is the same failure seen later. Either way the next
+        forced turn goes unconstrained. See ``_turn``.
+        """
+        if choice in (None, "auto"):
+            return
+        chat = result.chat
+        if getattr(chat, "degenerate", False) or chat.truncated:
+            if not self.state.constraint_failed:
+                log.warning(
+                    "turn %d: a constrained reply (%s) came back %s; later forced "
+                    "turns in this run go unconstrained",
+                    self.context.turn,
+                    "named tool" if isinstance(choice, dict) else choice,
+                    "as padding" if getattr(chat, "degenerate", False) else "cut off",
+                )
+            self.state.constraint_failed = True
+
     def _answer_truncated(
         self, result: TurnResult, incomplete: Sequence[ToolCall]
     ) -> Iterator[Event]:
@@ -2452,18 +2488,30 @@ class AgentLoop:
                     if self.router.touched
                     else "Nothing has been written this run yet"
                 )
-                body = (
-                    f"Your call to {call.name}"
-                    + (f" for {target}" if target else "")
-                    + " arrived cut off -- the arguments stop partway through, so "
-                    "the call was not made"
-                    + (f" and {target} is unchanged" if target else "")
-                    + ". Nothing is wrong with your JSON; this is what running into "
-                    f"the {config_for(self.state.mode).max_tokens:,}-token output "
-                    "limit looks like.\n\n"
-                    + self._shorter_reply(call.name, alone)
-                    + f"\n\n{landed}."
-                )
+                if getattr(result.chat, "degenerate", False):
+                    # Not an oversized reply: a stalled one. Saying "too long"
+                    # would send the model off to write less of what it never
+                    # wrote in the first place.
+                    body = (
+                        f"Your call to {call.name} stalled: after the first words "
+                        "the reply turned into blank padding and never finished, so "
+                        "the call was not made. Write the whole reply again, "
+                        "straight through."
+                        + f"\n\n{landed}."
+                    )
+                else:
+                    body = (
+                        f"Your call to {call.name}"
+                        + (f" for {target}" if target else "")
+                        + " arrived cut off -- the arguments stop partway through, so "
+                        "the call was not made"
+                        + (f" and {target} is unchanged" if target else "")
+                        + ". Nothing is wrong with your JSON; this is what running into "
+                        f"the {config_for(self.state.mode).max_tokens:,}-token output "
+                        "limit looks like.\n\n"
+                        + self._shorter_reply(call.name, alone)
+                        + f"\n\n{landed}."
+                    )
                 said = f"output limit reached mid-call; {names} was not dispatched"
             else:
                 body = (

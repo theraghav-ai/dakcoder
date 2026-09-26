@@ -413,6 +413,9 @@ class Progress:
     #: adopted, because a push-back that never stops asking spends the whole
     #: budget on the shape of the work instead of the work.
     plan_objections: int = 0
+    #: Whether a constrained (named or ``required``) request has already come
+    #: back as padding or cut off in this run. See ``AgentLoop._note_constraint``.
+    constraint_failed: bool = False
     #: Questions sent back because they had already been asked and answered.
     reasks: int = 0
     #: What the last reply hashed to -- its prose and every call in it -- and
