@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -114,11 +115,54 @@ async def test_malformed_requests_get_json_rpc_errors(app, body, code) -> None:
     assert response.json()["error"]["code"] == code
 
 
-async def test_an_unknown_skill_and_an_unnamed_repository_are_refused(app, remote) -> None:
+async def test_an_unknown_skill_is_refused(app, remote) -> None:
     async with as_caller(app, "agent-7") as agent:
         skill = await call(agent, send("x", remote, skill="deploy-to-production"))
-        body = send("x", remote)
-        body["params"]["message"]["metadata"] = {}
-        nowhere = await call(agent, body)
     assert skill["error"]["code"] == -32602
-    assert nowhere["error"]["code"] == -32602
+
+
+def without_a_repository(text: str = "noop") -> dict:
+    """A message naming neither a workspace nor a repository."""
+    return rpc(
+        "message/send",
+        {
+            "message": {
+                "kind": "message",
+                "role": "user",
+                "messageId": "m1",
+                "parts": [{"kind": "text", "text": text}],
+                "metadata": {},
+            },
+            "configuration": {"blocking": True},
+        },
+    )
+
+
+async def test_naming_no_repository_runs_on_a_scratch_workspace(app, service) -> None:
+    """A question is not a mistake. It was refused for want of a `repo_url`;
+    now it gets an empty workspace, where the knowledge base still answers."""
+    async with as_caller(app, "agent-7") as agent:
+        first = await call(agent, without_a_repository())
+        second = await call(agent, without_a_repository())
+    assert first["result"]["status"]["state"] == "completed"
+    assert second["result"]["contextId"] == first["result"]["contextId"], "the scratch lease is reused"
+    leases = service.store.leases("agent-7")
+    assert [lease.scratch for lease in leases] == [True], "one scratch lease, and only one"
+
+
+async def test_a_scratch_workspace_does_not_use_up_the_lease_allowance(app, service, remote) -> None:
+    """An empty directory is not the resource the per-caller cap rations."""
+    service.settings = replace(service.settings, max_leases_per_user=1)
+    async with as_caller(app, "agent-7") as agent:
+        await call(agent, send("noop", remote, blocking=True))
+        answered = await call(agent, without_a_repository())
+    assert answered["result"]["status"]["state"] == "completed"
+    assert len(service.store.leases("agent-7")) == 2
+
+
+async def test_a_scratch_session_has_nothing_to_deliver(app) -> None:
+    async with as_caller(app, "agent-7") as agent:
+        task = (await call(agent, without_a_repository("write handler/x.go")))["result"]
+        refused = await agent.post(f"/v1/sessions/{task['id']}/deliver", json={"title": "nope"})
+    assert refused.status_code == 409
+    assert "scratch workspace" in refused.json()["error"]

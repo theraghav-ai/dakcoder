@@ -124,6 +124,7 @@ from .undo import ensure_private
 from .prompts import mode_instruction, system_prompt
 from .tools import registry
 from .tools.control import PlanStep, split_paths, steps_from_meta
+from .tools.fs import EMPTY_WORKSPACE, workspace_empty
 from .tools.router import ApprovalRequest, Router
 
 log = logging.getLogger(__name__)
@@ -1299,7 +1300,14 @@ class AgentLoop:
             # next compaction evicts.
             self.context.pin_directive(task)
         else:
-            self.context.set_task(task, acceptance=acceptance)
+            # Said before the first turn rather than left for `repo_map` to
+            # discover: a run that learns the tree is empty from its tools has
+            # already spent turns searching, and by then the loop is telling it
+            # to stop searching and say what it could not find.
+            pinned = task
+            if workspace_empty(self.router.workspace.root):
+                pinned = f"{task}\n\n({EMPTY_WORKSPACE})"
+            self.context.set_task(pinned, acceptance=acceptance)
         self._refresh_project_docs()
 
         # What this run is for, in order of how much the loop actually knows.

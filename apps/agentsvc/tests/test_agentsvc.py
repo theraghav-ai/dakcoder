@@ -53,6 +53,30 @@ async def test_a_lease_is_a_mirror_and_a_working_copy(app, remote, service: Serv
     )
 
 
+async def test_a_scratch_workspace_is_leased_with_no_repository(app, service: Service) -> None:
+    """`{"scratch": true}`: an empty directory, for a caller with a question
+    rather than a change. No mirror, so nothing can be pushed from it."""
+    async with as_caller(app, "alice") as alice:
+        leased = (await alice.post("/v1/workspaces", json={"scratch": True})).json()
+        again = (await alice.post("/v1/workspaces", json={"scratch": True})).json()
+    assert leased["repo_url"] == "scratch" and leased["ref"] == ""
+    assert again["id"] == leased["id"], "one scratch workspace per caller, reused"
+    lease_dir = Path(service.store.lease(leased["id"], "alice").path)
+    assert Git.worktree(lease_dir).is_dir() and not list(Git.worktree(lease_dir).iterdir())
+    assert not Git.mirror(lease_dir).exists(), "a scratch lease has nothing to push to"
+
+
+async def test_a_run_on_a_scratch_workspace_works_and_can_be_released(app, service: Service) -> None:
+    async with as_caller(app, "alice") as alice:
+        leased = (await alice.post("/v1/workspaces", json={"scratch": True})).json()
+        session = await run(alice, leased["id"], "noop")
+        detail = await settled(alice, session["id"])
+        released = await alice.delete(f"/v1/workspaces/{leased['id']}")
+    assert detail["status"] == "done"
+    assert released.status_code == 200
+    assert service.store.lease(leased["id"], "alice") is None
+
+
 async def test_only_listed_repositories_can_be_leased(app, service: Service, remote) -> None:
     async with as_caller(app, "alice") as alice:
         other = await alice.post("/v1/workspaces", json={"repo_url": "https://gitlab/other.git"})

@@ -20,7 +20,18 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-__all__ = ["Delivery", "Lease", "SessionRow", "Store"]
+__all__ = ["SCRATCH_REPO", "Delivery", "Lease", "SessionRow", "Store"]
+
+#: The ``repo_url`` of a lease that clones nothing: an empty working directory,
+#: for a caller who asked a question rather than named a repository. The agent's
+#: knowledge base ships with it and needs no checkout, so "what does the
+#: template say about X" is answerable with no repository at all; refusing those
+#: for want of a ``repo_url`` sent callers hunting for one to name.
+#:
+#: Not a URL, and deliberately not one git could resolve: nothing clones, pushes
+#: or delivers from a scratch lease, and the checks that matter test for this
+#: value rather than for a missing mirror on disk.
+SCRATCH_REPO = "scratch"
 
 _SCHEMA = """
 create table if not exists leases (
@@ -69,6 +80,11 @@ class Lease:
     @property
     def repo(self) -> Path:
         return Path(self.path)
+
+    @property
+    def scratch(self) -> bool:
+        """A lease with no repository: an empty directory, nothing to deliver."""
+        return self.repo_url == SCRATCH_REPO
 
     def public(self) -> dict[str, Any]:
         """What a caller is shown: never the path on the server."""
