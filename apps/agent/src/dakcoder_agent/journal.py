@@ -42,6 +42,7 @@ transcripts.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +58,18 @@ __all__ = ["Journal", "restore_summaries"]
 #: few times a turn rather than a few times a second.
 FLUSH_AT = 32
 
+#: How long a caller that asked to wait for the disk will wait.
+WRITE_WAIT_SECONDS = 10.0
+
+#: One writer thread for every journal in the process. The event-loop thread
+#: used to write `events.jsonl` itself, inside the session lock, a few times a
+#: turn (`Session.record`): a slow disk stalled every request handler and every
+#: other session's events for the length of the write. One thread, so writes
+#: land in the order they were submitted.
+_WRITER = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="dakcoder-journal"
+)
+
 
 class Journal:
     """The on-disk record of one session."""
@@ -71,6 +84,9 @@ class Journal:
         #: Set once a write has failed. Retrying every event on a read-only
         #: checkout would put an exception in the hot path a few times a second.
         self._broken = False
+        #: The most recent write handed to the writer thread, for the callers
+        #: that need it on disk before they go on.
+        self._last: concurrent.futures.Future[None] | None = None
 
     # -- writing -----------------------------------------------------------
 
@@ -80,13 +96,35 @@ class Journal:
             return
         self._buffer.append(json.dumps(payload, separators=(",", ":"), default=str))
         if len(self._buffer) >= FLUSH_AT:
-            self.flush()
+            # The routine flush, off the caller's thread. The explicit ones --
+            # a mutation, the end of a run -- still wait, because what follows
+            # them reads the file.
+            self.flush(wait=False)
 
-    def flush(self) -> None:
-        """Write what is buffered. Best-effort, and silent about it."""
-        if self._broken or not self._buffer:
+    def flush(self, *, wait: bool = True) -> None:
+        """Hand what is buffered to the writer; with ``wait``, return once it is on disk."""
+        if self._broken:
             return
-        pending, self._buffer = self._buffer, []
+        if self._buffer:
+            pending, self._buffer = self._buffer, []
+            self._last = _WRITER.submit(self._write, pending)
+        if wait:
+            self._drain()
+
+    def _drain(self) -> None:
+        """Block until the writer has landed everything handed to it so far."""
+        last = self._last
+        if last is None:
+            return
+        try:
+            last.result(timeout=WRITE_WAIT_SECONDS)
+        except Exception:  # noqa: BLE001 - `_write` records its own failure
+            pass
+
+    def _write(self, pending: list[str]) -> None:
+        """Append the lines. Best-effort, and silent about it."""
+        if self._broken:
+            return
         try:
             ensure_private(self.root.parents[2])
             self.root.mkdir(parents=True, exist_ok=True)
@@ -96,9 +134,14 @@ class Journal:
             self._broken = True
 
     def write_meta(self, summary: dict[str, Any]) -> None:
-        """Replace the session summary. Called when something about it changes."""
+        """Replace the session summary. Called when something about it changes.
+
+        After the events, so the summary on disk never describes events that
+        are not there yet.
+        """
         if self._broken:
             return
+        self._drain()
         try:
             ensure_private(self.root.parents[2])
             self.root.mkdir(parents=True, exist_ok=True)
@@ -119,6 +162,7 @@ class Journal:
         than raised on: a transcript missing its final event is worth having.
         """
         out: list[dict[str, Any]] = []
+        self._drain()
         try:
             with self._events.open("r", encoding="utf-8") as fh:
                 for line in fh:

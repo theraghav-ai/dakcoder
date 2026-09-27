@@ -7,7 +7,8 @@ by rule:
 
 * **Refused**: anything that touches a protected path (``PROTECTED_GLOBS``:
   generated or structural files), anything the router says must always ask
-  (``delete_file``), and adding a dependency, which the router says is
+  (``delete_file``), an arbitrary command (``run_terminal``, whose arguments
+  no rule can review), and adding a dependency, which the router says is
   "allow-listed and reviewed, not added mid-task". Nobody reviews an
   unattended run, so none of these may happen in one.
 * **Approved**: the rest. A scaffold or a commit on unprotected paths is the
@@ -49,6 +50,11 @@ def auto_safe(request: ApprovalRequest) -> tuple[bool, str]:
         return False, (
             f"auto_safe refused {request.tool}: it always needs a person's approval, and "
             "this run has nobody to ask"
+        )
+    if request.tool == "run_terminal":
+        return False, (
+            "auto_safe refused run_terminal: an arbitrary command cannot be reviewed by "
+            "rule, and nobody reviews this run"
         )
     if request.tool == "go_mod" and request.arguments.get("op") == "get":
         return False, (

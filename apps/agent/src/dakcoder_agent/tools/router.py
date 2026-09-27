@@ -517,6 +517,13 @@ class Router:
 
         return args, tuple(dict.fromkeys(resolved))
 
+    def _present(self, paths: Sequence[str]) -> bool:
+        """Whether every path exists on disk, for approvals about what is there."""
+        try:
+            return all(self.workspace.resolve(p).exists() for p in paths)
+        except (PathEscape, ValueError, OSError):
+            return True
+
     def _approval(
         self, spec: ToolSpec, args: dict[str, Any], paths: Sequence[str]
     ) -> ApprovalRequest | None:
@@ -526,6 +533,11 @@ class Router:
 
         if spec.approval is Approval.ALWAYS:
             if self.policy.allows(spec):
+                return None
+            if spec.name == "delete_file" and paths and not self._present(paths):
+                # Nothing to approve: the handler refuses a path that is not
+                # there, and a card for it asked the developer to approve a
+                # deletion that could not happen (38af5843c38e, turns 20-27).
                 return None
             return ApprovalRequest(
                 spec.name,

@@ -37,7 +37,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable, Sequence
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
@@ -99,6 +99,23 @@ class Stage:
     #: that cannot honestly run here is reported as advisory with this reason
     #: rather than failing the change. Returning ``""`` keeps it blocking.
     advisory_when: Callable[["GateContext"], str] = lambda _ctx: ""
+    #: Whether a finding in a file this run touched is charged whatever the
+    #: baseline says. Compilation only. The baseline excuses what was already
+    #: failing when the task began -- and a run that then *edits* a file that
+    #: was failing answers for it compiling, whoever broke it first. Without
+    #: this a session's own earlier damage came back excused: b593cd7ae46e
+    #: broke `repo/postgres/employee.go` in one message and had the next
+    #: message's gate call those errors "already present before this run".
+    charge_touched: bool = False
+    #: Whether this stage's verdict means nothing when the module does not
+    #: compile. `go vet` and `go test` on a red package print the compiler's
+    #: errors again and fail -- so when `go_build` was excused for those same
+    #: errors, this stage blocked on them, and one report told the model
+    #: "advisory, not yours to fix" and "make the edit" about one error
+    #: (9ae9b5925046, b593cd7ae46e). Such a stage is skipped when every package
+    #: this run touched is red, and inherits the build's excuse when it
+    #: reproduced nothing but the excused errors.
+    after_build: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -718,6 +735,7 @@ GATE: tuple[Stage, ...] = (
         # workspace that does not build is a workspace where no task can ever
         # finish, and the run is told the breakage is its own.
         baseline_key="go_build",
+        charge_touched=True,
     ),
     Stage(
         "govalid_gen",
@@ -737,6 +755,7 @@ GATE: tuple[Stage, ...] = (
         skip_reason=_NO_MODULE,
         halts=True,
         baseline_key="go_build",
+        charge_touched=True,
     ),
     # Baselined, like every other blocking stage, and for the reason the others
     # are: without one it reports whatever it finds and the loop reads every
@@ -781,6 +800,7 @@ GATE: tuple[Stage, ...] = (
         when=_has_go,
         skip_reason=_NO_MODULE,
         baseline_key="go_vet",
+        after_build=True,
     ),
     Stage(
         "go_test",
@@ -791,6 +811,7 @@ GATE: tuple[Stage, ...] = (
         skip_reason="no test files",
         baseline_key="go_test",
         advisory_when=_tests_can_run,
+        after_build=True,
     ),
     Stage(
         "go_mod tidy",
@@ -1038,7 +1059,7 @@ def _take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
 
         passed[tool] = outcome.ok
         if not outcome.ok:
-            keys = _finding_keys(outcome.for_model())
+            keys = _finding_keys(outcome.content)
             findings[tool] = keys
             # A failure that named no file and no line is a failure about the
             # module or the machine, not a list of findings: `-mod=readonly`
@@ -1076,8 +1097,13 @@ def _take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
 def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
     results: list[StageResult] = []
     started = time.monotonic()
+    # What compilation said, for the stages that mean nothing without it.
+    build_red = False
+    build_excused: frozenset[str] = frozenset()
+    red_dirs: set[str] = set()
 
     for index, stage in enumerate(stages):
+        charged: frozenset[str] | None = None
         if not stage.when(ctx):
             results.append(
                 StageResult(stage.name, True, stage.blocking, "", skipped=stage.skip_reason)
@@ -1088,6 +1114,21 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
         if args is None:
             results.append(
                 StageResult(stage.name, True, stage.blocking, "", skipped="nothing in scope")
+            )
+            continue
+
+        if stage.after_build and build_red and _touched_all_red(ctx, red_dirs):
+            # 72 seconds of `go vet` and `go test` on packages that do not
+            # compile, to be told what `go_build` already said.
+            results.append(
+                StageResult(
+                    stage.name,
+                    True,
+                    stage.blocking,
+                    "",
+                    skipped="not run: the packages this run changed do not compile; "
+                    "see go_build",
+                )
             )
             continue
 
@@ -1107,8 +1148,21 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
             if reason := stage.advisory_when(ctx):
                 blocking = False
                 content = f"{content}\n\nAdvisory, not blocking: {reason}."
+            elif (
+                stage.after_build
+                and build_red
+                and _only_excused_build_errors(stage, found, content, build_excused)
+            ):
+                blocking = False
+                content = (
+                    f"{content}\n\nAdvisory, not blocking: these are the compile errors "
+                    "go_build reported above, already present before this run changed "
+                    "anything; nothing here ran on the code."
+                )
             elif stage.baseline_key:
                 charged = ctx.baseline.charge(stage.baseline_key, found)
+                if stage.charge_touched:
+                    charged = _charge_touched(ctx, stage, found, charged)
                 if charged is not None and not charged:
                     blocking = False
                     content = (
@@ -1131,6 +1185,17 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
         results.append(
             StageResult(stage.name, ok, blocking, content, elapsed, findings=found)
         )
+
+        if stage.tool == "go_build" and not ok:
+            build_red = True
+            own = found if charged is None else charged
+            build_excused = build_excused | (found - own)
+            root = ctx.router.workspace.root
+            red_dirs.update(
+                _dir_of(_relative(path, root))
+                for path in (finding_path(stage.tool, k) for k in found)
+                if path
+            )
 
         if blocking and not ok and stage.halts:
             # Fail-fast, but only where "fast" is also "correct". Running
@@ -1156,6 +1221,80 @@ def _run(ctx: GateContext, stages: Sequence[Stage]) -> GateReport:
         # `unverified` without ever asking them.
 
     return GateReport(tuple(results), (), time.monotonic() - started)
+
+
+def _relative(path: str, root: Path) -> str:
+    """A path a tool printed, in the workspace-relative POSIX form ``touched`` uses.
+
+    `go build` prints paths relative to its working directory with the OS
+    separator, and absolute for a file outside it; `Router.touched` holds
+    workspace-relative POSIX. Same normalisation as `build_errors`.
+    """
+    out = path.replace("\\", "/")
+    prefix = str(root).replace("\\", "/").rstrip("/") + "/"
+    if out.lower().startswith(prefix.lower()):
+        out = out[len(prefix):]
+    return out.removeprefix("./")
+
+
+def _dir_of(rel: str) -> str:
+    return str(PurePosixPath(rel).parent)
+
+
+def _touched_all_red(ctx: GateContext, red_dirs: set[str]) -> bool:
+    """Whether every package this run changed a Go file in failed to compile."""
+    dirs = {_dir_of(p) for p in ctx.go_files}
+    return bool(dirs) and dirs <= red_dirs
+
+
+def _charge_touched(
+    ctx: GateContext, stage: Stage, found: frozenset[str], charged: frozenset[str] | None
+) -> frozenset[str] | None:
+    """Findings in files this run touched are this run's, whatever the baseline says.
+
+    The baseline is a picture of the workspace as the *task* found it, and a
+    run that edits a file that was already failing to compile answers for it
+    compiling: it cannot know its own edit is sound otherwise, and the
+    developer reading "not yours to fix" about a file the agent just rewrote
+    cannot act on it. Compilation only (`Stage.charge_touched`): a lint
+    finding in a touched legacy file is still the house style, not a
+    regression, and the rule-class excuse in `Baseline.charge` exists for it.
+    """
+    if charged is None:
+        # No baseline, or the stage was green before this run: everything is
+        # already charged, and there is nothing to add to "everything".
+        return None
+    root = ctx.router.workspace.root
+    touched = set(ctx.touched)
+    mine = frozenset(
+        k
+        for k in found
+        if (path := finding_path(stage.tool, k)) and _relative(path, root) in touched
+    )
+    return charged | mine
+
+
+def _only_excused_build_errors(
+    stage: Stage, found: frozenset[str], content: str, build_excused: frozenset[str]
+) -> bool:
+    """Whether a failing post-build stage reproduced the excused compile errors and nothing else.
+
+    `go test` on a red package prints the compiler's errors under ``# pkg`` and
+    then ``FAIL pkg [build failed]``; `go vet` prints them prefixed ``vet:``.
+    Keyed the way the baseline keyed them, those are the same findings
+    `go_build` was excused for, and charging them again here is the
+    contradiction this exists to remove. Any keyed finding *not* among the
+    excused ones -- a real test failure, a vet finding in code that did
+    compile -- keeps the stage blocking.
+    """
+    keyed = frozenset(
+        key
+        for key in (_line_key(k[5:].strip()) if k.startswith("vet: ") else k for k in found)
+        if finding_path(stage.tool, key)
+    )
+    if keyed - build_excused:
+        return False
+    return bool(keyed) or "[build failed]" in content
 
 
 #: Stages whose findings are keyed out of ``meta`` rather than off their text.
@@ -1221,7 +1360,10 @@ def _stage_findings(stage: Stage, result: ToolResult) -> frozenset[str]:
         # rendered prose: that is grouped, elided and worst-first, so it does not
         # contain the findings at all past the third of each rule.
         return frozenset(str(k) for k in (result.meta.get("violation_keys") or ()))
-    return _finding_keys(result.for_model())
+    # `content`, not `for_model()`: the fix sentence appended for the model
+    # ("Fix the first error listed...") is not a finding, and it was being
+    # stored as one.
+    return _finding_keys(result.content)
 
 
 def finding_path(tool: str, key: str) -> str:

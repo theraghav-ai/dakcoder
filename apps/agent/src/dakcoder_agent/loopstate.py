@@ -451,6 +451,10 @@ class Progress:
     #: Whether a constrained (named or ``required``) request has already come
     #: back as padding or cut off in this run. See ``AgentLoop._note_constraint``.
     constraint_failed: bool = False
+    #: ``router.model_mutations`` as of the last turn forced to edit, or -1.
+    #: Read by ``AgentLoop._edit_request``: a second edit force at the same
+    #: count is one the first did not move, and it names the tool.
+    edit_force_mutations: int = -1
     #: Questions sent back because they had already been asked and answered.
     reasks: int = 0
     #: What the last reply hashed to -- its prose and every call in it -- and

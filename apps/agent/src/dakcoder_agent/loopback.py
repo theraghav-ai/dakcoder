@@ -122,6 +122,49 @@ APPROVAL_TIMEOUT = _approval_timeout()
 APPROVAL_POLL = 5.0
 
 
+class _Table(dict):
+    """A dict shared between the event loop and the worker threads.
+
+    Every session's approvals, context and loop are written by the worker
+    thread that runs it and read by request handlers on the event loop. A
+    single dict operation is atomic under the GIL; iterating one while another
+    thread writes it is not (``dictionary changed size during iteration``),
+    and `_forget`, `_release` and `pending_for` all iterate. So iteration hands
+    back a snapshot, taken under the one lock the writes take too.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        with self._lock:
+            super().__setitem__(key, value)
+
+    def __delitem__(self, key: Any) -> None:
+        with self._lock:
+            super().__delitem__(key)
+
+    def pop(self, key: Any, *default: Any) -> Any:
+        with self._lock:
+            return super().pop(key, *default)
+
+    def items(self) -> list[tuple[Any, Any]]:  # type: ignore[override]
+        with self._lock:
+            return list(super().items())
+
+    def values(self) -> list[Any]:  # type: ignore[override]
+        with self._lock:
+            return list(super().values())
+
+    def keys(self) -> list[Any]:  # type: ignore[override]
+        with self._lock:
+            return list(super().keys())
+
+    def __iter__(self):  # type: ignore[override]
+        return iter(self.keys())
+
+
 @dataclass
 class PendingApproval:
     """One decision the run is blocked on."""
@@ -192,8 +235,15 @@ class Loopback:
         version: str = "dev",
         gateway_url: str = "",
         suspend_on_timeout: bool = False,
+        allow_unattended: bool = False,
     ) -> None:
         self.workspace = workspace
+        #: Whether a caller may choose ``auto_safe``. Hosted only: the policy
+        #: exists for an A2A caller or a scheduled job in a runner's container,
+        #: and it approves by rule. Locally every loopback-token holder is on
+        #: the developer's own machine, where an approval nobody answers is the
+        #: developer's to make, not a rule's.
+        self.allow_unattended = allow_unattended
         #: Hosted (host-plan §10): an approval nobody answered in time
         #: *suspends* the run instead of counting as a refusal. Locally a
         #: refusal is right, because the developer is there and chose not to
@@ -213,11 +263,11 @@ class Loopback:
         self.tool_catalog = tool_catalog or {}
         self.version = version
         self.gateway_url = gateway_url
-        self.approvals: dict[str, PendingApproval] = {}
-        self.contexts: dict[str, Any] = {}
+        self.approvals: dict[str, PendingApproval] = _Table()
+        self.contexts: dict[str, Any] = _Table()
         #: The loop that last ran for each session, so a follow-up can inherit
         #: its ledgers the way it already inherits its context.
-        self.loops: dict[str, Any] = {}
+        self.loops: dict[str, Any] = _Table()
         # Dropped together with the session they belong to. These hold the whole
         # message list and the whole ledger set, so they are the expensive half
         # of a session and were the half nothing ever released (BUG L-12).
@@ -263,25 +313,6 @@ class Loopback:
         self._spawn(session, task, intent, tuple(acceptance))
         return session
 
-    def _resume_intent(self, session: Session) -> Intent:
-        """What a follow-up on this conversation is asking for.
-
-        ``AUTO``, always, and that is the change. The old version returned the
-        *mode the previous run ended in* -- so a conversation that had finished
-        in the Debugger answered its next message with the Debugger's overlay,
-        its budget and its tool set, whatever the message said. It was written to
-        fix the opposite bug (a session that had just produced a plan re-planned
-        it on "go") and it fixed that one by hard-coding the other.
-
-        Neither is a decision about what was asked. A follow-up is a new
-        request, and the classifier sees the conversation as well as the message
-        -- which is exactly what it needs to tell "go" after a plan from "go" as
-        a topic. Where the run resumes follows from that, not from where it
-        stopped.
-        """
-        del session
-        return Intent.AUTO
-
     def follow_up(
         self, session: Session, text: str, *, intent: Intent | None = None
     ) -> Session:
@@ -308,9 +339,12 @@ class Loopback:
         session.cancel = threading.Event()
         session.winding_down = threading.Event()
         session.record(Event(EventType.USER, {"text": text, "turn": session.turns}))
-        self._spawn(
-            session, text, intent or self._resume_intent(session), (), continued=True
-        )
+        # `AUTO` when the caller did not say: a follow-up is a new request, and
+        # the classifier sees the conversation as well as the message. The
+        # version that resumed in *the mode the previous run ended in* answered
+        # every message after a Debugger run with the Debugger's overlay,
+        # budget and tools, whatever the message said.
+        self._spawn(session, text, intent or Intent.AUTO, (), continued=True)
         return session
 
     def _spawn(
@@ -894,6 +928,12 @@ def create_app(runtime: Loopback, *, authenticate: Authenticator | None = None) 
         if policy not in POLICIES:
             raise HTTPException(
                 status_code=400, detail=f"approval_policy must be one of {', '.join(POLICIES)}"
+            )
+        if policy == AUTO_SAFE and not runtime.allow_unattended:
+            raise HTTPException(
+                status_code=403,
+                detail="approval_policy auto_safe is not available on this runtime: locally "
+                "every approval is the developer's to make",
             )
         session = runtime.start(
             task,

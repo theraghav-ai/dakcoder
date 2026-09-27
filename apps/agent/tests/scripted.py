@@ -167,6 +167,14 @@ def forced_args(name: str) -> dict:
         },
         "ask_developer": {"questions": ["Which table?"]},
         "repo_map": {},
+        # An edit force offers the edit tools alone (`AgentLoop._edit_request`),
+        # so a stub that has to pick one needs arguments the schema takes.
+        "write_file": {"path": "handler/user.go", "content": "package handler\n"},
+        "patch_file": {
+            "path": "handler/user.go",
+            "old": "package handler",
+            "new": "package handler // forced",
+        },
     }.get(name, {"answer": "Nothing further to add."})
 
 

@@ -36,6 +36,7 @@ from typing import Any
 
 import httpx
 
+from .cancel import cancelled as _cancelled
 from .config import Deployment, LLMConfig
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ __all__ = [
     "Usage",
     "ToolCall",
     "EmptyCompletionError",
+    "RequestCancelled",
     "UnsupportedParameterError",
     "UpstreamError",
 ]
@@ -162,6 +164,16 @@ class UnsupportedParameterError(UpstreamError):
     ``drop_params`` is off on this proxy, so an unknown parameter 400s rather
     than being silently ignored — which is the right behaviour and is what makes
     the startup capability probe load-bearing rather than decorative.
+    """
+
+
+class RequestCancelled(RuntimeError):
+    """The run stopped wanting the answer while it was streaming.
+
+    Raised from inside the stream, so the response is closed on the way out
+    and the connection is not left draining tokens nobody will read. Never
+    retried: the caller ends the run, and `_send` checks before each attempt.
+    See ``dakcoder_shared.cancel``.
     """
 
 
@@ -609,6 +621,9 @@ class LLMClient:
                     raise
                 last = exc
 
+            if _cancelled():
+                # A retry nobody is waiting for.
+                raise RequestCancelled("the run was stopped while the model call was retried")
             delay = BACKOFF_SECONDS[min(attempt - 1, len(BACKOFF_SECONDS) - 1)]
             # Said, because a retry is otherwise invisible: the turn simply
             # takes longer, and "the gateway is slow" is the conclusion drawn.
@@ -737,6 +752,11 @@ def _consume_stream(
     runaway = False
 
     for line in lines:
+        if _cancelled():
+            # Checked per frame, keep-alives included, so a Stop reaches a
+            # stream within one frame of the gateway rather than at the read
+            # timeout.
+            raise RequestCancelled("the run was stopped while the model was answering")
         line = line.strip()
         if not line or not line.startswith("data:"):
             continue

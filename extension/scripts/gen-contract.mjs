@@ -23,8 +23,12 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+// `fileURLToPath`, not `.pathname`: a checkout under a directory with a space
+// in its name ("My Projects") left `%20` in the path and the generator reported
+// api/contract.json missing.
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const CONTRACT = join(ROOT, '..', 'api', 'contract.json');
 const OPENAPI = join(ROOT, '..', 'api', 'openapi.json');
 const TARGET = join(ROOT, 'src', 'contract.gen.ts');

@@ -17,7 +17,7 @@ dakcoder is a coding agent for India Post IT 2.0 Go services built on `n-api-tem
 
 ## Commands
 
-Python runs from the repo root without installing anything: `pytest.ini` puts every `apps/*/src` on the path. On this Windows checkout use the venv interpreter, `.venv/Scripts/python.exe`. `make` may not be installed, so each Makefile target is a thin wrapper over the commands below.
+Python runs from the repo root without installing anything: `pytest.ini` puts every `apps/*/src` on the path. If a `.venv` exists, use its interpreter (`.venv/Scripts/python.exe`); otherwise the system `python` (3.13, with pytest and pytest-asyncio installed) works from the repo root. `make` may not be installed, so each Makefile target is a thin wrapper over the commands below.
 
 ```bash
 # Python

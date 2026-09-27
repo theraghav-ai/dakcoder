@@ -574,7 +574,16 @@ def delete_file(inv: Invocation) -> ToolResult:
             fix="Delete the files individually, or leave the directory in place.",
         )
     if not path.exists():
-        return ToolResult.success(f"{rel} was already gone")
+        # A failure, and a dead end: nothing was deleted, and asking again
+        # cannot change that. As a cached *success* it was replayed six times
+        # in one field session (38af5843c38e, turns 20-27), with an approval
+        # card each time for a deletion that never happened.
+        return ToolResult.failure(
+            f"{rel} does not exist; nothing was deleted.",
+            fix="If the file was meant to be replaced, write the replacement with "
+            "`write_file`. If it was already removed, move on to the next step.",
+            meta={"dead_end": f"{rel} does not exist"},
+        )
     lines = 0
     try:
         with open(path, "rb") as handle:

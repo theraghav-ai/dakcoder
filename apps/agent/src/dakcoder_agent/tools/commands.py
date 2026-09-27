@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from dakcoder_shared import cancel as _cancel
 from dakcoder_shared.config import MODEL_CREDENTIAL_VARS
 from dakcoder_shared.envelope import Mutation, MutationKind, ToolResult
 
@@ -100,10 +101,12 @@ class Completed:
     output: str
     seconds: float
     timed_out: bool = False
+    #: Killed because the developer stopped the run, not because it was slow.
+    cancelled: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.code == 0 and not self.timed_out
+        return self.code == 0 and not self.timed_out and not self.cancelled
 
 
 def child_env() -> dict[str, str]:
@@ -137,6 +140,12 @@ def child_env() -> dict[str, str]:
 #: thread starts with a copy of the context that created it — so the baseline
 #: thread setting it does not change what the run thread's tools do.
 READONLY_MODULES: ContextVar[bool] = ContextVar("dakcoder_readonly_modules", default=False)
+
+
+#: How often a running child is asked whether the developer has stopped the
+#: run. A quarter-second is invisible next to any Go command and means a Stop
+#: reaches a `go test` in 0.25s rather than at its 300s timeout.
+CANCEL_POLL_SECONDS = 0.25
 
 
 def run(
@@ -189,21 +198,37 @@ def run(
     )
 
     captured, reader = _pump(proc)
-    timed_out = False
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_tree(proc)
+    timed_out = cancelled = False
+    stop = _cancel.CANCELLED.get()
+    while True:
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:  # pragma: no cover - the kernel refused
-            pass
+            # Polled when the run can be stopped, so an abort reaches the child
+            # within a quarter of a second rather than at its timeout: a `go
+            # test` held the developer's Stop for up to 300 seconds, and a `go
+            # build` for 120, while the panel said "stopping". Without a
+            # signal to poll, one wait for the whole timeout, as before.
+            proc.wait(timeout=CANCEL_POLL_SECONDS if stop is not None else timeout)
+            break
+        except subprocess.TimeoutExpired:
+            if stop is not None and stop():
+                cancelled = True
+            elif time.monotonic() - started >= timeout:
+                timed_out = True
+            else:
+                continue
+            _kill_tree(proc)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:  # pragma: no cover - the kernel refused
+                pass
+            break
     reader.join(timeout=5)
 
     output = _join(b"".join(captured))
     if timed_out:
         return Completed(tuple(argv), 124, output, time.monotonic() - started, timed_out=True)
+    if cancelled:
+        return Completed(tuple(argv), 130, output, time.monotonic() - started, cancelled=True)
     return Completed(
         tuple(argv), proc.returncode or 0, output, time.monotonic() - started
     )
@@ -443,6 +468,11 @@ def _result(
             fix="If this is the first run, the module cache may be fetching from "
             "gitlab.cept.gov.in. Check GOPRIVATE and git credentials before retrying.",
             meta={"argv": done.argv, "timeout": True},
+        )
+    if done.cancelled:
+        return ToolResult.failure(
+            f"{what} was stopped at the developer's request after {int(done.seconds)}s.",
+            meta={"argv": done.argv, "cancelled": True},
         )
     body = done.output or f"{what}: clean"
     if done.ok:

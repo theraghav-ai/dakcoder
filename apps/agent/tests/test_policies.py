@@ -27,7 +27,7 @@ def request(tool: str, *paths: str, **arguments) -> ApprovalRequest:
     [
         (request("resource_scaffold", "handler/pension.go", "repo/postgres/pension.go"), True),
         (request("git_ops", op="commit", message="add pension"), True),
-        (request("run_terminal", argv="go generate ./..."), True),
+        (request("run_terminal", argv="go generate ./..."), False),
         (request("patch_file", "go.mod"), False),
         (request("delete_file", "handler/old.go"), False),
         (request("go_mod", op="get", pkg="github.com/x/y"), False),
@@ -77,7 +77,7 @@ async def run_with(tmp_path: Path, policy: str | None) -> tuple[Loopback, dict, 
         agents.append(AsksTwice(approve))
         return agents[-1]
 
-    runtime = Loopback(tmp_path, build, token=TOKEN)
+    runtime = Loopback(tmp_path, build, token=TOKEN, allow_unattended=True)
     transport = CheckedTransport(create_app(runtime))
     async with httpx.AsyncClient(
         transport=transport, base_url="http://127.0.0.1", headers={"Authorization": f"Bearer {TOKEN}"}

@@ -166,6 +166,7 @@ def build(
         version=version,
         gateway_url=gateway_url,
         suspend_on_timeout=hosted,
+        allow_unattended=hosted,
     )
     holder["runtime"] = runtime
     # Closed with the sidecar at shutdown; `main` already owns both.

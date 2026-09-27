@@ -15,6 +15,7 @@ import pytest
 from dakcoder_agent.modes import Mode
 from dakcoder_agent.tools import fs, registry
 from dakcoder_agent.tools.router import Invocation, Router
+from dakcoder_shared.envelope import ToolResult
 from dakcoder_shared.paths import Workspace
 
 #: The gofmt tests assert what the real formatter does to real bytes; without the
@@ -233,11 +234,16 @@ def test_deleting_a_directory_is_refused(router: Router) -> None:
     assert "directory" in out.content
 
 
-def test_deleting_an_absent_file_is_idempotent(router: Router) -> None:
-    out = router.dispatch(
-        "delete_file", {"path": "handler/gone.go", "reason": "cleanup"}, approved=True
-    )
-    assert out.ok
+def test_deleting_an_absent_file_is_a_dead_end_and_asks_nobody(router: Router) -> None:
+    """Not idempotent any more, on purpose. "Was already gone" was a cached
+    *success*, and one field session replayed it six times with an approval
+    card each time for a deletion that never happened (38af5843c38e). A path
+    that is not there is a failure the ledger can hold as a dead end -- and
+    nothing to approve, so no `approved=True` is needed to reach the handler."""
+    out = router.dispatch("delete_file", {"path": "handler/gone.go", "reason": "cleanup"})
+    assert isinstance(out, ToolResult), "an absent path raised an approval card"
+    assert not out.ok
+    assert out.meta.get("dead_end")
     assert out.mutations == ()
 
 

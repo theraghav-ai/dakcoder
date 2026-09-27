@@ -52,10 +52,11 @@ import re
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from dakcoder_shared.cancel import CANCELLED
 from dakcoder_shared.envelope import (
     DeltaCoalescer,
     Event,
@@ -64,6 +65,7 @@ from dakcoder_shared.envelope import (
     ToolResult,
 )
 from dakcoder_shared.llm import (
+    RequestCancelled,
     LLMClient,
     Metering,
     ToolCall,
@@ -187,9 +189,12 @@ _TASK_SCOPED: tuple[str, ...] = (
     "tried",
     "reply_key",
     "reply_repeats",
+    "edit_force_mutations",
     "degenerate_refused",
     "dependencies_changed",
     "last_gate",
+    "gate_key",
+    "gate_turn",
     "gate_failures",
     "last_build",
 )
@@ -203,6 +208,30 @@ _CONTINUES = re.compile(
     r"fix (?:it|that|this|them)|finish (?:it|that|this))\b",
     re.IGNORECASE,
 )
+
+#: The surface form of a question: an interrogative, or a request to be told.
+#: One of two witnesses `_run` needs before it answers a follow-up in ASK
+#: while a plan is open; the classifier is the other.
+_QUESTION_OPENERS = re.compile(
+    r"^\s*(?:why|what|when|where|which|who|whom|whose|how|did|do|does|is|are|was|"
+    r"were|can|could|should|would|will|have|has|had|explain|describe|tell me|"
+    r"show me|summari[sz]e|list)\b",
+    re.IGNORECASE,
+)
+
+
+def _reads_as_question(task: str) -> bool:
+    """Whether a message *looks* like a question, before anyone is asked.
+
+    Cheap and deliberately shallow: it ends in a question mark, or it opens
+    with an interrogative or a verb that asks to be told something. "Now start
+    step 2" is neither; "did you fix them all?" and "explain the employee
+    handler" are both.
+    """
+    text = (task or "").strip()
+    if not text:
+        return False
+    return text.endswith("?") or bool(_QUESTION_OPENERS.match(text))
 
 
 def _routes_on_file(path: Path) -> int:
@@ -414,6 +443,7 @@ _OWNER: dict[str, str] = {
     "preamble_last": "progress",
     "plan_objections": "progress",
     "constraint_failed": "progress",
+    "edit_force_mutations": "progress",
     "reasks": "progress",
     "reply_key": "progress",
     "reply_repeats": "progress",
@@ -1195,6 +1225,27 @@ MAX_CLOSE_COMPACTIONS = 3
 #: works 5/5. See ``tools/control.py``.
 _TERMINAL = frozenset({"submit_plan", "ask_developer", "finish"})
 
+#: What a turn made to *edit* may call: everything that changes a file, the
+#: plan's own exits, and the terminals. No read tool.
+#:
+#: ``required`` over the full list only guarantees *a* call, and the cheapest
+#: schema-valid call is the read the model just made. Sessions 3baf69127eaf
+#: (turns 19-22), 9ae9b5925046 (47-55) and b593cd7ae46e (52-56, 77-80) each
+#: answered a forced-edit turn with the same intercepted read until the stall
+#: bound ended the run. See `AgentLoop._edit_request`.
+_EDIT_TOOLS = frozenset({
+    "write_file",
+    "patch_file",
+    "delete_file",
+    "govalid_gen",
+    "fx_wire",
+    "resource_scaffold",
+    "go_mod",
+    "revise_plan",
+    "finish",
+    "ask_developer",
+})
+
 #: What a mode is forced to call when it has stopped asking for anything new.
 #:
 #: Named, not ``"required"``: ``required`` would let it pick a research tool and
@@ -1284,6 +1335,9 @@ class AgentLoop:
         self.result: RunResult | None = None
         #: The background baseline. See ``_take_baseline``.
         self._baseline_thread: threading.Thread | None = None
+        #: The previous message's state, when `_baseline_thread` was inherited
+        #: from it and is still writing there. See `carry_from`.
+        self._baseline_source: Any = None
         #: This run's accounting. Replaced at `run`; initialised here so a
         #: caller driving `_run` directly still has one to finish.
         self._metrics_acc = metrics.Accumulator()
@@ -1312,24 +1366,33 @@ class AgentLoop:
         costs a run bounded memory and no retained transcript.
         """
         self._metrics_acc = metrics.Accumulator(self.session_id or "")
-        for event in self._run(
-            task,
-            acceptance=acceptance,
-            intent=intent,
-            continued=continued,
-            start=start,
-        ):
-            try:
-                self._metrics_acc.feed({"type": str(event.type), "data": event.data})
-            except Exception:  # noqa: BLE001 - accounting must never fail a run
-                log.warning("run metrics could not read an event", exc_info=True)
-            # The same funnel, for the same reason it exists: a new `yield
-            # Event(...)` anywhere inside cannot be missed by omission. The
-            # recorder is `None` unless DAKCODER_DEBUG is set, so this is one
-            # identity check per event when it is off.
-            if self._debug is not None:
-                self._debug.event(str(event.type), event.data)
-            yield event
+        # The developer's Stop, where the blocking calls can see it: the model
+        # stream checks it per frame and `commands.run` polls it every quarter
+        # second (see `dakcoder_shared.cancel`). Set for this thread and reset
+        # on the way out, so a run that ends leaves no stale signal behind for
+        # whatever this thread does next.
+        token = CANCELLED.set(self.cancelled)
+        try:
+            for event in self._run(
+                task,
+                acceptance=acceptance,
+                intent=intent,
+                continued=continued,
+                start=start,
+            ):
+                try:
+                    self._metrics_acc.feed({"type": str(event.type), "data": event.data})
+                except Exception:  # noqa: BLE001 - accounting must never fail a run
+                    log.warning("run metrics could not read an event", exc_info=True)
+                # The same funnel, for the same reason it exists: a new `yield
+                # Event(...)` anywhere inside cannot be missed by omission. The
+                # recorder is `None` unless DAKCODER_DEBUG is set, so this is
+                # one identity check per event when it is off.
+                if self._debug is not None:
+                    self._debug.event(str(event.type), event.data)
+                yield event
+        finally:
+            CANCELLED.reset(token)
 
     def _run(
         self,
@@ -1419,7 +1482,28 @@ class AgentLoop:
         if decided is Intent.AUTO and continued and awaiting is not Intent.AUTO:
             decided, source = awaiting, "answer"
         if decided is Intent.AUTO and continued and self._work_in_flight():
-            decided, source = Intent.AGENT, "session"
+            # A follow-up on a plan with open steps continues that plan --
+            # unless it is a question *about* it. Session 9ae9b5925046 asked
+            # "why is it that you are calling go build again and again?" and
+            # b593cd7ae46e asked "did you fix them all?" and "explain the
+            # employee handler"; all three re-entered AGENT unanswered, and the
+            # last one ran the gate and ended `unverified` on a request to be
+            # told something.
+            #
+            # Two witnesses, both required: the message has to read as a
+            # question (`_reads_as_question`) and the classifier has to agree.
+            # The classifier alone guessed "question" for three of five
+            # imperative messages in one migration session, which is why this
+            # rule exists; the surface form alone would send "what about the
+            # repo layer, add it too" to a mode with no write tools. The plan
+            # is kept either way: an answered question leaves the work where
+            # it was, and the next message continues it.
+            if _reads_as_question(task) and not _CONTINUES.match(task or ""):
+                guess = self._classify(task, continued=continued)
+                if guess is not Intent.AGENT:
+                    decided, source = guess, "classified"
+            if decided is Intent.AUTO:
+                decided, source = Intent.AGENT, "session"
         if decided is Intent.AUTO:
             decided, source = self._classify(task, continued=continued), "classified"
         elif (
@@ -1462,7 +1546,20 @@ class AgentLoop:
         # runs without one deliberately: a converted service that does not build
         # has not been converted. It also saves about thirty seconds of `go vet`
         # per message on a module that cannot compile.
-        if decided is Intent.AGENT and not self.state.migration.defers_gate:
+        #
+        # And once per *task*, not once per message. Taken again on every
+        # follow-up, the snapshot held the previous messages' edits: session
+        # b593cd7ae46e broke `repo/postgres/employee.go` in its fourth message
+        # and its fifth message's gate reported those errors as "already
+        # present before this run changed anything". A follow-up keeps the
+        # baseline `carry_from` handed it -- and the thread still measuring it,
+        # when the previous message ended first -- and takes a new one only for
+        # a new task, whose change set starts empty too.
+        if (
+            decided is Intent.AGENT
+            and not self.state.migration.defers_gate
+            and (not continued or new_task or not self._has_baseline())
+        ):
             self._take_baseline()
 
         for _ in range(self.max_turns):
@@ -1620,12 +1717,11 @@ class AgentLoop:
         """
         try:
             config = config_for(self.state.mode)
-            record = self._metrics_acc.finish()
+            record = self._metrics_acc.finish(context_window=CONTEXT_WINDOW)
             record.session_id = record.session_id or (self.session_id or "")
             record.outcome = str(self.result.outcome) if self.result else ""
             record.turns = self.context.turn
             record.output_limit = record.output_limit or config.max_tokens
-            record.context_window = CONTEXT_WINDOW
             record.budget = record.budget or config.prompt_budget
             payload = record.as_dict()
         except Exception as exc:  # noqa: BLE001 - see the docstring
@@ -1783,6 +1879,16 @@ class AgentLoop:
 
     # -- the baseline -----------------------------------------------------
 
+    def _has_baseline(self) -> bool:
+        """Whether this task already has its picture of what was broken on arrival.
+
+        Either the snapshot landed, or a thread is still taking it. A follow-up
+        that has neither -- the previous message's baseline failed, say -- takes
+        one now, which is late but better than none: `charge_touched` in the
+        gate still holds the run to every file it edited.
+        """
+        return self.state.baseline.taken or self._baseline_thread is not None
+
     def _take_baseline(self) -> None:
         """Record what was already broken, off the critical path.
 
@@ -1838,8 +1944,14 @@ class AgentLoop:
         if thread is None:
             return
         thread.join(timeout=BASELINE_JOIN_SECONDS)
+        source = self._baseline_source
+        if source is not None and source.baseline.taken:
+            # Measured by the previous message's loop, into *its* state: the
+            # thread's closure writes where it was started. See `carry_from`.
+            self.state.baseline = source.baseline
         if not thread.is_alive():
             self._baseline_thread = None
+            self._baseline_source = None
 
     # -- one turn ---------------------------------------------------------
 
@@ -1948,13 +2060,17 @@ class AgentLoop:
             # which was true of the turn and of nothing else. The refusal in
             # `_phase_ended` then sent it straight back into the same loop.
             #
-            # A stall is not a reason to stop. It is a reason to stop *reading*,
-            # and `required` over the whole list says exactly that, which is
-            # already how the research fence answers the identical situation
-            # twenty lines below.
+            # A stall is not a reason to stop. It is a reason to stop *reading*
+            # -- and `required` over the whole list does not say that. It says
+            # "make a call", and the cheapest schema-valid call is the read the
+            # model just made: sessions 3baf69127eaf (turns 19-22),
+            # 9ae9b5925046 (47-55) and b593cd7ae46e (52-56, 77-80) each
+            # answered it with the same intercepted read until the stall bound
+            # ended the run. ``"edit"`` is resolved by `_edit_request` below
+            # into `required` over the edit tools alone, then a named tool.
             outstanding = [] if because else self._outstanding()
             if outstanding:
-                forced_choice = "required"
+                forced_choice = "edit"
                 self.context.append_user(self._stall_notice() + self._outstanding_ask())
             elif (
                 not because
@@ -1984,7 +2100,7 @@ class AgentLoop:
                 # Session dc45499ea819 was sent that exit eleven times with the
                 # compiler errors in the turn above it, and answered each time
                 # by building again.
-                forced_choice = "required"
+                forced_choice = "edit"
                 self.context.append_user(self._stall_notice() + self._build_ask())
             else:
                 self.context.append_user(
@@ -2014,9 +2130,10 @@ class AgentLoop:
                 # plainly what is stopping you". Forcing `finish` on the same
                 # turn forbids the first half of that instruction, and the run
                 # then burns MAX_FORCED_TERMINAL forced finishes and ends
-                # UNVERIFIED with the fix one call away (BUG L-2). `required`
-                # keeps a tool call mandatory without naming which.
-                forced_choice = "required"
+                # UNVERIFIED with the fix one call away (BUG L-2). An edit force
+                # keeps a tool call mandatory and takes the reads off the table;
+                # see `_edit_request`.
+                forced_choice = "edit"
                 report = self.state.last_gate
                 blocker = (
                     report.blocked_by.name if report and report.blocked_by else "the gate"
@@ -2029,11 +2146,12 @@ class AgentLoop:
                     "stopping you and call `finish`."
                 )
             elif outstanding:
-                # Not a terminal call: a tool call, any tool call, with the
-                # message naming what is missing. `required` rather than a named
-                # choice because the right move is `write_file` or `patch_file`
-                # and which one depends on whether the file exists yet.
-                forced_choice = "required"
+                # Not a terminal call: an edit, with the message naming what is
+                # missing. The first force is `required` over the edit tools,
+                # because the right move is `write_file` or `patch_file` and
+                # which one depends on whether the file exists yet; the second
+                # names one (`_edit_request`).
+                forced_choice = "edit"
                 self.context.append_user(
                     f"You have spent {self.state.research_turns} turns reading in "
                     "this phase and have not closed it. You have read enough.\n\n"
@@ -2043,7 +2161,7 @@ class AgentLoop:
                 # As the stall escape above: a phase with nothing outstanding
                 # on the plan and a build that does not compile is not a phase
                 # to be walked to `finish`.
-                forced_choice = "required"
+                forced_choice = "edit"
                 self.context.append_user(
                     f"You have spent {self.state.research_turns} turns in this phase "
                     "without getting it to build.\n\n" + self._build_ask()
@@ -2070,19 +2188,24 @@ class AgentLoop:
 
         # What this turn is allowed to call, and how hard.
         #
-        # Three cases, and only the last one narrows the tool list. A branch
-        # that set `forced_choice` itself wants a *kind* of move -- an edit, or
-        # any tool at all -- and the right call there is `write_file` or
-        # `patch_file`, so it keeps everything. A turn that is ending the phase
-        # gets the terminals and nothing else: that is what makes `required`
-        # safe, and what stops a Planner being handed `submit_plan` as its only
-        # legal move when the task was a question (BUG L-28).
+        # Three cases, and two of them narrow the tool list. A branch that
+        # wants an *edit* gets the edit tools and the terminals: `required`
+        # over the whole list only guarantees *a* call, and the field data says
+        # that call is the last read again (see the stall block above and
+        # `_edit_request`). A turn that is ending the phase gets the terminals
+        # and nothing else: that is what makes `required` safe, and what stops
+        # a Planner being handed `submit_plan` as its only legal move when the
+        # task was a question (BUG L-28). Any other `forced_choice` keeps
+        # everything.
         tool_choice: str | dict[str, Any] | None = None
         offered = tools
         if answering:
-            tool_choice = forced_choice or self._terminal_choice()
-            if forced_choice is None:
-                offered, tool_choice = self._terminal_request(tools, tool_choice)
+            if forced_choice == "edit":
+                offered, tool_choice = self._edit_request(tools)
+            elif forced_choice is not None:
+                tool_choice = forced_choice
+            else:
+                offered, tool_choice = self._terminal_request(tools, self._terminal_choice())
             if self.state.constraint_failed and tool_choice is not None:
                 # A constrained reply has already failed this run -- padding, or
                 # cut off -- and the same request fails the same way: session
@@ -2326,6 +2449,11 @@ class AgentLoop:
                         {"kind": "tool_choice_unsupported", "value": str(tool_choice)},
                     )
                     tool_choice = "required" if isinstance(tool_choice, dict) else None
+        except RequestCancelled:
+            # The developer's Stop reached the stream. Not an error and not a
+            # reply: the run ends the way `_run` ends it between turns.
+            self.result = self._abort()
+            return None
         except OverBudgetError as exc:
             # The context manager exists to prevent this, so reaching it means
             # compaction could not free enough. Compacting harder and retrying
@@ -3623,6 +3751,34 @@ class AgentLoop:
                 report,
             )
         if self.router.touched:
+            if report is None and self.router.mutations and not self.state.migration.defers_gate:
+                # Files changed and no verdict on them. Session b593cd7ae46e
+                # ended here with three edited files and "the gate has not run
+                # on them yet", which told the developer nothing they could act
+                # on. The run is over either way; one gate says whether what it
+                # left behind is sound.
+                report = self._gate_once()
+                if report is not None:
+                    files = "\n".join(f"  - {p}" for p in self.router.touched)
+                    if report.ok:
+                        return RunResult(
+                            Outcome.DONE if not self._outstanding() else Outcome.NO_PROGRESS,
+                            f"{stuck}. The gate is clean on the "
+                            f"{len(self.router.touched)} file(s) changed:\n{files}"
+                            + self._unfinished(),
+                            self.context.turn,
+                            tuple(self.router.touched),
+                            report,
+                        )
+                    return RunResult(
+                        Outcome.UNVERIFIED,
+                        f"{stuck}. The gate was run on the changed files and is blocked"
+                        + (f" at {report.blocked_by.name}" if report.blocked_by else "")
+                        + self._unfinished(),
+                        self.context.turn,
+                        tuple(self.router.touched),
+                        report,
+                    )
             files = "\n".join(f"  - {p}" for p in self.router.touched)
             verdict = (
                 "the gate has not run on them yet"
@@ -3644,6 +3800,34 @@ class AgentLoop:
             tuple(self.router.touched),
             report,
         )
+
+    def _gate_once(self) -> GateReport | None:
+        """Run the full gate on the change set and record it, without acting on it.
+
+        For a run that is ending anyway (`_stalled`): the report goes to the
+        developer and into the state the next message inherits, and nothing is
+        sent back to the model. ``None`` when the gate itself failed to run,
+        which is reported as what it is rather than as a verdict.
+        """
+        try:
+            self._await_baseline()
+            report = full_gate(
+                self.router,
+                self.router.touched,
+                dependencies_changed=self.state.dependencies_changed,
+                baseline=self.state.baseline,
+            )
+        except Exception as exc:  # noqa: BLE001 - the run is ending; say so and go
+            log.warning("the closing gate could not run: %s", exc, exc_info=True)
+            self._relay(
+                Event(EventType.ERROR, {"message": f"the closing gate could not run: {exc}"})
+            )
+            return None
+        self.state.last_gate = report
+        self.state.gate_key = (self.router.model_mutations, tuple(self.router.touched))
+        self.state.gate_turn = self.context.turn
+        self._relay(Event(EventType.GATE, {"kind": "full", "closing": True, **report.as_dict()}))
+        return report
 
     def _intercept(self, call: ToolCall, fingerprint: str) -> tuple[str, str, str] | None:
         """What to answer without dispatching, or None to dispatch.
@@ -4080,6 +4264,56 @@ class AgentLoop:
         self.state.prefix_break = ""
         return ""
 
+    def _edit_request(
+        self, tools: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], str | dict[str, Any]]:
+        """The tools and the choice for a turn that has to edit.
+
+        The stall escape and the research fence both reach a point where the
+        loop knows the next move is a write -- a plan step no change has
+        reached, a build or a gate that is red with nothing edited since --
+        and both used to send ``required`` over the whole list, reasoning that
+        a stall is a reason to stop reading and ``required`` says so. Measured
+        against the debug records, it does not. ``required`` is a grammar over
+        an array of every offered tool; nothing in it prefers one tool to
+        another, so the model picks the cheapest schema-valid continuation,
+        which is the read it made last turn. That read is answered from the
+        ledger, the turn counts as stalled, and the same request goes out
+        again: 3baf69127eaf answered four such turns with `handler_map` and
+        ended `no_progress`; 9ae9b5925046 and b593cd7ae46e did the same with
+        `read_file` and `repo_map`.
+
+        Two forces, and they escalate.
+
+        **First**: ``required`` over `_EDIT_TOOLS` alone. A call is mandatory
+        and a read is impossible, and the model still chooses *which* edit, or
+        declines through `revise_plan`, `ask_developer` or `finish`.
+
+        **Second**, when the first changed nothing: the tool is named --
+        `write_file` if an open target does not exist yet, `patch_file`
+        otherwise. A named choice constrains the reply to one schema, which is
+        the one shape the endpoint cannot answer with a repeat.
+
+        "Changed nothing" is read off ``router.model_mutations`` rather than a
+        counter: a force that produced an edit has done its job, and the next
+        force starts over at the wide end.
+
+        The narrowed list is a prefix break and costs one re-prefill. Every
+        forced turn that changed nothing already cost a full prefill, four to
+        six times over per run, so this is cheaper as well as correct.
+        """
+        offered = [t for t in tools if t["function"]["name"] in _EDIT_TOOLS] or tools
+        mutations = self.router.model_mutations
+        repeat = self.state.edit_force_mutations == mutations
+        self.state.edit_force_mutations = mutations
+        if not repeat:
+            return offered, "required"
+        missing = [p for p in self._open_targets() if not self._on_disk(p)]
+        name = "write_file" if missing else "patch_file"
+        if not any(t["function"]["name"] == name for t in offered):
+            return offered, "required"
+        return offered, {"type": "function", "function": {"name": name}}
+
     def _terminal_request(
         self, tools: list[dict[str, Any]], choice: str | dict[str, Any]
     ) -> tuple[list[dict[str, Any]], str | dict[str, Any]]:
@@ -4114,8 +4348,8 @@ class AgentLoop:
         Not fixed by naming ``finish`` anyway. Two terminals are two different
         answers to "what is this turn for", and choosing for the model is BUG
         L-28 in the other mode. What removes the cost is not reaching here: a
-        stall with outstanding work now takes the `required`-over-the-whole-list
-        branch in `_run`, which is the case this was being paid for.
+        stall with outstanding work now takes the edit branch (`_edit_request`),
+        which is the case this was being paid for.
 
         PLANNER keeps the narrowed list, and that is deliberate rather than an
         oversight. Its three terminals are three different answers to "what was
@@ -4451,6 +4685,35 @@ class AgentLoop:
             # files are still untouched. One field run ended exactly here, with
             # "the migration.md file is written and ready for execution" and a
             # migration nobody had started.
+            if (
+                blocked
+                and self.state.intent is Intent.AGENT
+                and self.state.terminal_forced
+                and not self.state.plan
+                and not self.router.touched
+            ):
+                # Made to stop, stopped without a plan, and *said what it was
+                # blocked on*. The research fence walked this Planner to
+                # `finish` and it obeyed: 9ae9b5925046 turn 13 ended "done:
+                # answered; blocked on: Need to create handler..." on a request
+                # to complete and fix an API, and b593cd7ae46e turn 14 did the
+                # same on a request to fix the build. A change request that
+                # produced no plan, no change, and a list of the work still to
+                # do is not done, and saying so is what lets the developer's
+                # "continue" start from the right place.
+                #
+                # `blocked` is the witness, deliberately. A forced `finish`
+                # with an answer and nothing blocked is the model saying the
+                # task was a question after all (BUG L-28), and it gets to.
+                self.result = RunResult(
+                    Outcome.NO_PROGRESS,
+                    "the planning phase was made to stop and ended without a plan, "
+                    f"saying it was blocked on: {blocked}. Nothing was changed. Reply "
+                    "**continue** to plan again, or name the files to change",
+                    self.context.turn,
+                    tuple(self.router.touched),
+                )
+                return
             self.result = RunResult(
                 Outcome.DONE,
                 (f"answered; blocked on: {blocked}" if blocked else "answered")
@@ -5519,6 +5782,20 @@ class AgentLoop:
         # looked like may not be, so the body and search-place ledgers start
         # empty like `last_results` does.
         self.state.tried = list(previous.state.tried)
+        # The baseline, and the thread still taking it when the previous message
+        # ended first. Alive is checked *before* the snapshot is copied:
+        # `measure` writes into the previous loop's state, so a thread that
+        # finishes between the two lines has already landed in the copy, and
+        # one still running is read back from there by `_await_baseline`. A
+        # thread that is over and left nothing (the baseline failed) is not
+        # carried, so `_has_baseline` says so and `_run` takes one. Without any
+        # of this a follow-up saw `taken == False` on every message, took a
+        # fresh baseline of a workspace the session had already edited, and
+        # excused the session's own damage.
+        thread = getattr(previous, "_baseline_thread", None)
+        if thread is not None and thread.is_alive():
+            self._baseline_thread = thread
+            self._baseline_source = previous.state
         self.state.baseline = previous.state.baseline
         self.state.plan = previous.state.plan
         self.state.plan_summary = previous.state.plan_summary
@@ -5532,6 +5809,15 @@ class AgentLoop:
         # the follow-up read a step noted "go build fails on it" against a loop
         # that had never seen a build, and the first clean lint promoted it.
         self.state.last_build = previous.state.last_build
+        # And the gate's verdict, for the same reason again. Without it the
+        # state block read "Last gate: not run yet" one message after a failing
+        # gate, the full gate re-ran from scratch on an unchanged workspace, and
+        # the follow-up's forced turns had no report to ask an edit for.
+        # `gate_failures` stays per message on purpose: a developer who types
+        # again is entitled to a fresh three attempts.
+        self.state.last_gate = previous.state.last_gate
+        self.state.gate_key = previous.state.gate_key
+        self.state.gate_turn = previous.state.gate_turn
         # The question the previous run stopped on. Carried because the whole
         # point of it is to be read by the *next* message, and `_State` is
         # built per message: without this it is set and thrown away in the same
@@ -8042,9 +8328,14 @@ def _describe(group: Any) -> dict[str, Any]:
     numbers a run dies on.
     """
     out: dict[str, Any] = {}
-    for field_name, value in vars(group).items():
+    pairs = (
+        [(f.name, getattr(group, f.name)) for f in fields(group)]
+        if is_dataclass(group) and not isinstance(group, type)
+        else list(vars(group).items())
+    )
+    for field_name, value in pairs:
         if isinstance(value, dict):
-            out[field_name] = {"n": len(value), "keys": sorted(value)[:8]}
+            out[field_name] = {"n": len(value), "keys": sorted(value, key=str)[:8]}
         elif isinstance(value, (list, tuple, set, frozenset)):
             items = list(value)
             out[field_name] = (
@@ -8054,6 +8345,11 @@ def _describe(group: Any) -> dict[str, Any]:
             )
         elif value is None or isinstance(value, (str, int, float, bool)):
             out[field_name] = value if not isinstance(value, str) else value[:200]
+        elif is_dataclass(value) and not isinstance(value, type):
+            # A `Baseline`, a `BuildVerdict`, a `GateReport`: field by field.
+            # 200 characters of a repr hid the one field that mattered in the
+            # b593cd7ae46e baseline -- which `go_build` keys it held.
+            out[field_name] = _describe(value)
         else:
             out[field_name] = str(value)[:200]
     return out

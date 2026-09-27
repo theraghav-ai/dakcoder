@@ -54,6 +54,11 @@ class RunMetrics:
     completion_tokens: list[int] = field(default_factory=list)
     cached_tokens: list[int] = field(default_factory=list)
     reasoning_tokens: int = 0
+    #: Turns whose usage chunk said ``0`` prompt tokens. Zero is "not
+    #: reported", not a free prompt: a named-tool turn came back with 0/0
+    #: (5f09b5f4d993, turn 23) and was recorded as costing nothing. Kept out
+    #: of the series above and counted here instead.
+    unreported_turns: int = 0
     #: The prompt ceiling these turns were measured against, so a report does
     #: not have to know which build produced the run.
     budget: int = 0
@@ -184,7 +189,11 @@ class Accumulator:
 
         elif kind == "usage":
             self._saw_usage = True
-            m.prompt_tokens.append(int(data.get("prompt_tokens") or 0))
+            prompt = int(data.get("prompt_tokens") or 0)
+            if prompt > 0:
+                m.prompt_tokens.append(prompt)
+            else:
+                m.unreported_turns += 1
             m.completion_tokens.append(int(data.get("completion_tokens") or 0))
             cached = data.get("cached_tokens")
             m.cached_tokens.append(int(cached) if isinstance(cached, int) else 0)
@@ -265,12 +274,24 @@ class Accumulator:
                 if path not in m.evicted_paths_reread:
                     m.evicted_paths_reread.append(path)
 
-    def finish(self) -> RunMetrics:
+    def finish(self, *, context_window: int = 0) -> RunMetrics:
+        """The record, closed.
+
+        ``context_window`` is what the live loop knows and the events do not
+        carry until this very record is emitted. It is passed in here rather
+        than set on the result afterwards because the "window not recorded"
+        note was being written first, and every session's metrics event
+        carried it.
+        """
         m = self.m
+        if context_window:
+            m.context_window = context_window
         m.files_read = sorted(self._read_counts)
         m.bytes_read = sum(self._read_bytes.values())
         if not self._saw_usage:
             _note(m, "no usage events: token counts unavailable")
+        if m.unreported_turns:
+            _note(m, f"{m.unreported_turns} turn(s) reported no usage; totals are low by that")
         if not m.context_window and not self._saw_metrics:
             _note(m, "no metrics event: the model's window was not recorded")
         return m

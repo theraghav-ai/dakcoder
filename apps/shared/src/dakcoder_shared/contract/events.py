@@ -148,6 +148,11 @@ class GateRun(GateReport):
 
     kind: Literal["inner", "full"]
     cached: Absent[bool] = Field(default=None, description="A full gate answered from its last run.")
+    closing: Absent[bool] = Field(
+        default=None,
+        description="A full gate run as a stalled run ended, on the files it had changed; "
+        "its report is final and was not sent back to the model.",
+    )
 
 
 class GateForcedToolCall(Wire):
@@ -311,6 +316,11 @@ class MetricsPayload(Wire):
     completion_tokens: list[int]
     cached_tokens: list[int]
     reasoning_tokens: int
+    unreported_turns: int = Field(
+        default=0,
+        description="Turns whose usage chunk reported 0 prompt tokens. Not free turns: "
+        "not reported, and kept out of prompt_tokens and the totals.",
+    )
     budget: int
     context_window: int
     compactions: list[CompactionRecord]

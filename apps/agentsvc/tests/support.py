@@ -145,7 +145,12 @@ class InProcessBackend:
     def start(self, lease_id: str, worktree: Path, token: str, credential: str) -> tuple[str, Any]:
         self.credentials[lease_id] = credential
         runtime = Loopback(
-            worktree, lambda session, _a: StandInAgent(worktree, session.approval_policy), token=token
+            worktree,
+            lambda session, _a: StandInAgent(worktree, session.approval_policy),
+            token=token,
+            # A stand-in for a *hosted* runner, which is the only place
+            # `auto_safe` is offered (see `Loopback.allow_unattended`).
+            allow_unattended=True,
         )
         runtime.set_credential(credential)
         url = f"http://runner-{lease_id}-{len(self.started)}"
