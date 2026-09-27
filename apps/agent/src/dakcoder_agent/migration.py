@@ -72,9 +72,14 @@ __all__ = [
     "MigrationState",
     "PROGRESS_PATH",
     "PROTECTED",
+    "ARCHIVE_DIR",
+    "MARKER_PATH",
     "RECORD_PATH",
     "SETTLED",
+    "archive_record",
     "load_record",
+    "merged_roadmap",
+    "record_removed",
     "save_record",
     "Phase",
     "phases_from_meta",
@@ -277,11 +282,17 @@ class MigrationState:
         re-submitted roadmap is the common case -- every phase opens with a
         ``submit_plan`` -- and a re-submission that reset the closed phases
         would send the run back to phase one with the work already on disk.
+
+        **And a re-submission never shrinks the record.** See `merged_roadmap`:
+        the workspace record of pao-backend went from seven phases to five (the
+        two closed ones dropped) to one, because each resumed session re-sent
+        only the phases it was thinking about and this installed them whole.
         """
+        merged = merged_roadmap(self.phases, phases)
         done = {p.name.strip().lower() for p in self.phases if p.status == "done"}
         self.phases = tuple(
             replace(p, status="done") if p.name.strip().lower() in done else p
-            for p in phases
+            for p in merged
         )
 
     def evidenced(self, name: str) -> bool:
@@ -378,12 +389,18 @@ class MigrationState:
                     return index, phase
         return self.current
 
-    def block(self, named: str = "") -> list[str]:
+    def block(self, named: str = "", *, mode: str = "planner") -> list[str]:
         """The roadmap as a cursor, for the state block, or ``[]``.
 
         A cursor and not a list, one level up from ``_plan_block`` and for its
         argument: a model shown a seven-item checklist works on seven items. It
         is shown where it is, what this phase breaks into, and what comes next.
+
+        **Written for the phase that reads it.** ``mode`` is the loop's mode
+        (``ask``, ``planner`` or ``agent``). The block used to tell every phase
+        what only the Planner can do -- "`submit_plan` with the same `phases`"
+        -- and in session 9ba77962405b an ASK turn and seven PLANNER turns were
+        each told a move they did not hold, in the last position of the prompt.
         """
         if not self.active:
             # Nothing at all for the run this is not about, which is almost
@@ -392,7 +409,10 @@ class MigrationState:
             # is now competing for the last position in the prompt.
             return []
         if self.phases and self.resumed and not named:
-            return self.resume_block()
+            return self.resume_block(mode=mode)
+        if not self.phases and mode != "planner":
+            # The instruction below is a Planner's: only it holds `submit_plan`.
+            return ["Migration: under way, with no roadmap recorded yet."]
         if not self.phases:
             # The instruction lives here, not in the mode overlay, and the
             # difference is what it costs: an overlay is paid on every turn of
@@ -434,10 +454,18 @@ class MigrationState:
             )
         planned_now = {u.get("file") for u in self.units.values() if u.get("phase_key") == _key(phase.name)}
         if later := [f for f in self.backlog.get(_key(phase.name), []) if f not in planned_now]:
+            # The remedy names a tool the reading phase holds: `revise_plan` is
+            # the acting phase's, and the Planner's way to add a step is the plan.
+            remedy = {
+                "agent": " One that needs no change: `revise_plan` it in as a skipped "
+                "step, saying why.",
+                "planner": " Each still gets a step; one that needs no change says so "
+                "in its `action`, and the acting phase marks it skipped.",
+            }.get(mode, "")
             lines.append(
                 f"  Also in this phase, not in this plan ({len(later)}): {_clip(later)}. "
-                "Finish this plan first; the phase stays open until they are done. One "
-                "that needs no change: `revise_plan` it in as a skipped step, saying why."
+                "Finish this plan first; the phase stays open until they are done."
+                + remedy
             )
         nxt = next(
             (
@@ -455,14 +483,19 @@ class MigrationState:
         if self.branch:
             lines.append(f"  Branch: {self.branch}" + (f" (cut from {self.base})" if self.base else ""))
         lines.append(f"  Plan and progress: {PROGRESS_PATH} (written for you, kept current)")
+        # "Close this phase and stop" read, to a phase with twelve steps still
+        # pending, as an instruction to stop now -- beside a cursor saying "Now:
+        # step 1" and a stall message saying "give the developer what you have".
+        # What it meant is that the *next* phase is the developer's to open.
         lines.append(
             "  The gate is deferred until the last phase closes: a half-converted "
-            "service cannot build, so a failing gate now would say nothing. Close "
-            "this phase and stop; the developer decides when the next one opens."
+            "service cannot build, so a failing gate now would say nothing. When "
+            "this phase's steps are done the run ends there; the developer decides "
+            "when the next phase opens."
         )
         return lines
 
-    def resume_block(self) -> list[str]:
+    def resume_block(self, *, mode: str = "planner") -> list[str]:
         """What a session that picks up an earlier session's migration is told.
 
         Rendered until the session adopts a plan of its own. Everything in it is
@@ -472,10 +505,14 @@ class MigrationState:
         """
         total = len(self.phases)
         done = [p.name for p in self.phases if p.status == "done"]
+        # "Do not re-plan" sat one line above "`submit_plan` ... steps", and
+        # beside a plan check demanding a new roadmap of three phases: three
+        # instructions, at most two of which could be obeyed at once.
         lines = [
             f"Migration: RESUMING — {len(done)} of {total} phase(s) closed in earlier "
-            "sessions" + (f" ({', '.join(done)})" if done else "") + ". Do not re-plan "
-            "or redo a closed phase.",
+            "sessions" + (f" ({', '.join(done)})" if done else "") + ". The roadmap "
+            "below is restored from the record and stays as it is; do not redo a "
+            "closed phase.",
         ]
         here = self.current
         if here is None:
@@ -502,11 +539,26 @@ class MigrationState:
         if summary := self.scope_summary():
             lines.append("  Scope, from legacy_audit:")
             lines.extend(f"    {line}" for line in summary)
-        lines.append(
-            "  `submit_plan` with the same `phases` (same names, so the closed ones "
-            f"stay closed) and `steps` for what is left of {phase.name} only. For a "
-            "split file run `handler_map` first: a group it marks done needs no step."
-        )
+        if mode == "planner":
+            # Steps only. "The same `phases`" was read as "the phases you mean
+            # to work", and a model that sent `phases=[handlers]` replaced a
+            # seven-phase roadmap with one phase (9ba77962405b, turn 11).
+            lines.append(
+                f"  `submit_plan` with `steps` for what is left of {phase.name} only, "
+                "each with `phase` set to it. Leave `phases` out: the roadmap is "
+                "already recorded. For a split file run `handler_map` first: a group "
+                "it marks done needs no step."
+            )
+        elif mode == "ask":
+            lines.append(
+                "  This phase answers the developer and cannot write: answer what "
+                "they asked. The migration carries on when they ask for it."
+            )
+        else:
+            lines.append(
+                f"  Work the steps planned for what is left of {phase.name}; a group "
+                "`handler_map` marks done needs no edit."
+            )
         if self.expected_branch:
             lines.append(
                 f"  Branch: the conversion is on `{self.expected_branch}` and the "
@@ -887,6 +939,99 @@ def _clip(names: Sequence[str], limit: int = 8) -> str:
 #: nothing but the workspace, so whichever session opens next finds it.
 RECORD_PATH = ".dakcoder/migration/state.json"
 
+#: Beside the migration folder, not in it: that this workspace has kept a record.
+#:
+#: What makes deleting the folder mean something. `load_record` falls back to
+#: the sessions' own `plan.json` files for a workspace whose migration predates
+#: the record, and it did that for *every* workspace with the record missing --
+#: so a developer who deleted `.dakcoder/migration/` to start again found it
+#: rebuilt, on the next `/migrate`, from whichever session had last held a plan
+#: (session 3baf69127eaf restored 9ba77962405b's one-phase roadmap). Once this
+#: exists the record is the only source, and a missing record is no migration.
+#: Outside the folder so that deleting the folder leaves it; `plan.json` could
+#: not carry it, being the C3 shape under contract.
+MARKER_PATH = ".dakcoder/migration-record"
+
+#: Where a migration set aside by "start over" goes. Kept, not deleted: it is
+#: the only account of what the earlier attempt did.
+ARCHIVE_DIR = ".dakcoder/migration-archive"
+
+_MARKER_TEXT = (
+    "This workspace keeps its migration record in .dakcoder/migration/.\n"
+    "Delete that folder to forget the migration; it is not rebuilt from sessions.\n"
+)
+
+
+def _mark(root: Path) -> None:
+    """Best-effort: a missing marker costs the delete-means-reset rule, not a run."""
+    marker = Path(root) / MARKER_PATH
+    if marker.is_file():
+        return
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(_MARKER_TEXT, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def record_removed(root: Path) -> bool:
+    """Whether the workspace had a migration record and it has since been deleted."""
+    root = Path(root)
+    return (root / MARKER_PATH).is_file() and not (root / RECORD_PATH).is_file()
+
+
+def archive_record(root: Path) -> str:
+    """Set the workspace's migration aside, for "start over". Its new home, or ``""``.
+
+    Moved whole -- record, plan document, anything else in the folder -- to a
+    timestamped directory under `ARCHIVE_DIR`, and the marker kept, so nothing
+    rebuilds it from the sessions afterwards.
+    """
+    root = Path(root)
+    source = root / Path(RECORD_PATH).parent
+    _mark(root)
+    if not source.is_dir():
+        return ""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = root / ARCHIVE_DIR / stamp
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        n = 1
+        while target.exists():
+            n += 1
+            target = root / ARCHIVE_DIR / f"{stamp}-{n}"
+        os.replace(source, target)
+    except OSError:
+        return ""
+    return target.relative_to(root).as_posix()
+
+
+def merged_roadmap(recorded: Sequence[Phase], submitted: Sequence[Phase]) -> tuple[Phase, ...]:
+    """The roadmap a submission leaves on record.
+
+    Three rules, all about a roadmap already on record, and all measured on the
+    same workspace: seven phases, then five, then one.
+
+    * A submission naming only phases the record has is a restatement -- a
+      resumed session re-sending the phase it is about to work -- and changes
+      nothing. That is the one that shrank seven phases to one.
+    * A closed phase is never dropped. Its work is on disk and its branch is
+      cut; a roadmap without it sends the next session to redo it. That is the
+      one that lost `branch` and `dependencies`.
+    * Anything else is a new roadmap for what is still open, installed after
+      the closed phases.
+    """
+    submitted = tuple(submitted)
+    if not recorded:
+        return submitted
+    if not submitted:
+        return tuple(recorded)
+    names = {_key(p.name) for p in submitted}
+    if names <= {_key(p.name) for p in recorded}:
+        return tuple(recorded)
+    kept = tuple(p for p in recorded if p.status == "done" and _key(p.name) not in names)
+    return kept + submitted
+
 
 def load_record(root: Path) -> MigrationState | None:
     """The workspace's migration record, or ``None`` when there is none.
@@ -896,19 +1041,28 @@ def load_record(root: Path) -> MigrationState | None:
     ``plan.json``, so a workspace whose migration began before it has its
     progress there and nowhere else -- and reading only the record is what sent
     the first run after the upgrade back to "which branch should I cut from?".
+
+    **Only for such a workspace.** Once `MARKER_PATH` exists the record has been
+    kept here, and its absence is the developer's decision, not a gap to fill.
     """
+    root = Path(root)
+    legacy = not (root / MARKER_PATH).is_file()
     try:
-        raw = json.loads((Path(root) / RECORD_PATH).read_text(encoding="utf-8"))
+        raw = json.loads((root / RECORD_PATH).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return _from_sessions(Path(root))
+        return _from_sessions(root) if legacy else None
     if not isinstance(raw, Mapping):
-        return _from_sessions(Path(root))
+        return _from_sessions(root) if legacy else None
     state = MigrationState.from_dict(raw)
     state.backlog = {
         k: [f for f in v if not _bookkeeping(f)] for k, v in state.backlog.items()
     }
     state.files = tuple(f for f in state.files if not _bookkeeping(f))
-    return state if state.phases else _from_sessions(Path(root))
+    if not state.phases:
+        return _from_sessions(root) if legacy else None
+    # A record read is a record kept: from here on, deleting it means it.
+    _mark(root)
+    return state
 
 
 def _from_sessions(root: Path) -> MigrationState | None:
@@ -956,6 +1110,7 @@ def save_record(root: Path, state: MigrationState) -> None:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump({**state.as_dict(), "updated": _now()}, fh, indent=1, sort_keys=True)
             os.replace(tmp, target)
+            _mark(Path(root))
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1207,7 +1362,9 @@ def plan_objection(
     The objections are ordered the way a plan fails them, and exactly one is
     returned: a model handed four complaints at once answers the last.
     """
-    roadmap = tuple(phases) or state.phases
+    # The roadmap this plan would leave on record -- the same merge `adopt`
+    # makes, so the check and the adoption agree about what they are judging.
+    roadmap = merged_roadmap(state.phases, phases)
     if not roadmap:
         return (
             "this is a service migration and the plan has no phases. Send `phases` "
@@ -1216,13 +1373,22 @@ def plan_objection(
             "breaks into. The SOP's are branch, dependencies, handlers, DTOs and "
             "validation, bootstrap and FX, tests, swagger"
         )
-    if len(roadmap) < MIN_PHASES:
+    # The shape of the roadmap is asked of the *first* roadmap only. Once one is
+    # on record it is settled: the resume view says it "stays as it is", and a
+    # session that sends steps alone -- as that view asks -- was then told "the
+    # roadmap has 1 phase(s) ... send `phases`", a demand only a re-plan could
+    # meet. Every resumed session of pao-backend spent both of its objections on
+    # it before the third submission was taken as it stood (9ba77962405b turns
+    # 7-11, 3baf69127eaf turns 10-15). A roadmap recorded too short is fixed by
+    # starting over, which the developer can now ask for.
+    first = not state.phases
+    if first and len(roadmap) < MIN_PHASES:
         return (
             f"the roadmap has {len(roadmap)} phase(s). A migration is planned in at "
             f"least {MIN_PHASES}, in execution order — a conversion delivered in one "
             "or two lumps is the one that cannot be reviewed and cannot be resumed"
         )
-    if thin := [p.name or "(unnamed)" for p in roadmap if len(p.part_list) < MIN_PARTS]:
+    if first and (thin := [p.name or "(unnamed)" for p in roadmap if len(p.part_list) < MIN_PARTS]):
         return (
             "these phases name no breakdown: "
             + ", ".join(thin[:4])

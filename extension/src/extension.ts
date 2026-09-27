@@ -869,16 +869,52 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // this keeps the task text from contradicting it with "plan the first
     // phase" and "cut the branch first" -- the words that sent every earlier
     // `/migrate` back to phase one.
-    const resuming = !target ? recordedMigration() : undefined;
+    const recorded = !target ? recordedMigration() : undefined;
+    let resuming = recorded;
+    // Asked, never assumed. There was no way to start a migration over: a
+    // recorded one was always resumed, and deleting its folder was undone from
+    // the sessions' plan files. The runtime now archives the record when the
+    // task says "start the migration over", and this is where it is said.
+    let startOver = false;
+    if (recorded) {
+      type Choice = vscode.QuickPickItem & { restart: boolean };
+      const choices: Choice[] = [
+        {
+          label: vscode.l10n.t('Continue the migration'),
+          description: vscode.l10n.t(
+            '{0} of {1} phase(s) closed; next: {2}',
+            recorded.closed,
+            recorded.total,
+            recorded.open,
+          ),
+          restart: false,
+        },
+        {
+          label: vscode.l10n.t('Start over from scratch'),
+          description: vscode.l10n.t(
+            'Set the recorded migration aside under .dakcoder/migration-archive and plan a new one',
+          ),
+          restart: true,
+        },
+      ];
+      const pick = await vscode.window.showQuickPick(choices, {
+        placeHolder: vscode.l10n.t('This workspace has a migration in progress'),
+      });
+      if (!pick) return;
+      if (pick.restart) {
+        resuming = undefined;
+        startOver = true;
+      }
+    }
     const task = resuming
       ? [
           'Continue migrating this service to the n-api-template.',
           '',
           `An earlier session started it: ${resuming.closed} of ${resuming.total} phase(s)`,
           `are closed and the open one is ${resuming.open}. The runtime has restored the`,
-          'roadmap and what is done; the state block shows it. Do not re-plan or redo a',
-          'closed phase and do not cut a new branch. Send `submit_plan` with the same',
-          'phases and steps for what is left of the open phase only.',
+          'roadmap and what is done; the state block shows it. Do not redo a closed',
+          'phase and do not cut a new branch. Send `submit_plan` with steps for what',
+          'is left of the open phase only; leave `phases` out, the roadmap is recorded.',
           '',
           'For each handler file still to convert, plan from handler_map path=<file>:',
           "one step per group it lists that is not done, naming the group's methods.",
@@ -896,6 +932,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ...MIGRATION_CHECKS,
         ].join('\n')
       : [
+          // The runtime recognises this sentence (`_asks_restart`) and archives
+          // the recorded migration before anything reads it.
+          ...(startOver
+            ? ['Start the migration over from scratch: the recorded one is set aside.', '']
+            : []),
           'Migrate this service from the legacy api-* libraries to the n-api-template.',
           '',
           'Read @skill:legacy-migration first, then run legacy_audit to see the scope.',

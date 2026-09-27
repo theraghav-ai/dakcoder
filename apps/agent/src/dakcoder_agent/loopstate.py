@@ -58,6 +58,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .tools.control import PlanStep
 
 __all__ = [
+    "BuildVerdict",
     "CallLedger",
     "GateState",
     "Progress",
@@ -318,6 +319,36 @@ class ReadState:
         self.search_repeats = 0
 
 
+@dataclass(frozen=True, slots=True)
+class BuildVerdict:
+    """A failing ``go build`` the model ran, as the loop last saw it.
+
+    The gate's report is the only verdict the loop used to read, and the gate
+    runs only on ``finish``. A model that builds on its own and never finishes
+    -- session dc45499ea819, turns 39 to 90 -- was invisible to it: every step
+    `done`, "Last gate: not run yet", and fifty turns of compiler errors in the
+    transcript that no predicate consulted.
+    """
+
+    #: What ran it: ``go_build``, or ``run_terminal`` for a ``go build`` argv.
+    tool: str
+    turn: int
+    #: ``router.model_mutations`` when it ran, so "nothing has been edited
+    #: since" is a comparison rather than a guess.
+    mutations: int
+    #: ``(path, first error)`` per file it named, from `gate.build_errors`.
+    errors: tuple[tuple[str, str], ...]
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(path for path, _ in self.errors)
+
+    @property
+    def first(self) -> str:
+        path, message = self.errors[0]
+        return f"{path}: {message}"
+
+
 @dataclass
 class GateState:
     """What the verification gate has said, and what has happened since."""
@@ -337,6 +368,10 @@ class GateState:
     #: The turn the last full gate ran on, for the state block.
     gate_turn: int = 0
     dependencies_changed: bool = False
+    #: The last ``go build`` the model ran that failed on code, with no clean
+    #: whole-module build or passing gate build stage since. ``None`` otherwise.
+    #: See ``AgentLoop._note_build``.
+    last_build: BuildVerdict | None = None
 
 
 @dataclass

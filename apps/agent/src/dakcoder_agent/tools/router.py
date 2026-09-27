@@ -297,6 +297,17 @@ class Router:
         except PathEscape as exc:
             return ToolResult.failure(f"{name}: {exc.reason}.", fix=exc.fix)
 
+        if not gate and (history := [p for p in paths if is_history(p)]):
+            # Deterministic, so a dead end: asking again cannot change it.
+            return ToolResult.failure(
+                f"{name}: {history[0]} is the runtime's own history (a past session's "
+                "journal or undo snapshot, or a migration set aside), not the "
+                "workspace. Nothing in it is current.",
+                fix="Read the workspace file itself. The live migration record, when "
+                "there is one, is .dakcoder/migration/plan.md.",
+                meta={"dead_end": f"{history[0]} is runtime history"},
+            )
+
         decision = self._approval(spec, args, paths)
         if decision is not None and not (approved or gate):
             return decision
@@ -688,6 +699,8 @@ class Router:
         except OSError:
             return "", []
         shown: list[str] = []
+        # History is not listed either: it is where the stale copies live.
+        entries = [e for e in entries if not is_history(self._relative(str(e)) + "/")]
         for entry in entries[: self._LISTING]:
             rel = self._relative(str(entry))
             shown.append(f"{rel}/" if entry.is_dir() else rel)
@@ -740,8 +753,31 @@ class Router:
 _IGNORED_DIRS = frozenset({".git", "vendor", "node_modules", ".venv", "bin", "dist", "build"})
 
 
+#: The runtime's own history under `.dakcoder`: every session's journal, plan
+#: and undo snapshots, and migrations set aside by "start over". Never the
+#: workspace, and never current. Session 3baf69127eaf asked for the deleted
+#: `.dakcoder/migration/plan.md`, was offered
+#: `.dakcoder/sessions/c83e18571ac3/undo/files/.dakcoder/migration/plan.md` as
+#: "the closest file", read it, and planned against a roadmap two sessions old.
+_HISTORY = (".dakcoder/sessions/", ".dakcoder/migration-archive/")
+
+
+def is_history(rel: str) -> bool:
+    """Whether a workspace-relative path is inside the runtime's own history."""
+    posix = rel.replace("\\", "/").lower()
+    while posix.startswith("./"):
+        posix = posix[2:]
+    return any(posix.startswith(prefix) or posix == prefix.rstrip("/") for prefix in _HISTORY)
+
+
 def _ignored(path: Path) -> bool:
-    return any(part in _IGNORED_DIRS for part in path.parts)
+    if any(part in _IGNORED_DIRS for part in path.parts):
+        return True
+    parts = [p.lower() for p in path.parts]
+    return any(
+        a == ".dakcoder" and b in ("sessions", "migration-archive")
+        for a, b in zip(parts, parts[1:])
+    )
 
 
 # ── approval reasons ────────────────────────────────────────────────────────

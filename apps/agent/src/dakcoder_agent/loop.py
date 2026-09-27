@@ -85,6 +85,7 @@ from .context import (
 )
 from .gate import (
     ROUTES_BEFORE,
+    build_errors,
     finding_path,
     GateReport,
     StageResult,
@@ -101,18 +102,21 @@ from .hooks import (
     hook_context_block,
     parallel_batch,
 )
-from .loopstate import CallLedger, GateState, Progress, ReadState, TaskState
+from .loopstate import BuildVerdict, CallLedger, GateState, Progress, ReadState, TaskState
 from .migration import (
     BASE_BRANCH,
     DEFAULT_BRANCH,
     MIN_PHASES,
     PROGRESS_PATH,
     PROTECTED,
+    MigrationState,
     Phase,
+    archive_record,
     load_record,
     phases_from_meta,
     plan_objection,
     progress_document,
+    record_removed,
     save_record,
     size_objection,
     split_files,
@@ -136,6 +140,26 @@ _RESUME_WORDS = re.compile(
     r"next phase|phase \d+)\b",
     re.IGNORECASE,
 )
+
+#: What a message says when it wants the migration begun again rather than
+#: resumed. `_RESUME_WORDS` matches "migrate" in any sentence, so "Migrate start
+#: from the scratch" (session 9ba77962405b) resumed phase 1 of the old roadmap:
+#: nothing anywhere could say "start over". Read only together with
+#: `_MIGRATION_WORDS` -- "rewrite this handler from scratch" in the middle of a
+#: conversion is an edit, not a request to throw the conversion away.
+_RESTART_WORDS = re.compile(
+    r"\bfrom\s+(?:the\s+)?scratch\b|\bstart(?:ing)?\s+(?:it\s+|the\s+migration\s+|this\s+)?"
+    r"(?:all\s+)?over\b|\bstart\s+(?:it\s+|the\s+migration\s+)?(?:afresh|again|fresh)\b|"
+    r"\brestart\s+(?:the\s+|this\s+)?migration\b|\bfresh\s+start\b|\bbegin\s+again\b",
+    re.IGNORECASE,
+)
+_MIGRATION_WORDS = re.compile(r"\bmigrat\w*|\bn-api\b", re.IGNORECASE)
+
+
+def _asks_restart(task: str) -> bool:
+    """Whether this message asks for the migration to be started over."""
+    text = task or ""
+    return bool(_RESTART_WORDS.search(text) and _MIGRATION_WORDS.search(text))
 
 
 #: What a task owns and the next task must start without. Everything a
@@ -167,6 +191,7 @@ _TASK_SCOPED: tuple[str, ...] = (
     "dependencies_changed",
     "last_gate",
     "gate_failures",
+    "last_build",
 )
 
 #: A follow-up that refers to the task just finished rather than naming a new
@@ -373,6 +398,7 @@ _OWNER: dict[str, str] = {
     "idle_since_gate": "gate",
     "gate_turn": "gate",
     "dependencies_changed": "gate",
+    "last_build": "gate",
     # How the turn budget is being spent, and every bound on spending it.
     "stalled_turns": "progress",
     "research_turns": "progress",
@@ -990,6 +1016,40 @@ def _reply_fingerprint(content: str, calls: Sequence[ToolCall]) -> str:
     ).hexdigest()[:16]
 
 
+#: How a plan step held open by a failing build says so, at the head of its
+#: ``note``. A prefix rather than a flag because the note is the one place a
+#: step carries its reason -- it is what the state block and the forced turn
+#: already quote -- and because `_release_build` has to tell these holds from
+#: the inner loop's own objections, which only a clean lint may lift.
+_BUILD_NOTE = "go build fails on it"
+
+
+def _build_scope(name: str, argv: Any) -> str:
+    """What a call compiled: ``"module"``, ``"package"``, or ``""`` for no build.
+
+    Only a build of ``./...`` answers for the whole module, and only that may
+    clear a failure: `go build ./handler/...` passing says nothing about the
+    file in `repo/` the last build named. A bare `go build` compiles the root
+    package alone, so it is a package build too.
+
+    `run_terminal` counts because the field run used both: `go_build` and
+    `run_terminal ["go","build","./..."]` fingerprint differently, so a model
+    alternating them gets two dispatches of the same build per repeat.
+    """
+    if name == "go_build":
+        return "module"
+    if name != "run_terminal" or not isinstance(argv, (list, tuple)) or len(argv) < 2:
+        return ""
+    if str(argv[0]).lower().removesuffix(".exe") != "go" or argv[1] != "build":
+        return ""
+    return "module" if "./..." in argv[2:] else "package"
+
+
+def _held_by_build(step: PlanStep) -> bool:
+    """Whether this step is ``written`` only because a build named its file."""
+    return step.status == "written" and step.note.startswith(_BUILD_NOTE)
+
+
 def _holds_a_phase_open(step: PlanStep) -> bool:
     """Whether this step must be finished before its phase may close.
 
@@ -1105,6 +1165,12 @@ LINES_PER_READ = 150
 #: turns.
 MIN_READS = 10
 MAX_READS = 60
+
+#: How narrow a read in the acting phase has to be to count as preparing an edit,
+#: and so be served even over lines already in context. About one method: the
+#: groups `handler_map` cuts are ~800 lines holding about nine, and a range wider
+#: than this is reading, not quoting. Same as `LINES_PER_READ` on purpose.
+ANCHOR_SLICE_LINES = LINES_PER_READ
 
 #: How many retrievals in a row may return nothing new before ``search_docs`` is
 #: withdrawn for the rest of the run. The corpus does not acquire new sections
@@ -1291,7 +1357,14 @@ class AgentLoop:
         # has learned. `continued` stays true: the classifier still reads the
         # conversation, because "do it" means something only after what it
         # answers. `new_task` is what the task-shaped decisions below read.
-        new_task = continued and self._starts_new_task(task)
+        #
+        # A migration the developer has set aside -- asked to start over, or
+        # deleted the record of -- is forgotten *first*, because every decision
+        # below reads it: `_starts_new_task` refuses to start one while a
+        # migration is active, and `_resume_migration` would restore it.
+        restart = _asks_restart(task)
+        set_aside = self._forget_migration(restart=restart)
+        new_task = continued and (bool(set_aside) or self._starts_new_task(task))
         if new_task:
             self._begin_new_task(task, acceptance)
         elif continued:
@@ -1309,6 +1382,15 @@ class AgentLoop:
                 pinned = f"{task}\n\n({EMPTY_WORKSPACE})"
             self.context.set_task(pinned, acceptance=acceptance)
         self._refresh_project_docs()
+        if set_aside:
+            # Said to the model, not only done: the conversation above may hold
+            # the old roadmap, its plan and its progress, and nothing else in it
+            # says they stopped applying.
+            self.context.append_user(set_aside)
+        if restart:
+            # The developer asked for a migration by name; the classifier does
+            # not get to decide this one is a bug fix.
+            self.state.migration.active = True
 
         # What this run is for, in order of how much the loop actually knows.
         #
@@ -1494,7 +1576,12 @@ class AgentLoop:
                 self._plan_record.save(self.router.workspace.root)
         before = (self.context.directives or (self.context.task_text,))[-1]
         self.router.begin_task()
-        self.context.start_task(task, acceptance=acceptance, after=before)
+        # The same note a first message gets on an empty workspace -- a new task
+        # is pinned exactly as a first one is.
+        pinned = task
+        if workspace_empty(self.router.workspace.root):
+            pinned = f"{task}\n\n({EMPTY_WORKSPACE})"
+        self.context.start_task(pinned, acceptance=acceptance, after=before)
         self.context.append_user(task)
         log.info("session %s: new task, previous plan closed", self.session_id or "-")
 
@@ -1869,6 +1956,36 @@ class AgentLoop:
             if outstanding:
                 forced_choice = "required"
                 self.context.append_user(self._stall_notice() + self._outstanding_ask())
+            elif (
+                not because
+                and self.state.mode is Mode.PLANNER
+                and any(_holds_a_phase_open(step) for step in self.state.plan)
+            ):
+                # A Planner holding a plan with work left. "Give the developer
+                # what you have" is a report, and this phase's exit is the plan:
+                # the state block says "end it with `submit_plan`", and session
+                # 9ba77962405b's Planner, told to report instead, called
+                # `finish` on "I have established the migration plan" six
+                # times, and no step was ever handed to the acting phase. The
+                # turn is still cut to the terminals, so `finish` stays on offer
+                # for a Planner that really has nothing to hand over.
+                self.context.append_user(
+                    self._stall_notice()
+                    + "The plan above still has steps to do. End this phase with "
+                    "`submit_plan` -- those steps, changed only where the developer "
+                    "asked -- so the acting phase can work them; `ask_developer` only "
+                    "if a decision is genuinely theirs."
+                )
+            elif not because and self._build_wants_an_edit():
+                # The model's own build is failing on a file no step holds --
+                # `main.go`, a neighbour the change broke. "Give the developer
+                # what you have" is the exit for a run with nothing left to do,
+                # and a run whose code does not compile has something left.
+                # Session dc45499ea819 was sent that exit eleven times with the
+                # compiler errors in the turn above it, and answered each time
+                # by building again.
+                forced_choice = "required"
+                self.context.append_user(self._stall_notice() + self._build_ask())
             else:
                 self.context.append_user(
                     because
@@ -1921,6 +2038,15 @@ class AgentLoop:
                     f"You have spent {self.state.research_turns} turns reading in "
                     "this phase and have not closed it. You have read enough.\n\n"
                     + self._outstanding_ask()
+                )
+            elif self._build_wants_an_edit():
+                # As the stall escape above: a phase with nothing outstanding
+                # on the plan and a build that does not compile is not a phase
+                # to be walked to `finish`.
+                forced_choice = "required"
+                self.context.append_user(
+                    f"You have spent {self.state.research_turns} turns in this phase "
+                    "without getting it to build.\n\n" + self._build_ask()
                 )
             else:
                 self.context.append_user(
@@ -2448,11 +2574,27 @@ class AgentLoop:
         cuts that short (``ChatResult.degenerate``); a reply cut off by the limit
         under a constraint is the same failure seen later. Either way the next
         forced turn goes unconstrained. See ``_turn``.
+
+        **Unless the call survived the padding.** The client salvages a call
+        that was whole under its trailing whitespace and reports it with
+        ``finish_reason == "tool_calls"``; `degenerate` stays set because the
+        stream *was* padded. That reply is the constraint working, not failing.
+        Session dc45499ea819, turn 24: a forced turn wrote an 8,818-character
+        `core/domain/employee.go` that landed intact, this read the flag alone,
+        and every forced turn for the next 66 went out unforced -- eleven
+        `must_answer` escapes that could not end anything, and a run that died
+        on the same reply sent five times.
         """
         if choice in (None, "auto"):
             return
         chat = result.chat
-        if getattr(chat, "degenerate", False) or chat.truncated:
+        incomplete = getattr(chat, "incomplete_tool_calls", None)
+        salvaged = (
+            not chat.truncated
+            and bool(getattr(chat, "tool_calls", ()))
+            and not (incomplete() if callable(incomplete) else ())
+        )
+        if chat.truncated or (getattr(chat, "degenerate", False) and not salvaged):
             if not self.state.constraint_failed:
                 log.warning(
                     "turn %d: a constrained reply (%s) came back %s; later forced "
@@ -3017,6 +3159,8 @@ class AgentLoop:
                 and self.state.migration.defers_gate
             ):
                 mid_migration_failures.add(call.name)
+            if not refused_by_mode:
+                self._note_build(call, outcome)
             if call.name == "go_mod":
                 self.state.dependencies_changed = True
             # Where the migration's branch rule is satisfied, and it is read off
@@ -3692,7 +3836,14 @@ class AgentLoop:
                 + (" and none of them have been written" if len(missing) > 1
                    else " and it has not been written")
             )
-        if unverified := [s for s in self.state.plan if s.status == "written"]:
+        # Not a step a failing build holds: `finish` is what runs the gate, and
+        # the gate builds `./...` first, so the build is re-asked with its full
+        # output and the baseline behind it. Objecting here would spend the one
+        # push-back to say less than the gate is about to -- and in words
+        # ("the formatter and the contract linter") that are not the reason.
+        if unverified := [
+            s for s in self.state.plan if s.status == "written" and not _held_by_build(s)
+        ]:
             # Written but not clean. A distinct objection from "you never wrote
             # it", and the plan could not state it at all before the `written`
             # status existed -- the step was `done` the moment the write landed,
@@ -3725,6 +3876,134 @@ class AgentLoop:
             and report is not None
             and not report.ok
             and self.state.gate_failures <= MAX_GATE_FAILURES
+        )
+
+    def _note_build(self, call: ToolCall, outcome: ToolResult) -> None:
+        """Read a build the model ran, the way the gate's own build is read.
+
+        Every step's criterion said `go_build`, and nothing checked one: steps
+        reached `done` on the inner loop's formatter and linter (see
+        `_verify_written`), and the gate that would have built them runs only
+        on `finish`. Session dc45499ea819 built `./...` itself for fifty turns
+        and saw `handler/employee.go` fail every time while its state block
+        read "Plan: all 7 step(s) settled" and "Last gate: not run yet". The
+        stall escape believed the plan, found nothing outstanding, and told it
+        to "give the developer what you have" -- so it built again.
+
+        A failure that names a file is recorded and holds the steps covering it
+        at `written`. A clean `./...` build lifts both. Nothing else is read:
+        a timeout, or a failure that names no file (a module fetch, a missing
+        toolchain), is not something an edit can move, and holding a step on
+        it would be the unsatisfiable condition this file keeps having to
+        remove. Not mid-migration either, where a red build is the design.
+        """
+        if self.state.mode is not Mode.AGENT or self.state.migration.defers_gate:
+            return
+        scope = _build_scope(call.name, outcome.meta.get("argv"))
+        if not scope or outcome.meta.get("timeout"):
+            return
+        if outcome.ok:
+            if scope == "module":
+                self._release_build()
+            return
+        # The baseline is what excuses a file that was failing before the run,
+        # and it is taken on a thread. Read half-taken, it excuses nothing and
+        # a legacy file's old error holds a step no edit of this run can clear.
+        # Waited for only here, on a failure, as `_verify` waits for it.
+        if getattr(self, "_baseline_thread", None) is not None:
+            self._await_baseline()
+        errors = build_errors(
+            outcome.content,
+            excused=self.state.baseline.findings.get("go_build", frozenset()),
+            root=str(self.router.workspace.root),
+        )
+        if not errors:
+            return
+        self.state.last_build = BuildVerdict(
+            tool=call.name,
+            turn=self.context.turn,
+            mutations=self.router.model_mutations,
+            errors=errors,
+        )
+        self._hold_for_build(errors)
+
+    def _hold_for_build(self, errors: Sequence[tuple[str, str]]) -> None:
+        """Put back to `written` every settled step whose file the build names.
+
+        `done` and not-yet-held `written` only. A step the inner loop is
+        already holding keeps that note: its objection is about the same file
+        and is lifted by a clean lint, which a clean build must not pre-empt.
+        """
+        if not self.state.plan:
+            return
+        changed = False
+        plan: list[PlanStep] = []
+        for step in self.state.plan:
+            hit = next(((p, m) for p, m in errors if step.covers(p)), None)
+            held_elsewhere = step.status == "written" and step.note and not _held_by_build(step)
+            if (
+                hit is None
+                or step.status not in ("done", "written")
+                or held_elsewhere
+                or self._phase_closed(step)
+            ):
+                plan.append(step)
+                continue
+            path, message = hit
+            note = f"{_BUILD_NOTE}: {path}: {message}"[:200]
+            if step.status != "written" or step.note != note:
+                changed = True
+            plan.append(replace(step, status="written", note=note))
+        if changed:
+            self.state.plan = tuple(plan)
+            self._save_plan()
+
+    def _release_build(self) -> None:
+        """A clean module build: forget the failure, and settle what it held."""
+        self.state.last_build = None
+        if not any(_held_by_build(step) for step in self.state.plan):
+            return
+        self.state.plan = tuple(
+            replace(step, status="done", note="") if _held_by_build(step) else step
+            for step in self.state.plan
+        )
+        self._save_plan()
+
+    def _build_is_red(self) -> bool:
+        """Whether the last build this run knows of failed on code."""
+        return (
+            self.state.mode is Mode.AGENT
+            and self.state.last_build is not None
+            and not self.state.migration.defers_gate
+        )
+
+    def _build_wants_an_edit(self) -> bool:
+        """A failing build with nothing edited since: the next move is an edit.
+
+        `_gate_wants_an_edit`'s question asked of the model's own build, for
+        the forced turns that would otherwise read "nothing outstanding" off a
+        plan whose files do not compile.
+        """
+        build = self.state.last_build
+        return (
+            self._build_is_red()
+            and build is not None
+            and build.mutations == self.router.model_mutations
+        )
+
+    def _build_ask(self) -> str:
+        """What a forced turn asks for when the model's own build is failing."""
+        build = self.state.last_build
+        assert build is not None
+        more = len(build.errors) - 1
+        return (
+            f"The last `go build` (turn {build.turn}) fails, and nothing has been "
+            f"edited since, so building again returns the same errors. First: "
+            f"{build.first}"
+            + (f" (and {more} more file(s))" if more > 0 else "")
+            + ".\n\nFix it now: read the definition the error names if you need "
+            "to, then `patch_file` the line. If it genuinely cannot be fixed, say "
+            "in one line what is stopping you and call `finish`."
         )
 
     def _terminal_choice(self) -> str | dict[str, Any]:
@@ -4183,7 +4462,10 @@ class AgentLoop:
 
         # Whether this plan was volunteered or extracted. The turn that
         # produced it recorded which; `_open_targets` is what reads it.
-        self.state.plan_forced = self.state.terminal_forced
+        #
+        # Extracted is not the same as uncommitted, and `_plan_is_commitment`
+        # says when it is not.
+        self.state.plan_forced = self.state.terminal_forced and not self._plan_is_commitment()
         self.state.forced_terminal = 0
         # The research fence and the narration re-ask are both once per
         # *phase*, which is what the reasoning behind them was always about: a
@@ -4522,6 +4804,14 @@ class AgentLoop:
         self.state.gate_key = key
         self.state.gate_turn = self.context.turn
         yield Event(EventType.GATE, {"kind": "full", **report.as_dict()})
+
+        # The gate's own build is the same evidence `_note_build` reads, and
+        # newer. A gate that fails later -- at `rules_lint`, say -- has still
+        # compiled the module, and leaving a step held by a build that has
+        # since passed would name a failure that is no longer there.
+        builds = [r for r in report.results if r.name.startswith("go_build") and not r.skipped]
+        if builds and all(r.ok for r in builds):
+            self._release_build()
 
         if report.ok:
             self.state.gate_failures = 0
@@ -5048,6 +5338,31 @@ class AgentLoop:
             return Mode.AGENT
         return Mode.PLANNER
 
+    def _plan_is_commitment(self) -> bool:
+        """Whether a plan is work the developer asked for, however it came back.
+
+        `plan_forced` exists for BUG L-28: a *question* the classifier took for
+        work, walked to the research fence, and made to produce a plan -- which
+        then pinned the session to a migration nobody requested. The guard is
+        about whose idea the work was, and one fact answers that without the
+        classifier: **a migration already on record** -- a roadmap this
+        workspace agreed to before this plan arrived. A plan for its open phase
+        is that migration continuing, whatever turn it came back on.
+
+        Not a *given* AGENT intent. The panel's Agent toggle is a mode, not a
+        claim that the message asks for work -- L-28's own reproduction is
+        "validate the migration plan" sent with the toggle on.
+
+        Session 9ba77962405b resumed a recorded migration and was treated as
+        L-28 anyway: its plan arrived on a forced turn, so the acting phase's
+        stall escape found no "open targets" and offered `ask_developer` and
+        `finish` alone with twelve steps pending (turn 15), and `_work_in_flight`
+        sent every one of the six follow-ups to PLANNER, which has no write
+        tool, to be told "Now: step 1" again.
+        """
+        migration = self.state.migration
+        return migration.active and bool(migration.phases)
+
     def _work_in_flight(self) -> bool:
         """Whether this session has committed work that is not finished.
 
@@ -5078,7 +5393,7 @@ class AgentLoop:
         """
         if not any(_holds_a_phase_open(step) for step in self.state.plan):
             return False
-        return not self.state.plan_forced or bool(self.router.touched)
+        return not self.state.plan_forced or bool(self.router.touched) or self._plan_is_commitment()
 
     def restore_plan(self, session_id: str) -> bool:
         """Reload this session's plan from disk. ``False`` when there is none.
@@ -5212,6 +5527,11 @@ class AgentLoop:
         # at precisely the moment the run has been stuck on it longest -- the
         # loop this counter exists to break spanned three messages.
         self.state.cursor = previous.state.cursor
+        # With the plan too, and for the same reason: a step it holds at
+        # `written` is carried, so the build that holds it has to be. Without it
+        # the follow-up read a step noted "go build fails on it" against a loop
+        # that had never seen a build, and the first clean lint promoted it.
+        self.state.last_build = previous.state.last_build
         # The question the previous run stopped on. Carried because the whole
         # point of it is to be read by the *next* message, and `_State` is
         # built per message: without this it is set and thrown away in the same
@@ -5502,7 +5822,7 @@ class AgentLoop:
         """
         if self.state.mode is not Mode.AGENT:
             return []
-        if self.state.plan_forced and not self.router.touched:
+        if self.state.plan_forced and not self.router.touched and not self._plan_is_commitment():
             return []
         return self._unwritten_targets()
 
@@ -5739,7 +6059,7 @@ class AgentLoop:
         # frame is a model that finishes the plan and reports the migration
         # done. `MigrationState.block` renders a cursor for the same reason
         # `_plan_block` does.
-        lines.extend(self.state.migration.block(self._plan_phase()))
+        lines.extend(self.state.migration.block(self._plan_phase(), mode=str(self.state.mode)))
         if self.state.migration.expected_branch:
             lines.append(
                 f"Migration: its branch `{self.state.migration.expected_branch}` exists "
@@ -5781,7 +6101,7 @@ class AgentLoop:
 
         if self.state.plan:
             lines.extend(self._plan_block())
-            if self.state.plan_forced and not self.router.touched:
+            if self.state.plan_forced and not self.router.touched and not self._plan_is_commitment():
                 lines.append(
                     "  (this plan was written on a turn that accepted no other call. "
                     "If the task was a question, `finish` with the answer is the right "
@@ -5807,6 +6127,21 @@ class AgentLoop:
             lines.append(f"Last gate: {verdict} (turn {self.state.gate_turn})")
         elif self.state.mode is Mode.AGENT and touched:
             lines.append("Last gate: not run yet on these files")
+
+        # Beside the gate line, because until `finish` it is the only verdict
+        # on whether the code compiles. Without it the block said "not run yet"
+        # under fifty turns of the model's own failing builds (dc45499ea819).
+        build = self.state.last_build
+        if build is not None and self._build_is_red():
+            since = self.router.model_mutations - build.mutations
+            lines.append(
+                f"Last build: FAIL (turn {build.turn}) — {build.first[:160]}"
+                + (
+                    f"; {since} edit(s) since, so build again to check them"
+                    if since > 0
+                    else "; nothing edited since, so building again returns the same"
+                )
+            )
 
         ruled = self._ruled_out()
         if ruled:
@@ -5931,6 +6266,14 @@ class AgentLoop:
                     f"Plan: every step is written, but the gate is failing at {where}, "
                     "so the work is not done. Fix that before finishing."
                 )
+            elif self._build_is_red():
+                # The same contradiction with the model's own build as the
+                # witness. A build naming a step's file holds that step and never
+                # gets here; this is one that names only files outside the plan.
+                lines.append(
+                    "Plan: every step is written, but the last build fails, so the "
+                    "work is not done. Fix that before finishing."
+                )
             else:
                 lines.append(f"Plan: all {len(plan)} step(s) settled.")
             if settled:
@@ -5945,6 +6288,36 @@ class AgentLoop:
         index, step = active
         state = "" if step.status == "pending" else f" [{step.status}]"
         where = f" of phase {step.phase}" if step.phase else ""
+        nxt = next(
+            (
+                f"step {i} — {s.file}"
+                for i, s in enumerate(plan, 1)
+                if i > index and (s.open or s.status == "written")
+            ),
+            "",
+        )
+        if self.state.mode is not Mode.AGENT:
+            # **Where the work stands, not an order.** "Now: step 1 ... one
+            # `patch_file` per method ... read just that method" was rendered
+            # to every phase, in the last position of the prompt. Session
+            # 9ba77962405b ran it past a Planner and an Ask phase for twenty-two
+            # turns across six developer messages: neither holds `patch_file`,
+            # so the one move the order ended on was never on offer, and each
+            # turn restarted the order from its first line -- the same searches,
+            # the same reads -- and the developer's actual question ("what is in
+            # the context?") went unanswered under it.
+            lines.append(
+                f"Plan in hand: step {index} of {len(plan)}{where}{state} — {step.file} "
+                f"— {step.action}"
+            )
+            lines.append("  " + self._not_acting_note())
+            if settled:
+                lines.append("  Done: " + ", ".join(settled[-STATE_ITEMS:]))
+            if stuck:
+                lines.append("  Blocked: " + ", ".join(stuck[-STATE_ITEMS:]))
+            if nxt:
+                lines.append(f"  Then: {nxt}")
+            return lines
         lines.append(
             f"Now: step {index} of {len(plan)}{where}{state} — {step.file} — {step.action}"
         )
@@ -5967,11 +6340,10 @@ class AgentLoop:
                 f"  This is one of {len(same) + 1} steps on {step.file}. Convert "
                 "only the methods this step names, one `patch_file` per method with "
                 "the method's own signature line as the anchor; several patches in "
-                "one reply is fine. Find each with `search_repo` (line numbers shift "
-                "as earlier steps land) and read just that method -- `read_file` takes "
-                "`start` and `end`. Do not read or rewrite the whole file. The step "
+                "one reply is fine. Do not read or rewrite the whole file. The step "
                 "advances when `unit_check` finds all of its methods converted."
             )
+            lines.extend(self._where_the_methods_are(step))
         if step.accepts:
             lines.append(f"  Accepts: {step.accepts}")
         migration = self.state.migration
@@ -5997,16 +6369,124 @@ class AgentLoop:
             lines.append("  Done: " + ", ".join(settled[-STATE_ITEMS:]))
         if stuck:
             lines.append("  Blocked: " + ", ".join(stuck[-STATE_ITEMS:]))
-        nxt = next(
-            (
-                f"step {i} — {s.file}"
-                for i, s in enumerate(plan, 1)
-                if i > index and (s.open or s.status == "written")
-            ),
-            "",
-        )
         lines.append(f"  Next: {nxt}" if nxt else "  Next: nothing — this is the last step.")
         return lines
+
+    def _not_acting_note(self) -> str:
+        """What a phase that cannot write is told about a plan it is holding.
+
+        Its own next move, and nothing it does not hold. The Planner's is
+        `submit_plan`, which is also how the plan reaches the acting phase; an
+        Ask phase's is the answer.
+        """
+        if self.state.mode is Mode.PLANNER:
+            return (
+                "This phase plans and cannot write; the acting phase works these "
+                "steps. End it with `submit_plan`: the steps still to do, changed "
+                "only where the developer's latest message or a failed approach "
+                "calls for it."
+            )
+        return (
+            "This phase answers the developer and cannot write. The plan is where "
+            "the work stands, not this turn's task: answer the developer's latest "
+            "message."
+        )
+
+    def _where_the_methods_are(self, step: PlanStep) -> list[str]:
+        """Where each of a split step's methods is, and whether it is already in context.
+
+        The step used to say "find each with `search_repo` and read just that
+        method" whatever the run already held. Session 9ba77962405b held all of
+        it -- an 800-line read of the handler and one of the repository -- and
+        did exactly as told: six searches, then six narrow reads, every one
+        refused as "already in context above", then the same six searches
+        again, for twenty-two turns. Two instructions that could not both be
+        obeyed, and the one in the last position of the prompt won each time.
+
+        So the spans come from `handler_map` (current, because it is taken
+        after every edit) and the coverage from the context itself, and the
+        line says which methods need a read and which need a patch. Nothing
+        when there is no sidecar to ask: the step still names its methods.
+        """
+        names = self._step_methods(step)
+        spans = self._method_spans(step.file)
+        if not names or not spans:
+            return [
+                "  Find each method with `search_repo` (line numbers shift as earlier "
+                "steps land) and read just that method -- `read_file` takes `start` and "
+                "`end`."
+            ]
+        seen = _ReadLedger()
+        for low, high in self.context.coverage().get(step.file, []):
+            seen.add(low, high)
+        held, unread, repo = [], [], []
+        for name in names:
+            entry = spans.get(name)
+            if entry is None:
+                continue
+            start, end, calls = entry
+            repo.extend(c for c in calls if c not in repo)
+            (held if seen.covers(start, end) else unread).append(f"{name} {start}-{end}")
+        out: list[str] = []
+        if held:
+            out.append(
+                f"  In context already ({len(held)}): " + ", ".join(held)
+                + ". Patch these from what you have; reading them again returns nothing new."
+            )
+        if unread:
+            out.append(
+                f"  Not read yet ({len(unread)}): " + ", ".join(unread)
+                + ". Read exactly those lines (`read_file` with `start` and `end`)."
+            )
+        if repo:
+            out.append(
+                "  The repository methods they call, converted in this step too "
+                "(*gin.Context becomes context.Context): " + ", ".join(repo[:12])
+                + (f" +{len(repo) - 12} more" if len(repo) > 12 else "")
+                + ". `search_repo` finds each"
+                # Promised only where `_re_reading` keeps it: a file the
+                # migration's scope names. No inventory, no promise.
+                + (
+                    f"; a `read_file` of just that method, under {ANCHOR_SLICE_LINES} "
+                    "lines, is served even when an earlier read covered it."
+                    if self.state.migration.defers_gate and self.state.migration.scope
+                    else "."
+                )
+            )
+        if held and not unread:
+            out.append("  Every method of this step is in context: the next call is `patch_file`.")
+        return out
+
+    def _method_spans(self, path: str) -> dict[str, tuple[int, int, list[str]]]:
+        """``name -> (start, end, repository calls)`` from `handler_map`, or ``{}``.
+
+        Cached until the next edit: the state block is rendered every turn and
+        the spans move only when something is written.
+        """
+        try:
+            key = (path, self.router.model_mutations)
+        except AttributeError:
+            return {}
+        cache = self.__dict__.setdefault("_span_cache", {})
+        if key in cache:
+            return cache[key]
+        data = self._handler_map(path)
+        found = data.get("methods") if data else None
+        spans: dict[str, tuple[int, int, list[str]]] = {}
+        for m in found if isinstance(found, list) else ():
+            if not isinstance(m, dict) or not m.get("name"):
+                continue
+            try:
+                start, end = int(m.get("start") or 0), int(m.get("end") or 0)
+            except (TypeError, ValueError):
+                continue
+            if start > 0 and end >= start:
+                calls = [str(c) for c in m.get("repo") or () if c]
+                spans[str(m["name"])] = (start, end, calls)
+        for stale in [k for k in cache if k[1] != key[1]]:
+            del cache[stale]
+        cache[key] = spans
+        return spans
 
     def _cursor_age(self, step: PlanStep) -> str:
         """How long the cursor has sat on this step, as one line, or ``""``.
@@ -6109,6 +6589,9 @@ class AgentLoop:
         have promoted them. There is nothing left for a ``written`` step to be
         waiting on.
         """
+        # The gate built `./...` and it is clean, so no build failure the model
+        # saw earlier is still true.
+        self.state.last_build = None
         if not any(step.status == "written" for step in self.state.plan):
             return
         self.state.plan = tuple(
@@ -6173,7 +6656,14 @@ class AgentLoop:
 
         promoted = []
         for step in self.state.plan:
-            if step.status != "written":
+            if step.status != "written" or _held_by_build(step):
+                # A step a failing build holds is not the linter's to settle.
+                # The build named the file, and a clean format and lint of it
+                # says nothing about whether it compiles -- promoting it here
+                # is how session dc45499ea819 came to read "all 7 settled"
+                # over a handler that had not compiled for fifty turns. A
+                # clean `./...` build or a passing gate releases it
+                # (`_release_build`, `_settle_written`).
                 promoted.append(step)
                 continue
             # **Per file, not per report.** A stage holds a step open only when
@@ -6410,6 +6900,52 @@ class AgentLoop:
             pass
         # And the record the next session resumes from. See `migration.RECORD_PATH`.
         save_record(root, migration)
+
+    def _forget_migration(self, *, restart: bool) -> str:
+        """Drop a migration the developer has set aside. What to tell the model, or ``""``.
+
+        Two ways to set one aside, and both used to be undone by the runtime:
+
+        * **Asking to start over.** The record is archived under `ARCHIVE_DIR`
+          and the migration begins with no roadmap.
+        * **Deleting `.dakcoder/migration/`.** A session holding the migration
+          in memory -- carried from the last message, or restored from its own
+          `plan.json` -- wrote it straight back on its next plan change, and a
+          new session rebuilt it from any session's `plan.json`. `load_record`
+          now declines the second; this declines the first.
+
+        The plan goes with it (`_run` treats the message as a new task), and the
+        route inventory stays: it was taken before any conversion, which is what
+        a fresh attempt compares against too.
+        """
+        root = self.router.workspace.root
+        held = self.state.migration
+        if restart:
+            where = archive_record(root)
+            if not (where or held.phases):
+                return ""
+            note = (
+                "The developer asked to start the migration over. The earlier one"
+                + (f" has been set aside to {where}" if where else " has been set aside")
+                + ": its roadmap, its plan and its progress no longer apply, and "
+                "anything about them earlier in this conversation is history, not "
+                "state. Plan this migration from the start, from the code as it is now."
+            )
+        elif held.phases and record_removed(root):
+            note = (
+                "The developer deleted the migration record (.dakcoder/migration/) "
+                "since the last message, so that migration is over: its roadmap, "
+                "plan and progress no longer apply, and anything about them earlier "
+                "in this conversation is history, not state. Treat this message on "
+                "its own terms."
+            )
+        else:
+            return ""
+        log.info("session %s: migration set aside (%s)", self.session_id or "-",
+                 "start over" if restart else "record deleted")
+        self.state.migration = MigrationState()
+        self._plan_record.migration = self.state.migration
+        return note
 
     def _resume_migration(self, task: str) -> bool:
         """Pick up the workspace's unfinished migration, if this run is one.
@@ -6845,6 +7381,24 @@ class AgentLoop:
         anchoring = self.state.mode is Mode.AGENT and self._is_plan_target(path)
 
         start, end = _as_line(parsed.get("start")), _as_line(parsed.get("end"))
+        # **And a narrow slice of a file the conversion changes.** A migration
+        # step converts the repository methods its handlers call, in a file the
+        # step does not name, so `_is_plan_target` said no: session 9ba77962405b
+        # asked for `GetOfficenameRepo`'s 24 lines to edit it and was told they
+        # were somewhere in an 800-line read from turn 3 -- true, and of no use
+        # to a model about to quote them into `old`. A slice this narrow of a
+        # file in the migration's scope is the shape of an edit being prepared;
+        # the fingerprint ledger still answers a verbatim repeat, and the
+        # per-file budget below still bounds it. Any other file keeps the
+        # coverage refusal.
+        if (
+            not anchoring
+            and self._conversion_touches(path)
+            and start is not None
+            and end is not None
+            and 0 <= end - start < ANCHOR_SLICE_LINES
+        ):
+            anchoring = True
         if start is None and end is None:
             # A whole-file read. Only redundant once the whole file has been
             # delivered, which `covers` can answer exactly when the length is
@@ -6868,12 +7422,14 @@ class AgentLoop:
             return ""
         high = end or (ledger.lines or low)
         if not anchoring and ledger.covers(low, high):
+            # Where they are and what to do with them. "Already in context" alone
+            # left the model with the lines it wanted and no way to use them, and
+            # it asked again (9ba77962405b).
             return (
-                f"Lines {low}-{high} of this file are already in context above, from "
-                f"{ledger.summary()}.\n\n"
-                "This read was not dispatched because it asks for nothing new. A range "
-                "reaching past what you have already been given is read normally, so "
-                "widen it or move to a part of the file you have not seen."
+                f"Lines {low}-{high} of this file are already in context above, in "
+                f"the read_file result for {path} ({ledger.summary()}).\n\n"
+                "This read was not dispatched because it asks for nothing new. "
+                + self._after_a_covered_read()
             )
 
         if ledger.calls >= ledger.budget():
@@ -6885,6 +7441,36 @@ class AgentLoop:
                 "you have."
             )
         return ""
+
+    def _conversion_touches(self, path: str) -> bool:
+        """Whether the acting phase of an open migration converts ``path``.
+
+        The migration's scope (every file `legacy_audit` found on the old
+        libraries) and its backlog (every file a phase was planned to cover):
+        the repository files a handler step also changes are in the first.
+        """
+        migration = self.state.migration
+        if self.state.mode is not Mode.AGENT or not migration.defers_gate:
+            return False
+        if path in migration.scope:
+            return True
+        return any(path in files for files in migration.backlog.values())
+
+    def _after_a_covered_read(self) -> str:
+        """The next move after a refused re-read, for the phase that was refused.
+
+        Every phase used to be told to "widen it or move to a part of the file
+        you have not seen" -- more reading -- which is the one thing a refused
+        re-read proves the run does not need.
+        """
+        if self.state.mode is Mode.AGENT:
+            return (
+                "Work from those lines; a range reaching past what you have is read "
+                "normally."
+            )
+        if self.state.mode is Mode.PLANNER:
+            return "Plan from those lines; this phase ends with `submit_plan`."
+        return "Answer from those lines."
 
     def _live_reads(self, path: str, recorded: _ReadLedger) -> _ReadLedger:
         """What the model can actually still see of ``path``, right now.

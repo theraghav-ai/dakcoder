@@ -646,14 +646,27 @@ class ContextManager:
         volatile: list[str] = []
         if self._plan_text:
             volatile.append(f"# Plan\n{self._plan_text}")
-        if self._directives:
-            since = "\n".join(f"- {d}" for d in self._directives)
+        earlier, latest = self._directives[:-1], self._directives[-1:]
+        if earlier:
+            since = "\n".join(f"- {d}" for d in earlier)
             volatile.append(f"# Since then, the developer has said\n{since}")
         if self._state_text:
-            # Last, so the ground truth about the work is the closest thing to
-            # the model's next token, and so that rebuilding it every turn
-            # costs its own ~150 tokens and nothing above it.
+            # Near the end, so the ground truth about the work is close to the
+            # model's next token, and so that rebuilding it every turn costs its
+            # own ~150 tokens and nothing above it.
             volatile.append(self._state_text)
+        if latest:
+            # **After** the state, not in the list above it. The state block's
+            # cursor ("Now: step 1 ...") is an order, and an order in the last
+            # position outranks a message three sections up: session
+            # 9ba77962405b's developer wrote "then verify them", "what is in the
+            # context?" and "what is india post?", each filed under "Since
+            # then", and each run answered the cursor instead.
+            volatile.append(
+                f"# The developer's latest message\n{latest[0]}\n\n"
+                "This is what the current run answers; the state above is where "
+                "the work stands."
+            )
         self._directive_message = (
             Message(Role.USER, "\n\n".join(volatile), Layer.DIRECTIVE, source="directive")
             if volatile

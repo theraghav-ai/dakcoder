@@ -119,6 +119,10 @@ def test_a_mid_migration_step_says_how_it_is_checked(planning_router) -> None:
     """Said on the step because the plan may predate the objection -- the field
     run's did -- and a plan that says go_build still reaches the acting phase."""
     loop = _loop_with_callmap(planning_router)
+    # The acting phase: a phase that cannot write is shown the plan as where
+    # the work stands, not told how to work it (see
+    # test_migration_state_agrees.py).
+    loop.state.mode = Mode.AGENT
     loop.state.migration.active = True
     loop.state.migration.adopt(ROADMAP)
     loop.state.plan = (_step("go_build passes for the handler package", file="handler/paogen.go"),)

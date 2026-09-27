@@ -253,7 +253,14 @@ def test_an_unreported_gap_is_called_out_as_worse_than_a_failure() -> None:
 #: for the next session instead of rediscovered at ~100,000 prompt tokens a turn.
 #: `remember` rides on the call that ends the run, so keeping the file current
 #: costs no turn of its own.
-PREFIX_CEILING = {Mode.ASK: 3_560, Mode.PLANNER: 4_150, Mode.AGENT: 5_270}
+#: Every mode moved by 60 for the rule that code pasted into the message counts
+#: as opened. A caller with no repository gets a scratch workspace, and on it
+#: "never describe code you have not opened" read as "decline": a field run was
+#: handed a Go function with three syntax errors, found an empty tree, and
+#: listed the errors instead of fixing them, asking for a repository it did not
+#: need. (Both raises -- this and AGENTS.md's -- are applied here; the merge that
+#: brought them together had kept only one.)
+PREFIX_CEILING = {Mode.ASK: 3_620, Mode.PLANNER: 4_210, Mode.AGENT: 5_330}
 
 
 @pytest.mark.parametrize("mode", list(Mode))

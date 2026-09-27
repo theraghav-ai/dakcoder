@@ -52,6 +52,7 @@ __all__ = [
     "GateReport",
     "Stage",
     "StageResult",
+    "build_errors",
     "full_gate",
     "inner_loop",
     "take_baseline",
@@ -565,6 +566,55 @@ def _line_key(stripped: str) -> str:
         rest = parts[3:] if len(parts) >= 4 and parts[2].strip().isdigit() else parts[2:]
         return f"{path}|{':'.join(rest).strip()}"
     return stripped
+
+
+def build_errors(
+    content: str,
+    *,
+    excused: frozenset[str] = frozenset(),
+    root: str = "",
+) -> tuple[tuple[str, str], ...]:
+    """``(path, first error)`` per file a compiler's output names, in order.
+
+    For the loop's reading of a ``go build`` the *model* ran, which the gate
+    never sees. Session dc45499ea819 is why it has to read them at all: every
+    plan step reached ``done`` on the inner loop's formatter and linter, the
+    model's own builds said ``handler/employee.go`` did not compile for fifty
+    turns, and nothing in the loop's state disagreed with "all 7 steps
+    settled" -- so the stall escape told it to report, and it kept building.
+
+    Here, beside `_line_key`, so a line is excused by exactly the key the
+    baseline recorded it under. ``excused`` is that baseline: a file that was
+    already failing to compile before the run is not this run's step to hold.
+
+    Paths come back workspace-relative and POSIX, the form ``PlanStep.covers``
+    compares against. ``go build`` prints them relative to its working
+    directory with the OS separator (``handler\\employee.go`` on Windows), and
+    absolute for a file outside it, which ``root`` turns back into relative.
+    """
+    prefix = root.replace("\\", "/").rstrip("/") + "/" if root else ""
+    first: dict[str, str] = {}
+    for line in content.splitlines():
+        stripped = line.strip()
+        if _is_context(stripped) or _line_key(stripped) in excused:
+            continue
+        # The path ends at the first ".go:<line>" -- not at the first colon,
+        # which on Windows is the drive letter of an absolute path.
+        head, sep, rest = stripped.partition(".go:")
+        number = rest.split(":", 1)[0].strip()
+        if not sep or not number.isdigit():
+            continue
+        path = (head + ".go").replace("\\", "/")
+        if prefix and path.lower().startswith(prefix.lower()):
+            path = path[len(prefix):]
+        path = path.removeprefix("./")
+        if not path or " " in path:
+            continue
+        # Drop the line, and the column when there is one, as `_line_key` does.
+        parts = rest.split(":")
+        tail = parts[2:] if len(parts) >= 3 and parts[1].strip().isdigit() else parts[1:]
+        first.setdefault(path, ":".join(tail).strip())
+    return tuple(first.items())
 
 
 def _is_context(stripped: str) -> bool:
