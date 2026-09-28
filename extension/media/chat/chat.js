@@ -507,7 +507,7 @@
   const SUGGESTIONS = [
     ['/scaffold', 'cmdScaffold'],
     ['/audit', 'cmdAudit'],
-    ['/migrate', 'cmdMigrate'],
+    ['/migration', 'cmdMigrate'],
     ['/debug', 'cmdDebug'],
   ];
 

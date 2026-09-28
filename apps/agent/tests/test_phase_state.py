@@ -631,7 +631,53 @@ def test_a_stalled_acting_turn_keeps_its_write_tools(
         assert "write_file" in offered and "patch_file" in offered
         assert set(offered) != {"finish"}
     pushed = [m.content for m in loop.context.build() if m.content.startswith("Stop searching.")]
-    assert pushed and "Write it now" in pushed[0]
+    # "Change it now", not "Write it now": handler/user.go is on disk, and
+    # `write_file` refuses an existing file (session 8d075515671e).
+    assert pushed and "Change it now" in pushed[0] and "patch_file" in pushed[0]
+
+
+def test_a_step_creating_a_file_already_on_disk_is_told_so_and_the_refusal_replays_as_one(
+    planning_router: Router, gated, written
+) -> None:
+    """Session 8d075515671e, whole.
+
+    Its first step was "Create db/employee.sql" over a file an earlier session
+    had written byte for byte. `write_file` refused it, and the four repeats
+    that followed were each answered from the cache as `ok: true` and "that is
+    the current answer ... use it" -- four green rows in the panel for one
+    refusal, and nothing in what the model read that said to stop.
+    """
+    root = planning_router.workspace.root
+    (root / "db").mkdir(exist_ok=True)
+    ddl = "CREATE TABLE hr.employees (employee_id BIGSERIAL PRIMARY KEY);\n"
+    (root / "db" / "employee.sql").write_text(ddl, encoding="utf-8")
+    plan = calls((
+        "submit_plan",
+        json.dumps({
+            "summary": "fix the employee API",
+            "steps": [{
+                "file": "db/employee.sql",
+                "action": "Create the employee table DDL file",
+                "accepts": "read",
+            }],
+        }),
+    ))
+    write = calls(("write_file", json.dumps({"path": "db/employee.sql", "content": ddl})))
+    loop, _ = build(planning_router, [plan, write, write], max_turns=4)
+    events = list(loop.run("fix the employee API", intent=Intent.AGENT))
+
+    said = [m.content or "" for m in loop.context.build()]
+    assert any(
+        "db/employee.sql already exists, and the plan says to create it" in m for m in said
+    ), "the plan was adopted without saying its file is already there"
+    writes = [
+        e.data for e in events
+        if str(e.type) == "tool_result" and e.data.get("name") == "write_file"
+    ]
+    assert [w["ok"] for w in writes] == [False, False], "a replayed refusal was reported as a success"
+    assert writes[1].get("intercepted") and "refused again" in writes[1]["content"]
+    assert any(m.startswith("write_file was refused:") for m in said)
+    assert (root / "db" / "employee.sql").read_text(encoding="utf-8") == ddl
 
 
 def test_a_clean_gate_settles_a_step_stranded_at_written(

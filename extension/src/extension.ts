@@ -749,8 +749,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // handler, the one I am looking at"; the panel's hint says "Migrate to
     // n-api-template" and is offered on the empty panel as a first action,
     // where it can only mean the service. So this is the service one, and
-    // `/migrate handler/paogen.go` narrows it.
-    if (command === 'migrate') {
+    // `/migration handler/paogen.go` narrows it.
+    //
+    // `/migration` is its name now; `/migrate` is kept as an alias for the
+    // hands that learned it. Either way the task the runtime receives starts
+    // with `/migration`, which is the only thing that starts a migration there
+    // (see `MIGRATION_TASK` below).
+    if (command === 'migration' || command === 'migrate') {
       void startMigration(argument.trim());
       return;
     }
@@ -859,6 +864,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     'another handler also calls, run impact on it.',
   ];
 
+  /**
+   * The word every migration task opens with, and the runtime's only signal
+   * that a task *is* a migration (`MIGRATION_COMMAND` in `loop.py`).
+   *
+   * It had four others, all guesses: the intent classifier, a plan that came
+   * back with phases, a message saying "continue" or "template" near a
+   * recorded migration, and "start over" near "migrate". Session
+   * 8d075515671e was asked to fix an employee API, its planner volunteered
+   * phases, and the run cut a branch and deferred its gate for a CRUD fix.
+   * The runtime strips the word before the model sees the task.
+   */
+  const MIGRATION_TASK = '/migration';
+
   async function startMigration(target: string): Promise<void> {
     if (!(await ready())) return;
 
@@ -906,7 +924,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         startOver = true;
       }
     }
-    const task = resuming
+    const body = resuming
       ? [
           'Continue migrating this service to the n-api-template.',
           '',
@@ -959,6 +977,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           '',
           ...MIGRATION_CHECKS,
         ].join('\n');
+    const task = `${MIGRATION_TASK}\n${body}`;
 
     try {
       const session = await runtime.client.startTask(task, {

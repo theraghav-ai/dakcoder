@@ -153,9 +153,9 @@ def test_the_gate_never_runs_while_a_phase_is_open(gated, planning_router) -> No
     )
     # The branch rule is not what this test is about; satisfy it up front.
     loop.state.migration.branch = "template-conversion"
-    # Intent left AUTO on purpose: the classifier is one of the two things that
-    # can say "migration", and this is the path it runs on.
-    list(loop.run("migrate pisapi to the n-api template"))
+    # Intent left AUTO on purpose. The command, not the classifier, is what
+    # says "migration" now (session 8d075515671e).
+    list(loop.run("/migration migrate pisapi to the n-api template"))
 
     assert ran == [], f"the gate ran mid-migration: {ran}"
     assert loop.result is not None and loop.result.outcome == "done"
@@ -175,8 +175,8 @@ def test_no_baseline_is_taken_during_a_migration(planning_router, monkeypatch) -
         AgentLoop, "_take_baseline", lambda self: taken.append(self.state.intent)
     )
 
-    loop, _ = build(planning_router, [say("thinking")], migration=True, max_turns=1)
-    list(loop.run("migrate pisapi"))
+    loop, _ = build(planning_router, [say("thinking")], max_turns=1)
+    list(loop.run("/migration migrate pisapi"))
     assert taken == [], "a migration took a baseline of its own half-converted state"
 
     loop2, _ = build(planning_router, [say("thinking")], migration=False, max_turns=1)
@@ -184,29 +184,52 @@ def test_no_baseline_is_taken_during_a_migration(planning_router, monkeypatch) -
     assert len(taken) == 1, "an ordinary change still takes one"
 
 
-def test_a_given_intent_still_gets_asked_whether_this_is_a_migration(
-    planning_router,
-) -> None:
-    """The hole `/migrate` fell into, closed at the source.
+def test_only_the_migration_command_starts_a_migration(planning_router) -> None:
+    """Session 8d075515671e: a CRUD fix became a five-phase conversion.
 
-    A caller that supplies the intent -- the panel's Agent toggle, the
-    `/migrate` command, any API client -- used to skip the classifier entirely,
-    and the classifier is the only thing that asks whether this is a
-    whole-service conversion. So the one entry point named after migrating was
-    the one where none of the migration rules engaged.
+    Nothing the developer said made it one -- the Planner volunteered
+    `phases`, and before that the classifier's third answer, a "continue" near
+    a recorded migration or "start over" near "migrate" could each do the same.
+    The developer knows when they are converting a service, and says so with
+    `/migration`.
     """
-    loop, client = build(
-        planning_router, [say("thinking")], migration=True, max_turns=1
-    )
-    list(loop.run("Migrate this service to the n-api-template", intent=Intent.AGENT))
+    loop, client = build(planning_router, [say("thinking")], max_turns=1)
+    list(loop.run("/migration Migrate this service to the n-api-template", intent=Intent.AGENT))
+    assert loop.state.migration.active
+    assert client.classifications == 0, "the command needs no classifier"
+    pinned = next(m.content for m in loop.context.build() if m.source == "task")
+    assert "/migration" not in pinned, "the command reached the model"
+    assert pinned.startswith("# Task\nMigrate this service to the n-api-template")
 
-    assert client.classifications == 1, "asked exactly once"
-    assert loop.state.migration.active, "an explicit agent intent skipped the question"
+
+def test_a_bare_migration_command_asks_for_the_whole_service(planning_router) -> None:
+    loop, _ = build(planning_router, [say("thinking")], max_turns=1)
+    list(loop.run("/migration", intent=Intent.AGENT))
+    assert loop.state.migration.active
+    pinned = next(m.content for m in loop.context.build() if m.source == "task")
+    assert pinned.startswith("# Task\nMigrate this service from the legacy api-* libraries")
+
+
+def test_the_word_migrate_without_the_command_is_ordinary_work(planning_router) -> None:
+    """The classifier scripted to say "migration" as loudly as it can, and
+    ignored: nothing reads that answer any more."""
+    loop, client = build(planning_router, [say("thinking")], migration=True, max_turns=1)
+    list(loop.run("Migrate this service to the n-api-template"))
+    assert client.classifications == 1, "the kind is still asked"
     assert loop.state.intent is Intent.AGENT
-    assert loop.state.intent_source == "given", "the caller's answer still stands"
-    assert loop.state.intent_why == "", (
-        "a classification the run did not act on must not explain its routing"
-    )
+    assert not loop.state.migration.active
+
+    given, client = build(planning_router, [say("thinking")], migration=True, max_turns=1)
+    list(given.run("Migrate this service to the n-api-template", intent=Intent.AGENT))
+    assert client.classifications == 0, "a given intent is not classified for its shape"
+    assert not given.state.migration.active
+
+
+def test_start_over_without_the_command_sets_nothing_aside(planning_router) -> None:
+    """Archiving the workspace's record is the command's to ask for."""
+    loop, _ = build(planning_router, [say("thinking")], max_turns=1)
+    list(loop.run("start the migration over from scratch", intent=Intent.AGENT))
+    assert not loop.state.migration.active
 
 
 def test_the_question_is_not_asked_when_the_roadmap_already_answers_it(
@@ -357,38 +380,28 @@ def test_a_phased_plan_is_accepted_and_travels_in_meta() -> None:
     assert "[deps · go get]" in result.content
 
 
-def test_a_roadmap_is_itself_the_evidence_that_this_is_a_migration() -> None:
-    """The second of the two signals, and the one that covers the panel.
-
-    The classifier only runs when the intent is AUTO -- a developer who hits the
-    Agent toggle answers the intent question and the classifier is skipped
-    entirely -- so a run started that way would never be told it is a migration.
-    A plan that arrives with a roadmap is the stronger witness anyway: it is the
-    model's own commitment, not a 160-token guess about a sentence.
-    """
+def test_a_roadmap_does_not_start_a_migration() -> None:
+    """It used to: a plan with MIN_PHASES phases switched migration on, as the
+    stronger witness than the classifier. Session 8d075515671e's Planner
+    volunteered four for a CRUD fix, and the run cut a branch and deferred its
+    gate. Outside `/migration` the phases are dropped, said so, and the steps
+    are the plan."""
     loop = _loop()
     loop._baseline_thread = None
-    assert not loop.state.migration.active
-
     list(
         loop._phase_ended(
             "submit_plan",
             _plan_result(
-                steps=[
-                    {
-                        "file": "go.mod",
-                        "action": "swap",
-                        "accepts": "tidy",
-                        "phase": "deps",
-                    }
-                ],
+                steps=[{"file": "go.mod", "action": "swap", "accepts": "tidy", "phase": "deps"}],
                 phases=ROADMAP,
             ),
         )
     )
-    assert loop.state.migration.active
-    assert loop.state.migration.defers_gate
-    assert [p.name for p in loop.state.migration.phases] == ["branch", "deps", "handlers"]
+    assert not loop.state.migration.active
+    assert loop.state.migration.phases == ()
+    assert [s.file for s in loop.state.plan] == ["go.mod"], "the steps were not adopted"
+    told = [m.content for m in loop.context.build() if "`phases` are only for a migration" in (m.content or "")]
+    assert told and "/migration" in told[0]
 
 
 def test_an_unphased_migration_plan_is_not_adopted(tmp_path: Path) -> None:
@@ -1484,11 +1497,159 @@ def test_a_planned_deletion_cannot_be_undone_by_a_write(planning_router) -> None
     refused = [
         m.content or ""
         for m in loop.context.build()
-        if m.role.value == "tool" and "deleted by this migration on purpose" in (m.content or "")
+        # "this migration" or "this plan", by whether the run is migrating --
+        # and this one is not activated, only branched.
+        if m.role.value == "tool" and "on purpose" in (m.content or "")
     ]
     assert refused, "the resurrection was not refused"
     assert "revise_plan" in refused[0], "no way out was named"
     assert loop.state.churn == {}, "no cycle can form once the write is refused"
+
+
+# ── a removal the step never asked for ──────────────────────────────────────
+#
+# Session dcb37c9aaba6, a plain CRUD task. Its step for the repository read "Fix
+# Squirrel queries to use dblib.Psql and remove logging", the run deleted the
+# file to rewrite it, and the "remove" in that sentence recorded the deletion as
+# planned. The rewrite was refused five times, `revise_plan` -- the escape the
+# refusal named -- could not have lifted it, and the run ended with no
+# repository layer.
+
+
+def test_a_step_that_removes_something_inside_its_file_did_not_ask_for_the_file_to_go(
+    tmp_path: Path,
+) -> None:
+    loop = _loop(tmp_path)
+    loop.state.plan = (
+        PlanStep(
+            "repo/postgres/employee.go",
+            "Fix Squirrel queries to use dblib.Psql and remove logging",
+            "go_build",
+        ),
+        PlanStep("handler/form.go", "Dropdown options for the status field", "go_build"),
+        PlanStep(
+            "handler/employee_validator.go",
+            "Remove validator file - validation tags will be handled by govalid_gen",
+            "go_build",
+        ),
+        PlanStep("go.work", "Deleting go.work", "it is gone"),
+    )
+    assert not loop._step_wants_removal("repo/postgres/employee.go")
+    assert not loop._step_wants_removal("handler/form.go")
+    assert loop._step_wants_removal("handler/employee_validator.go")
+    assert loop._step_wants_removal("go.work")
+
+
+def test_deleting_a_file_to_rewrite_it_lets_the_rewrite_through(planning_router) -> None:
+    """The field sequence, through the loop, outside a migration."""
+    root = planning_router.workspace.root
+    (root / "repo" / "postgres").mkdir(parents=True, exist_ok=True)
+    (root / "repo" / "postgres" / "employee.go").write_text(
+        "package repository\n" * 20, encoding="utf-8"
+    )
+    loop, _ = build(
+        planning_router,
+        [
+            calls((
+                "delete_file",
+                json.dumps({
+                    "path": "repo/postgres/employee.go",
+                    "reason": "Delete repository file to rewrite with correct imports",
+                }),
+            )),
+            calls((
+                "write_file",
+                json.dumps({
+                    "path": "repo/postgres/employee.go",
+                    "content": "package repository\n",
+                }),
+            )),
+            calls(("finish", json.dumps({"answer": "rewrote the repository"}))),
+        ],
+        max_turns=4,
+    )
+    loop.state.plan = (
+        PlanStep(
+            "repo/postgres/employee.go",
+            "Fix Squirrel queries to use dblib.Psql and remove logging",
+            "go_build",
+        ),
+    )
+    list(loop.run("fix the repository", intent=Intent.AGENT, continued=True))
+
+    assert loop.state.retired == set(), "a delete-to-rewrite was recorded as planned"
+    target = root / "repo" / "postgres" / "employee.go"
+    assert target.read_text(encoding="utf-8") == "package repository\n", "the rewrite was refused"
+
+
+def test_revising_the_step_releases_a_retired_file(planning_router) -> None:
+    """The escape the refusal names has to be one. Nothing ever left `retired`,
+    so a revision saying "the file stays" left the write refused."""
+    root = planning_router.workspace.root
+    (root / "handler").mkdir(parents=True, exist_ok=True)
+    (root / "handler" / "employee_validator.go").write_text("package handler\n", encoding="utf-8")
+    write = calls((
+        "write_file",
+        json.dumps({"path": "handler/employee_validator.go", "content": "package handler\n"}),
+    ))
+    loop, _ = build(
+        planning_router,
+        [
+            calls((
+                "delete_file",
+                json.dumps({"path": "handler/employee_validator.go", "reason": "the plan says so"}),
+            )),
+            write,
+            calls((
+                "revise_plan",
+                json.dumps({
+                    "reason": "the handler still calls these validators",
+                    "steps": [{
+                        "file": "handler/employee_validator.go",
+                        "action": "Restore the custom employee validators",
+                        "accepts": "go_build",
+                    }],
+                }),
+            )),
+            write,
+            calls(("finish", json.dumps({"answer": "validators restored"}))),
+        ],
+        max_turns=6,
+    )
+    loop.state.plan = (
+        PlanStep("handler/employee_validator.go", "Remove the validator file", "go_build"),
+    )
+    list(loop.run("drop the validator", intent=Intent.AGENT, continued=True))
+
+    refused = [
+        m.content or ""
+        for m in loop.context.build()
+        if m.role.value == "tool" and "on purpose" in (m.content or "")
+    ]
+    assert refused, "the first write was not refused"
+    assert "deleted by this plan on purpose" in refused[0]
+    assert "migration" not in refused[0], "a plain task was told it was a migration"
+    assert loop.state.retired == set(), "the revision did not release the file"
+    assert (root / "handler" / "employee_validator.go").exists(), "the write after it was refused"
+
+
+def test_a_revision_that_omits_the_finished_removal_keeps_it_retired(tmp_path: Path) -> None:
+    """`_adopt_plan` keeps settled steps a revision does not mention, so leaving
+    the step out is not retracting it -- only re-wording it is."""
+    loop = _migrating(tmp_path)
+    loop.state.plan = (
+        PlanStep("routes/routes.go", "delete the retired routes file", "gone", phase="deps", status="written"),
+    )
+    loop.state.retired = {"routes/routes.go"}
+    list(loop._adopt_plan((PlanStep("handler/user.go", "convert it", "go build", phase="deps"),), ""))
+    assert loop.state.retired == {"routes/routes.go"}
+
+    list(loop._adopt_plan(
+        (PlanStep("routes/routes.go", "keep the routes file for now", "go build", phase="deps"),), ""
+    ))
+    assert loop.state.retired == set()
+    assert loop.state.removed == {"routes/routes.go"}, "a released file still missing is a loss"
+    assert loop.state.plan[-1].status == "pending"
 
 
 def test_a_turn_that_only_re_deletes_is_not_progress(planning_router) -> None:

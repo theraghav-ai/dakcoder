@@ -626,7 +626,7 @@ export class GoDiagnostics implements vscode.Disposable {
     if (!target) {
       void vscode.window.showInformationMessage(
         vscode.l10n.t(
-          'Put the cursor on a dakcoder finding to migrate that handler, or run /migrate in the chat to convert the whole service.',
+          'Put the cursor on a dakcoder finding to migrate that handler, or run /migration in the chat to convert the whole service.',
         ),
       );
       return;

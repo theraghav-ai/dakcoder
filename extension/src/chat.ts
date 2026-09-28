@@ -110,6 +110,7 @@ export type SlashCommand =
   | 'service'
   | 'audit'
   | 'legacy'
+  | 'migration'
   | 'migrate'
   | 'debug'
   | 'explain'
@@ -1235,7 +1236,7 @@ function slashCommands(s: Record<string, string>): SlashSpec[] {
     { name: 'service', hint: s['cmdService']! },
     { name: 'audit', hint: s['cmdAudit']! },
     { name: 'legacy', hint: s['cmdLegacy']! },
-    { name: 'migrate', hint: s['cmdMigrate']! },
+    { name: 'migration', hint: s['cmdMigrate']! },
     { name: 'debug', hint: s['cmdDebug']! },
     { name: 'explain', hint: s['cmdExplain']! },
     { name: 'fix', hint: s['cmdFix']! },
@@ -1333,6 +1334,8 @@ const SLASH: ReadonlySet<string> = new Set<SlashCommand>([
   'service',
   'audit',
   'legacy',
+  'migration',
+  // The old name, still accepted; not listed in the catalog above.
   'migrate',
   'debug',
   'explain',

@@ -94,10 +94,12 @@ Adding or growing a tool schema trips it. Trim first; if you must raise the ceil
 
 **Migration** (`migration.py` plus the migration paths in `loop.py`) is a phased roadmap:
 
+- Only a task that starts with `/migration` (`MIGRATION_COMMAND`) starts, resumes or restarts one. The classifier, a plan with `phases`, and resume or restart wording don't. The extension's `/migration` and its `/migrate` alias add the word, and the runtime strips it before the model sees the task.
+
 - The gate is deferred until the last phase closes.
 - Files over `BIG_FILE` lines are split into one step per `handler_map` group.
 - A split step advances only when `unit_check` confirms its methods are converted.
-- State persists per workspace in `.dakcoder/migration/state.json`, which is what a new `/migrate` session resumes from. `.dakcoder/migration/plan.md` is the human-readable view, and its shape is a contract with the extension's Migration view.
+- State persists per workspace in `.dakcoder/migration/state.json`, which is what a new `/migration` session resumes from. `.dakcoder/migration/plan.md` is the human-readable view, and its shape is a contract with the extension's Migration view.
 - The per-session `.dakcoder/sessions/<id>/plan.json` carries only the REST-contract shape.
 
 **AGENTS.md** (`tools/agents_md.py`) is loaded into the project layer each run. Sessions edit only the fenced `dakcoder:notes` section, via `update_agents_md` or `finish`'s `remember` field.

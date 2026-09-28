@@ -160,7 +160,9 @@ def test_a_start_over_message_begins_a_migration_with_no_roadmap(planning_router
     root = planning_router.workspace.root
     _recorded(root)
     loop, _ = build(planning_router, [say("Planning from the start.")], max_turns=2)
-    list(loop.run("Migrate start from the scratch. everything is new here", intent=Intent.AGENT))
+    # Through `/migration`: since session 8d075515671e only the command can
+    # set a recorded migration aside (see test_start_over_without_the_command).
+    list(loop.run("/migration Migrate start from the scratch. everything is new here", intent=Intent.AGENT))
 
     assert loop.state.migration.active
     assert not loop.state.migration.phases, "the old roadmap was resumed"

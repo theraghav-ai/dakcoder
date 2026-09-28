@@ -246,6 +246,11 @@ class CallLedger:
     #: to say it is partial: presenting a third of a result as "the current
     #: answer" is what makes asking again the reasonable move (BUG L-17).
     partial_results: dict[str, int] = field(default_factory=dict)
+    #: Fingerprints whose cached result is a *failure*, so a replay can say so.
+    #: Every replay went out with ``ok: true``, and session 8d075515671e's panel
+    #: showed four green "write_file ok" rows for four repeats of one write
+    #: `write_file` had refused -- a refusal replayed as a success.
+    failed_results: set[str] = field(default_factory=set)
     #: Calls the tools themselves declared can never succeed as asked.
     #: fingerprint -> the tool's one-line reason.
     dead_ends: dict[str, str] = field(default_factory=dict)
@@ -267,6 +272,7 @@ class CallLedger:
         """
         self.last_results.pop(fingerprint, None)
         self.partial_results.pop(fingerprint, None)
+        self.failed_results.discard(fingerprint)
 
     def world_changed(self, mutations: int) -> bool:
         """Clear what a write invalidates, and say whether anything did.
@@ -283,6 +289,7 @@ class CallLedger:
         self.seen_calls.clear()
         self.last_results.clear()
         self.partial_results.clear()
+        self.failed_results.clear()
         self.dead_ends.clear()
         self.truncated_at.clear()
         return True

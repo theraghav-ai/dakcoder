@@ -1,6 +1,6 @@
 {
  "api_version": "1.1",
- "release": "0.4.17",
+ "release": "0.4.21",
  "facts": [
   "event assistant",
   "event assistant_delta",
@@ -746,6 +746,7 @@
   "get event gate<GateRun>.blocked_by : string",
   "get event gate<GateRun>.blocked_by always",
   "get event gate<GateRun>.cached : boolean",
+  "get event gate<GateRun>.closing : boolean",
   "get event gate<GateRun>.kind : string",
   "get event gate<GateRun>.kind always",
   "get event gate<GateRun>.not_run : array",
@@ -850,6 +851,7 @@
   "get event metrics.truncations always",
   "get event metrics.turns : integer",
   "get event metrics.turns always",
+  "get event metrics.unreported_turns : integer",
   "get event plan.items : array",
   "get event plan.items always",
   "get event plan.items[].accepts : string",

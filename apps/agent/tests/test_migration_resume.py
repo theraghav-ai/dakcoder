@@ -65,6 +65,17 @@ def _loop(root: Path) -> AgentLoop:
     return loop
 
 
+def _resume(loop: AgentLoop) -> bool:
+    """What `_run` does for a `/migration` task: switch migration on, then resume.
+
+    `_resume_migration` read the message for "migrate", "continue" and the
+    like; since session 8d075515671e only the command resumes one, and `_run`
+    has set `active` from it before resume is asked.
+    """
+    loop.state.migration.active = True
+    return loop._resume_migration()
+
+
 def _half_done(root: Path, *, branch: str = "template-conversion") -> MigrationState:
     """What an earlier session left: branch and deps closed, handlers part-done."""
     state = MigrationState(active=True, branch=branch, base="development", routes=42)
@@ -121,7 +132,7 @@ def test_a_new_migration_session_resumes_where_the_last_one_stopped(tmp_path: Pa
     _git(tmp_path, "template-conversion")
     loop = _loop(tmp_path)
 
-    assert loop._resume_migration("Migrate this service to the n-api-template.")
+    assert _resume(loop)
 
     migration = loop.state.migration
     assert migration.active and migration.resumed
@@ -136,7 +147,7 @@ def test_the_resumed_session_is_told_what_is_done_and_what_is_left(tmp_path: Pat
     _half_done(tmp_path)
     _git(tmp_path, "template-conversion")
     loop = _loop(tmp_path)
-    loop._resume_migration("continue the migration")
+    _resume(loop)
 
     block = "\n".join(loop.state.migration.block(""))
     assert "RESUMING" in block and "2 of 4 phase(s) closed" in block
@@ -152,7 +163,7 @@ def test_resubmitting_the_roadmap_does_not_reopen_what_an_earlier_session_closed
 ) -> None:
     _half_done(tmp_path)
     loop = _loop(tmp_path)
-    loop._resume_migration("migrate")
+    _resume(loop)
     loop.state.migration.adopt(tuple(Phase(p.name, p.covers, p.parts) for p in ROADMAP))
     assert [p.status for p in loop.state.migration.phases][:2] == ["done", "done"]
     objection = plan_objection(
@@ -166,7 +177,7 @@ def test_resubmitting_the_roadmap_does_not_reopen_what_an_earlier_session_closed
 def test_an_unrelated_task_does_not_pick_up_the_migration(tmp_path: Path) -> None:
     _half_done(tmp_path)
     loop = _loop(tmp_path)
-    assert not loop._resume_migration("fix the nil check in handler/user.go")
+    assert not loop._resume_migration()
     assert not loop.state.migration.active
 
 
@@ -176,7 +187,7 @@ def test_a_finished_migration_is_not_resumed(tmp_path: Path) -> None:
     for phase in ROADMAP:
         state.close(phase.name)
     save_record(tmp_path, state)
-    assert not _loop(tmp_path)._resume_migration("migrate this service")
+    assert not _resume(_loop(tmp_path))
 
 
 def test_a_resumed_migration_off_its_branch_holds_writes_until_it_switches_back(
@@ -185,7 +196,7 @@ def test_a_resumed_migration_off_its_branch_holds_writes_until_it_switches_back(
     _half_done(tmp_path)
     _git(tmp_path, "development")
     loop = _loop(tmp_path)
-    loop._resume_migration("continue the migration")
+    _resume(loop)
 
     migration = loop.state.migration
     assert migration.branch == "" and migration.expected_branch == "template-conversion"
@@ -203,7 +214,7 @@ def test_the_routes_file_alone_is_enough_not_to_retake_the_inventory(tmp_path: P
     (tmp_path / ROUTES_BEFORE).parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / ROUTES_BEFORE).write_text("{}", encoding="utf-8")
     loop = _loop(tmp_path)
-    loop._resume_migration("migrate")
+    _resume(loop)
     assert loop.state.routes_saved
 
 
@@ -493,7 +504,7 @@ def test_a_second_session_plans_the_next_phase_not_phase_one(gated, planning_rou
     )
     one.session_id = "session-one"
     one.state.migration.branch = "template-conversion"
-    list(one.run("migrate this service to the n-api template"))
+    list(one.run("/migration migrate this service to the n-api template"))
     root = planning_router.workspace.root
     record = load_record(root)
     assert record is not None and record.phase_named("branch").status == "done"
@@ -520,7 +531,7 @@ def test_a_second_session_plans_the_next_phase_not_phase_one(gated, planning_rou
         max_turns=3,
     )
     two.session_id = "session-two"
-    list(two.run("migrate this service to the n-api template"))
+    list(two.run("/migration migrate this service to the n-api template"))
 
     migration = two.state.migration
     assert migration.phase_named("branch").status == "done", "the closed phase was reopened"
@@ -562,7 +573,7 @@ def test_a_record_left_by_a_run_stopped_after_the_cut_resumes_past_the_branch(tm
     save_record(tmp_path, state)
     _git(tmp_path, "migrate-to-n-api")
     loop = _loop(tmp_path)
-    assert loop._resume_migration("Continue migrating this service")
+    assert _resume(loop)
     assert loop.state.migration.phase_named("branch").status == "done"
     assert loop.state.migration.current[1].name == "deps"
     assert load_record(tmp_path).phase_named("branch").status == "done", "written back at once"
@@ -576,7 +587,7 @@ def test_off_its_branch_the_phase_stays_closed_and_the_run_switches_back(tmp_pat
     save_record(tmp_path, state)
     _git(tmp_path, "main")
     loop = _loop(tmp_path)
-    loop._resume_migration("continue the migration")
+    _resume(loop)
     migration = loop.state.migration
     assert migration.phase_named("branch").status == "done", "the branch exists; it is not re-cut"
     assert migration.expected_branch == "migrate-to-n-api"

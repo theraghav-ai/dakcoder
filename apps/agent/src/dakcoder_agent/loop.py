@@ -108,7 +108,6 @@ from .loopstate import BuildVerdict, CallLedger, GateState, Progress, ReadState,
 from .migration import (
     BASE_BRANCH,
     DEFAULT_BRANCH,
-    MIN_PHASES,
     PROGRESS_PATH,
     PROTECTED,
     MigrationState,
@@ -135,16 +134,9 @@ from .tools.router import ApprovalRequest, Router
 
 log = logging.getLogger(__name__)
 
-#: What a message says when it is about the migration already under way. Read
-#: only when the workspace has an unfinished migration record to resume.
-_RESUME_WORDS = re.compile(
-    r"\b(?:migrat\w*|conver(?:t|sion)\w*|n-api|template|continue|resume|carry on|"
-    r"next phase|phase \d+)\b",
-    re.IGNORECASE,
-)
-
 #: What a message says when it wants the migration begun again rather than
-#: resumed. `_RESUME_WORDS` matches "migrate" in any sentence, so "Migrate start
+#: resumed. `_RESUME_WORDS` (retired with session 8d075515671e: only
+#: `/migration` resumes one now) matched "migrate" in any sentence, so "Migrate start
 #: from the scratch" (session 9ba77962405b) resumed phase 1 of the old roadmap:
 #: nothing anywhere could say "start over". Read only together with
 #: `_MIGRATION_WORDS` -- "rewrite this handler from scratch" in the middle of a
@@ -162,6 +154,38 @@ def _asks_restart(task: str) -> bool:
     """Whether this message asks for the migration to be started over."""
     text = task or ""
     return bool(_RESTART_WORDS.search(text) and _MIGRATION_WORDS.search(text))
+
+
+#: How a migration is asked for, and since session 8d075515671e the only way one
+#: begins. It had four other ways in, and each was a guess: the intent
+#: classifier's third answer, a plan arriving with three or more `phases`, a
+#: new session's message containing "continue" or "template" while a record sat
+#: in `.dakcoder/migration/`, and "start over" said near "migrate". That session
+#: asked to fix an employee API; its Planner volunteered `phases`, and the run
+#: became a five-phase conversion -- a branch cut from main, the gate deferred,
+#: plan objections about `parts` -- for a CRUD fix. The developer knows when
+#: they are converting a service, so they say so, and nothing else decides it.
+#: The extension's `/migration` (and its `/migrate` alias) starts every task
+#: with this word; an API client does the same.
+MIGRATION_COMMAND = "/migration"
+_MIGRATION_COMMAND = re.compile(r"^\s*/migration\b[ \t]*", re.IGNORECASE)
+
+#: What a bare `/migration` asks for.
+_MIGRATION_DEFAULT_TASK = (
+    "Migrate this service from the legacy api-* libraries to the n-api-template."
+)
+
+
+def _migration_command(task: str) -> str | None:
+    """The task with its leading `/migration` taken off, or ``None`` without one.
+
+    Taken off because the model is not the audience for it: the loop is, and
+    the loop has acted on it by the time the task is pinned.
+    """
+    match = _MIGRATION_COMMAND.match(task or "")
+    if match is None:
+        return None
+    return task[match.end():].strip() or _MIGRATION_DEFAULT_TASK
 
 
 #: What a task owns and the next task must start without. Everything a
@@ -410,6 +434,7 @@ _OWNER: dict[str, str] = {
     "mutations_seen": "calls",
     "last_results": "calls",
     "partial_results": "calls",
+    "failed_results": "calls",
     "dead_ends": "calls",
     "truncated_at": "calls",
     # What has been read and searched, and how much of each.
@@ -597,13 +622,6 @@ Also "change" when they are approving work just described to them ("go", "do
 it", "yes please"), or when they ask a question and then ask for the work as
 well ("explain the handler, then migrate it").
 
-Then one more question, only when the answer above is "change": is this a
-**whole-service migration** -- converting a legacy api-* service to the n-api
-template, or being asked to carry on with one already under way? Set
-"migration" true for that, and for nothing else. One handler, one bug, one new
-endpoint is ordinary work however much it touches, and a *question* about a
-migration is not one.
-
 Answer with the JSON object only. Keep "why" to at most eight words.
 
 CONVERSATION SO FAR:
@@ -637,24 +655,14 @@ _INTENT_SCHEMA: dict[str, Any] = {
                     "description": "At most eight words: the word that decided it.",
                     "maxLength": 120,
                 },
-                # Third, and last, because it is the only one with a default
-                # that is right when the model says nothing: an ordinary
-                # change. A false negative costs a migration the phased
-                # treatment and is visible immediately -- the developer sees an
-                # eight-step plan for a forty-file conversion. A false positive
-                # costs a bug fix its gate, which is the expensive direction,
-                # so the prompt spends its words ruling that out.
-                "migration": {
-                    "type": "boolean",
-                    "description": "True only for a whole-service legacy-to-template conversion.",
-                },
+                # There was a third, `migration`, and it was the expensive
+                # direction's only guard: a false positive cost a bug fix its
+                # gate. It is gone because only `/migration` starts a migration
+                # now (`_migration_command`), so nothing reads it.
             },
-            # The first two. `why` was optional and the model simply left it
-            # out -- measured live, empty on every classification -- so the
-            # field the loop reads back to explain a misroute never arrived.
-            # `migration` is not required: it is meaningless on a question, and
-            # a required boolean is one more thing a 160-token reply can be cut
-            # in the middle of.
+            # Both. `why` was optional and the model simply left it out --
+            # measured live, empty on every classification -- so the field the
+            # loop reads back to explain a misroute never arrived.
             "required": ["kind", "why"],
         },
     },
@@ -970,6 +978,23 @@ MAX_FINISH_REFUSALS = 1
 #: A tool name as it appears inside a sentence. Tool names are lower_snake_case
 #: by the registry's own rule, so this needs no vocabulary of its own.
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
+
+#: A plan step whose `action` *opens* with a removal: "Delete go.work",
+#: "remove the retired routes file". Leading, and a whole word, because a
+#: removal verb anywhere in the sentence is not the step removing its file --
+#: session dcb37c9aaba6 read "Fix Squirrel queries to use dblib.Psql and remove
+#: logging" as a planned deletion of `repo/postgres/employee.go`. See
+#: `_step_wants_removal`.
+_REMOVAL_LEAD = re.compile(
+    r"^\W*(?:(?:delet|remov|retir)(?:e|es|ed|ing)|drop(?:s|ped|ping)?)\b",
+    re.IGNORECASE,
+)
+
+#: A plan step whose `action` opens by creating its file. Leading, for the
+#: reason `_REMOVAL_LEAD` is: "Add employee routes to the router" edits a file
+#: that exists, and "create" further in names something inside it. See
+#: `_note_existing_creations`.
+_CREATION_LEAD = re.compile(r"^\W*creat(?:e|es|ed|ing)\b", re.IGNORECASE)
 
 #: How many times a question already answered is sent back before it is simply
 #: put to the developer again.
@@ -1425,9 +1450,25 @@ class AgentLoop:
         # deleted the record of -- is forgotten *first*, because every decision
         # below reads it: `_starts_new_task` refuses to start one while a
         # migration is active, and `_resume_migration` would restore it.
-        restart = _asks_restart(task)
+        #
+        # And only a `/migration` task can set one aside or start one. "Start
+        # over" read off any message archived the workspace's record whenever
+        # the sentence also said "migrate"; the command is the developer saying
+        # this is about the conversion, so it is the only thing that gets to.
+        body = _migration_command(task)
+        commanded = body is not None
+        if commanded:
+            task = body
+        restart = commanded and _asks_restart(task)
         set_aside = self._forget_migration(restart=restart)
-        new_task = continued and (bool(set_aside) or self._starts_new_task(task))
+        new_task = continued and (
+            bool(set_aside)
+            # A `/migration` sent into a conversation about something else is a
+            # new task: the plan and change set it would inherit belong to that
+            # other work, not to the conversion.
+            or (commanded and not self.state.migration.active)
+            or self._starts_new_task(task)
+        )
         if new_task:
             self._begin_new_task(task, acceptance)
         elif continued:
@@ -1450,9 +1491,11 @@ class AgentLoop:
             # the old roadmap, its plan and its progress, and nothing else in it
             # says they stopped applying.
             self.context.append_user(set_aside)
-        if restart:
-            # The developer asked for a migration by name; the classifier does
-            # not get to decide this one is a bug fix.
+        if commanded:
+            # The developer asked for a migration by name. This was `restart`
+            # alone -- "start over" was the one request trusted to mean a
+            # migration -- and the classifier decided every other one. Now it
+            # is the command, and nothing else switches migration on.
             self.state.migration.active = True
 
         # What this run is for, in order of how much the loop actually knows.
@@ -1506,33 +1549,19 @@ class AgentLoop:
                 decided, source = Intent.AGENT, "session"
         if decided is Intent.AUTO:
             decided, source = self._classify(task, continued=continued), "classified"
-        elif (
-            decided is Intent.AGENT
-            and (not continued or new_task)
-            and not self.state.migration.active
-        ):
-            # The kind is settled and the *shape* is not, and they are different
-            # questions.
-            #
-            # A caller that supplies the intent -- the panel's Agent toggle, the
-            # `/migrate` command, any API client -- skips the classifier
-            # entirely, and the classifier is the only thing that asks whether
-            # this is a whole-service conversion. So the one entry point named
-            # after migrating was the one where none of the migration rules
-            # engaged: no phased plan, no branch held, no route inventory, and
-            # the gate running on a service in the middle of being converted.
-            #
-            # One call, on the first message of a session that may write, and
-            # never when a roadmap already says the answer. `_classify`'s return
-            # is discarded here on purpose: the developer has answered that half
-            # already and their answer is not the classifier's to revise.
-            self._classify(task, continued=continued, kind_known=True)
+        # There was a second classifier call here, for the *shape* alone, made
+        # when a caller supplied the intent: the classifier was then the only
+        # thing that asked whether a task was a whole-service conversion, so
+        # `/migrate` -- which supplies `agent` -- engaged none of the migration
+        # rules without it. The `/migration` command answers that question now
+        # (`_migration_command`), so the call is gone, and with it one model
+        # round trip on the first message of every session that may write.
         self.state.intent = decided
         self.state.intent_source = source
         # Before the baseline: a resumed migration defers the gate, and a
         # baseline of a half-converted service is exactly what must not be taken.
         if not continued or new_task:
-            self._resume_migration(task)
+            self._resume_migration()
 
         self._switch(self._opening_mode(decided, continued=continued))
         # Only a run that may write needs to know what was already broken.
@@ -1754,15 +1783,8 @@ class AgentLoop:
 
     # -- intent -----------------------------------------------------------
 
-    def _classify(self, task: str, *, continued: bool, kind_known: bool = False) -> Intent:
-        """Ask the model, once, what kind of request this is — and what shape.
-
-        ``kind_known`` is the call made for the second answer alone, when the
-        caller already supplied the intent. The verdict is still parsed and
-        still returned, because the reply carries both; what changes is that
-        ``intent_why`` is left alone. That field exists to explain a *misroute*,
-        and filling it from a classification the run did not act on would
-        attribute the routing to a call that had no part in it.
+    def _classify(self, task: str, *, continued: bool) -> Intent:
+        """Ask the model, once, what kind of request this is.
 
         One call, ``role="fast"``, a two-key schema and a handful of output
         tokens. The conversation so far is included because a follow-up cannot be
@@ -1841,27 +1863,13 @@ class AgentLoop:
         # Kept, not discarded. `why` has been in `_INTENT_SCHEMA` since the
         # classifier was written and the answer went straight in the bin, so the
         # one artefact that could explain a misroute never existed.
-        if not kind_known:
-            self.state.intent_why = str((parsed or {}).get("why", "") or "").strip()[:300]
+        self.state.intent_why = str((parsed or {}).get("why", "") or "").strip()[:300]
 
-        # Only ever set here, never cleared here. A session that has been told
-        # once that it is a migration stays one: the later messages of a
-        # migration are "carry on", "start phase 3", "yes" -- and a classifier
-        # given those in isolation has no reason to say migration, so re-asking
-        # would drop the roadmap, the branch rule and the deferred gate exactly
-        # when the run is deepest into needing them.
-        #
-        # Read only off a "change", which is what the prompt asks the question
-        # about. A reply that says this changes no files is not evidence that it
-        # is a whole-service conversion, whatever it puts in the third field.
-        if kind == "change" and bool((parsed or {}).get("migration")):
-            self.state.migration.active = True
-
-        if kind != "change":
-            # The caller's own answer stands when there is one. This call was
-            # made for the shape, and the kind was not its to revise.
-            return Intent.AGENT if kind_known else Intent.ASK
-        return Intent.AGENT
+        # It used to answer a third question too -- is this a whole-service
+        # migration -- and set `migration.active` on a yes. Session 8d075515671e
+        # is why it no longer does: only the `/migration` command starts one,
+        # and the kind of a message is all this is asked.
+        return Intent.AGENT if kind == "change" else Intent.ASK
 
     def _last_reply(self, limit: int = 600) -> str:
         """The last thing the agent said to the developer, or ``""``.
@@ -3147,7 +3155,12 @@ class AgentLoop:
                     {
                         "id": call.id,
                         "name": call.name,
-                        "ok": True,
+                        # A replayed failure is still a failure. See
+                        # `CallLedger.failed_results`.
+                        "ok": not (
+                            intercept_kind == "cached"
+                            and fingerprint in self.state.calls.failed_results
+                        ),
                         "turn": self.context.turn,
                         "intercepted": True,
                         # *Which* ledger answered, because they are different
@@ -3341,6 +3354,11 @@ class AgentLoop:
                     self.state.partial_results[fingerprint] = len(whole)
                 else:
                     self.state.partial_results.pop(fingerprint, None)
+                # And whether it failed, so the replay is not a success.
+                if outcome.ok:
+                    self.state.calls.failed_results.discard(fingerprint)
+                else:
+                    self.state.calls.failed_results.add(fingerprint)
             if outcome.truncated:
                 self.state.truncated_at[fingerprint] = _volume(call)
             else:
@@ -3613,8 +3631,8 @@ class AgentLoop:
                 f"- If your plan step removes {them}, leave {them} deleted and work "
                 "the next step. If the step is not closing on the delete, its `file` "
                 "names more than one path or its `action` does not say the file is "
-                "removed -- `revise_plan` with one step per file, `action` saying it "
-                "is deleted, fixes both.\n"
+                "removed -- `revise_plan` with one step per file, `action` starting "
+                "\"Delete\", fixes both.\n"
                 f"- If the step does not remove {them}, leave {them} on disk and work "
                 "the next step.\n\n"
                 "Going round again ends the run as stalled."
@@ -3897,8 +3915,22 @@ class AgentLoop:
             # run:" with ok=false, which is how a call that succeeded came to
             # look like a call that failed -- and a model that reads a failure
             # retries it.
+            #
+            # The mirror case is a call that *failed*, and "that is the current
+            # answer ... use it and move to the next step" is the wrong thing to
+            # say about a refusal. Session 8d075515671e sent one refused
+            # `write_file` four more times and was told each time it had an
+            # answer to use; what it had was a refusal to act on differently.
             whole = self.state.partial_results.get(fingerprint)
-            if whole is None:
+            if fingerprint in self.state.calls.failed_results:
+                body = (
+                    f"{call.name} was refused:\n\n{cached}\n\n"
+                    "-- it ran earlier and failed, and nothing in the workspace has "
+                    "changed since, so sending it again gets the same refusal. Do "
+                    "what the refusal says instead, or a different call; if nothing "
+                    "will do, say plainly what is blocking you."
+                )
+            elif whole is None:
                 body = (
                     f"{call.name} returned:\n\n{cached}\n\n"
                     "-- that is the current answer. The call ran earlier, nothing in the "
@@ -3924,10 +3956,11 @@ class AgentLoop:
                     "keep returning the answer above while the workspace is unchanged. "
                     "Turns that only repeat earlier calls end the run."
                 )
+            refused = fingerprint in self.state.calls.failed_results
             return (
                 body,
-                f"{call.name} asked again with the same arguments; answered from the "
-                "previous result",
+                f"{call.name} asked again with the same arguments; "
+                + ("refused again, as before" if refused else "answered from the previous result"),
                 "cached",
             )
 
@@ -4741,11 +4774,20 @@ class AgentLoop:
         self.state.progress.phase_ended()
         steps = self._normalise_plan(steps_from_meta(dict(outcome.meta)))
         phases = phases_from_meta(dict(outcome.meta))
-        # A roadmap is itself the evidence. A plan that arrives with phases is a
-        # phased plan whatever the 160-token classifier decided, and the
-        # classifier is the weaker witness of the two.
-        if phases and len(phases) >= MIN_PHASES:
-            self.state.migration.active = True
+        # A roadmap is *not* evidence of a migration. This switched migration
+        # on for any plan with MIN_PHASES phases, as the stronger witness than
+        # the classifier -- and session 8d075515671e's Planner volunteered four
+        # for a CRUD fix, so the run cut a branch, deferred its gate and argued
+        # about `parts`. Only `/migration` starts one; outside it, phases are
+        # dropped and the steps are the plan.
+        if phases and not self.state.migration.active:
+            phases = []
+            self.context.append_user(
+                "`phases` are only for a migration, and this task is not one -- "
+                "a migration starts with the developer's `/migration` command. The "
+                "phases were ignored and the steps adopted as the plan. Leave "
+                "`phases` out of any later `submit_plan` or `revise_plan`."
+            )
         if self.state.migration.active:
             # Every file a plan names is a file its phase covers, whether or not
             # this plan is adopted: a plan refused as too big for one submission
@@ -5335,6 +5377,42 @@ class AgentLoop:
             "\"the file is gone\". The plan stands; this is about how you verify it."
         )
 
+    def _note_existing_creations(self) -> None:
+        """Say so when a step creates a file that is already on disk.
+
+        Session 8d075515671e planned "Create db/employee.sql" over a file an
+        earlier session had written, byte for byte. The step could not close:
+        `write_file` refuses to overwrite, a patch of identical text changes
+        nothing, and a step closes only on a write. The run re-sent the refused
+        write until it ended no-progress. Said once at adoption, where the
+        model can still decide, with the exit that is true here -- `skipped`,
+        the creation being unnecessary -- and the one for a file that does need
+        changing.
+        """
+        present = [
+            s.file
+            for s in self.state.plan
+            if s.status == "pending"
+            and s.file
+            and _CREATION_LEAD.match(s.action)
+            and not any(s.covers(t) for t in self.router.touched)
+            and self._on_disk(s.file)
+        ]
+        if not present:
+            return
+        names = ", ".join(dict.fromkeys(present[:STATE_ITEMS]))
+        plural = len(present) > 1
+        self.context.append_user(
+            f"Before you start: {names} "
+            + ("already exist" if plural else "already exists")
+            + ", and the plan says to create "
+            + ("them" if plural else "it")
+            + ". `write_file` will not overwrite a file. For each: if it already "
+            "does what its step says, `revise_plan` that step to `skipped` with the "
+            "note \"already exists\"; if it needs changing, read it and change it "
+            "with `patch_file`."
+        )
+
     def _resurrects_a_retired_file(self, call: ToolCall) -> str:
         """Why this write undoes a deletion the plan asked for, or ``""``.
 
@@ -5355,7 +5433,14 @@ class AgentLoop:
 
         The escape is `revise_plan`. If the file genuinely has to come back, the
         step that removed it was wrong, and saying so is a plan revision rather
-        than a silent write.
+        than a silent write. It is a real escape only because `_adopt_plan`
+        releases a path once no step asks for its removal (`_release_retired`);
+        until session dcb37c9aaba6 nothing ever left `retired`, so the revision
+        this names changed nothing and the refusal was unbounded.
+
+        Worded for the run it is in. It said "this migration" on a plain CRUD
+        task, and told that run to fix whatever referred to the file -- the
+        handler that needed the repository it had just deleted to rewrite.
         """
         if not self.state.retired:
             return ""
@@ -5379,17 +5464,55 @@ class AgentLoop:
             None,
         )
         said = f' — "{step.action}"' if step is not None else ""
+        migrating = self.state.migration.active
+        why = (
+            " A service mid-conversion does not build, and restoring the file it "
+            "is converting away from is how a conversion ends up shipping the "
+            "thing it was meant to remove."
+            if migrating
+            else ""
+        )
         return (
-            f"{rel} was deleted by this migration on purpose{said}, and writing it "
-            "again undoes that step.\n\n"
+            f"{rel} was deleted by this {'migration' if migrating else 'plan'} on "
+            f"purpose{said}, and writing it again undoes that step.\n\n"
             "If a build error named it, the error is in whatever still refers to "
             f"it, not in {rel} being absent — fix the import or the registration "
-            "that points at it. A service mid-conversion does not build, and "
-            "restoring the file it is converting away from is how a conversion "
-            "ends up shipping the thing it was meant to remove.\n\n"
+            f"that points at it.{why}\n\n"
             "If the file genuinely has to come back, the step that removed it was "
-            "wrong: call `revise_plan` and say so."
+            "wrong: call `revise_plan` with that step's `action` saying what the "
+            "file is for instead of that it is deleted, and the write is allowed."
         )
+
+    def _release_retired(self) -> None:
+        """Let go of every retired path no step in the plan still asks to remove.
+
+        The other half of the escape `_resurrects_a_retired_file` names. Paths
+        entered `retired` and nothing ever took them out, so a `revise_plan`
+        saying "that step was wrong, the file stays" left the refusal exactly
+        where it was. Read off the installed plan, so a revision that merely
+        omits a finished removal step does not release it -- `_adopt_plan` keeps
+        settled steps the new plan does not mention -- and only one that
+        re-words the step's `action` does.
+
+        A released path that is still missing was a loss after all, so it goes
+        to `removed` and its step back to pending, the same as an unplanned
+        deletion: the finish then holds it until the file is written.
+        """
+        if not self.state.retired:
+            return
+        released = {p for p in self.state.retired if not self._step_wants_removal(p)}
+        if not released:
+            return
+        self.state.retired -= released
+        for path in sorted(released):
+            try:
+                exists = self.router.workspace.resolve(path).exists()
+            except (PathEscape, ValueError, OSError):
+                exists = False
+            if exists:
+                continue
+            self.state.removed.add(path)
+            self._mark_steps(path, "pending", "deleted; its replacement has not been written")
 
     def _note_delete(self, path: str) -> int:
         """Record a deletion, and return how many cycles this path has been through.
@@ -5437,10 +5560,20 @@ class AgentLoop:
         Narrow on purpose. It is not asking what the reply said; it is asking
         whether *this step's own one-sentence description of itself* is a
         removal.
+
+        And the description has to *open* with the removal. This matched the
+        verbs anywhere in the sentence, and session dcb37c9aaba6 paid for it: a
+        step reading "Fix Squirrel queries to use dblib.Psql and remove logging"
+        counted as asking for `repo/postgres/employee.go` to go. The run deleted
+        the file to rewrite it -- `write_file` will not overwrite, so that is
+        how a whole-file rewrite is done -- the deletion was recorded as
+        planned, `_resurrects_a_retired_file` refused the rewrite five times,
+        and the run ended unverified with the repository layer missing. A step
+        whose work is the deletion says so first; one that removes something
+        *inside* its file does not.
         """
-        verbs = ("delete", "remove", "drop", "retire")
         return any(
-            step.covers(path) and any(v in step.action.lower() for v in verbs)
+            step.covers(path) and _REMOVAL_LEAD.match(step.action)
             for step in self.state.plan
         )
 
@@ -6219,8 +6352,19 @@ class AgentLoop:
         on a step whose premise was false, and in all three the only status the
         model could reach was `skipped`, which means "unnecessary" and was not
         true.
+
+        And "write it now" is wrong about a file that is already on disk and
+        this run has not touched, which the docstring above said and the code
+        did not check. Session 8d075515671e's first step was "Create
+        db/employee.sql"; an earlier session had written it, byte for byte.
+        `write_file` refused to overwrite it, this said "Write it now" three
+        times, and the model re-sent the same refused write until the run
+        ended no-progress. There, `skipped` *is* true -- the creation was
+        unnecessary -- so that is the exit it is told about.
         """
-        missing = self._open_targets()
+        open_ = self._open_targets()
+        missing = [p for p in open_ if not self._on_disk(p)]
+        present = [p for p in open_ if p not in missing]
         unclean = [s for s in self.state.plan if s.status == "written" and s.file]
         parts: list[str] = []
         if missing:
@@ -6228,6 +6372,19 @@ class AgentLoop:
                 "Your plan set out to write " + ", ".join(missing) + ". "
                 + ("Write them now" if len(missing) > 1 else "Write it now")
                 + ", from what you already have."
+            )
+        if present:
+            plural = len(present) > 1
+            them = "them" if plural else "it"
+            parts.append(
+                ", ".join(present)
+                + (" already exist" if plural else " already exists")
+                + f" and this run has not changed {them} yet. Change {them} now "
+                "with `patch_file` -- `write_file` will not overwrite an existing "
+                "file, and sending the same write again gets the same refusal. If "
+                + ("they already do" if plural else "it already does")
+                + " what the step says, `revise_plan` that step to `skipped` with "
+                "the note \"already exists\"."
             )
         if unclean:
             names = ", ".join(dict.fromkeys(s.file for s in unclean))
@@ -7233,7 +7390,7 @@ class AgentLoop:
         self._plan_record.migration = self.state.migration
         return note
 
-    def _resume_migration(self, task: str) -> bool:
+    def _resume_migration(self) -> bool:
         """Pick up the workspace's unfinished migration, if this run is one.
 
         `/migrate` opens a new session every time, and a session used to start
@@ -7242,14 +7399,17 @@ class AgentLoop:
         first save overwrote the plan document. The record is keyed by the
         workspace alone, so the migration is resumed whichever session opens.
 
-        Only for a run that is about the migration -- the classifier said so,
-        or the message says "migrate", "continue" and the like. A bug fix asked
-        in the middle of a conversion is not the conversion.
+        Only for a run that is about the migration, which is a `/migration`
+        task: `_run` has set `active` from the command by now. This also read
+        the message for "migrate", "continue", "template" and the like, so a new
+        session asked to "continue" anything, in a workspace holding a record,
+        came back as the conversion. A bug fix asked in the middle of a
+        conversion is not the conversion.
         """
         migration = self.state.migration
         if migration.phases:
             return False  # restored with this session's own plan already
-        if not (migration.active or _RESUME_WORDS.search(task or "")):
+        if not migration.active:
             return False
         root = self.router.workspace.root
         record = load_record(root)
@@ -7483,6 +7643,9 @@ class AgentLoop:
             s for s in self.state.plan if s.status in history and s.file not in incoming
         )
         self.state.plan = kept + merged
+        # Before the plan is recorded and rendered, so a step whose removal was
+        # just retracted shows as pending rather than as the deletion it was.
+        self._release_retired()
         if summary:
             self.state.plan_summary = summary
         # Recorded before it is rendered. A plan was a tuple in a process,
@@ -7496,6 +7659,7 @@ class AgentLoop:
             rendered = f"{self.state.plan_summary}\n\n{rendered}"
         self.context.set_plan(rendered)
         self._note_unrunnable_criteria()
+        self._note_existing_creations()
         yield Event(
             EventType.PLAN,
             {
