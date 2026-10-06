@@ -633,23 +633,47 @@ def test_a_baseline_taken_after_an_edit_is_discarded(
     is the second lock: a baseline whose measurement spans a mutation is thrown
     away rather than trusted.
     """
-    seen = {"n": 0}
-
-    def counting(_inv):
-        # The workspace changes underneath the baseline, exactly as a `patch_file`
-        # landing mid-measurement would.
-        # A `patch_file` landing mid-measurement, as the counter sees it.
-        seen["n"] += 1
-        router.mutations += 1
+    def editing(_inv):
+        # A real `write_file`, dispatched through the router mid-measurement, so
+        # the counters move the way they move in a live run. This test used to
+        # bump `router.mutations` by hand, and passed whatever the router
+        # actually counted.
+        router.dispatch(
+            "write_file",
+            {"path": "handler/late.go", "content": "package handler\n"},
+            approved=True,
+        )
         return ToolResult.success("go_build: clean")
 
-    router.handlers["go_build"] = counting
+    router.handlers["go_build"] = editing
 
     baseline = take_baseline(router, include_tests=False)
     assert not baseline.taken, "a baseline that spans an edit must not be trusted"
     assert not baseline.passed
+    assert "written while it was being measured" in baseline.why_not
     # And an untaken baseline excuses nothing, so the run is still answerable.
     assert not baseline.excuses("go_build", frozenset({"x|y|z"}))
+
+
+def test_a_baseline_survives_a_documentation_write_during_measurement(
+    gate: Recorder, router: Router
+) -> None:
+    """05cd8b8369aa: the run wrote AGENTS.md while the baseline was measuring.
+
+    Nothing any stage reads changed, and discarding the snapshot for it left
+    the gate charging the service's own go.mod drift to the run."""
+
+    def documenting(_inv):
+        router.dispatch(
+            "write_file", {"path": "AGENTS.md", "content": "# notes\n"}, approved=True
+        )
+        return ToolResult.success("go_build: clean")
+
+    router.handlers["go_build"] = documenting
+
+    baseline = take_baseline(router, include_tests=False)
+    assert router.mutations == 1 and router.code_mutations == 0
+    assert baseline.taken, baseline.why_not
 
 
 def test_a_baseline_that_was_never_taken_excuses_nothing(
@@ -844,3 +868,91 @@ def _scripted(router: Router, answers: dict[str, ToolResult]) -> Router:
     for name, result in answers.items():
         recorder.answer(name, result)
     return router
+
+
+# ── session 05cd8b8369aa: a change that is only documentation ────────────────
+
+
+def test_a_change_set_of_documentation_runs_no_go_stage(gate: Recorder, router: Router) -> None:
+    """05cd8b8369aa: asked for an AGENTS.md, the run was handed `go mod tidy`'s
+    verdict on the service's own go.mod and edited it until nothing built."""
+    report = full_gate(router, ["AGENTS.md", "docs/notes.md"])
+
+    assert gate.calls == [], f"a Go stage ran on prose: {gate.order}"
+    assert report.ok
+    assert all(r.skipped.startswith("only documentation changed") for r in report.results)
+
+
+def test_documentation_is_gated_when_the_module_embeds_files(
+    gate: Recorder, router: Router, workspace: Workspace
+) -> None:
+    """The one way a Markdown file reaches the compiler."""
+    (workspace.root / "docs.go").write_text(
+        'package main\n\nimport _ "embed"\n\n//go:embed AGENTS.md\nvar notes string\n',
+        encoding="utf-8",
+    )
+    full_gate(router, ["AGENTS.md"])
+    assert "go_build" in gate.order
+
+
+def test_prose_beside_go_is_gated_as_usual(gate: Recorder, router: Router) -> None:
+    full_gate(router, ["AGENTS.md", "handler/user.go"])
+    assert "go_build" in gate.order
+
+
+def test_a_requirement_flipping_to_direct_is_a_tidy_finding() -> None:
+    """It produced no key, so the baseline read "tidy failing, on nothing" and
+    `Baseline.charge` excused the stage whole -- new drift included."""
+    from dakcoder_agent.tools.commands import _mod_findings
+
+    before = "module m\n\nrequire (\n\tgithub.com/google/uuid v1.6.0 // indirect\n\tx.test/a v1.0.0\n)\n"
+    after = "module m\n\nrequire (\n\tgithub.com/google/uuid v1.6.0\n\tx.test/b v1.0.0\n)\n"
+
+    assert _mod_findings(before, after) == ["+x.test/b", "-x.test/a", "~github.com/google/uuid"]
+
+
+def test_a_module_problem_that_predates_the_run_does_not_block_swagger_check(
+    gate: Recorder, router: Router
+) -> None:
+    """Found by the real-toolchain replay: a service with no configs/ had every
+    Go change blocked at swagger_check, as the run's own failure."""
+    problem = "there is no configs/ directory, so generation cannot be enabled"
+    gate.answer(
+        "swagger_check",
+        ToolResult.failure(
+            f"swagger_check found 1 problem(s):\n  - {problem}",
+            meta={"violations": [], "problems": [problem]},
+        ),
+    )
+    baseline = take_baseline(router, include_tests=False)
+    assert baseline.passed["swagger_check"] is False
+
+    report = full_gate(router, ["handler/user.go"], baseline=baseline)
+    swagger = next(r for r in report.results if r.name == "swagger_check")
+    assert not swagger.blocking, swagger.content
+
+
+def test_a_generated_validator_that_redeclares_a_hand_written_one_is_found(tmp_path) -> None:
+    """The happy path was red on this at HEAD: govalid wrote a `Validate` for the
+    template's `ListUsersParams`, which already has one, and the gate's own
+    rebuild failed on a file the run never wrote."""
+    from dakcoder_agent.tools.commands import _redeclared_validators
+
+    (tmp_path / "request.go").write_text(
+        "package request\n\ntype ListUsersParams struct{}\n\n"
+        "func (p *ListUsersParams) Validate() error { return nil }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "request_listusersparams_validator.go").write_text(
+        "package request\n\nfunc (s *ListUsersParams) Validate() error { return nil }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "request_createuser_validator.go").write_text(
+        "package request\n\nfunc (s *CreateUser) Validate() error { return nil }\n",
+        encoding="utf-8",
+    )
+
+    created = ["request_createuser_validator.go", "request_listusersparams_validator.go"]
+    assert _redeclared_validators(tmp_path, created) == ["request_listusersparams_validator.go"]
+    # Only what this call created is ever a candidate.
+    assert _redeclared_validators(tmp_path, []) == []

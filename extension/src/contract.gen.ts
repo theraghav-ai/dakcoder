@@ -1,6 +1,6 @@
 // Generated from api/contract.json and api/openapi.json by scripts/gen-contract.mjs.
 // Do not edit. Run `make contract` at the repository root and commit the result.
-// openapi.json digest: d3968d0a37d7bf56
+// openapi.json digest: 20e11de76ee7da1e
 
 /**
  * The runtime API this build speaks. A mismatch with `/v1/health` is refused
@@ -14,7 +14,7 @@ export const API_VERSION = '1.1';
  * with additions this build does not know about. That is legal under C2, so it
  * is logged, not refused.
  */
-export const CONTRACT_HASH = '8753703732640fec';
+export const CONTRACT_HASH = '309bae6744531db8';
 
 /**
  * Every event type the runtime can emit (C2). A lower bound: a newer runtime
@@ -322,6 +322,8 @@ export interface GateRun {
   cached?: boolean;
   /** A full gate run as a stalled run ended, on the files it had changed; its report is final and was not sent back to the model. */
   closing?: boolean;
+  /** A full gate: `taken` when what was already failing before the run was measured and excused, otherwise why it was not. */
+  baseline?: string;
 }
 
 export interface GateStage {

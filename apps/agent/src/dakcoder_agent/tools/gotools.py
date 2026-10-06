@@ -834,8 +834,15 @@ def _swagger_check(sidecar: GoTools, inv: Invocation) -> ToolResult:
         for pattern in ("configs/*.yaml", "configs/*.yml")
         for p in inv.workspace.root.glob(pattern)
     )
+    #: Problems with the module rather than with a route, which have no
+    #: `rule|path|message` key -- carried as their own keys in `meta`, so the
+    #: baseline can record one that was there before the run and the gate can
+    #: excuse it. Session 05cd8b8369aa's real-toolchain replay found this one
+    #: blocking every Go change on a service with no configs/, as this run's.
+    problems: list[str] = []
     if not configs:
-        blocking.append("there is no configs/ directory, so generation cannot be enabled")
+        problems.append("there is no configs/ directory, so generation cannot be enabled")
+        blocking.append(problems[-1])
     checked = {p: _has_key(p, _SWAGGER_KEY) for p in configs}
     missing = [inv.workspace.relative(p) for p, present in checked.items() if present is False]
     unknown = [inv.workspace.relative(p) for p, present in checked.items() if present is None]
@@ -862,7 +869,7 @@ def _swagger_check(sidecar: GoTools, inv: Invocation) -> ToolResult:
     # Carried on every return, pass or fail, because the caller that needs them
     # is the one taking the baseline -- and it takes it on a clean repository,
     # where this returns success and there is nothing to read off the body.
-    meta: dict[str, Any] = {"violations": keys}
+    meta: dict[str, Any] = {"violations": keys, "problems": problems}
     if pre_existing:
         advisory.append(
             f"{len(pre_existing)} handler(s) were already missing Routes() before "

@@ -140,6 +140,57 @@ def test_a_follow_up_keeps_the_baseline_the_task_started_with(
     assert nxt.state.baseline is first.state.baseline
 
 
+def test_a_new_task_reuses_a_baseline_nothing_has_invalidated(
+    planning_router, gated, written, monkeypatch
+) -> None:
+    """05cd8b8369aa: the planning message ended in eleven seconds, "write it"
+    was a new task, and a second baseline started beside the first, still
+    measuring the same untouched module."""
+    import dakcoder_agent.loop as loop_module
+
+    started: list[float] = []
+
+    def slow(router, **kw):
+        started.append(time.monotonic())
+        time.sleep(0.3)
+        return Baseline(taken=True)
+
+    monkeypatch.setattr(loop_module, "take_baseline", slow)
+
+    first, _ = build(planning_router, [calls(("finish", json.dumps({"answer": "plan"})))])
+    list(first.run("Create AGENTS.md", intent=Intent.AGENT))
+    nxt, _ = _follow_up(first, [say("ok")])
+    list(nxt.run("write it", continued=True))
+    nxt._await_baseline()
+
+    assert len(started) == 1, "a second baseline of an untouched workspace"
+    assert nxt.state.baseline.taken
+
+
+def test_a_new_task_after_a_code_edit_measures_again_and_keeps_its_own(
+    planning_router, gated, written, monkeypatch
+) -> None:
+    """The case `_begin_new_task` takes a fresh baseline for -- and the new
+    snapshot must not be overwritten by the previous message's, which predates
+    the edit and would charge it to this task."""
+    import dakcoder_agent.loop as loop_module
+
+    snapshots = iter([Baseline(taken=True, why_not="first"), Baseline(taken=True, why_not="second")])
+    monkeypatch.setattr(loop_module, "take_baseline", lambda router, **kw: next(snapshots))
+
+    first, _ = build(planning_router, [plan_call(), patch(), say("done")], max_turns=6)
+    list(first.run("add Routes", intent=Intent.AGENT))
+    first._await_baseline()
+    assert planning_router.code_mutations > 0
+
+    nxt, _ = _follow_up(first, [say("ok")])
+    nxt._baseline_source = first.state  # as if its thread were still running
+    list(nxt.run("now document the handler", continued=True))
+    nxt._await_baseline()
+
+    assert nxt.state.baseline.why_not == "second"
+
+
 # ── F1/F2 in the gate ────────────────────────────────────────────────────────
 
 

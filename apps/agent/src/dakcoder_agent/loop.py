@@ -87,6 +87,7 @@ from .context import (
 )
 from .gate import (
     ROUTES_BEFORE,
+    Baseline,
     build_errors,
     finding_path,
     GateReport,
@@ -1363,6 +1364,11 @@ class AgentLoop:
         #: The previous message's state, when `_baseline_thread` was inherited
         #: from it and is still writing there. See `carry_from`.
         self._baseline_source: Any = None
+        #: ``router.code_mutations`` when the baseline was started, or None when
+        #: none was. While the two still agree, nothing the toolchain reads has
+        #: changed since, and the snapshot -- taken or still being taken -- is a
+        #: picture of the workspace as it is now. See `_baseline_still_current`.
+        self._baseline_mark: int | None = None
         #: This run's accounting. Replaced at `run`; initialised here so a
         #: caller driving `_run` directly still has one to finish.
         self._metrics_acc = metrics.Accumulator()
@@ -1584,10 +1590,21 @@ class AgentLoop:
         # baseline `carry_from` handed it -- and the thread still measuring it,
         # when the previous message ended first -- and takes a new one only for
         # a new task, whose change set starts empty too.
+        #
+        # Not even for a new task, when the snapshot already in hand is still a
+        # picture of the workspace: nothing the toolchain reads has been written
+        # since it was started. Session 05cd8b8369aa's first message planned and
+        # ended in eleven seconds, its "write it" was a new task, and a second
+        # baseline started beside the first, still-running one -- two `go vet`s
+        # and two unscoped lints over the same untouched module, for one answer.
         if (
             decided is Intent.AGENT
             and not self.state.migration.defers_gate
-            and (not continued or new_task or not self._has_baseline())
+            and (
+                not continued
+                or (new_task and not self._baseline_still_current())
+                or not self._has_baseline()
+            )
         ):
             self._take_baseline()
 
@@ -1897,6 +1914,22 @@ class AgentLoop:
         """
         return self.state.baseline.taken or self._baseline_thread is not None
 
+    def _baseline_still_current(self) -> bool:
+        """Whether the baseline in hand still describes the workspace as it is.
+
+        True when one was taken (or is being taken) and nothing the toolchain
+        reads has been written since it started -- so a new task would measure
+        exactly what it already holds. False after any code edit, which is the
+        case `_begin_new_task` exists for: the last task's edits are this task's
+        starting point, and a snapshot from before them would charge them here.
+        """
+        mark = getattr(self, "_baseline_mark", None)
+        return (
+            mark is not None
+            and mark == self.router.code_mutations
+            and self._has_baseline()
+        )
+
     def _take_baseline(self) -> None:
         """Record what was already broken, off the critical path.
 
@@ -1920,6 +1953,13 @@ class AgentLoop:
                 # reverts to blaming the run for what it found, which is the
                 # behaviour that shipped -- so this is a degradation worth
                 # seeing in the transcript rather than inferring later.
+                #
+                # And logged, because the relay is transient: when the message
+                # that started this thread has already ended, nothing records
+                # what it sends, and session 05cd8b8369aa's baseline failed with
+                # no trace in its events or in the runtime log.
+                log.warning("pre-run baseline could not be taken: %s", exc, exc_info=True)
+                self.state.baseline = Baseline(why_not=f"it raised: {exc}")
                 self._relay(
                     Event(
                         EventType.ERROR,
@@ -1934,6 +1974,13 @@ class AgentLoop:
 
         thread = threading.Thread(target=measure, name="dakcoder-baseline", daemon=True)
         self._baseline_thread = thread
+        # This thread writes into *this* loop's state. A source inherited from
+        # the previous message belongs to the thread this one replaces, and left
+        # set, `_await_baseline` would join the new thread and then copy the old
+        # snapshot over the new one -- a picture from before the last task's
+        # edits, which charges those edits to this task.
+        self._baseline_source = None
+        self._baseline_mark = self.router.code_mutations
         thread.start()
 
     def _await_baseline(self) -> None:
@@ -5108,7 +5155,23 @@ class AgentLoop:
         self.state.last_gate = report
         self.state.gate_key = key
         self.state.gate_turn = self.context.turn
-        yield Event(EventType.GATE, {"kind": "full", **report.as_dict()})
+        # Whether this verdict had a baseline behind it, in the persisted event.
+        # Without one every pre-existing failure reads as the run's own, and
+        # session 05cd8b8369aa could not be diagnosed afterwards because nothing
+        # recorded that it had none. An additive field; clients ignore it.
+        baseline = self.state.baseline
+        if baseline.taken:
+            measured = "taken"
+        elif self.state.migration.active:
+            # Deliberate: see `_run` -- a conversion's damage *is* the workspace.
+            measured = "not taken: a migration is gated without one"
+        else:
+            measured = baseline.why_not or "not taken"
+            log.warning("gate ran without a pre-run baseline: %s", measured)
+        yield Event(
+            EventType.GATE,
+            {"kind": "full", **report.as_dict(), "baseline": measured},
+        )
 
         # The gate's own build is the same evidence `_note_build` reads, and
         # newer. A gate that fails later -- at `rules_lint`, say -- has still
@@ -5930,6 +5993,9 @@ class AgentLoop:
             self._baseline_thread = thread
             self._baseline_source = previous.state
         self.state.baseline = previous.state.baseline
+        # And when it was started, so `_baseline_still_current` can tell a new
+        # task whether that snapshot is still the workspace it is starting on.
+        self._baseline_mark = getattr(previous, "_baseline_mark", None)
         self.state.plan = previous.state.plan
         self.state.plan_summary = previous.state.plan_summary
         # With the plan, because it is a fact *about* the plan. A cursor that

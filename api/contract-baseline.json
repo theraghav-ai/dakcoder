@@ -1,6 +1,6 @@
 {
  "api_version": "1.1",
- "release": "0.4.21",
+ "release": "0.4.22",
  "facts": [
   "event assistant",
   "event assistant_delta",
@@ -743,6 +743,7 @@
   "get event gate<GateRoutes>.saved always",
   "get event gate<GateRoutes>.unresolved : integer",
   "get event gate<GateRoutes>.unresolved always",
+  "get event gate<GateRun>.baseline : string",
   "get event gate<GateRun>.blocked_by : string",
   "get event gate<GateRun>.blocked_by always",
   "get event gate<GateRun>.cached : boolean",

@@ -33,6 +33,7 @@ blocks on violations that were there before the session started.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import time
@@ -45,7 +46,7 @@ from typing import Any
 from dakcoder_shared.envelope import ToolResult
 
 from .tools import commands
-from .tools.router import Router
+from .tools.router import Router, is_prose
 
 __all__ = [
     "Baseline",
@@ -57,6 +58,8 @@ __all__ = [
     "inner_loop",
     "take_baseline",
 ]
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +183,13 @@ class Baseline:
     #: True once the baseline has actually been taken. A gate that runs before
     #: it is ready must not read an empty baseline as "nothing was broken".
     taken: bool = False
+    #: Why it was not taken, when it was not. Session 05cd8b8369aa ran with
+    #: ``taken == False`` from its first turn to its last and nothing anywhere
+    #: said why -- not the events, not the runtime log -- so the gate charged
+    #: the service's own go.mod drift to a run that wrote one Markdown file, and
+    #: the cause could only be guessed at afterwards. The reason travels with the
+    #: snapshot so whoever reads the snapshot can say it.
+    why_not: str = ""
 
     def charge(self, tool: str, current: frozenset[str]) -> frozenset[str] | None:
         """The findings in ``current`` this run is answerable for.
@@ -788,6 +798,11 @@ GATE: tuple[Stage, ...] = (
         _scoped_with_baseline,
         when=_has_go,
         skip_reason=_NO_MODULE,
+        # The route findings are discounted on the far side (`compliance`), but
+        # a problem with the module itself -- no configs/ at all -- is not a
+        # route, and without a baseline key it blocked every Go change on a
+        # service that had it before the run started.
+        baseline_key="swagger_check",
     ),
     # Scoped to the packages this run changed, and baselined against what vet
     # already said before it started. Unscoped and unbaselined, this stage
@@ -864,6 +879,39 @@ GATE: tuple[Stage, ...] = (
 )
 
 
+#: Directories whose Go files are not the service's: the runtime's own undo
+#: snapshots hold copies of handlers, and a copy that embeds is not the module.
+_NOT_THE_MODULE = frozenset({".git", ".dakcoder", "vendor", "node_modules"})
+
+
+def _embeds_files(root: Path) -> bool:
+    """Whether any Go file in the module compiles a file into the binary.
+
+    The one way a Markdown file reaches the compiler. Checked rather than
+    assumed away, because a service that embeds its API notes or its email
+    templates does exist, and for it a documentation edit *is* a build input.
+    """
+    for path in root.rglob("*.go"):
+        if _NOT_THE_MODULE.intersection(path.relative_to(root).parts[:-1]):
+            continue
+        try:
+            if "//go:embed" in path.read_text(encoding="utf-8", errors="replace"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _prose_only(router: Router, touched: Sequence[str]) -> str:
+    """The skip reason when nothing in ``touched`` can change a Go verdict, else ``""``."""
+    if not touched or not all(is_prose(p) for p in touched):
+        return ""
+    if _embeds_files(router.workspace.root):
+        return ""
+    shown = ", ".join(touched[:3]) + (f" and {len(touched) - 3} more" if len(touched) > 3 else "")
+    return f"only documentation changed ({shown}); no Go stage reads it"
+
+
 def inner_loop(router: Router, touched: Sequence[str]) -> GateReport:
     """The sub-second check after an edit batch.
 
@@ -887,7 +935,20 @@ def full_gate(
     ran over the whole module and reported whatever they found; the loop read
     every finding as the run's own, and on a repository that was not already
     green no change could ever clear it.
+
+    **Not at all for a change set that is only documentation.** Every stage here
+    is a question about Go, and an AGENTS.md cannot change the answer to any of
+    them -- so asking anyway can only report what was already true of the
+    service, as if the run had done it. Session 05cd8b8369aa: asked for an
+    AGENTS.md, it was handed `go mod tidy`'s verdict on a go.mod that had been
+    drifting since before the session, told to "fix the imports that caused the
+    drift", and spent fourteen turns on go.mod until the service no longer built.
     """
+    touched = tuple(touched)
+    if reason := _prose_only(router, touched):
+        return GateReport(
+            tuple(StageResult(s.name, True, s.blocking, "", skipped=reason) for s in GATE)
+        )
     return _run(
         GateContext(router, tuple(touched), dependencies_changed, baseline or Baseline()),
         GATE,
@@ -1016,7 +1077,8 @@ def take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
 
 
 def _take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
-    before = router.mutations
+    before = router.code_mutations
+    started = time.monotonic()
     findings: dict[str, frozenset[str]] = {}
     passed: dict[str, bool] = {}
     rule_classes: dict[str, frozenset[str]] = {}
@@ -1076,14 +1138,35 @@ def _take_baseline(router: Router, *, include_tests: bool = True) -> Baseline:
         outcome = router.run_gate_tool("swagger_check", {})
         if isinstance(outcome, ToolResult):
             compliance = frozenset(str(k) for k in (outcome.meta.get("violations") or ()))
+            passed["swagger_check"] = outcome.ok
+            if not outcome.ok:
+                findings["swagger_check"] = _swagger_keys(outcome)
     except Exception:  # noqa: BLE001 - see above
         pass
 
-    if router.mutations != before:
+    seconds = time.monotonic() - started
+    if router.code_mutations != before:
         # Something was written while this was being measured, so it is not a
         # picture of the workspace as the run found it. Better none than one
         # that excuses the run's own damage.
-        return Baseline()
+        #
+        # *Code* mutations, not all of them. The measurement takes as long as
+        # `go vet` does, and a run that writes its AGENTS.md in that window has
+        # changed nothing any stage here reads -- discarding the snapshot for it
+        # left session 05cd8b8369aa's gate nothing to excuse the service's own
+        # go.mod drift with. And said out loud, because it was silent there.
+        why = (
+            f"{router.code_mutations - before} file(s) the toolchain reads were "
+            f"written while it was being measured ({seconds:.0f}s)"
+        )
+        log.warning("pre-run baseline discarded: %s", why)
+        return Baseline(why_not=why)
+    red = sorted(tool for tool, ok in passed.items() if not ok)
+    log.info(
+        "pre-run baseline taken in %.1fs: %s",
+        seconds,
+        "already failing: " + ", ".join(red) if red else "every stage clean",
+    )
     return Baseline(
         findings=findings,
         passed=passed,
@@ -1355,6 +1438,8 @@ def _stage_findings(stage: Stage, result: ToolResult) -> frozenset[str]:
     """The failing stage's findings, keyed the same way the baseline keyed them."""
     if stage.tool == "go_mod":
         return frozenset(str(k) for k in (result.meta.get("findings") or ()))
+    if stage.tool == "swagger_check":
+        return _swagger_keys(result)
     if stage.tool == "rules_lint":
         # `rule|path|message`, the same shape the baseline recorded. Never the
         # rendered prose: that is grouped, elided and worst-first, so it does not
@@ -1364,6 +1449,18 @@ def _stage_findings(stage: Stage, result: ToolResult) -> frozenset[str]:
     # ("Fix the first error listed...") is not a finding, and it was being
     # stored as one.
     return _finding_keys(result.content)
+
+
+def _swagger_keys(result: ToolResult) -> frozenset[str]:
+    """`swagger_check`'s findings: its route violations and its module problems.
+
+    The baseline and the gate both key it here, so the two cannot disagree on
+    shape -- which is the whole of what makes a pre-existing problem excusable.
+    """
+    return frozenset(
+        str(k)
+        for k in (*(result.meta.get("violations") or ()), *(result.meta.get("problems") or ()))
+    )
 
 
 def finding_path(tool: str, key: str) -> str:

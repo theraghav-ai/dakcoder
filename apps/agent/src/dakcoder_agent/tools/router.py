@@ -48,7 +48,30 @@ __all__ = [
     "Router",
     "ToolHandler",
     "ToolOutcome",
+    "is_prose",
 ]
+
+#: Files no Go tool reads: not the compiler, not vet, not tidy, not the linter.
+#: Deliberately short. `.txt` is not here because a test reads its testdata at
+#: run time, and `.yaml`/`.json` are not here because a service reads its config
+#: and swagger does too. Only what is written for people to read.
+_PROSE_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
+
+
+def is_prose(path: str) -> bool:
+    """Whether ``path`` is documentation that cannot change any Go verdict.
+
+    Two callers ask, and both answer the same question: the gate skips its Go
+    stages for a change set that is all prose, and the baseline keeps a snapshot
+    a prose write landed in the middle of. Session 05cd8b8369aa was asked for an
+    AGENTS.md and nothing else: the gate ran `go mod tidy` over the module,
+    charged the service's own `// indirect` drift to the run, and the run spent
+    fourteen turns editing go.mod until the service no longer built.
+
+    One exception, which the gate checks for itself: a module that embeds files
+    (`//go:embed`) can compile a Markdown file into the binary.
+    """
+    return path.replace("\\", "/").lower().endswith(_PROSE_SUFFIXES)
 
 #: A handler takes the validated arguments and the context it needs, and returns
 #: a result. It never sees the raw model output — the router has already checked
@@ -200,6 +223,13 @@ class Router:
         #: questions that mean "has the model changed anything since I last
         #: looked" have to subtract them (BUG L-29).
         self.gate_mutations: int = 0
+        #: Of all of them, the ones that could change what a Go tool reports:
+        #: every mutation of a path that is not prose. What the baseline compares
+        #: to decide whether its snapshot is still a picture of the workspace as
+        #: the run found it -- an AGENTS.md written while `go vet` was measuring
+        #: does not make the vet result wrong, and discarding the snapshot for it
+        #: hands the gate nothing to excuse pre-existing failures with.
+        self.code_mutations: int = 0
 
     def begin_task(self) -> None:
         """Start a new task's change set, in the same session.
@@ -329,6 +359,8 @@ class Router:
             self.mutations += 1
             if gate:
                 self.gate_mutations += 1
+            if not is_prose(mutation.path):
+                self.code_mutations += 1
             if mutation.path not in self.touched:
                 self.touched.append(mutation.path)
             if self.undo is not None:

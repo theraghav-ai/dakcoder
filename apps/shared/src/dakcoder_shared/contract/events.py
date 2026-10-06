@@ -153,6 +153,11 @@ class GateRun(GateReport):
         description="A full gate run as a stalled run ended, on the files it had changed; "
         "its report is final and was not sent back to the model.",
     )
+    baseline: Absent[str] = Field(
+        default=None,
+        description="A full gate: `taken` when what was already failing before the run was "
+        "measured and excused, otherwise why it was not.",
+    )
 
 
 class GateForcedToolCall(Wire):

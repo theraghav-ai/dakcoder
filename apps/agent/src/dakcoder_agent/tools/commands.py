@@ -815,21 +815,33 @@ def _mod_findings(before: str, after: str) -> list[str]:
     is not something this run did, and the baseline needs a key that does not
     move. The module path is that key; the version is not, because a bump
     changes it while describing the same drift.
+
+    A requirement that only changes between direct and indirect is drift too,
+    and keyed as ``~module``. It used to produce no key at all, so a service
+    whose go.mod marked a directly imported module ``// indirect`` -- session
+    05cd8b8369aa's `github.com/google/uuid` -- had a baseline that said "tidy
+    was failing, on nothing", and `Baseline.charge` excuses that whole: any
+    module a run then added on top of it went through unexamined.
     """
 
-    def requires(text: str) -> set[str]:
-        out: set[str] = set()
+    def requires(text: str) -> dict[str, bool]:
+        out: dict[str, bool] = {}
         for line in text.split("\n"):
             stripped = line.strip()
             if not stripped or stripped.startswith(("//", "module ", "go ", "require (", ")")):
                 continue
             parts = stripped.removeprefix("require ").split()
             if len(parts) >= 2 and "/" in parts[0]:
-                out.add(parts[0])
+                out[parts[0]] = "// indirect" in stripped
         return out
 
     was, now = requires(before), requires(after)
-    return sorted({f"-{m}" for m in was - now} | {f"+{m}" for m in now - was})
+    flipped = {m for m in was.keys() & now.keys() if was[m] != now[m]}
+    return sorted(
+        {f"-{m}" for m in was.keys() - now.keys()}
+        | {f"+{m}" for m in now.keys() - was.keys()}
+        | {f"~{m}" for m in flipped}
+    )
 
 
 def govalid_gen(inv: Invocation) -> ToolResult:
@@ -880,15 +892,66 @@ def govalid_gen(inv: Invocation) -> ToolResult:
             fix_on_fail="Check the validate tags on the request structs for a typo.",
         )
 
+    # govalid writes a `Validate` for every struct in request.go, including one
+    # the service already wrote by hand -- the reference template's
+    # `ListUsersParams` has one -- and the package then declares the method
+    # twice. The gate's own rebuild failed on that, so every scaffold onto a
+    # template-derived service ended `unverified` blocked at "go_build (after
+    # generate)" on a file the run never wrote; the real-toolchain happy path
+    # had been red on it with nobody looking, because it is marked slow.
+    # Only files this call *created* are removed: one that was already there is
+    # the developer's, clash or not.
+    clashes = _redeclared_validators(handler, [n for n in after if n not in before])
+    for name in clashes:
+        try:
+            (handler / name).unlink()
+        except OSError:
+            continue
+        after.pop(name, None)
+
     changed = sorted(
-        f"handler/{name}" for name, digest in after.items() if before.get(name) != digest
+        f"handler/request/{name}" for name, digest in after.items() if before.get(name) != digest
+    )
+    removed = (
+        f" Not kept: {', '.join(clashes)} -- each would redeclare a Validate method "
+        "request.go already defines by hand."
+        if clashes
+        else ""
     )
     if not changed:
-        return ToolResult.success("govalid: validators already current")
+        return ToolResult.success("govalid: validators already current." + removed)
     return ToolResult.success(
-        f"govalid regenerated {len(changed)} validator(s): {', '.join(changed)}",
+        f"govalid regenerated {len(changed)} validator(s): {', '.join(changed)}." + removed,
         mutations=[Mutation(p, MutationKind.MODIFY) for p in changed],
     )
+
+
+#: A `Validate` method declaration, capturing the receiver's type name.
+_VALIDATE_METHOD = re.compile(r"^func\s*\(\s*\w*\s*\*?\s*(\w+)\s*\)\s*Validate\s*\(", re.MULTILINE)
+
+
+def _redeclared_validators(handler: Path, created: Sequence[str]) -> list[str]:
+    """Of the validator files govalid just created, those whose `Validate`
+    a hand-written file in the package already declares for the same type."""
+    if not created:
+        return []
+    by_hand: set[str] = set()
+    for path in handler.glob("*.go"):
+        if path.name.endswith("_validator.go"):
+            continue
+        try:
+            by_hand.update(_VALIDATE_METHOD.findall(path.read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            continue
+    clashes = []
+    for name in created:
+        try:
+            body = (handler / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if by_hand.intersection(_VALIDATE_METHOD.findall(body)):
+            clashes.append(name)
+    return sorted(clashes)
 
 
 def _validator_snapshot(handler: Path) -> dict[str, int]:

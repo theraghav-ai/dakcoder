@@ -2294,6 +2294,10 @@
           "closing": {
             "description": "A full gate run as a stalled run ended, on the files it had changed; its report is final and was not sent back to the model.",
             "type": "boolean"
+          },
+          "baseline": {
+            "description": "A full gate: `taken` when what was already failing before the run was measured and excused, otherwise why it was not.",
+            "type": "string"
           }
         },
         "required": [
