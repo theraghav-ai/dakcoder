@@ -49,6 +49,7 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -129,6 +130,7 @@ from .modes import CONTEXT_WINDOW, Intent, Mode, config_for
 from .plan import PlanRecord
 from .undo import ensure_private
 from .prompts import mode_instruction, system_prompt
+from .tools import commands as _commands
 from .tools import registry
 from .tools.control import PlanStep, split_paths, steps_from_meta
 from .tools.fs import EMPTY_WORKSPACE, workspace_empty
@@ -812,6 +814,12 @@ MAX_REVISIONS = 2
 #: identical calls in one batch are answered once, and calls past the cap are
 #: answered "not run" with a reason, which keeps the wire coherent.
 MAX_CALLS_PER_BATCH = 6
+
+#: The api-* modules the dependency phase replaces with an n-api-* one, from
+#: the skill's swap table. `api-config` is not here: it stays.
+_SWAPPED = frozenset(
+    {"api-bootstrapper", "api-server", "api-log", "api-errors", "api-db", "api-validation"}
+)
 
 #: How many entries each list in the state block carries.
 STATE_ITEMS = 8
@@ -2687,6 +2695,17 @@ class AgentLoop:
         migration = self.state.migration
         if not migration.active:
             return None
+        spec = registry.get(call.name)
+        if spec is None or not spec.mutates or call.name == "git_ops":
+            return None
+        if not (self.router.workspace.root / ".git").is_dir():
+            return None
+        # Before the first write, whatever the branch. It used to be taken only
+        # below the early return for "a branch is already cut", so a run that
+        # did step one right -- `git_ops` first, then edits -- never recorded
+        # the routes at all, and the last phase's lost-route check was skipped
+        # for want of the file (live run f756001b8845).
+        self._save_routes()
         # A branch, *and* one that is not the branch everybody else is on.
         #
         # The recorded branch comes from `git_ops`, which reports whatever it
@@ -2696,12 +2715,6 @@ class AgentLoop:
         # one outcome step one exists to prevent.
         if migration.branch and migration.branch.lower() not in PROTECTED:
             return None
-        spec = registry.get(call.name)
-        if spec is None or not spec.mutates or call.name == "git_ops":
-            return None
-        if not (self.router.workspace.root / ".git").is_dir():
-            return None
-        self._save_routes()
         if migration.expected_branch:
             # A resumed migration whose branch exists and is not checked out.
             # Cutting a new one would fork the conversion; switching back is one
@@ -3068,7 +3081,8 @@ class AgentLoop:
         skipped: dict[str, str] = {}
         seen_in_batch: set[str] = set()
         others = [c for c in calls if c.name != "finish"]
-        for position, call in enumerate(calls):
+        dispatched = 0
+        for call in calls:
             fingerprint = _fingerprint(call)
             if fingerprint in seen_in_batch:
                 skipped[call.id] = (
@@ -3102,6 +3116,9 @@ class AgentLoop:
             if reason := self._regenerates_a_failing_file(call):
                 skipped[call.id] = reason
                 continue
+            if reason := self._tidies_mid_migration(call):
+                skipped[call.id] = reason
+                continue
             if call.name == "finish" and others:
                 skipped[call.id] = (
                     "it was sent in the same reply as other calls. Read their "
@@ -3109,11 +3126,23 @@ class AgentLoop:
                     "nothing else in it."
                 )
                 continue
-            if position >= MAX_CALLS_PER_BATCH:
+            # The cap counts calls that will run, not calls already answered.
+            # Counting by position made the refusal permanent: live run
+            # f756001b8845 sent eleven `impact` calls, six ran and five were
+            # told "ask again in a later turn"; it asked again by resending all
+            # eleven, the first six were answered from the ledger and still
+            # took the six slots, and the same five were refused for three
+            # turns running. A repeat the ledgers answer costs nothing.
+            if self._answered_from_ledger(call, fingerprint):
+                continue
+            if dispatched >= MAX_CALLS_PER_BATCH:
                 skipped[call.id] = (
                     f"more than {MAX_CALLS_PER_BATCH} calls were sent in one reply; "
-                    "ask for it again in a later turn."
+                    "ask for it again in a later turn, on its own or with fewer "
+                    "others."
                 )
+                continue
+            dispatched += 1
 
         # A batch that is all reads runs at once.
         #
@@ -3943,6 +3972,24 @@ class AgentLoop:
         self._relay(Event(EventType.GATE, {"kind": "full", "closing": True, **report.as_dict()}))
         return report
 
+    def _answered_from_ledger(self, call: ToolCall, fingerprint: str) -> bool:
+        """Whether ``_intercept`` will answer this call without dispatching it.
+
+        A side-effect-free preview of its first two ledgers, for the batch cap.
+        An approximation that errs towards "dispatch": a call it misses runs,
+        which costs a slot, never an answer.
+        """
+        if call.name in _TERMINAL:
+            return False
+        if fingerprint in self.state.dead_ends:
+            return True
+        capped = self.state.truncated_at.get(fingerprint)
+        return (
+            fingerprint in self.state.last_results
+            and fingerprint in self.context.visible_results
+            and not (capped is not None and _volume(call) > capped)
+        )
+
     def _intercept(self, call: ToolCall, fingerprint: str) -> tuple[str, str, str] | None:
         """What to answer without dispatching, or None to dispatch.
 
@@ -4129,6 +4176,20 @@ class AgentLoop:
             # unnecessary, and it is entitled to say so and be believed; what it
             # is not entitled to is silence, and it has now spoken twice.
             return ""
+        if broken := self._unparsed():
+            # Before everything else: a file that does not parse is not a step
+            # in progress, it is a file every other tool now misreads. Live run
+            # f756001b8845 finished "done" over a handler/transferentry.go with
+            # `syntax error: unexpected keyword if`; the next session's
+            # handler_map read it as "0 handler methods" and planned around it.
+            rel, error = broken[0]
+            return (
+                f"{rel} does not parse ({error}), so handler_map, unit_check and the "
+                "linter all misread it. Fix the syntax at that line -- or, if the "
+                "method cannot be finished now, put its original body back -- before "
+                "finishing. A file still broken when this run ends is restored to "
+                "what it was before the run"
+            )
         if gone := self._deleted_and_not_replaced():
             # First, because it is the one objection that names work already
             # *lost* rather than work not yet started. A run that finishes here
@@ -4175,6 +4236,51 @@ class AgentLoop:
             where = f" at {blocker}" if blocker else ""
             return f"the verification gate is failing{where} and nothing has been edited since"
         return ""
+
+    def _unparsed(self) -> list[tuple[str, str]]:
+        """Touched Go files that do not parse, with gofmt's first error for each.
+
+        Asked only where the answer decides how a run ends, never per turn: one
+        `gofmt -e -l` per touched file, tens of milliseconds each.
+        """
+        binary = shutil.which("gofmt")
+        if binary is None:
+            return []
+        root = self.router.workspace.root
+        out: list[tuple[str, str]] = []
+        for rel in self.router.touched:
+            if not rel.endswith(".go") or not (root / rel).is_file():
+                continue
+            done = _commands.run([binary, "-e", "-l", rel], root, timeout=60)
+            if done.ok or done.timed_out or done.cancelled:
+                continue
+            first = next((line.strip() for line in done.output.splitlines() if line.strip()), "")
+            out.append((rel, first[:200] or "gofmt could not parse it"))
+        return out
+
+    def _restore_unparsed(self) -> list[str]:
+        """Put back, from the undo store, every touched Go file that does not parse.
+
+        The end-of-run half of `_why_not_done`'s parse objection, for the phase
+        whose gate is deferred: nothing else would ever notice. A half-converted
+        file is the plan working; a file that does not parse is a trap for the
+        next session, which reads it through the parser and sees nothing there.
+        Its steps go back to pending, so the phase stays open on them.
+        """
+        undo = getattr(self.router, "undo", None)
+        restored: list[str] = []
+        for rel, error in self._unparsed():
+            if undo is not None and undo.restore(rel):
+                restored.append(f"{rel} ({error})")
+                self.state.plan = tuple(
+                    replace(step, status="pending", note="restored: the run left it unparseable")
+                    if step.covers(rel) and step.status not in ("skipped",)
+                    else step
+                    for step in self.state.plan
+                )
+        if restored:
+            self._save_plan()
+        return restored
 
     def _gate_wants_an_edit(self) -> bool:
         """Whether a failing gate is currently asking for a change that has not come.
@@ -4837,6 +4943,40 @@ class AgentLoop:
                 )
                 return
 
+            # The same, for a migration's planner: an open phase is planned with
+            # `submit_plan`, and the planner that `finish`es instead ends the
+            # session with nothing to act on. Live run 31f695f60ba1 resumed at
+            # handlers, re-read six files for three turns, and finished
+            # "blocked: I cannot determine the exact state of each handler
+            # method conversion" -- the question handler_map answers. `blocked`
+            # does not excuse it here: unlike a change request, the phase says
+            # what the work is. Once, like the refusal above.
+            if (
+                self.state.mode is Mode.PLANNER
+                and self.state.migration.active
+                and not self.state.plan
+                and not self.router.touched
+                and self.state.finish_refused < MAX_FINISH_REFUSALS
+                and (here := self.state.migration.current) is not None
+            ):
+                self.state.finish_refused += 1
+                _, phase = here
+                left = self.state.migration.outstanding(phase.name, self._converted)
+                start = (
+                    f"`handler_map path={left[0]}` lists its groups and which are done; "
+                    if left and left[0].endswith(".go")
+                    else ""
+                )
+                self.context.append_user(
+                    f"Phase {phase.name} is open and this turn plans it: call "
+                    "`submit_plan` with steps for the work left in it, each with "
+                    f"`phase` set to {phase.name}. {start}a group it marks done needs "
+                    "no step, and the acting phase checks each step with unit_check. "
+                    "If the phase genuinely has nothing left, call `finish` again "
+                    "and say so; it is taken as it stands."
+                )
+                return
+
             # Emitted as the assistant's own words, because that is what it is:
             # the developer reads this, and a `finish` whose answer only appeared
             # inside a tool result would be an answer nobody was shown.
@@ -5371,6 +5511,7 @@ class AgentLoop:
         which files the change set actually holds, what is still open, and what
         the next phase is. Nothing here is read out of the model's prose.
         """
+        restored = self._restore_unparsed()
         closed = self._close_phase()
         if not self.state.migration.defers_gate:
             # The last phase just closed, so the conversion is supposed to
@@ -5432,6 +5573,12 @@ class AgentLoop:
             headline
             + ". Written: "
             + (written or "nothing")
+            + (
+                ". Restored to their state before this run, because they did not "
+                "parse: " + "; ".join(restored)
+                if restored
+                else ""
+            )
             + f". The branch is {migration.branch or 'not set'}"
             + (
                 f", and the {self.state.routes_before} route(s) this service served "
@@ -5528,6 +5675,22 @@ class AgentLoop:
             self.state.phase_left = tuple(left)
             self._save_plan()
             return ""
+        if not evidenced and (unswapped := self._unswapped(phase, steps)):
+            # The dependency phase closes on go.mod, not on its steps. Live run
+            # 52fd0837801c ran `go get` for six n-api-* modules, then `go mod
+            # tidy`, which removed all six; every step was done and the phase
+            # closed "complete" over a go.mod still entirely on api-*.
+            self.state.phase_left = ("go.mod",)
+            self.context.append_user(
+                "The dependencies phase is not done: go.mod does not require "
+                + ", ".join(unswapped)
+                + ". Add each with `go_mod op=get` (version omitted) and do not run "
+                "`go mod tidy` -- until the code imports them it removes them again. "
+                "If a module genuinely cannot be fetched, `revise_plan` the go.mod "
+                "step to `blocked` with the error."
+            )
+            self._save_plan()
+            return ""
         self.state.phase_left = ()
         if not migration.close(phase.name):
             return ""
@@ -5539,6 +5702,31 @@ class AgentLoop:
         self.state.plan_objections = 0
         self._save_plan()
         return phase.name
+
+    def _unswapped(self, phase: Any, steps: Sequence[PlanStep]) -> list[str]:
+        """The n-api-* modules a dependency phase was to add and go.mod lacks.
+
+        Empty for any other phase, for a service with no legacy api-* modules,
+        and when the go.mod step was blocked -- the bounded exit, as everywhere.
+        """
+        said = " ".join(
+            [phase.name, getattr(phase, "covers", "") or "", getattr(phase, "parts", "") or ""]
+        ).lower()
+        if not any(word in said for word in ("depend", "go.mod", "go-mod", "swap")):
+            return []
+        if any(s.file == "go.mod" and s.status == "blocked" for s in steps):
+            return []
+        try:
+            text = (self.router.workspace.root / "go.mod").read_text(encoding="utf-8")
+        except OSError:
+            return []
+        required = re.findall(r"it-2\.0-common/(n?-?api-[a-z]+)\s+v", text)
+        legacy = {m for m in required if m.startswith("api-")}
+        have = {m for m in required if m.startswith("n-api-")}
+        return [
+            f"n-{m}" for m in sorted(legacy)
+            if m in _SWAPPED and f"n-{m}" not in have
+        ]
 
     def _deleted_and_not_replaced(self) -> list[str]:
         """Files this session removed that are still not on disk.
@@ -5634,6 +5822,42 @@ class AgentLoop:
             "does what its step says, `revise_plan` that step to `skipped` with the "
             "note \"already exists\"; if it needs changing, read it and change it "
             "with `patch_file`."
+        )
+
+    def _tidies_mid_migration(self, call: ToolCall) -> str:
+        """Why `go mod tidy` must wait for the last phase, or ``""``.
+
+        Tidy keeps what the code imports and drops the rest. In the dependency
+        phase no code imports an n-api-* module yet, so the SOP's `go get` x6
+        then `go mod tidy` removes all six again and keeps every api-* one.
+        Live run 52fd0837801c did exactly that, and the phase closed as
+        "complete" over a go.mod still entirely on api-* (field session
+        c83e18571ac3 the same). The gate's own tidy stage runs at the end,
+        when the code has been converted and tidy is right.
+        """
+        migration = self.state.migration
+        if not (migration.active and migration.phases and migration.defers_gate):
+            return ""
+        try:
+            args = call.parsed() or {}
+        except ValueError:
+            return ""
+        if call.name == "go_mod":
+            tidy = str(args.get("op") or "").strip().lower() == "tidy"
+        elif call.name == "run_terminal":
+            argv = args.get("argv")
+            text = " ".join(argv) if isinstance(argv, list) else str(argv or "")
+            tidy = bool(re.search(r"\bmod\W+tidy\b", text))
+        else:
+            return ""
+        if not tidy:
+            return ""
+        return (
+            "`go mod tidy` waits for the migration's last phase. Until the code "
+            "imports the n-api-* modules, tidy deletes them from go.mod again and "
+            "keeps every api-* one. Add each replacement with `go_mod op=get` and "
+            "leave both generations in go.mod; the final gate tidies once the "
+            "handlers are converted."
         )
 
     def _regenerates_a_failing_file(self, call: ToolCall) -> str:
@@ -7514,7 +7738,13 @@ class AgentLoop:
             elif open_here := [i for i in covering if self.state.plan[i].open]:
                 target = {open_here[0]}
         verdicts: dict[int, tuple[str, str]] = {}
-        if split and status == "written":
+        # A migration step is held to unit_check whether or not its file is
+        # split. Live run 948802ca77ce rewrote handler/objectionfile.go (226
+        # lines, one step), never ran unit_check, and finished "converted" with
+        # 0 of its 2 methods on the template shape: a clean lint promoted the
+        # step, because only split steps asked the code.
+        checked = split or self.state.migration.active
+        if checked and status == "written":
             # **A write is not a step.** Converting a group is one `patch_file`
             # per method, and each of those is a mutation. Marking the step
             # written on the first one moved the cursor to the next step with
@@ -7526,7 +7756,9 @@ class AgentLoop:
             # no sidecar, keeps the old rule.
             for i in target:
                 step = self.state.plan[i]
-                methods = self._step_methods(step)
+                methods = self._step_methods(step) or (
+                    [] if split else self._file_methods(step.file)
+                )
                 if not methods:
                     continue
                 verdict = self._unit_state(step.file, methods)
@@ -7861,6 +8093,14 @@ class AgentLoop:
             return []
         said = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", f"{step.part} {step.action}"))
         return [n for n in names if n in said]
+
+    def _file_methods(self, path: str) -> list[str]:
+        """Every handler method ``handler_map`` finds in ``path``; empty for a non-handler file."""
+        data = self._handler_map(path) if path.endswith(".go") else None
+        found = data.get("methods") if data else None
+        if not isinstance(found, list):
+            return []
+        return [str(m.get("name")) for m in found if isinstance(m, dict) and m.get("name")]
 
     def _unit_state(self, path: str, methods: Sequence[str]) -> tuple[bool, list[str]] | None:
         """``unit_check`` on a step's methods: (all converted, the ones that are not)."""

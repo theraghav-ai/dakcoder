@@ -74,6 +74,14 @@ def _phases(*, status: str = "pending") -> tuple[Phase, ...]:
     return tuple(Phase(**p, status=status) for p in ROADMAP)
 
 
+def _at_handlers() -> MigrationState:
+    """A migration whose branch and deps phases have closed, so a plan of
+    handler steps is a plan for the open phase rather than one that skips it."""
+    state = MigrationState(active=True)
+    state.adopt(tuple(replace(p, status="done") if p.name != "handlers" else p for p in _phases()))
+    return state
+
+
 def _loop(root: Path | None = None) -> AgentLoop:
     loop = AgentLoop.__new__(AgentLoop)
     loop.router = Router(Workspace(root or Path.cwd()))
@@ -591,7 +599,7 @@ def test_splitting_that_file_across_steps_is_accepted(tmp_path: Path) -> None:
     ]
     assert len(steps) == 9, "6,571 lines is nine steps at 800 lines each"
     assert (
-        plan_objection(MigrationState(active=True), _phases(), steps, lines=loop._line_count)
+        plan_objection(_at_handlers(), _phases(), steps, lines=loop._line_count)
         == ""
     )
 
@@ -604,7 +612,7 @@ def test_a_small_file_is_never_asked_to_be_split(tmp_path: Path) -> None:
 
     assert (
         plan_objection(
-            MigrationState(active=True),
+            _at_handlers(),
             _phases(),
             [PlanStep("handler/objection.go", "convert", "build", phase="handlers")],
             lines=loop._line_count,

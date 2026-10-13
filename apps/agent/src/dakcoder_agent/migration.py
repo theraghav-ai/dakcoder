@@ -529,8 +529,21 @@ class MigrationState:
             f"  Open: phase {index} of {total} — {phase.name}"
             + (f" ({phase.covers})" if phase.covers else "")
         )
-        if settled := list(dict.fromkeys(label(u) for u in mine if u.get("status") in SETTLED)):
+        # Blocked is not done. Live run 1b3369d4cfb3 was told "Already done in
+        # it (12)" about twelve steps an earlier session had marked blocked on
+        # its way out, while unit_check said 0 of their methods were converted;
+        # it spent the session reconciling the two.
+        if settled := list(dict.fromkeys(label(u) for u in mine if u.get("status") in FINISHED)):
             lines.append(f"  Already done in it ({len(settled)}): " + _clip(settled))
+        if blocked := [u for u in mine if u.get("status") == "blocked"]:
+            labels = list(dict.fromkeys(label(u) for u in blocked))
+            why = next((u.get("note") for u in blocked if u.get("note")), "")
+            lines.append(
+                f"  Blocked by an earlier session, not converted ({len(labels)}): "
+                + _clip(labels)
+                + (f" -- it said: {why[:160]}" if why else "")
+                + ". Plan them again; handler_map shows what is left in each."
+            )
         if pending := list(dict.fromkeys(label(u) for u in mine if u.get("status") not in SETTLED)):
             lines.append(f"  Planned, not finished ({len(pending)}): " + _clip(pending))
         planned = {u.get("file") for u in mine}
@@ -650,7 +663,7 @@ class MigrationState:
             key = _unit_key(phase, path, what)
             status = str(getattr(step, "status", "") or "pending")
             was = self.units.get(key)
-            if was is not None and was.get("status") in SETTLED and status not in SETTLED:
+            if was is not None and was.get("status") in FINISHED and status not in SETTLED:
                 # A later plan re-listing finished work does not reopen it: the
                 # change set that settled it is still on disk.
                 continue
@@ -844,6 +857,11 @@ class MigrationState:
 #: The step statuses that settle a unit. ``written`` is not one of them -- see
 #: ``AgentLoop._close_phase``.
 SETTLED = frozenset({"done", "skipped", "blocked"})
+
+#: The settled statuses that mean the work is finished. ``blocked`` settles a
+#: step within a session -- it lets the plan move past it -- but across
+#: sessions it is unconverted work, not done work.
+FINISHED = frozenset({"done", "skipped"})
 
 
 #: Words that say a phase does more than cut the branch. Earlier roadmaps had
@@ -1473,6 +1491,29 @@ def plan_objection(
             + ", which has already closed. Plan the next phase that is still open: "
             + ", ".join(p.name for p in roadmap if p.name.strip().lower() not in closed)
         )
+
+    # A plan that starts past an open phase skips it. `steps_for_phase` opens
+    # the phase the earliest step names, so steps for handlers alone opened
+    # handlers with dependencies still pending: session 37ecc37866e8 and live
+    # run f756001b8845 converted handlers to `serverRoute` against a go.mod
+    # still on api-*. Only a branch-only phase may be passed over -- the
+    # acting phase cuts the branch whatever the plan says.
+    order = [p.name.strip().lower() for p in roadmap]
+    named = [order.index(k) for k in spread - closed if k in order]
+    if named:
+        skipped = [
+            p for p in roadmap[: min(named)]
+            if p.name.strip().lower() not in closed and not _branch_only(p)
+        ]
+        if skipped:
+            first = skipped[0]
+            return (
+                f"the steps start at a later phase while {first.name} ("
+                f"{first.covers or 'the phase before it'}) is still open, and a phase "
+                "cannot be skipped. Send the steps for "
+                f"{first.name} now -- only those; the later phases are planned when "
+                "they open"
+            )
     return ""
 
 

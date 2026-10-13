@@ -124,7 +124,7 @@ rule 1 is the dependency swap's one wrong turn.
 - `routes.go` is retired; each handler declares its own `Routes() []serverRoute.Route`.
 - All request DTOs consolidate into one file, `handler/request/request.go`, `package request`.
 - `ShouldBind` and the hand-written validator service go; `govalid` generates compile-time validation from struct tags.
-- Errors unify on `apierrors.NewAppError`; responses unify on the `port` envelopes.
+- Errors unify on `apierrors.HandleErrorWithStatusCodeAndMessage`; responses unify on the `port` envelopes.
 - Logging moves to `n-api-log` with levels configurable down to DEBUG.
 - gRPC and Connect-RPC standardise on `bootstrapper.FxGrpc` with a `grpcserver.HandlerRegistry`; the service never builds its own server.
 - The read replica stops being a second pool: `read_db` becomes an FX alias of `write_db`.
@@ -179,8 +179,9 @@ go get github.com/bufbuild/protovalidate-go@v0.9.2
 go get gitlab.cept.gov.in/it-2.0-common/grpc-server@latest
 go get go.uber.org/fx@latest
 go get github.com/jackc/pgx/v5@latest
-go mod tidy
 ```
+
+**Do not run `go mod tidy` in this phase.** Tidy keeps what the code imports, and until the handlers are converted nothing imports an n-api-* module: it deletes every one of them again and keeps every api-* one. Both generations stay in go.mod until the last phase, whose gate tidies once the code has moved.
 
 `grpc-server` is only needed by services that expose gRPC or Connect-RPC; the rest of the list is unconditional.
 
@@ -255,7 +256,7 @@ No `*gin.Context` in any handler or service signature, and no `ShouldBind` anywh
 func (ah *AwardHandler) FetchAwardsSummary(sctx *serverRoute.Context, _ struct{}) (*response.AwardSummaryAPIResponse, error) {
     summary, err := ah.svc.GetSummary(sctx.Ctx)
     if err != nil {
-        return nil, apierrors.NewAppError(apierrors.HTTPErrorInternalServerError, "Failed to fetch summary", err)
+        return nil, apierrors.HandleErrorWithStatusCodeAndMessage(apierrors.HTTPErrorInternalServerError, "Failed to fetch summary", err)
     }
     return summary, nil
 }
@@ -330,14 +331,14 @@ type AirlinesReportResponse struct {
 }
 ```
 
-## Errors: NewAppError, one return per branch
+## Errors: one return per branch
 
-`apierrors.NewAppError` takes the HTTP error constant first, then the client-facing message, then the underlying error. Return it directly — it is already the error value:
+`apierrors.HandleErrorWithStatusCodeAndMessage` takes the HTTP error constant first, then the client-facing message, then the underlying error, and returns an `*AppError` — return it directly as the error. Not `apierrors.NewAppError`: in n-api-errors it is `NewAppError(message string, code int, err error)` and returns an `AppError` value whose `Error()` has a pointer receiver, so returning it as an `error` does not compile. A repository error with nothing to add is returned as it is, `return nil, err`, as the template's handlers do:
 
 ```go
 if err != nil {
     log.Error(sctx.Ctx, "Failed to process award: %s", err.Error())
-    return nil, apierrors.NewAppError(
+    return nil, apierrors.HandleErrorWithStatusCodeAndMessage(
         apierrors.HTTPErrorBadRequest,
         "Invalid award payload",
         err,
@@ -439,7 +440,7 @@ func validatePositive(val float64) bool {
 }
 ```
 
-Complex business validation stays in the handler/service layer, and it returns an `apierrors.NewAppError` like any other handler failure — not a bare `errors.New`.
+Complex business validation stays in the handler/service layer, and it returns an `apierrors.HandleErrorWithStatusCodeAndMessage` error like any other handler failure — not a bare `errors.New`.
 
 **Critical govalid rules.** Never define a `Validate()` method on a request DTO — govalid generates it, and yours collides at compile time. And every DTO must be registered for generation: at least one field carrying a `validate:` tag (even `validate:"omitempty"`), or a `// +govalid:struct` marker on the struct. A struct that qualifies under neither gets no generated `Validate()`, and the server throws `validator not implemented` at bind time.
 

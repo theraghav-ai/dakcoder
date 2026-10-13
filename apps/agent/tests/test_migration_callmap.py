@@ -13,6 +13,8 @@ The sidecar half (`handler_map`, `unit_check`, `impact`) is tested in Go, in
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from dakcoder_shared.envelope import ToolResult
 
 from dakcoder_agent.loop import MIGRATION_TOOLS
@@ -64,7 +66,9 @@ def test_the_last_phase_may_be_checked_by_the_build() -> None:
 
 def test_a_unit_check_step_is_accepted() -> None:
     step = _step("unit_check path=handler/objection.go methods=CreateObjectionHandler says DONE")
-    assert plan_objection(_state(), ROADMAP, [step]) == ""
+    state = _state()
+    state.adopt(tuple(replace(p, status="done") if p.name in ("branch", "deps") else p for p in ROADMAP))
+    assert plan_objection(state, ROADMAP, [step]) == ""
 
 
 def test_the_split_advice_names_handler_map() -> None:

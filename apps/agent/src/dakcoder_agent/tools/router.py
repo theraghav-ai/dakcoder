@@ -1041,6 +1041,20 @@ def _coerce(spec: ToolSpec, raw: Any, *, gate: bool = False) -> dict[str, Any]:
     # reason -- naming it is how it gets tried.
     allowed = set(props) | (set(spec.gate_params) if gate else set())
 
+    # `search_repo(path=...)` is what every model reaches for first, and the
+    # refusal cost more than a turn: session 11e91c951efb read "unknown
+    # parameter(s) path" and finished "blocked: search_repo tool returns
+    # 'unknown parameter(s) path' error". Read as the glob it means, without a
+    # schema change -- a seventh parameter would be paid for on every turn.
+    if spec.name == "search_repo" and "glob" not in raw:
+        where = raw.get("path") or raw.get("paths")
+        if isinstance(where, str) and where.strip() and "," not in where:
+            where = where.strip().replace("\\", "/").rstrip("/")
+            raw = {k: v for k, v in raw.items() if k not in ("path", "paths")}
+            if where not in ("", "."):
+                file_like = any(c in where for c in "*?[") or "." in where.rsplit("/", 1)[-1]
+                raw["glob"] = where if file_like else f"{where}/**"
+
     unknown = set(raw) - allowed
     if unknown:
         known = ", ".join(props) or "none"

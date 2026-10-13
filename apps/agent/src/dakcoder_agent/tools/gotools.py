@@ -398,14 +398,14 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
 
     def rules_lint(inv: Invocation) -> ToolResult:
         args: dict[str, Any] = {}
-        if inv.arg("paths"):
-            args["paths"] = _list(inv.arg("paths"))
+        scoped = _scope(getattr(sidecar, "root", None), inv.arg("paths"))
+        if scoped:
+            args["paths"] = scoped
         if inv.arg("only"):
             args["only"] = _list(inv.arg("only"))
         # A finding is not a tool failure — it is the tool succeeding. Marking it
         # ok=False would make the loop treat a lint report as a broken tool and
         # retry it, which wastes a turn and reads as noise in a transcript.
-        scoped = _list(inv.arg("paths"))
         return _report(
             sidecar.call("rules_lint", args),
             lambda p: _render_lint(
@@ -414,8 +414,8 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
         )
 
     def legacy_audit(inv: Invocation) -> ToolResult:
-        args = {"paths": _list(inv.arg("paths"))} if inv.arg("paths") else {}
-        scoped = _list(inv.arg("paths"))
+        scoped = _scope(getattr(sidecar, "root", None), inv.arg("paths"))
+        args = {"paths": scoped} if scoped else {}
         reply = sidecar.call("legacy_audit", args)
         result = _report(
             reply,
@@ -545,7 +545,7 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
             args["against"] = str(inv.arg("against"))
 
         def render(payload: Mapping[str, Any]) -> str:
-            result = payload.get("result") or {}
+            result = _route_payload(payload)
             rows = list(result.get("routes") or [])
             legacy = int(result.get("legacy") or 0)
             template = int(result.get("template") or 0)
@@ -617,8 +617,8 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
         # comparison that found four missing endpoints and came back "ok" would
         # be a check that runs, prints the problem, and passes anyway.
         try:
-            result = (json.loads(reply.text) or {}).get("result") or {}
-        except (json.JSONDecodeError, ValueError, TypeError):
+            result = _route_payload(json.loads(reply.text) or {})
+        except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
             return out
         missing = list(result.get("missing") or [])
         meta = {
@@ -698,7 +698,10 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
         args: dict[str, Any] = {"path": inv.arg("path")}
         if inv.arg("methods"):
             args["methods"] = _list(inv.arg("methods"))
-        return _callmap(sidecar.call("unit_check", args))
+        result = _callmap(sidecar.call("unit_check", args))
+        if result.ok and (recipe := _conversion_recipe(str(result.content or ""))):
+            result = replace(result, content=f"{result.content}\n\n{recipe}")
+        return result
 
     def _callmap(reply: Reply) -> ToolResult:
         """A call-map report, with its facts kept as data beside the text.
@@ -965,6 +968,95 @@ def _baseline_keys(raw: Any) -> frozenset[str]:
     return frozenset(part for part in str(raw).split("\x1f") if part)
 
 
+#: What each `unit_check` reason becomes, as the edit. Keyed by the words the
+#: report uses, so only the transforms a step actually needs are shown.
+#:
+#: The report said what was wrong and never what to write instead, and the live
+#: model filled the gap with the one change it was sure of: the signature. Live
+#: run f756001b8845 rewrote five transferentry handlers to `(sctx
+#: *serverRoute.Context, req struct{})` and left every `ctx.ShouldBindJSON`,
+#: `apierrors.HandleDBError(ctx, err); return` and `handleSuccess` in place --
+#: the file stopped parsing -- and the next session revised a step to
+#: "skipped: methods already use n-api signature" over bodies still on gin.
+_RECIPE = (
+    ("takes *gin.Context",
+     "signature: `func (h *X) Name(sctx *serverRoute.Context, req T) (*R, error)` -- T "
+     "is the struct the body bound into (a struct, never a slice: wrap a slice in "
+     "one with `validate:\"required,dive\"`); no input is `_ struct{}`. R is the "
+     "response struct the body built."),
+    ("calls ShouldBind",
+     "delete every `ShouldBind*`/`ValidateStruct` block and its error branch: the "
+     "server binds and validates `req` before the method runs."),
+    ("writes its own response",
+     "`handleSuccess(ctx, apiRsp)` becomes `return &apiRsp, nil`; every "
+     "`apierrors.HandleXxxError(ctx, err); return` becomes `return nil, err` "
+     "(keep the log line before it), as the template's handlers do."),
+    ("make it context.Context",
+     "repository: `ctx *gin.Context` becomes `ctx context.Context` (import "
+     "\"context\"); the handler passes `sctx.Ctx`. Its body needs no other change."),
+)
+
+
+def _conversion_recipe(report: str) -> str:
+    """The edits a NOT DONE `unit_check` is asking for, or ``""``."""
+    if not report.startswith("NOT DONE"):
+        return ""
+    lines = [f"- {fix}" for reason, fix in _RECIPE if reason in report]
+    if not lines:
+        return ""
+    return (
+        "To convert each method above -- the whole body, not only its signature; a "
+        "method whose body still uses gin is not converted:\n" + "\n".join(lines)
+    )
+
+
+def _route_payload(payload: Any) -> Mapping[str, Any]:
+    """route_inventory's fields, wrapped in ``result`` or not.
+
+    The sidecar sends them at the top level (`RouteInventoryOutput`); this read
+    only ``payload["result"]``, so every inventory counted 0 routes, the
+    migration recorded "routes 0", and a comparison could never find a
+    missing route.
+    """
+    if not isinstance(payload, Mapping):
+        return {}
+    inner = payload.get("result")
+    return inner if isinstance(inner, Mapping) and inner else payload
+
+
+def _scope(root: Path | None, raw: Any) -> list[str]:
+    """``paths`` for the linters, as the files the sidecar can match.
+
+    The sidecar scopes by exact file path, so a directory scoped to nothing.
+    Session 3baf69127eaf's planner asked `legacy_audit paths=handler` on a
+    service with 132 legacy findings and was told "0 blocking and 0 advisory
+    finding(s) in the 1 file(s) you changed ... 13 more ... not yours to fix";
+    live run f756001b8845 did the same with `paths="."`. Both planned the
+    migration blind. A directory becomes the Go files under it, and the module
+    root (`.`, `./...`) means no scope at all.
+    """
+    if root is None:
+        return _list(raw)
+    out: list[str] = []
+    for part in _list(raw):
+        rel = part.replace("\\", "/").strip()
+        rel = rel[:-4] if rel.endswith("/...") else rel
+        rel = rel.strip("/") if rel not in ("/",) else ""
+        if rel in ("", ".", "...", "./"):
+            return []
+        rel = rel[2:] if rel.startswith("./") else rel
+        target = root / rel
+        if target.is_dir():
+            out.extend(
+                p.relative_to(root).as_posix()
+                for p in sorted(target.rglob("*.go"))
+                if not any(s.startswith(".") or s == "vendor" for s in p.relative_to(root).parts)
+            )
+        else:
+            out.append(rel)
+    return list(dict.fromkeys(out))
+
+
 def _list(raw: Any) -> list[str]:
     """Comma-separated string to list.
 
@@ -1078,14 +1170,14 @@ def _render_lint(
         by_rule.setdefault(str(f.get("rule", "?")), []).append(f)
     ranked = sorted(by_rule.items(), key=lambda kv: -len(kv[1]))
 
-    where = f" in the {len(wanted)} file(s) you changed" if wanted else ""
+    where = f" in the {len(wanted)} file(s) in scope" if wanted else ""
     out = [
         f"{len(shown):,} blocking and {len(shown_warnings):,} advisory finding(s)"
         f"{where}, in {len(by_rule)} rule(s). Grouped, worst first."
     ]
     if elsewhere:
         out.append(
-            f"({elsewhere:,} more in files this run has not touched — not yours to "
+            f"({elsewhere:,} more in files outside that scope — not yours to "
             "fix, and not shown.)"
         )
     for rule, group in ranked[:_MAX_GROUPS]:
