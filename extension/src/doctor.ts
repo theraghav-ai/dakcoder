@@ -101,6 +101,7 @@ const GOPLS_PACKAGE = 'golang.org/x/tools/gopls@latest';
 const GOVALID_PACKAGE = `${GITLAB_HOST}/it-2.0-common/n-api-validation/cmd/govalid@latest`;
 const GOLANGCI_PACKAGE = 'github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest';
 const GOVULNCHECK_PACKAGE = 'golang.org/x/vuln/cmd/govulncheck@latest';
+const GOIMPORTS_PACKAGE = 'golang.org/x/tools/cmd/goimports@latest';
 const BUF_PACKAGE = 'github.com/bufbuild/buf/cmd/buf@latest';
 
 const EXTENSION_ID = 'dop.dakcoder-go';
@@ -643,8 +644,37 @@ export class Doctor implements vscode.Disposable {
       pkg: GOVULNCHECK_PACKAGE,
       missing: vscode.l10n.t('not installed. The vulnerability stage is skipped rather than failed.'),
     });
+    const goimports = await this.checkGoimports(env);
     const buf = await this.checkBuf(env, root);
-    return [gopls, govalid, golangci, govulncheck, buf];
+    return [gopls, govalid, goimports, golangci, govulncheck, buf];
+  }
+
+  /**
+   * goimports is what the after-edit format step uses to add and drop imports;
+   * without it that step falls back to gofmt, which fixes none. A live run with
+   * it missing rewrote one file nine times over `undefined: port` and
+   * `"fmt" imported and not used`, which goimports fixes on its own.
+   *
+   * Located rather than probed: it answers no version flag, and any other
+   * flag either exits non-zero or reads stdin.
+   */
+  private async checkGoimports(env: Record<string, string>): Promise<Check> {
+    const name = 'goimports';
+    const found = await this.locate(name, env);
+    if (found) {
+      return { name, state: 'pass', detail: found };
+    }
+    return {
+      name,
+      state: 'warn',
+      detail: vscode.l10n.t(
+        'not installed. The agent formats edited files with gofmt instead, which does not add missing imports or remove unused ones.',
+      ),
+      fix: {
+        label: vscode.l10n.t('Install {0}', name),
+        run: () => this.goInstall(GOIMPORTS_PACKAGE, name),
+      },
+    };
   }
 
   /**

@@ -1,0 +1,19 @@
+Create or improve AGENTS.md at the repository root: the instructions every
+coding agent reads before working here (https://agents.md).
+
+Survey first: repo_map, the Makefile or build scripts, go.mod, CI config,
+linter config, README, and any CLAUDE.md, GEMINI.md, .cursor/rules or
+.github/copilot-instructions.md. Then write short, concrete sections:
+- Project overview: what the service is, in two or three lines.
+- Commands: the exact build, test, lint and run commands, as they work here.
+- Code style and conventions that are not obvious from the code.
+- Testing: how tests are laid out and run, and what must pass before done.
+- Commit and PR rules, if the repository shows any.
+- Security and no-go areas: generated files, DDL, secrets, paths never edited.
+
+Only what an agent cannot work out quickly from the code, and nothing it
+can: no file listings, no dependency lists. Aim for under 150 lines.
+If AGENTS.md exists, keep what the developers wrote and improve it; never
+touch the section between the dakcoder:notes markers. If another agent file
+holds the rules, import it with a line `@CLAUDE.md` rather than copying it.
+Never write a credential. Finish with a summary of what you wrote.

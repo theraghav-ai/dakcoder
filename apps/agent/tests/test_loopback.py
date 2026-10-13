@@ -78,7 +78,7 @@ def scripted(router: Router, workspace):
 
     for stage in GATE:
         router.handlers[stage.tool] = clean(stage.tool)
-    for name in ("gofmt", "rules_lint", "go_diagnostics"):
+    for name in ("gofmt", "go_compile", "rules_lint", "go_diagnostics"):
         router.handlers[name] = clean(name)
 
     router.handlers.update(control.HANDLERS)

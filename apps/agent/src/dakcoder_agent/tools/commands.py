@@ -32,7 +32,7 @@ import subprocess
 import threading
 from collections.abc import Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,7 @@ from dakcoder_shared import cancel as _cancel
 from dakcoder_shared.config import MODEL_CREDENTIAL_VARS
 from dakcoder_shared.envelope import Mutation, MutationKind, ToolResult
 
+from .imports import import_hints, importers, module_path
 from .router import Invocation, MissingToolchain
 
 __all__ = ["HANDLERS", "Completed", "run"]
@@ -494,11 +495,136 @@ def _result(
 
 def go_build(inv: Invocation) -> ToolResult:
     done = run(["go", "build", "./..."], inv.workspace.root, timeout=GATE_TIMEOUT)
-    return _result(
-        done,
-        what="go build ./...",
-        fix_on_fail="Fix the first error listed; later ones are often consequences of it.",
+    return _with_import_hints(
+        _result(
+            done,
+            what="go build ./...",
+            fix_on_fail="Fix the first error listed; later ones are often consequences of it.",
+        ),
+        inv.workspace.root,
     )
+
+
+def _with_import_hints(result: ToolResult, root: Path) -> ToolResult:
+    """Add how this service imports each name the compiler called undefined.
+
+    In ``fix``, not ``content``: content lines are what the baseline keys as
+    findings, and a hint's file count moves as the run adds files, which would
+    turn an old finding new. The model reads both (`ToolResult.for_model`).
+    """
+    if result.ok:
+        return result
+    hints = import_hints(result.content, root)
+    if not hints:
+        return result
+    return replace(result, fix=f"{hints}\n\n{result.fix}".strip())
+
+
+#: The after-edit compile is not the gate: a cold module cache is the gate's
+#: problem to wait out, not every edit batch's.
+COMPILE_TIMEOUT = 60
+
+
+def go_compile(inv: Invocation) -> ToolResult:
+    """`go build` of the named packages, for the inner loop.
+
+    An import cycle is rewritten into one ``path:line:`` finding per edge.
+    The toolchain reports it as a chain -- ``package a / imports b from x.go /
+    imports a from y.go: import cycle not allowed`` -- with no position, so
+    `build_errors` keyed nothing from it, no step was held, and the model read
+    a bare chain of package names. Session 3a82e19883f7 read it as a problem
+    with the request validators and deleted them, twice.
+    """
+    packages = _patterns(inv.arg("pattern"))
+    done = run(["go", "build", *packages], inv.workspace.root, timeout=COMPILE_TIMEOUT)
+    result = _result(
+        done,
+        what=f"go build {' '.join(packages)}",
+        # The second sentence is the live replay of 3a82e19883f7: eight rewrites
+        # of a repository file guessing at `dblib.SelectOneOK`'s return values
+        # and argument types, with forty correct calls to it in the next file.
+        fix_on_fail="Fix the first error listed; later ones are often consequences of it. "
+        "If an error is about calling something this service already uses -- wrong "
+        "number of values, wrong argument type -- search_repo for an existing call "
+        "of it and copy that shape, rather than guessing again.",
+    )
+    if done.ok or "import cycle not allowed" not in result.content:
+        return _with_import_hints(result, inv.workspace.root)
+    edges = _cycle_edges(result.content, inv.workspace.root)
+    if not edges:
+        return result
+    lines = [f"{path}:{line}:1: {pkg} imports {target} here" for pkg, target, path, line in edges]
+    body = "import cycle not allowed:\n" + "\n".join(lines)
+    return replace(result, content=body, fix=_cycle_advice(edges, inv.workspace.root))
+
+
+def _cycle_advice(edges: list[tuple[str, str, str, int]], root: Path) -> str:
+    """Which import in the cycle is the service's, and which one to take out.
+
+    Measured by how many files make each import: the service's established
+    direction has many, the import that closed the cycle usually one. The live
+    replay of 3a82e19883f7 was told only "put the types where the existing
+    direction allows them", understood it ("port cannot import domain"), and
+    wrote the same `core/port` file importing `core/domain` back twice.
+    """
+    counted = [(len(importers(root, pkg, target)), pkg, target, path) for pkg, target, path, _ in edges]
+    if not counted:
+        return ""
+    counted.sort(key=lambda c: c[0], reverse=True)
+    most, est_pkg, est_target, _ = counted[0]
+    breaking = [c for c in counted[1:] if c[0] < most]
+    if not breaking:
+        return (
+            "Each line is one import in the cycle; one of them has to go. Keep the "
+            "direction the service already uses and take out the import in the file "
+            "this task wrote."
+        )
+    _, pkg, target, path = breaking[-1]
+    return (
+        f"{est_pkg} already imports {est_target} in this service ({most} file(s)), so "
+        f"nothing in {pkg} may import {target}. Rewrite {path} without its import of "
+        f"{target}: give its types their own fields instead of {target} types, or "
+        f"declare them in {target} itself. Writing {path} again with that import "
+        "brings the cycle straight back."
+    )
+
+
+def _cycle_edges(output: str, root: Path) -> list[tuple[str, str, str, int]]:
+    """``(package, imported, file, line)`` for each import in a reported cycle."""
+    module = module_path(root)
+    if not module:
+        return []
+
+    def rel(pkg: str) -> str:
+        return pkg.removeprefix(module).lstrip("/") or "."
+
+    current = ""
+    edges: list[tuple[str, str, str, int]] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if line.startswith("package "):
+            current = rel(line.removeprefix("package ").strip())
+            continue
+        if not line.startswith("imports ") or " from " not in line or not current:
+            continue
+        target_full, _, source = line.removeprefix("imports ").partition(" from ")
+        source = source.split(":", 1)[0].strip()
+        target = rel(target_full.strip())
+        path = source if current == "." else f"{current}/{source}"
+        edges.append((current, target, path, _import_line(root / path, target_full.strip())))
+        current = target
+    return edges
+
+
+def _import_line(path: Path, imported: str) -> int:
+    """The line of ``path`` that imports ``imported``, or 1."""
+    try:
+        for number, text in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if f'"{imported}"' in text:
+                return number
+    except OSError:
+        pass
+    return 1
 
 
 def _patterns(raw: str | None) -> list[str]:
@@ -1326,6 +1452,7 @@ def run_terminal(inv: Invocation) -> ToolResult:
 
 HANDLERS = {
     "go_build": go_build,
+    "go_compile": go_compile,
     "go_vet": go_vet,
     "go_test": go_test,
     "gofmt": gofmt,

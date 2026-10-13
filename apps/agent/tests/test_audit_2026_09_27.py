@@ -198,7 +198,7 @@ def _gate_stub(router: Router, answers: dict[str, ToolResult]) -> list[str]:
     from dakcoder_agent.gate import GATE
 
     order: list[str] = []
-    for name in {stage.tool for stage in GATE} | {"gofmt", "rules_lint", "go_diagnostics"}:
+    for name in {stage.tool for stage in GATE} | {"gofmt", "go_compile", "rules_lint", "go_diagnostics"}:
 
         def handler(inv, _name=name):
             order.append(_name)

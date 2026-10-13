@@ -88,6 +88,7 @@ from .context import (
 from .gate import (
     ROUTES_BEFORE,
     Baseline,
+    _finding_keys,
     build_errors,
     finding_path,
     GateReport,
@@ -203,6 +204,9 @@ _TASK_SCOPED: tuple[str, ...] = (
     "plan_forced",
     "cursor",
     "removed",
+    "created",
+    "whole_writes",
+    "rewrite_refused",
     "gone_once",
     "rewritten",
     "churn",
@@ -418,6 +422,9 @@ _OWNER: dict[str, str] = {
     "plan_forced": "task",
     "cursor": "task",
     "removed": "task",
+    "created": "task",
+    "whole_writes": "task",
+    "rewrite_refused": "task",
     "gone_once": "task",
     "rewritten": "task",
     "churn": "task",
@@ -976,6 +983,16 @@ def _is_degenerate(answer: str) -> bool:
 #: arbiter of whether a step was still needed.
 MAX_FINISH_REFUSALS = 1
 
+#: How often a whole rewrite of one file is refused while the compiler fails on
+#: it. See `AgentLoop._regenerates_a_failing_file`; past this the write is taken.
+MAX_REWRITE_REFUSALS = 2
+
+
+def _content_digest(content: str) -> str:
+    """A whole-file write's identity, line endings aside."""
+    normalised = content.replace("\r\n", "\n")
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
+
 #: A tool name as it appears inside a sentence. Tool names are lower_snake_case
 #: by the registry's own rule, so this needs no vocabulary of its own.
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
@@ -1078,6 +1095,10 @@ def _reply_fingerprint(content: str, calls: Sequence[ToolCall]) -> str:
 #: already quote -- and because `_release_build` has to tell these holds from
 #: the inner loop's own objections, which only a clean lint may lift.
 _BUILD_NOTE = "go build fails on it"
+
+#: Where request DTOs live, and what `govalid` generates the validators from.
+#: A plan step naming a generated validator is rewritten to this file.
+REQUEST_DTO_FILE = "handler/request/request.go"
 
 
 def _build_scope(name: str, argv: Any) -> str:
@@ -3078,6 +3099,9 @@ class AgentLoop:
             if reason := self._resurrects_a_retired_file(call):
                 skipped[call.id] = reason
                 continue
+            if reason := self._regenerates_a_failing_file(call):
+                skipped[call.id] = reason
+                continue
             if call.name == "finish" and others:
                 skipped[call.id] = (
                     "it was sent in the same reply as other calls. Read their "
@@ -3349,6 +3373,7 @@ class AgentLoop:
                 mid_migration_failures.add(call.name)
             if not refused_by_mode:
                 self._note_build(call, outcome)
+                outcome = self._mark_old_news(call, outcome)
             if call.name == "go_mod":
                 self.state.dependencies_changed = True
             # Where the migration's branch rule is satisfied, and it is read off
@@ -3438,6 +3463,24 @@ class AgentLoop:
                     # `action` is a typed field the model filled in to say what
                     # the step does; reading it is not the same as reading prose
                     # out of a reply.
+                    if (
+                        mutation.path in self.state.created
+                        and not self._step_wants_removal(mutation.path)
+                    ):
+                        # A file this task created, now gone again: the
+                        # workspace is where the task found it, not short of
+                        # something. No "write it back", and nothing for
+                        # `finish` to refuse over -- but the cycle detector
+                        # still sees it, so create/delete churn stays bounded.
+                        self.state.created.discard(mutation.path)
+                        if self._note_delete(mutation.path):
+                            churned.append(mutation.path)
+                        else:
+                            productive = True
+                        self._mark_steps(
+                            mutation.path, "pending", "created, then deleted, in this run"
+                        )
+                        continue
                     cycles = self._note_delete(mutation.path)
                     if cycles:
                         # Told about whatever the plan says, because a turn that
@@ -3476,6 +3519,12 @@ class AgentLoop:
                     continue
                 if not self._note_write(mutation.path):
                     productive = True
+                if call.name == "write_file":
+                    self._note_whole_write(call, mutation.path)
+                if mutation.kind is MutationKind.CREATE and mutation.path not in self.state.removed:
+                    # Not a path this task deleted and is now putting back: that
+                    # one existed before, and losing it again is a loss.
+                    self.state.created.add(mutation.path)
                 self.state.removed.discard(mutation.path)
                 # A mutation on a plan step's file is that step *written* --
                 # from the change set, which cannot lie, rather than from the
@@ -4191,6 +4240,38 @@ class AgentLoop:
         )
         self._hold_for_build(errors)
 
+    def _mark_old_news(self, call: ToolCall, outcome: ToolResult) -> ToolResult:
+        """Say so when a build or vet the model ran found only what was already there.
+
+        The gate excuses pre-existing findings and says why; the model's own
+        `go_vet` did not, so its result read as a defect to fix. The live replay
+        of session 05cd8b8369aa, asked for an AGENTS.md and nothing else, ran
+        `go vet ./...`, met the service's two-year-old struct-tag typo, and
+        patched `core/domain/transferentry.go` -- a file the task never named.
+        The baseline already knew that finding. Now the result says so.
+        """
+        if outcome.ok or self.state.mode is not Mode.AGENT:
+            return outcome
+        tool = {"go_build": "go_build", "go_vet": "go_vet"}.get(call.name, "")
+        argv = outcome.meta.get("argv")
+        if call.name == "run_terminal" and isinstance(argv, (list, tuple)) and len(argv) > 1:
+            if str(argv[0]).lower().removesuffix(".exe") == "go" and argv[1] in ("build", "vet"):
+                tool = f"go_{argv[1]}"
+        if not tool:
+            return outcome
+        if getattr(self, "_baseline_thread", None) is not None:
+            self._await_baseline()
+        baseline = self.state.baseline
+        found = _finding_keys(outcome.content)
+        if not baseline.taken or not found or not found <= baseline.findings.get(tool, frozenset()):
+            return outcome
+        return replace(
+            outcome,
+            fix="Every finding here was already failing before this run changed anything "
+            "(the run-start baseline measured it), so it is not this task's to fix. Leave "
+            "it unless the task is about it, and carry on with the plan.",
+        )
+
     def _hold_for_build(self, errors: Sequence[tuple[str, str]]) -> None:
         """Put back to `written` every settled step whose file the build names.
 
@@ -4728,6 +4809,34 @@ class AgentLoop:
                     "**continue** for the rest._"
                 )
 
+            # A change request that the planner answers with a description of
+            # the plan, instead of the plan, is sent back once -- before the
+            # developer is shown it as though it were the result. Session
+            # 05cd8b8369aa's planner ended "I've surveyed the repository and will
+            # create AGENTS.md ... What I'll write:" and the developer had to type
+            # "write it"; the live replay did the same, ending `done: answered`
+            # with nothing written. `submit_plan` is the planner's way out, and
+            # the escape stays open: a second `finish` is taken as it stands.
+            if (
+                self.state.mode is Mode.PLANNER
+                and not self.state.migration.active
+                and self.state.intent is Intent.AGENT
+                and not self.state.plan
+                and not self.router.touched
+                and not blocked
+                and self.state.finish_refused < MAX_FINISH_REFUSALS
+            ):
+                self.state.finish_refused += 1
+                self.context.append_user(
+                    "This task asks for a change, and planning ends with the plan "
+                    "itself: call `submit_plan` with what you just described -- one "
+                    "step per file -- and the acting phase writes it. If something "
+                    "must be decided first, `ask_developer`. If the task needs no "
+                    "change after all -- it was a question or a review -- call "
+                    "`finish` again with the same answer and it is delivered as is."
+                )
+                return
+
             # Emitted as the assistant's own words, because that is what it is:
             # the developer reads this, and a `finish` whose answer only appeared
             # inside a tool result would be an answer nobody was shown.
@@ -4954,6 +5063,11 @@ class AgentLoop:
         """
         report = inner_loop(self.router, self.router.touched)
         yield Event(EventType.GATE, {"kind": "inner", **report.as_dict()})
+        compiled = next(
+            (r for r in report.results if r.name == "go_compile" and not r.skipped), None
+        )
+        if compiled is not None:
+            self._note_compile(compiled)
         # The verification node. A step goes `written` when a mutation lands on
         # it and reaches `done` only here, when the formatter and the contract
         # linter come back clean over what was written. Before this there was no
@@ -4968,17 +5082,63 @@ class AgentLoop:
         if report.ok and not report.warnings:
             return
 
-        lint = next((r for r in report.results if r.name == "rules_lint"), None)
-        if lint is not None and not lint.ok and self._lint_is_old_news(lint):
-            # Everything it found was already being done in this service before
-            # the run started. Say nothing: the gate will still report it, once,
-            # at the end, where a summary belongs.
+        # Everything a stage found that the service was already doing before
+        # the run started is not news. Say nothing about it: the gate will still
+        # report it, once, at the end, where a summary belongs.
+        news = [
+            r
+            for r in report.warnings
+            if not (r.name == "rules_lint" and self._lint_is_old_news(r))
+            and not (r.name == "go_compile" and self._compile_is_old_news(r))
+        ]
+        if not news:
             return
 
         self.context.append_user(
-            "The formatter and the contract linter ran on what you just "
-            f"changed:\n\n{report.summary()}"
+            "The formatter, the compiler and the contract linter ran on what you "
+            f"just changed:\n\n{report.summary()}"
         )
+
+    def _compile_is_old_news(self, result: StageResult) -> bool:
+        """Whether the after-edit compile failed only where the service already did.
+
+        Keyed exactly as the baseline keyed its `go build`, so a legacy package
+        that never compiled does not repeat itself after every edit.
+        """
+        before = self.state.baseline.findings.get("go_build", frozenset())
+        return bool(result.findings) and result.findings <= before
+
+    def _note_compile(self, result: StageResult) -> None:
+        """Record the after-edit compile the way a build the model ran is recorded.
+
+        So the state block's "Last build" and the steps a failing build holds
+        say what the compiler said on the turn the code was written, not fifty
+        turns later. Not mid-migration, where a red build is the design.
+        """
+        if self.state.mode is not Mode.AGENT or self.state.migration.defers_gate:
+            return
+        if result.ok:
+            # The compile covers every package the change set touched, so a
+            # clean one answers for a failure an earlier compile recorded -- and
+            # for nothing a module build recorded, which it did not look at.
+            build = self.state.last_build
+            if build is not None and build.tool == "go_compile":
+                self._release_build()
+            return
+        errors = build_errors(
+            result.content,
+            excused=self.state.baseline.findings.get("go_build", frozenset()),
+            root=str(self.router.workspace.root),
+        )
+        if not errors:
+            return
+        self.state.last_build = BuildVerdict(
+            tool="go_compile",
+            turn=self.context.turn,
+            mutations=self.router.model_mutations,
+            errors=errors,
+        )
+        self._hold_for_build(errors)
 
     def _lint_is_old_news(self, result: StageResult) -> bool:
         """Whether an inner-loop lint found only what the service already does.
@@ -5475,6 +5635,70 @@ class AgentLoop:
             "note \"already exists\"; if it needs changing, read it and change it "
             "with `patch_file`."
         )
+
+    def _regenerates_a_failing_file(self, call: ToolCall) -> str:
+        """Why this whole-file write repeats a loop instead of fixing the file, or ``""``.
+
+        The write-and-delete loop the field and the live replays kept showing
+        is not about deleting: it is the model fixing a compile error by
+        regenerating the whole file, which re-rolls every line and lands new
+        errors as often as it fixes old ones. Session 3a82e19883f7's live
+        replay rewrote `core/domain/employee.go` nine times over one missing
+        import -- twice byte for byte -- and before a task's own files could be
+        overwritten it did the same as delete-then-write. Two rules:
+
+        * the same bytes as a version already written to this path this task
+          are refused outright -- writing them again is not a change;
+        * a third whole rewrite of a file the compiler is failing on is refused
+          with that file's errors and `patch_file` named. At most
+          ``MAX_REWRITE_REFUSALS`` times per file: past that the write goes
+          through, because a refusal nothing can get past is the failure this
+          file keeps having to remove.
+        """
+        if call.name != "write_file":
+            return ""
+        try:
+            args = call.parsed() or {}
+        except ValueError:
+            return ""
+        if args.get("append"):
+            return ""
+        path = self._relative(str(args.get("path") or ""))
+        content = str(args.get("content") or "")
+        versions = self.state.whole_writes.get(path, {})
+        if not path or not versions:
+            return ""
+        digest = _content_digest(content)
+        if digest in versions:
+            return (
+                f"it is byte for byte what you wrote to {path} at turn {versions[digest]}, "
+                "so it cannot change anything. Read the file and the compiler's errors on "
+                "it, then `patch_file` the lines they name."
+            )
+        build = self.state.last_build
+        errors = [m for p, m in (build.errors if build is not None else ()) if p == path]
+        refused = self.state.rewrite_refused.get(path, 0)
+        if len(versions) < 2 or not errors or refused >= MAX_REWRITE_REFUSALS:
+            return ""
+        self.state.rewrite_refused[path] = refused + 1
+        return (
+            f"{path} has been written whole {len(versions)} times this task and the "
+            "compiler has failed on it each time: a whole rewrite regenerates every line "
+            f"and re-rolls every error. What it says now: {'; '.join(errors[:3])}. "
+            "Fix that with `patch_file` on the lines it names -- read the file first if "
+            "you need the exact text."
+        )
+
+    def _note_whole_write(self, call: ToolCall, path: str) -> None:
+        """Record a whole-file write's content, for `_regenerates_a_failing_file`."""
+        try:
+            args = call.parsed() or {}
+        except ValueError:
+            return
+        if args.get("append"):
+            return
+        versions = self.state.whole_writes.setdefault(path, {})
+        versions.setdefault(_content_digest(str(args.get("content") or "")), self.context.turn)
 
     def _resurrects_a_retired_file(self, call: ToolCall) -> str:
         """Why this write undoes a deletion the plan asked for, or ``""``.
@@ -6037,6 +6261,9 @@ class AgentLoop:
         # Still true on the next message: a file deleted and not replaced is
         # deleted and not replaced whatever the developer types next.
         self.state.removed = set(previous.state.removed)
+        self.state.created = set(previous.state.created)
+        self.state.whole_writes = {k: dict(v) for k, v in previous.state.whole_writes.items()}
+        self.state.rewrite_refused = dict(previous.state.rewrite_refused)
         # And the churn ledger with it. The loop it catches spanned three
         # developer messages in the field -- a counter that restarted at each
         # one would have read "no cycles yet" on every turn the run was most
@@ -6202,8 +6429,54 @@ class AgentLoop:
                 out.append(step)
                 continue
             for path in self._paths_named_by(step.file):
+                if self._is_generated_validator(path):
+                    # Nobody writes a validator: the gate generates it from the
+                    # request structs. Session 3a82e19883f7 planned
+                    # `handler/request_employee_validator.go`, a step no write
+                    # could close -- it held the run open, and its last summary
+                    # still read "the plan named files this run never wrote".
+                    # So the step becomes the file that *is* written, at no cost
+                    # of a turn, and its note says why.
+                    out.append(
+                        replace(
+                            step,
+                            file=REQUEST_DTO_FILE,
+                            note=f"planned as {path}, which the gate generates from "
+                            f"the validate tags in {REQUEST_DTO_FILE}",
+                        )
+                    )
+                    continue
                 out.append(step if path == step.file else replace(step, file=path))
-        return tuple(out)
+        # A rewritten step can land on a file the plan already names; one step
+        # per file is what the plan means by it.
+        seen: set[str] = set()
+        unique: list[PlanStep] = []
+        for step in out:
+            if step.file == REQUEST_DTO_FILE and step.file in seen:
+                continue
+            seen.add(step.file)
+            unique.append(step)
+        return tuple(unique)
+
+    def _is_generated_validator(self, path: str) -> bool:
+        """A ``*_validator.go`` that is govalid's output, not a developer's file.
+
+        govalid names its output ``request_<struct>_validator.go``; anything else
+        with the suffix -- a service's hand-written `employee_validator.go` --
+        is the developer's and stays a step, deleted or not. Of the files with
+        govalid's name: not on disk yet, or on disk and marked generated.
+        """
+        name = path.rsplit("/", 1)[-1]
+        if not (name.startswith("request_") and name.endswith("_validator.go")):
+            return False
+        try:
+            target = self.router.workspace.resolve(path)
+            if not target.exists():
+                return True
+            with target.open(encoding="utf-8", errors="replace") as handle:
+                return "Code generated" in handle.read(400)
+        except (PathEscape, ValueError, OSError):
+            return False
 
     def _paths_named_by(self, file: str) -> tuple[str, ...]:
         """The normalised workspace-relative paths one ``file`` field names."""
@@ -7161,6 +7434,7 @@ class AgentLoop:
             r
             for r in report.warnings
             if not (r.name == "rules_lint" and self._lint_is_old_news(r))
+            and not (r.name == "go_compile" and self._compile_is_old_news(r))
         ]
 
         promoted = []
@@ -7720,12 +7994,23 @@ class AgentLoop:
         # 7 came back to an agent holding the edits and none of the plan that
         # produced them. See ``plan.py``.
         self._record_plan("replanned" if self.state.replans else "submitted")
+        yield from self._publish_plan()
+
+    def _publish_plan(self, *, notes: bool = True) -> Iterator[Event]:
+        """Render the plan into the context and announce it.
+
+        Shared by adoption and by a settle (`_settle_steps`): both change the
+        plan, and the context and the panel must show it as it now stands.
+        ``notes`` is the adoption-time advice about criteria and existing files,
+        which a status change on steps already adopted has no reason to repeat.
+        """
         rendered = "\n".join(step.rendered(i) for i, step in enumerate(self.state.plan, 1))
         if self.state.plan_summary:
             rendered = f"{self.state.plan_summary}\n\n{rendered}"
         self.context.set_plan(rendered)
-        self._note_unrunnable_criteria()
-        self._note_existing_creations()
+        if notes:
+            self._note_unrunnable_criteria()
+            self._note_existing_creations()
         yield Event(
             EventType.PLAN,
             {
@@ -7757,20 +8042,105 @@ class AgentLoop:
             },
         )
 
+    def _settles_only(self, steps: Sequence[PlanStep]) -> bool:
+        """Whether a revision only changes the status of steps already planned.
+
+        Every step it names is in the plan, and each either settles
+        (`blocked`, `skipped`) or keeps its action word for word. Models restate
+        the whole plan to change one status: the live replay of 3a82e19883f7
+        spent the revision cap on three such restatements, then had its one real
+        change of course -- skip `core/port/employee.go`, which was closing an
+        import cycle -- refused as "revised 2 times, not adopted", and wrote the
+        cycle back twice. A reworded action is a real revision and still counts.
+        """
+        current = {s.file: s for s in self.state.plan if s.file}
+        return bool(steps) and all(
+            s.file in current
+            and (
+                s.status in ("blocked", "skipped")
+                or not s.action
+                or s.action.strip() == current[s.file].action.strip()
+            )
+            for s in steps
+        )
+
+    def _settle_steps(self, steps: Sequence[PlanStep], reason: str) -> Iterator[Event]:
+        """Apply a settle-only revision in place, leaving every other step as it is.
+
+        Not through `_adopt_plan`, whose merge drops pending steps a revision
+        does not restate: a revision naming one blocked step would have
+        discarded the rest of the plan with it. A `done` step stays done -- the
+        change set settled it, and the model does not get to unsettle it.
+        """
+        wanted = {s.file: s for s in steps}
+        settled: list[str] = []
+        plan: list[PlanStep] = []
+        for step in self.state.plan:
+            ask = wanted.get(step.file)
+            # `pending` moves only a settled step back (unblocking it): a step
+            # restated as pending while `written` keeps what the change set
+            # says about it.
+            unblock = ask is not None and ask.status == "pending" and step.status in (
+                "blocked",
+                "skipped",
+            )
+            if (
+                ask is None
+                or step.status == "done"
+                or step.status == ask.status
+                or (ask.status == "pending" and not unblock)
+            ):
+                plan.append(step)
+                continue
+            note = (
+                ask.note[:200]
+                if ask.status == "pending"
+                else (ask.note or reason or f"{ask.status} by the agent")[:200]
+            )
+            plan.append(replace(step, status=ask.status, note=note))
+            settled.append(f"{step.file} {ask.status}")
+        if not settled:
+            self.context.append_user(
+                "Nothing changed: those steps are already settled. Carry on with the "
+                "steps still open, or call `finish`."
+            )
+            return
+        self.state.plan = tuple(plan)
+        self.state.tried.append(f"turn {self.context.turn}: settled {', '.join(settled)}")
+        del self.state.tried[:-STATE_ITEMS * 2]
+        self._record_plan("revised", reason)
+        if self.state.migration.active:
+            self.state.migration.record_steps(self.state.plan, methods=self._step_methods)
+        yield from self._publish_plan(notes=False)
+        self.context.append_user(
+            f"Recorded: {', '.join(settled)}. The rest of the plan stands -- carry on "
+            "with the steps still open, or call `finish` if none are."
+        )
+
     def _revised(self, outcome: ToolResult) -> Iterator[Event]:
         """Act on a `revise_plan` the router accepted."""
         reason = str(outcome.meta.get("reason") or "").strip()
+        steps = self._normalise_plan(steps_from_meta(dict(outcome.meta)))
+        if self._settles_only(steps):
+            # Taken whatever the revision count. Session 3a82e19883f7 marked a
+            # step it could not finish `blocked`, with the reason, four times --
+            # exactly what the stall messages tell it to do -- and was refused
+            # each time as "revised 2 times, not adopted". A status change on a
+            # step already planned is not a re-plan, and refusing the one exit
+            # the run is told to take is a push-back nothing can satisfy.
+            yield from self._settle_steps(steps, reason)
+            return
         self.state.revisions += 1
         if self.state.revisions > MAX_REVISIONS:
             self.context.append_user(
                 f"The plan has already been revised {MAX_REVISIONS} times this run and "
-                "this revision was not adopted. Carry out the plan as it stands, or "
-                "call `finish` and say in `blocked` what cannot be done."
+                "this revision was not adopted. Carry out the plan as it stands, mark "
+                "a step you cannot finish `blocked` with the reason (that is always "
+                "taken), or call `finish` and say in `blocked` what cannot be done."
             )
             return
         self.state.tried.append(f"turn {self.context.turn}: plan revised: {reason}")
         del self.state.tried[:-STATE_ITEMS * 2]
-        steps = self._normalise_plan(steps_from_meta(dict(outcome.meta)))
         if self.state.migration.active:
             # Held to the same size rule as `submit_plan`. A revision was the one
             # route around it: after a failed step, the model merged nine groups

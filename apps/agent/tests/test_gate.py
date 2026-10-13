@@ -33,7 +33,7 @@ class Recorder:
         self.router = router
         self.calls: list[tuple[str, dict]] = []
         self.answers: dict[str, ToolResult] = {}
-        for name in {stage.tool for stage in GATE} | {"gofmt", "rules_lint", "go_diagnostics"}:
+        for name in {stage.tool for stage in GATE} | {"gofmt", "go_compile", "rules_lint", "go_diagnostics"}:
             self._install(name)
 
     #: What a passing stage returns, per tool.

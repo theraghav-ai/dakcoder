@@ -119,7 +119,7 @@
     },
     {
       "name": "read_file",
-      "description": "Read a slice of one file. Always pass start and end when you know roughly where to look; without `end` you get 800 lines from `start`.",
+      "description": "Read a slice of one file, or list a directory. Pass start and end when you know roughly where to look; without `end` you get 800 lines from `start`.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1078,6 +1078,26 @@
       "mutates": false,
       "approval": "none",
       "provider": "python"
+    },
+    {
+      "name": "go_compile",
+      "description": "Compile the named packages only. Runs automatically after edits.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Package patterns, e.g. './core/port/... ./handler/...'."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [],
+      "mutates": false,
+      "approval": "none",
+      "provider": "python",
+      "gate_only": true
     },
     {
       "name": "go_vet",

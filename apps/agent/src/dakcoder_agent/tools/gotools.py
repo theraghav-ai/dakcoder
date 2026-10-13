@@ -39,6 +39,7 @@ from typing import Any
 from dakcoder_shared.envelope import Mutation, MutationKind, ToolResult
 
 from .fs import EMPTY_WORKSPACE, workspace_empty
+from .imports import import_summary
 from .router import Invocation
 
 __all__ = ["GoTools", "Reply", "SidecarError", "handlers_for"]
@@ -386,6 +387,13 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
             # `{"files":0,"packages":[]}` is true and reads as "the code is
             # missing". See `EMPTY_WORKSPACE` for the run that took it that way.
             return ToolResult.success(f"{result.content}\n\n{EMPTY_WORKSPACE}")
+        if result.ok and not inv.arg("package"):
+            # The whole-service map says which way its own imports point. See
+            # `imports.py` for the cycle a template-shaped guess closed.
+            payload = _json(result.content)
+            if payload and (graph := import_summary(inv.workspace.root)):
+                merged = {**payload, **graph}
+                return replace(result, content=json.dumps(merged, separators=(",", ":")))
         return result
 
     def rules_lint(inv: Invocation) -> ToolResult:

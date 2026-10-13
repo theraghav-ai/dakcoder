@@ -153,6 +153,22 @@ class TaskState:
     #: Checked against the disk when it is read, so a file the developer
     #: restored drops out of it by itself.
     removed: set[str] = field(default_factory=set)
+    #: Paths this task brought into existence. Deleting one of them is not a
+    #: loss -- the workspace is back where the task found it -- so it never
+    #: enters ``removed``. Session 3a82e19883f7 created `handler/request/request.go`,
+    #: deleted it, and was then told "you deleted it and the plan does not say to
+    #: remove it" and had `finish` refused because the file was "simply gone":
+    #: two push-backs to restore a file that had not existed an hour before.
+    created: set[str] = field(default_factory=set)
+    #: Whole-file writes per path this task: ``{path: {content digest: turn}}``.
+    #: How a run regenerating a file to fix one compile error is recognised --
+    #: the live replay of 3a82e19883f7 rewrote `core/domain/employee.go` nine
+    #: times over a missing import, twice byte for byte. See
+    #: `AgentLoop._regenerates_a_failing_file`.
+    whole_writes: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: How often a whole rewrite of each path has been refused. Bounded, so the
+    #: refusal is advice with teeth and never a wall.
+    rewrite_refused: dict[str, int] = field(default_factory=dict)
     #: Every path this session has deleted, whether or not it came back, and
     #: every path that has been written again since it went. Together they are
     #: how a *cycle* is recognised: a delete of something in ``rewritten`` is

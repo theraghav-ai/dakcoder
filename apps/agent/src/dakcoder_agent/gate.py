@@ -717,6 +717,19 @@ INNER: tuple[Stage, ...] = (
     # mechanical — a missing trailing newline, one struct-tag column — and
     # spending a turn asking it to fix its own whitespace is pure waste.
     Stage("gofmt", "gofmt", _scoped, blocking=False),
+    # The compiler, on the touched packages only. Not sub-second on a cold
+    # cache, and worth it: it is the one check here that can see a type error or
+    # an import cycle, and without it the first build was the model's own or the
+    # gate's -- session 3a82e19883f7 wrote five files over a domain<->port cycle
+    # it had made at turn 21 before anything compiled at turn 58.
+    Stage(
+        "go_compile",
+        "go_compile",
+        _packages,
+        blocking=False,
+        when=_has_go,
+        skip_reason=_NO_MODULE,
+    ),
     Stage(
         "go_diagnostics",
         "go_diagnostics",

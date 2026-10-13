@@ -675,14 +675,17 @@ def test_a_planner_at_the_fence_may_finish_instead_of_planning(planning_router, 
     requested, and the loop then spent the rest of the session enforcing it.
 
     The fence knows the phase has to end. It does not know whether the task was
-    work or a question. The model does, so it gets to say.
+    work or a question. The model does, so it gets to say -- twice: a planner
+    `finish` on a change request is sent back once in favour of `submit_plan`
+    (session 05cd8b8369aa described its plan instead of submitting it), and the
+    same answer sent again is delivered as is.
     """
     from dakcoder_agent.loop import MAX_RESEARCH_TURNS
 
     answer = json.dumps({"answer": "The plan is accurate except for step 3."})
     loop, client = build(
         planning_router,
-        _to_the_fence(MAX_RESEARCH_TURNS) + [calls(("finish", answer))],
+        _to_the_fence(MAX_RESEARCH_TURNS) + [calls(("finish", answer))] * 2,
         max_turns=MAX_RESEARCH_TURNS + 4,
     )
     events = list(loop.run("validate MIGRATION_PLAN.md against the codebase",

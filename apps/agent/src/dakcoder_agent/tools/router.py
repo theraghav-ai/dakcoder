@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from dakcoder_shared.envelope import Mutation, ToolResult
+from dakcoder_shared.envelope import Mutation, MutationKind, ToolResult
 from dakcoder_shared.paths import PathEscape, Workspace, is_protected
 
 from ..modes import Mode
@@ -230,6 +230,9 @@ class Router:
         #: does not make the vet result wrong, and discarding the snapshot for it
         #: hands the gate nothing to excuse pre-existing failures with.
         self.code_mutations: int = 0
+        #: Paths this task brought into existence. `write_file` may rewrite one
+        #: of them whole; see `fs.write_file`. Reset with ``touched``.
+        self.created: set[str] = set()
 
     def begin_task(self) -> None:
         """Start a new task's change set, in the same session.
@@ -242,6 +245,7 @@ class Router:
         The session's full list of changed files lives on the session.
         """
         self.touched = []
+        self.created = set()
 
     def register(self, name: str, handler: ToolHandler) -> None:
         if name not in registry.REGISTRY:
@@ -327,6 +331,11 @@ class Router:
         except PathEscape as exc:
             return ToolResult.failure(f"{name}: {exc.reason}.", fix=exc.fix)
 
+        if spec.name == "write_file" and not gate and paths and paths[0] in self.created:
+            # Not a model-visible parameter: the router knows which files this
+            # task created, the model's say-so does not enter into it.
+            args = {**args, "_replaceable": True}
+
         if not gate and (history := [p for p in paths if is_history(p)]):
             # Deterministic, so a dead end: asking again cannot change it.
             return ToolResult.failure(
@@ -361,6 +370,10 @@ class Router:
                 self.gate_mutations += 1
             if not is_prose(mutation.path):
                 self.code_mutations += 1
+            if mutation.kind is MutationKind.CREATE and not gate:
+                self.created.add(mutation.path)
+            elif mutation.kind is MutationKind.DELETE:
+                self.created.discard(mutation.path)
             if mutation.path not in self.touched:
                 self.touched.append(mutation.path)
             if self.undo is not None:
@@ -631,7 +644,7 @@ class Router:
         except IsADirectoryError as exc:
             return ToolResult.failure(
                 f"{spec.name}: {getattr(exc, 'filename', None) or exc} is a directory.",
-                fix="Use repo_map to list it, or name a file inside it.",
+                fix="read_file on the directory lists it; or name a file inside it.",
             )
         except Exception as exc:  # noqa: BLE001 - a tool crash must not end the session
             if getattr(exc, "missing", False):
@@ -896,10 +909,15 @@ _ALIASES: dict[str, str] = {
     "ripgrep": "search_repo",
     "find": "search_repo",
     "glob": "search_repo",
-    "ls": "repo_map",
-    "dir": "repo_map",
+    # A directory is listed by `read_file` on it; `repo_map` maps Go packages
+    # and answers nothing for a directory of SQL or YAML.
+    "ls": "read_file",
+    "dir": "read_file",
+    "list_dir": "read_file",
+    "list_directory": "read_file",
+    "listdir": "read_file",
+    "list_files": "read_file",
     "tree": "repo_map",
-    "list_files": "repo_map",
     "cat": "read_file",
     "head": "read_file",
     "tail": "read_file",

@@ -295,8 +295,8 @@ _SPECS: tuple[ToolSpec, ...] = (
         name="read_file",
         parallel=True,
         description=(
-            "Read a slice of one file. Always pass start and end when you know roughly "
-            "where to look; without `end` you get 800 lines from `start`."
+            "Read a slice of one file, or list a directory. Pass start and end when you "
+            "know roughly where to look; without `end` you get 800 lines from `start`."
         ),
         parameters=_obj(
             path=_str("Workspace-relative path, e.g. 'handler/user.go'."),
@@ -999,6 +999,20 @@ _SPECS: tuple[ToolSpec, ...] = (
         ),
         parameters=_obj(),
         modes=_ACTS,
+    ),
+    # The after-edit compile. Not offered to the model, so it costs the prompt
+    # nothing: the loop runs it on the packages an edit batch touched, so a
+    # compile error -- an import cycle above all -- is reported on the turn that
+    # made it. Session 3a82e19883f7 created a domain<->port cycle at turn 21 and
+    # nothing compiled until turn 58, five files later.
+    ToolSpec(
+        name="go_compile",
+        description="Compile the named packages only. Runs automatically after edits.",
+        parameters=_obj(
+            pattern=_str("Package patterns, e.g. './core/port/... ./handler/...'."),
+        ),
+        modes=frozenset(),
+        gate_only=True,
     ),
     ToolSpec(
         name="go_vet",

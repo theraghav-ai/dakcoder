@@ -15,16 +15,16 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 
 | Mode | Tools | Schema cost |
 |---|---|---|
-| **ask** | 20 | ~2,441 tokens |
-| **planner** | 22 | ~3,028 tokens |
-| **agent** | 31 | ~4,146 tokens |
+| **ask** | 20 | ~2,445 tokens |
+| **planner** | 22 | ~3,031 tokens |
+| **agent** | 31 | ~4,150 tokens |
 
 ## The catalogue
 
 | Tool | Modes | Mutates | Approval | Runs in | Description |
 |---|---|---|---|---|---|
 | `repo_map` | ask, planner, agent |  |  | gotools | Get the module path, package tree, exported symbols and FX providers. Call this first in an unfamiliar repository. Pass package to see one directory in full. |
-| `read_file` | ask, planner, agent |  |  | agent | Read a slice of one file. Always pass start and end when you know roughly where to look; without `end` you get 800 lines from `start`. |
+| `read_file` | ask, planner, agent |  |  | agent | Read a slice of one file, or list a directory. Pass start and end when you know roughly where to look; without `end` you get 800 lines from `start`. |
 | `search_repo` | ask, planner, agent |  |  | agent | Search file contents by regular expression. Use this instead of grep, and prefer it over reading files to find something. |
 | `code_graph` | ask, planner, agent |  |  | graphify | Look up the code graph: a symbol's edges, its callers, the path between two symbols, or a question. Cheaper than chaining search_repo and read_file. |
 | `search_docs` | ask, planner, agent |  |  | agent | Search the n-api-template knowledge base for the contract rule behind a pattern. Use it before inventing an approach, not after. |
@@ -55,6 +55,7 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `fx_wire` | agent | ✓ |  | gotools | Register a repository or handler in bootstrap/bootstrapper.go with the right annotations. Run this after adding either, or FX fails at startup. |
 | `govalid_gen` | agent | ✓ |  | agent | Regenerate handler/request/request_*_validator.go from the request structs. Run it whenever a validate tag changes; never hand-edit the generated files. |
 | `go_build` | agent |  |  | agent | Build every package. This is the authoritative signal: nothing is done until it is clean, whatever the other tools say. |
+| `go_compile` | gate |  |  | agent | Compile the named packages only. Runs automatically after edits. |
 | `go_vet` | agent |  |  | agent | Run go vet. Pass pattern to scope it to one package; unscoped it takes about thirty seconds, so never run that in the edit loop. |
 | `go_test` | agent |  |  | agent | Run tests. Pass pattern to scope to one package when output is large. |
 | `golangci_lint` | gate |  |  | agent | Run golangci-lint if the repository configures it. Advisory: its findings never block, so do not spend turns on them. |
@@ -82,7 +83,7 @@ Get the module path, package tree, exported symbols and FX providers. Call this 
 
 ### `read_file`
 
-Read a slice of one file. Always pass start and end when you know roughly where to look; without `end` you get 800 lines from `start`.
+Read a slice of one file, or list a directory. Pass start and end when you know roughly where to look; without `end` you get 800 lines from `start`.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -343,6 +344,14 @@ _No parameters._
 Build every package. This is the authoritative signal: nothing is done until it is clean, whatever the other tools say.
 
 _No parameters._
+
+### `go_compile`
+
+Compile the named packages only. Runs automatically after edits.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `pattern` | string |  | Package patterns, e.g. './core/port/... ./handler/...'. |
 
 ### `go_vet`
 

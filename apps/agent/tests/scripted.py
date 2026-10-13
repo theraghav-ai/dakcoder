@@ -276,7 +276,7 @@ def gated(planning_router: Router):
     """
     state: dict[str, str | None] = {"fail": None, "pre_existing": None}
 
-    for name in {stage.tool for stage in GATE} | {"gofmt", "rules_lint", "go_diagnostics"}:
+    for name in {stage.tool for stage in GATE} | {"gofmt", "go_compile", "rules_lint", "go_diagnostics"}:
 
         def handler(inv, _name=name):
             broke_it = state["fail"] == _name and planning_router.mutations > 0

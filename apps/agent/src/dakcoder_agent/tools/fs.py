@@ -267,10 +267,13 @@ def read_file(inv: Invocation) -> ToolResult:
     """
     path = inv.absolute()
     if path.is_dir():
-        return ToolResult.failure(
-            f"{inv.path()} is a directory.",
-            fix="Use repo_map to list a directory, or read_file on one file in it.",
-        )
+        # Listed, not refused. The refusal sent the model to `repo_map`, which
+        # maps Go packages and answers `"packages":[]` for `db/` -- so a planner
+        # wanting the existing DDL had no way to see it. The live replay of
+        # session 3a82e19883f7 spent its planning turns on `list_dir`, `git_diff`
+        # and `repo_map package=db`, and stopped "blocked: could not find db/
+        # directory contents".
+        return _listing(inv.path(), path)
 
     text = _read_text(path)
     lines = _to_lf(text).split("\n")
@@ -376,6 +379,25 @@ def write_file(inv: Invocation) -> ToolResult:
     path = inv.absolute()
     append = bool(inv.arg("append", False))
     content = inv.arg("content", "")
+
+    if path.exists() and not append and inv.arg("_replaceable", False):
+        # A file this task created, rewritten whole. Set by the router, never by
+        # the model (`_replaceable` is not in the schema): refusing it sent the
+        # live replay of session 3a82e19883f7 round delete-then-write eight
+        # times on its own new repository file, two turns a rewrite, until the
+        # stall guard ended it. Nothing the developer had is at stake -- the
+        # undo store recorded the path as absent before the task.
+        eol = _sibling_eol(path)
+        body = _apply_eol(content, eol)
+        if body and not body.endswith(eol):
+            body += eol
+        _write_text(path, body)
+        return ToolResult.success(
+            f"replaced {rel} ({len(content.splitlines())} lines); this task created it, "
+            "so it can be rewritten whole",
+            mutations=[Mutation(rel, MutationKind.MODIFY)],
+            meta={"eol": "crlf" if eol == "\r\n" else "lf"},
+        )
 
     if path.exists() and not append:
         return ToolResult.failure(
@@ -742,6 +764,40 @@ def workspace_empty(root: Path) -> bool:
         return not any(entry.name not in {".dakcoder", ".git"} for entry in root.iterdir())
     except OSError:
         return False
+
+
+#: Entries shown for one directory. Enough for any service directory; a
+#: generated tree gets its head and a count.
+LISTING_LIMIT = 100
+
+
+def _listing(rel: str, path: Path) -> ToolResult:
+    """One directory's entries: subdirectories first, then files with line counts."""
+    try:
+        entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except OSError as exc:
+        return ToolResult.failure(f"{rel} could not be listed: {exc}")
+    shown: list[str] = []
+    for entry in entries:
+        if entry.is_dir():
+            if entry.name not in PRUNE:
+                shown.append(f"  {entry.name}/")
+        elif entry.suffix.lower() in TEXT_SUFFIXES:
+            try:
+                count = len(_to_lf(_read_text(entry)).splitlines())
+            except (OSError, UnicodeError):
+                count = 0
+            shown.append(f"  {entry.name} ({count} lines)")
+        else:
+            shown.append(f"  {entry.name}")
+    more = len(shown) - LISTING_LIMIT
+    body = "\n".join(shown[:LISTING_LIMIT]) or "  (empty)"
+    if more > 0:
+        body += f"\n  ... and {more} more"
+    return ToolResult.success(
+        f"{rel}/ is a directory ({len(shown)} entries):\n{body}\n\n"
+        "read_file one of these to see it."
+    )
 
 
 def _top_level(root: Path) -> list[str]:

@@ -111,10 +111,21 @@ def test_reading_past_the_end_says_how_long_the_file_is(router: Router) -> None:
     assert "5 lines" in out.content
 
 
-def test_reading_a_directory_is_refused_with_the_right_tool(router: Router) -> None:
-    out = run(router, "read_file", path="handler")
+def test_reading_a_directory_lists_it(router: Router, workspace: Workspace) -> None:
+    """It used to be refused with "use repo_map", which maps Go packages only:
+    a planner asking about `db/` got `"packages":[]` and stopped, blocked on
+    "could not find db/ directory contents" (live replay of 3a82e19883f7)."""
+    (workspace.root / "db").mkdir(exist_ok=True)
+    (workspace.root / "db" / "users.sql").write_text("CREATE TABLE users ();\n", encoding="utf-8")
+    out = run(router, "read_file", path="db")
+    assert out.ok
+    assert "users.sql (1 lines)" in out.content
+
+
+def test_the_usual_names_for_listing_a_directory_point_at_read_file(router: Router) -> None:
+    out = router.dispatch("list_dir", {"path": "db"})
     assert not out.ok
-    assert "repo_map" in out.fix
+    assert "read_file" in out.fix
 
 
 def test_a_binary_file_is_refused(router: Router, workspace: Workspace) -> None:
@@ -350,8 +361,11 @@ def test_append_creates_the_file_when_it_is_not_there(
 def test_write_file_still_refuses_to_overwrite(router: Router, workspace: Workspace) -> None:
     """Append is safe by construction — it adds at the end and can destroy
     nothing. The refusal that protects an existing file is unchanged, and the
-    fix line now names all three ways forward."""
-    assert run(router, "write_file", path="report.md", content="one").ok
+    fix line now names all three ways forward.
+
+    The file is put there by the developer, not by this task: a file the task
+    created itself may be rewritten whole (see `Router.created`)."""
+    (workspace.root / "report.md").write_text("one\n", encoding="utf-8")
     out = run(router, "write_file", path="report.md", content="two")
     assert not out.ok
     assert "will not overwrite" in out.content
