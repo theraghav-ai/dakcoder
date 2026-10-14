@@ -2051,6 +2051,42 @@
         ],
         "type": "object"
       },
+      "GateConvert": {
+        "description": "The rule-based conversion ran before the model's first turn of a\nmigration's handlers phase: handlers, service wiring and request DTOs.",
+        "properties": {
+          "kind": {
+            "const": "convert",
+            "type": "string"
+          },
+          "converted": {
+            "type": "integer"
+          },
+          "helpers": {
+            "type": "integer"
+          },
+          "left": {
+            "type": "integer"
+          },
+          "pending_routes": {
+            "type": "integer"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "converted",
+          "helpers",
+          "left",
+          "pending_routes",
+          "files"
+        ],
+        "type": "object"
+      },
       "GateForcedToolCall": {
         "properties": {
           "kind": {
@@ -2097,6 +2133,7 @@
           "mapping": {
             "auto_approval": "#/components/schemas/GateAutoApproval",
             "compaction": "#/components/schemas/GateCompaction",
+            "convert": "#/components/schemas/GateConvert",
             "forced_tool_call": "#/components/schemas/GateForcedToolCall",
             "full": "#/components/schemas/GateRun",
             "inner": "#/components/schemas/GateRun",
@@ -2124,6 +2161,9 @@
           },
           {
             "$ref": "#/components/schemas/GatePhase"
+          },
+          {
+            "$ref": "#/components/schemas/GateConvert"
           },
           {
             "$ref": "#/components/schemas/GateRoutes"

@@ -12,7 +12,9 @@ C1 limits: at most **6 parameters** per tool, description at most **200 characte
 
 | Tool | Mutates | Params | Description |
 |---|---|---|---|
+| [`convert_dtos`](#convert_dtos) | ✓ | 2 | Move request DTOs into handler/request/request.go and give each a Validate(): govalid where its tags allow, the legacy validator where custom tags need it. |
 | [`convert_handlers`](#convert_handlers) | ✓ | 4 | Convert legacy gin handlers to the template shape by rule, and repository methods to context.Context. A method no rule fits is left unchanged, with the reason. |
+| [`convert_service`](#convert_service) | ✓ | 2 | Move routes.go into each handler's Routes(), register handlers as controllers in bootstrap, retire routes.go, swap the legacy libraries and rebuild the test harness. |
 | [`db_roundtrip_audit`](#db_roundtrip_audit) |  | 1 | Per repository method: database calls, whether any is in a loop, batched, in a transaction, plus a verdict. Worst first. Call before optimising by eye. |
 | [`fx_wire`](#fx_wire) | ✓ | 4 | Register a repository or handler in bootstrap/bootstrapper.go with the correct annotation. Never hand-edit it: an unannotated handler serves no routes. |
 | [`handler_map`](#handler_map) |  | 3 | One handler file split into conversion steps: every method with its lines, route and the repository methods it calls. Plan a migration's handler steps from this. |
@@ -33,6 +35,124 @@ A tool marked **Mutates** writes to the workspace and passes through the
 approval gate (Part A §7.2). Each of them takes `dry_run`, which returns the
 full result without touching the working tree — that is what the gate uses to
 show a diff before anything is written.
+
+---
+
+## convert_dtos
+
+Move request DTOs into handler/request/request.go and give each a Validate(): govalid where its tags allow, the legacy validator where custom tags need it.
+
+**Mutates the workspace.** Approval-gated.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `dry_run` | boolean |  | report what would change without writing |
+| `root` | string |  | workspace root; omit to use the server's default |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "dry_run": {
+      "description": "report what would change without writing",
+      "type": "boolean"
+    },
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "already": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "generated": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "moved": {
+      "type": "integer"
+    },
+    "notes": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "removed": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "report": {
+      "type": "string"
+    },
+    "runtime": {
+      "additionalProperties": {
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "null",
+          "array"
+        ]
+      },
+      "type": "object"
+    },
+    "written": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    }
+  },
+  "required": [
+    "moved",
+    "dry_run",
+    "report"
+  ],
+  "type": "object"
+}
+```
+
+</details>
 
 ---
 
@@ -225,6 +345,163 @@ Convert legacy gin handlers to the template shape by rule, and repository method
     "converted",
     "left",
     "helpers",
+    "dry_run",
+    "report"
+  ],
+  "type": "object"
+}
+```
+
+</details>
+
+---
+
+## convert_service
+
+Move routes.go into each handler's Routes(), register handlers as controllers in bootstrap, retire routes.go, swap the legacy libraries and rebuild the test harness.
+
+**Mutates the workspace.** Approval-gated.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `dry_run` | boolean |  | report what would change without writing |
+| `root` | string |  | workspace root; omit to use the server's default |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "dry_run": {
+      "description": "report what would change without writing",
+      "type": "boolean"
+    },
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "dropped": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": "string"
+    },
+    "handlers": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "pending": {
+            "type": "integer"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "routes": {
+            "type": "integer"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "file",
+          "prefix",
+          "routes"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "notes": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "pending": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "report": {
+      "type": "string"
+    },
+    "retired": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "tests": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "wired": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "written": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    }
+  },
+  "required": [
+    "handlers",
     "dry_run",
     "report"
   ],

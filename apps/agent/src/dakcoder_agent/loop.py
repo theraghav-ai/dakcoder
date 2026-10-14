@@ -820,6 +820,18 @@ MAX_REVISIONS = 2
 #: answered "not run" with a reason, which keeps the wire coherent.
 MAX_CALLS_PER_BATCH = 6
 
+#: Where a migration keeps the legacy service's lint findings, taken with the
+#: route inventory before the first write.
+LINT_BEFORE = ".dakcoder/migration/lint-before.json"
+
+#: The rules a conversion exists to satisfy. A legacy service violates every
+#: one of them, so the migration's lint baseline never excuses these: the
+#: final gate must not pass a handler still on gin because it was on gin
+#: before.
+CONVERSION_RULES = frozenset(
+    {"handler-signature", "handler-base", "fx-registration", "request-dto", "routes-in-handler"}
+)
+
 #: The api-* modules the dependency phase replaces with an n-api-* one, from
 #: the skill's swap table. `api-config` is not here: it stays.
 _SWAPPED = frozenset(
@@ -1602,8 +1614,10 @@ class AgentLoop:
         # baseline of a half-converted service is exactly what must not be taken.
         if not continued or new_task:
             self._resume_migration()
-        # Before the model's first turn: what a rule can convert is converted,
-        # and the model is planned onto what is left.
+        # Before the model's first turn: what a rule can do is done -- the
+        # dependency swap, then the conversion -- and the model is planned
+        # onto what is left.
+        yield from self._settle_dependencies()
         yield from self._convert_mechanically()
 
         self._switch(self._opening_mode(decided, continued=continued))
@@ -5461,11 +5475,14 @@ class AgentLoop:
             return
 
         self._await_baseline()
+        baseline = self.state.baseline
+        if baseline is None and self.state.migration.active:
+            baseline = self._migration_lint_baseline()
         report = full_gate(
             self.router,
             self.router.touched,
             dependencies_changed=self.state.dependencies_changed,
-            baseline=self.state.baseline,
+            baseline=baseline,
         )
         self.state.last_gate = report
         self.state.gate_key = key
@@ -5852,6 +5869,12 @@ class AgentLoop:
         """
         migration = self.state.migration
         if not (migration.active and migration.phases and migration.defers_gate):
+            return ""
+        # The last phase is where tidy belongs: the gate that closes it demands
+        # a tidy go.mod, so refusing it there would be a condition no edit
+        # could meet.
+        here = migration.current
+        if here is not None and here[0] == len(migration.phases):
             return ""
         try:
             args = call.parsed() or {}
@@ -7865,6 +7888,7 @@ class AgentLoop:
         # every attempt, and retrying it on each of forty write calls would cost
         # a subprocess launch apiece to reach the same answer.
         self.state.routes_saved = True
+        self._save_lint_before()
         try:
             # Through the gate path, because that is what this is: a harness
             # call the model did not make and cannot refuse. `route_inventory`
@@ -7885,6 +7909,76 @@ class AgentLoop:
                     "unresolved": int(outcome.meta.get("unresolved") or 0),
                 },
             )
+        )
+
+    def _settle_dependencies(self) -> Iterator[Event]:
+        """Do the dependency phase by rule, and close it on the evidence.
+
+        The phase is `go get` once per n-api module whose legacy module the
+        service requires -- nothing a model needs to decide. Left to the model,
+        live run 2026-10-14 (9cf7760f4801 and after) read "dependencies" as
+        "rewrite the imports" and spent three sessions hand-editing handlers,
+        repositories and routes.go, while go.mod already held every module:
+        the phase only closes when its plan's steps settle, and they never did.
+
+        So, when the open phase is the dependency phase and the branch is cut:
+        fetch what is missing through the gate path, and close the phase when
+        go.mod requires every replacement. The rule-based conversion then runs
+        in the same session. Anything a fetch cannot settle -- no network, a
+        private module -- leaves the phase to the model as before.
+        """
+        migration = self.state.migration
+        if not migration.active or migration.expected_branch or not migration.branch:
+            return
+        here = migration.current
+        if here is None or here[0] == len(migration.phases):
+            return
+        _, phase = here
+        said = f"{phase.name} {phase.covers} {getattr(phase, 'parts', '')}".lower()
+        if "handler" in said or not any(w in said for w in ("depend", "go.mod", "go-mod", "swap")):
+            return
+        missing = self._unswapped(phase, ())
+        if missing:
+            # Before the first write, as for every write in a migration.
+            self._save_routes()
+            for module in missing:
+                try:
+                    self.router.run_gate_tool(
+                        "go_mod", {"op": "get", "pkg": f"gitlab.cept.gov.in/it-2.0-common/{module}"}
+                    )
+                except Exception:  # noqa: BLE001 - the model can still do it
+                    return
+            if self._unswapped(phase, ()):
+                return
+        # Positive evidence only: nothing missing proves nothing about a go.mod
+        # that names no CEPT module at all.
+        try:
+            go_mod = (self.router.workspace.root / "go.mod").read_text(encoding="utf-8")
+        except OSError:
+            return
+        if "it-2.0-common/n-api-" not in go_mod:
+            return
+        if not migration.close(phase.name):
+            return
+        self.state.plan_objections = 0
+        self._save_progress()
+        nxt = migration.current
+        yield Event(
+            EventType.GATE,
+            {
+                "kind": "phase",
+                "deferred": migration.defers_gate,
+                "closed": phase.name,
+                "phase": nxt[1].name if nxt else "",
+                "index": nxt[0] if nxt else len(migration.phases),
+                "phases": len(migration.phases),
+            },
+        )
+        self.context.append_user(
+            f"The {phase.name} phase is done by rule: go.mod requires every n-api "
+            "module the service needs"
+            + (f" ({', '.join(missing)} fetched just now)" if missing else "")
+            + ". Do not edit go.mod or swap imports by hand."
         )
 
     def _convert_mechanically(self) -> Iterator[Event]:
@@ -7917,29 +8011,21 @@ class AgentLoop:
         if "handler" not in said:
             return
         self.state.mechanical_done = True
-        try:
-            dry = self.router.run_gate_tool("convert_handlers", {"dry_run": True})
-        except Exception:  # noqa: BLE001 - the model can still do it by hand
+        dry, done = self._convert_step("convert_handlers")
+        if dry is None or done is None:
             return
-        if not isinstance(dry, ToolResult) or not dry.ok:
-            return
-        changes = [str(p) for p in dry.meta.get("changes") or []]
-        done = dry
-        if changes:
-            # Before the first write, as for every write in a migration.
-            self._save_routes()
-            try:
-                done = self.router.run_gate_tool("convert_handlers", {"paths": ",".join(changes)})
-            except Exception:  # noqa: BLE001
-                return
-            if not isinstance(done, ToolResult) or not done.ok:
-                return
         converted = int(done.meta.get("converted") or 0)
         helpers = int(done.meta.get("helpers") or 0)
         # From the dry run, which saw every file: the write is scoped to the
         # files that change, so a file with nothing convertible is not in its
         # report -- and that file's methods are exactly what is left.
         left: dict[str, list[dict]] = dict(dry.meta.get("left_methods") or {})
+        # Then the wiring and the DTOs, which need the converted handlers: on
+        # pao-backend the three leave `go build` and `go vet ./...` passing.
+        _, service = self._convert_step("convert_service")
+        _, dtos = self._convert_step("convert_dtos")
+        pending = [str(p) for p in (service.meta.get("pending") if service else None) or []]
+        files = [m.path for r in (done, service, dtos) if r is not None for m in r.mutations]
         yield Event(
             EventType.GATE,
             {
@@ -7947,10 +8033,11 @@ class AgentLoop:
                 "converted": converted,
                 "helpers": helpers,
                 "left": sum(len(v) for v in left.values()),
-                "files": [m.path for m in done.mutations],
+                "pending_routes": len(pending),
+                "files": files,
             },
         )
-        if not converted and not helpers and not left:
+        if not converted and not helpers and not left and not files:
             return
         lines = [
             f"The handlers phase was started by rule, before this turn: {converted} handler "
@@ -7958,6 +8045,17 @@ class AgentLoop:
             "written (signature, binding, errors, response, context). They are done -- "
             "do not plan, read or re-check them; handler_map marks them converted.",
         ]
+        if service is not None and service.mutations:
+            lines.append(
+                "The service wiring was converted too: each handler declares its routes in "
+                "Routes(), bootstrap registers the handlers as controllers, routes/routes.go "
+                "is retired, and the legacy libraries are swapped."
+            )
+        if dtos is not None and dtos.mutations:
+            lines.append(
+                "The request DTOs moved to handler/request/request.go (package request) and "
+                "each has a Validate(); refer to them as request.X."
+            )
         if left:
             lines.append("")
             lines.append(
@@ -7970,10 +8068,103 @@ class AgentLoop:
                 for m in methods[:STATE_ITEMS * 3]:
                     why = "; ".join(str(r) for r in (m.get("reasons") or [])[:2])
                     lines.append(f"    - {m.get('name')}: {why}")
+            if pending:
+                lines.append("")
+                lines.append(
+                    "Each of these methods' routes is written as a `// TODO(migration):` line "
+                    "in its handler's Routes(). When a method is converted, replace its TODO "
+                    "with the registration -- the final gate checks every route the service "
+                    f"served is still served ({len(pending)} wait on these methods)."
+                )
         else:
             lines.append("No handler method is left on gin; the phase's handler work is done.")
         self.context.append_user("\n".join(lines))
         self._refresh_scope()
+
+    def _convert_step(self, tool: str) -> tuple[ToolResult | None, ToolResult | None]:
+        """One rule-based conversion: a dry run, then the real one on what it named.
+
+        The dry run lists every file the step will create, change or remove,
+        and the real run is dispatched with those as `paths`, so the router
+        snapshots each one for revert before it changes. (None, None) when the
+        step could not run; the model can still do the work by hand.
+        """
+        try:
+            dry = self.router.run_gate_tool(tool, {"dry_run": True})
+        except Exception:  # noqa: BLE001 - the model can still do it by hand
+            return None, None
+        if not isinstance(dry, ToolResult) or not dry.ok:
+            return None, None
+        changes = [str(p) for p in dry.meta.get("changes") or []]
+        if not changes:
+            return dry, dry
+        # Before the first write, as for every write in a migration.
+        self._save_routes()
+        try:
+            done = self.router.run_gate_tool(tool, {"paths": ",".join(changes)})
+        except Exception:  # noqa: BLE001
+            return dry, None
+        if not isinstance(done, ToolResult) or not done.ok:
+            return dry, None
+        return dry, done
+
+    def _save_lint_before(self) -> None:
+        """Record the legacy service's lint findings, once, before the first write.
+
+        The migration's final gate runs without a baseline, on purpose: a
+        converted service that does not build has not been converted. For
+        build and vet that is right. For the contract linter it charged the
+        conversion with the service's own policy: on pao-backend the gate
+        blocked on fourteen dep-allowlist findings -- Temporal, resty, uuid,
+        all needed by the service and all there before the migration began --
+        and the only edit that clears them is deleting the business logic.
+
+        Best-effort, like the route inventory beside it.
+        """
+        path = self.router.workspace.root / LINT_BEFORE
+        if path.exists():
+            return
+        try:
+            outcome = self.router.run_gate_tool("rules_lint", {})
+        except Exception:  # noqa: BLE001 - a baseline is an optimisation
+            return
+        if not isinstance(outcome, ToolResult) or not outcome.ok:
+            return
+        record = {
+            "rules": sorted(str(r) for r in outcome.meta.get("violation_rules") or ()),
+            "keys": sorted(str(k) for k in outcome.meta.get("violation_keys") or ()),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(record, indent=1), encoding="utf-8")
+        except OSError:
+            return
+
+    def _migration_lint_baseline(self) -> Baseline | None:
+        """The legacy lint findings as a baseline for `rules_lint` alone.
+
+        A finding is excused when its rule was already violated before the
+        migration began -- except the conversion's own rules, which a legacy
+        service always violates and which are the point of the exercise. Every
+        other stage is judged with no baseline, as before.
+        """
+        try:
+            record = json.loads((self.router.workspace.root / LINT_BEFORE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        rules = frozenset(str(r) for r in record.get("rules") or ()) - CONVERSION_RULES
+        keys = frozenset(
+            str(k) for k in record.get("keys") or ()
+            if str(k).split("|", 1)[0] not in CONVERSION_RULES
+        )
+        if not rules or not keys:
+            return None
+        return Baseline(
+            findings={"rules_lint": keys},
+            passed={"rules_lint": False},
+            rule_classes={"rules_lint": rules},
+            taken=True,
+        )
 
     def _save_progress(self) -> None:
         """Write the migration's progress where the next session can read it.

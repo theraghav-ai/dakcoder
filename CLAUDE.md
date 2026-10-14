@@ -10,7 +10,7 @@ dakcoder is a coding agent for India Post IT 2.0 Go services built on `n-api-tem
 - **`apps/gateway`**: identity (GitLab OAuth), quota, ledger and the model proxy. Server only, never in the `.vsix`.
 - **`apps/agentsvc`**: the hosted control plane. It handles workspace leases, runner containers, A2A, and delivery as a merge request. Server only. Deployment is in `deploy/HOSTING.md`.
 - **`apps/shared`**: token estimation and the wire contracts (`dakcoder_shared/contract/rest.py`, `envelope.py`).
-- **`gotools/`**: the Go sidecar, an MCP server. It provides the contract linter (`rules_lint`), legacy audit, scaffolders, `fx_wire`, `repo_map`, the migration call map (`handler_map`, `unit_check`, `impact`), the rule-based handler converter (`convert_handlers`) and the knowledge-base generator. `gotools/README.md` documents it in depth, including how to add a rule or change a scaffold template.
+- **`gotools/`**: the Go sidecar, an MCP server. It provides the contract linter (`rules_lint`), legacy audit, scaffolders, `fx_wire`, `repo_map`, the migration call map (`handler_map`, `unit_check`, `impact`), the rule-based converters (`convert_handlers`, `convert_service`, `convert_dtos`) and the knowledge-base generator. `gotools/README.md` documents it in depth, including how to add a rule or change a scaffold template.
 - **`extension/`**: the VS Code extension (TypeScript). It spawns the runtime, renders the chat webview (`media/chat/`), and owns approvals, the migration wizard and the diagnostics.
 
 `new-template/` (the reference template) and `pao-back-end-development/` (a real legacy service) are test corpora. Tests that need them skip when they are absent.
@@ -97,7 +97,8 @@ Adding or growing a tool schema trips it. Trim first; if you must raise the ceil
 - Only a task that starts with `/migration` (`MIGRATION_COMMAND`) starts, resumes or restarts one. The classifier, a plan with `phases`, and resume or restart wording don't. The extension's `/migration` and its `/migrate` alias add the word, and the runtime strips it before the model sees the task.
 
 - The gate is deferred until the last phase closes.
-- When the handlers phase opens, `_convert_mechanically` runs `convert_handlers` before the model's first turn: every method a rule fits is converted (and snapshotted for revert), and the model is planned only onto the methods it reports as left, with their reasons.
+- When the handlers phase opens, `_convert_mechanically` runs `convert_handlers`, `convert_service` and `convert_dtos` before the model's first turn (each dry-run first, so every file is snapshotted for revert). Handlers, routes (`Routes()` per handler, routes.go retired), bootstrap, main.go, library imports, the test harness and the request DTOs (moved to `handler/request`) are converted by rule; the model is planned only onto the methods left on gin, whose routes wait as `// TODO(migration):` lines in `Routes()`.
+- The final gate's `rules_lint` uses the legacy lint findings recorded before the first write (`.dakcoder/migration/lint-before.json`): policy findings the service already had are advisory; the conversion's own rules (`CONVERSION_RULES`) never are. `go mod tidy` is refused mid-migration and allowed in the last phase.
 - Files over `BIG_FILE` lines are split into one step per `handler_map` group.
 - A split step advances only when `unit_check` confirms its methods are converted.
 - State persists per workspace in `.dakcoder/migration/state.json`, which is what a new `/migration` session resumes from. `.dakcoder/migration/plan.md` is the human-readable view, and its shape is a contract with the extension's Migration view.

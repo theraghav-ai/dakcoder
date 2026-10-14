@@ -21,6 +21,8 @@ func cmdConvert(args []string, stdout, stderr io.Writer) int {
 	methods := fs.String("methods", "", "only these handler methods, comma-separated")
 	write := fs.Bool("write", false, "write the converted files (default: report only)")
 	format := fs.String("format", "text", "text|json")
+	service := fs.Bool("service", false, "convert the service wiring instead: routes.go into Routes(), bootstrap, main.go, library imports")
+	dtos := fs.Bool("dtos", false, "give every converted handler's request type a Validate(): govalid where it can, the legacy validator where custom tags need it")
 	if err := fs.Parse(args); err != nil {
 		return exitError
 	}
@@ -28,6 +30,30 @@ func cmdConvert(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "gotools convert: %v\n", err)
 		return exitError
+	}
+	if *dtos {
+		res, err := convert.DTOs(ws, *write)
+		if err != nil {
+			fmt.Fprintf(stderr, "gotools convert: %v\n", err)
+			return exitError
+		}
+		if *format == "json" {
+			return encode(stdout, stderr, res)
+		}
+		fmt.Fprint(stdout, convert.RenderDTOs(res))
+		return exitOK
+	}
+	if *service {
+		res, err := convert.Service(ws, *write)
+		if err != nil {
+			fmt.Fprintf(stderr, "gotools convert: %v\n", err)
+			return exitError
+		}
+		if *format == "json" {
+			return encode(stdout, stderr, res)
+		}
+		fmt.Fprint(stdout, convert.RenderService(res))
+		return exitOK
 	}
 	res, err := convert.Run(ws, convert.Options{Paths: split(*paths), Methods: split(*methods), Write: *write})
 	if err != nil {

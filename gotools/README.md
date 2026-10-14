@@ -296,6 +296,31 @@ gotools convert --root ../svc            # dry run: what would change, what is l
 gotools convert --root ../svc --write    # do it
 ```
 
+Two further steps finish what is mechanical, run after the handlers:
+
+- **`convert --service`** (MCP `convert_service`): each route in `routes/routes.go`
+  moves onto its handler as `Routes()` (the shared prefix goes to the
+  constructor's `SetPrefix(...).AddPrefix(...)`, a 201 is registered with
+  `http.StatusCreated`); handlers embed `*serverHandler.Base`; bootstrap
+  registers them with `fx.Annotate(..., fx.As(new(serverHandler.Handler)),
+  fx.ResultTags(...))` (Connect/gRPC handlers stay plain); `main.go` drops
+  `fx.Invoke(routes.Routes)`; routes.go is retired; api-log/db/errors/bootstrapper
+  swap to their n-api lines; the legacy test harness builds the template router
+  so the HTTP tests keep running; struct tags `go vet` rejects are fixed. A route
+  whose method is still on gin is written into `Routes()` as a
+  `// TODO(migration):` line, so nothing is lost when routes.go goes.
+- **`convert --dtos`** (MCP `convert_dtos`): request DTOs, and the handler-package
+  types they use, move to `handler/request/request.go` (package `request`),
+  unexported names exported and every use qualified. Each gets a `Validate()` —
+  n-api-server rejects a non-GET request whose type has none: govalid generates
+  it when every tag is one govalid implements; otherwise it calls the legacy
+  `validation.ValidateStruct`, so custom rules (`validatePaocode`, `employee_id`…)
+  are not silently dropped. A type with no tags gets a `Validate()` returning nil.
+
+On pao-backend, the three steps leave `go build ./...` and `go vet ./...`
+(tests included) passing, and the final gate's lint charging only the methods
+no rule fits.
+
 ---
 
 ## What it publishes

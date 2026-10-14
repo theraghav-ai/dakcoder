@@ -870,7 +870,12 @@ def test_the_route_inventory_is_taken_before_the_first_write(tmp_path: Path) -> 
 
     loop._migration_guard(ToolCall(id="1", name="write_file", arguments="{}"))
 
-    assert taken == [{"name": "route_inventory", "args": {"save": ROUTES_BEFORE}}]
+    # The legacy lint findings are recorded at the same moment, as the
+    # migration's lint baseline (LINT_BEFORE).
+    assert taken == [
+        {"name": "rules_lint", "args": {}},
+        {"name": "route_inventory", "args": {"save": ROUTES_BEFORE}},
+    ]
     assert loop.state.routes_before == 12
     assert loop.state.routes_saved
 
@@ -891,7 +896,7 @@ def test_the_inventory_is_taken_once_not_once_per_write(tmp_path: Path) -> None:
 
     for _ in range(3):
         loop._migration_guard(ToolCall(id="1", name="write_file", arguments="{}"))
-    assert calls_made == ["route_inventory"]
+    assert calls_made == ["rules_lint", "route_inventory"]
 
 
 def test_nothing_is_recorded_for_an_ordinary_change(tmp_path: Path) -> None:

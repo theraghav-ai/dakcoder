@@ -444,6 +444,9 @@ func initCall(x *ast.IfStmt) *ast.CallExpr {
 type emission struct {
 	values string
 	extra  []ast.Stmt
+	// errVar is the plain error a failure returns, when there is one: the
+	// value a log line before the return should carry.
+	errVar string
 }
 
 // emitter recognises a statement that writes the response, and says what the
@@ -480,7 +483,8 @@ func (c *methodConv) emitter(st ast.Stmt, list []ast.Stmt, i int) (emission, boo
 		pkg, _ := fn.X.(*ast.Ident)
 		if pkg != nil && pkg.Name == "apierrors" && strings.HasPrefix(fn.Sel.Name, "Handle") {
 			if len(call.Args) == 2 {
-				return emission{values: "nil, " + c.rewritten(call.Args[1])}, true
+				e := c.rewritten(call.Args[1])
+				return emission{values: "nil, " + e, errVar: e}, true
 			}
 			c.leave("apierrors.%s takes %d arguments; only (ctx, err) converts by rule", fn.Sel.Name, len(call.Args))
 			return emission{}, false
@@ -799,6 +803,10 @@ func (c *methodConv) emit(list []ast.Stmt, i int, out emission, terminal bool, r
 	for _, s := range out.extra {
 		c.remove(s)
 	}
+	ret := "return " + out.values
+	if line := c.logLine(list, i, out); line != "" {
+		ret = line + "\n" + ret
+	}
 	for j := i + 1; j < len(list); j++ {
 		switch x := list[j].(type) {
 		case *ast.ReturnStmt:
@@ -809,7 +817,7 @@ func (c *methodConv) emit(list []ast.Stmt, i int, out emission, terminal bool, r
 			}
 			c.returns[x] = true
 			c.replace(list[i].Pos(), list[i].End(), "")
-			c.replace(x.Pos(), x.End(), "return "+out.values)
+			c.replace(x.Pos(), x.End(), ret)
 			return
 		case *ast.ExprStmt:
 			if isLogCall(x) {
@@ -828,7 +836,37 @@ func (c *methodConv) emit(list []ast.Stmt, i int, out emission, terminal bool, r
 		return
 	}
 	c.replace(list[i].Pos(), list[i].End(), "")
-	c.insert(rbrace, "return "+out.values+"\n")
+	c.insert(rbrace, ret+"\n")
+}
+
+// logLine is the log call a converted failure needs, or "". The legacy
+// apierrors.HandleXxxError logged the failure itself; a bare `return nil,
+// err` does not, and the error-handling rule reports it. Added only where the
+// legacy block had no log line of its own around the response.
+func (c *methodConv) logLine(list []ast.Stmt, i int, out emission) string {
+	if out.errVar == "" || !c.hasLog() {
+		return ""
+	}
+	for j := i - 1; j <= i+3 && j < len(list); j++ {
+		if j < 0 || j == i {
+			continue
+		}
+		if es, ok := list[j].(*ast.ExprStmt); ok && isLogCall(es) {
+			return ""
+		}
+	}
+	return fmt.Sprintf("log.Error(sctx.Ctx, %q, %s)", c.fd.Name.Name+": %v", out.errVar)
+}
+
+// hasLog: the file imports a logger as `log`.
+func (c *methodConv) hasLog() bool {
+	for _, im := range c.f.AST.Imports {
+		p, _ := strconv.Unquote(im.Path.Value)
+		if importName(im) == "log" && strings.Contains(p, "api-log") {
+			return true
+		}
+	}
+	return false
 }
 
 func isLogCall(x *ast.ExprStmt) bool {

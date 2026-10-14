@@ -547,7 +547,12 @@ def _needs_containers(ctx: GateContext) -> bool:
     """
     root = ctx.router.workspace.root
     for package in ctx.touched_packages:
-        directory = root / package.removeprefix("./").removesuffix("/...")
+        # Suffix first: "./..." -- the pattern for a root-level change such as
+        # main.go -- loses its "./" to become "...", which is no directory, and
+        # the module's tests/ went unscanned. Every migration touches main.go,
+        # so on pao-backend the testcontainers suite blocked the final gate on
+        # a machine with no Docker daemon.
+        directory = root / package.removesuffix("/...").removeprefix("./")
         if not directory.is_dir():
             continue
         for test in directory.rglob("*_test.go"):

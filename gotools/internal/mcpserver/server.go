@@ -110,6 +110,7 @@ func NewServer(root, version string) (*mcp.Server, error) {
 	addAuditTools(s, abs)
 	addCallMapTools(s, abs)
 	addConvertTool(s, abs)
+	addConvertStepTools(s, abs)
 	return s, nil
 }
 

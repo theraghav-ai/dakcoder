@@ -1,6 +1,6 @@
 // Generated from api/contract.json and api/openapi.json by scripts/gen-contract.mjs.
 // Do not edit. Run `make contract` at the repository root and commit the result.
-// openapi.json digest: 20e11de76ee7da1e
+// openapi.json digest: b73fa9bba9dc9686
 
 /**
  * The runtime API this build speaks. A mismatch with `/v1/health` is refused
@@ -14,7 +14,7 @@ export const API_VERSION = '1.1';
  * with additions this build does not know about. That is legal under C2, so it
  * is logged, not refused.
  */
-export const CONTRACT_HASH = '309bae6744531db8';
+export const CONTRACT_HASH = 'd0fdf9a02a5b0a34';
 
 /**
  * Every event type the runtime can emit (C2). A lower bound: a newer runtime
@@ -263,6 +263,19 @@ export interface GateCompaction {
   evicted_paths: string[];
 }
 
+/**
+ * The rule-based conversion ran before the model's first turn of a
+ * migration's handlers phase: handlers, service wiring and request DTOs.
+ */
+export interface GateConvert {
+  kind: 'convert';
+  converted: number;
+  helpers: number;
+  left: number;
+  pending_routes: number;
+  files: string[];
+}
+
 export interface GateForcedToolCall {
   kind: 'forced_tool_call';
   mode: string;
@@ -276,7 +289,7 @@ export interface GateOverflowRecovery {
 }
 
 /** One of several shapes, told apart by `kind`. */
-export type GatePayload = GateRun | GateForcedToolCall | GateToolChoiceUnsupported | GateOverflowRecovery | GatePhase | GateRoutes | GateReplan | GateCompaction | GateAutoApproval | GateSuspended;
+export type GatePayload = GateRun | GateForcedToolCall | GateToolChoiceUnsupported | GateOverflowRecovery | GatePhase | GateConvert | GateRoutes | GateReplan | GateCompaction | GateAutoApproval | GateSuspended;
 
 /** A migration phase closed and the gate is deferred until the last one. */
 export interface GatePhase {

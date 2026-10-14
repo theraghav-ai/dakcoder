@@ -54,6 +54,8 @@ Mode filtering is a guarantee, not a hint: a tool absent from this table is abse
 | `project_scaffold` | agent | ✓ | **always** | gotools | Create a new n-api-template service in an empty directory, with configs, bootstrap and one working resource. Credential fields are left empty. |
 | `fx_wire` | agent | ✓ |  | gotools | Register a repository or handler in bootstrap/bootstrapper.go with the right annotations. Run this after adding either, or FX fails at startup. |
 | `convert_handlers` | gate | ✓ |  | gotools | Convert legacy gin handlers and repository methods to the template shape by rule. A method no rule fits is left unchanged, with the reason. |
+| `convert_service` | gate | ✓ |  | gotools | Move routes.go into each handler's Routes(), register handlers in bootstrap, retire routes.go and swap the legacy libraries. |
+| `convert_dtos` | gate | ✓ |  | gotools | Move request DTOs into handler/request/request.go and give each a Validate(). |
 | `govalid_gen` | agent | ✓ |  | agent | Regenerate handler/request/request_*_validator.go from the request structs. Run it whenever a validate tag changes; never hand-edit the generated files. |
 | `go_build` | agent |  |  | agent | Build every package. This is the authoritative signal: nothing is done until it is clean, whatever the other tools say. |
 | `go_compile` | gate |  |  | agent | Compile the named packages only. Runs automatically after edits. |
@@ -342,6 +344,24 @@ Convert legacy gin handlers and repository methods to the template shape by rule
 |---|---|---|---|
 | `paths` | string |  | Files the conversion may write, comma-separated. Omit for all. |
 | `methods` | string |  | Only these handler methods, comma-separated. |
+| `dry_run` | boolean |  | Report what would change without writing. |
+
+### `convert_service`
+
+Move routes.go into each handler's Routes(), register handlers in bootstrap, retire routes.go and swap the legacy libraries.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `paths` | string |  | Files the conversion may write, comma-separated. Omit for all. |
+| `dry_run` | boolean |  | Report what would change without writing. |
+
+### `convert_dtos`
+
+Move request DTOs into handler/request/request.go and give each a Validate().
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `paths` | string |  | Files the conversion may write, comma-separated. Omit for all. |
 | `dry_run` | boolean |  | Report what would change without writing. |
 
 ### `govalid_gen`

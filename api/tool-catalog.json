@@ -1076,6 +1076,54 @@
       "gate_only": true
     },
     {
+      "name": "convert_service",
+      "description": "Move routes.go into each handler's Routes(), register handlers in bootstrap, retire routes.go and swap the legacy libraries.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Files the conversion may write, comma-separated. Omit for all."
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Report what would change without writing."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [],
+      "mutates": true,
+      "approval": "none",
+      "provider": "gotools",
+      "gate_only": true
+    },
+    {
+      "name": "convert_dtos",
+      "description": "Move request DTOs into handler/request/request.go and give each a Validate().",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Files the conversion may write, comma-separated. Omit for all."
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Report what would change without writing."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "modes": [],
+      "mutates": true,
+      "approval": "none",
+      "provider": "gotools",
+      "gate_only": true
+    },
+    {
       "name": "govalid_gen",
       "description": "Regenerate handler/request/request_*_validator.go from the request structs. Run it whenever a validate tag changes; never hand-edit the generated files.",
       "parameters": {

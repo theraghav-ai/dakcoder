@@ -177,7 +177,7 @@ func TestToolNamesAreStable(t *testing.T) {
 		// step is done, and who calls a repository method.
 		"handler_map", "unit_check", "impact",
 		// Its deterministic half: the edits a conversion is made of, by rule.
-		"convert_handlers",
+		"convert_handlers", "convert_service", "convert_dtos",
 	}
 	for _, name := range want {
 		if !got[name] {

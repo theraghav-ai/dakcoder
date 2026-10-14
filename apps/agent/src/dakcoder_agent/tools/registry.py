@@ -250,6 +250,8 @@ _SAFE_MUTATORS = frozenset(
         # developer asked for the conversion when they typed /migration -- and
         # every file it writes is snapshotted for revert first.
         "convert_handlers",
+        "convert_service",
+        "convert_dtos",
     }
 )
 
@@ -999,6 +1001,41 @@ _SPECS: tuple[ToolSpec, ...] = (
         parameters=_obj(
             paths=_str("Files the conversion may write, comma-separated. Omit for all."),
             methods=_str("Only these handler methods, comma-separated."),
+            dry_run=_bool("Report what would change without writing."),
+        ),
+        modes=frozenset(),
+        mutates=True,
+        gate_only=True,
+        provider=Provider.GOTOOLS,
+    ),
+    # The rest of the deterministic conversion, run by the harness right after
+    # convert_handlers: the service's wiring (routes.go into each handler's
+    # Routes(), bootstrap, main.go, library imports, the test harness) and the
+    # request DTOs (moved to handler/request, each with a Validate()). On
+    # pao-backend the three together leave a service whose `go build` and
+    # `go vet ./...` pass, with only the methods no rule fits left to the model.
+    ToolSpec(
+        name="convert_service",
+        description=(
+            "Move routes.go into each handler's Routes(), register handlers in bootstrap, "
+            "retire routes.go and swap the legacy libraries."
+        ),
+        parameters=_obj(
+            paths=_str("Files the conversion may write, comma-separated. Omit for all."),
+            dry_run=_bool("Report what would change without writing."),
+        ),
+        modes=frozenset(),
+        mutates=True,
+        gate_only=True,
+        provider=Provider.GOTOOLS,
+    ),
+    ToolSpec(
+        name="convert_dtos",
+        description=(
+            "Move request DTOs into handler/request/request.go and give each a Validate()."
+        ),
+        parameters=_obj(
+            paths=_str("Files the conversion may write, comma-separated. Omit for all."),
             dry_run=_bool("Report what would change without writing."),
         ),
         modes=frozenset(),

@@ -166,6 +166,12 @@ func Take(ws *workspace.Workspace) *Inventory {
 // One direction only, and deliberately: routes *added* by a conversion are not
 // a defect -- a service that gains `/docs/v3Doc.json` has gained the thing the
 // conversion is for. Routes *lost* are the whole question.
+// frameworkServed is a route n-api-server registers on its own.
+func frameworkServed(r Route) bool {
+	p := strings.ToLower(r.Path)
+	return (strings.EqualFold(r.Method, "GET") && p == "/healthz") || strings.HasPrefix(p, "/swagger")
+}
+
 func Compare(before, after *Inventory) (missing []Route) {
 	have := map[string]bool{}
 	handlers := map[string]bool{}
@@ -175,8 +181,19 @@ func Compare(before, after *Inventory) (missing []Route) {
 			handlers[method(r.Handler)] = true
 		}
 	}
+	template := false
+	for _, r := range after.Routes {
+		template = template || r.Style == "template"
+	}
 	for _, r := range before.Routes {
 		if have[r.Key()] {
+			continue
+		}
+		// Served by n-api-server itself once the service is on it: the
+		// framework registers GET /healthz and the swagger UI, so a converted
+		// service that dropped its own copies has lost nothing -- and a check
+		// demanding them back could never be satisfied.
+		if template && frameworkServed(r) {
 			continue
 		}
 		// The path moved but the handler came across. Not a loss: a conversion

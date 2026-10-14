@@ -166,7 +166,9 @@ def test_the_routes_are_recorded_when_the_branch_was_cut_first(tmp_path: Path) -
     refused = loop._migration_guard(ToolCall(id="1", name="patch_file", arguments="{}"))
 
     assert refused is None, "a migration on its own branch writes freely"
-    assert taken == ["route_inventory"]
+    # with the legacy lint findings, taken at the same moment (the migration's
+    # lint baseline)
+    assert taken == ["rules_lint", "route_inventory"]
     assert loop.state.routes_before == 93
 
 
@@ -559,3 +561,156 @@ def test_the_skip_objection_comes_first_and_has_its_own_budget(tmp_path: Path) -
     assert any("cannot be skipped" in t for t in told), told
     assert not loop.state.plan, "nothing adopted"
     assert loop.state.skip_objected
+
+
+# ── 2026-10-14: the rest of the conversion, and the final gate ──────────────
+
+
+def test_the_migration_lint_baseline_excuses_legacy_policy_never_the_conversion(tmp_path: Path) -> None:
+    """pao-backend's final gate blocked on fourteen dep-allowlist findings --
+    Temporal, resty, uuid, all there before the migration -- and the only edit
+    that clears them deletes business logic. The conversion's own rules stay
+    charged: a handler still on gin is not excused for having been on gin."""
+    from dakcoder_agent.loop import LINT_BEFORE
+
+    loop = _migrating(tmp_path)
+    record = tmp_path / LINT_BEFORE
+    record.parent.mkdir(parents=True)
+    record.write_text(json.dumps({
+        "rules": ["dep-allowlist", "handler-signature", "request-dto"],
+        "keys": [
+            'dep-allowlist|bootstrap/b.go|dependency "go.temporal.io/sdk/client" is not on the approved list',
+            "handler-signature|handler/a.go|X takes *gin.Context; handlers must not depend on gin",
+        ],
+    }), encoding="utf-8")
+
+    base = loop._migration_lint_baseline()
+
+    assert base is not None and base.taken
+    assert base.rule_classes["rules_lint"] == {"dep-allowlist"}
+    assert all(not k.startswith("handler-signature") for k in base.findings["rules_lint"])
+    still_on_gin = frozenset({"handler-signature|handler/a.go|X takes *gin.Context; handlers must not depend on gin"})
+    assert base.charge("rules_lint", still_on_gin) == still_on_gin
+    new_dep = frozenset({'dep-allowlist|handler/a.go|dependency "github.com/go-resty/resty/v2" is not on the approved list'})
+    assert base.charge("rules_lint", new_dep) == frozenset()
+
+
+def test_go_mod_tidy_is_allowed_in_the_last_phase(tmp_path: Path) -> None:
+    """The gate that closes the last phase demands a tidy go.mod; refusing tidy
+    there was a condition no edit could meet."""
+    loop = _migrating(tmp_path, closed=("branch", "dependencies", "handlers"))
+
+    assert loop._tidies_mid_migration(_call("go_mod", {"op": "tidy"})) == ""
+
+
+def test_container_tests_are_found_for_a_root_level_change(tmp_path: Path) -> None:
+    """Every migration touches main.go, whose package pattern is ./... -- which
+    the scan turned into a directory called "..." and so never saw tests/."""
+    from dakcoder_agent.gate import GateContext, _needs_containers
+
+    (tmp_path / "go.mod").write_text("module m\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "main_test.go").write_text(
+        'package tests\n\nimport _ "github.com/testcontainers/testcontainers-go"\n', encoding="utf-8"
+    )
+    ctx = GateContext(router=Router(Workspace.at(tmp_path)), touched=("main.go",))
+
+    assert _needs_containers(ctx)
+
+
+ROUTED = {
+    **LEGACY,
+    "handler/ctors.go": (
+        "package handler\n\n"
+        "func NewObjectionHandler() *ObjectionHandler { return &ObjectionHandler{} }\n\n"
+        "func NewPaogenHandler() *PaogenHandler { return &PaogenHandler{} }\n"
+    ),
+    "bootstrap/bootstrapper.go": (
+        'package bootstrap\n\nimport (\n\thandler "legacy.test/handler"\n\t"go.uber.org/fx"\n)\n\n'
+        'var FxHandler = fx.Module("h", fx.Provide(handler.NewObjectionHandler, handler.NewPaogenHandler))\n'
+    ),
+    "main.go": (
+        'package main\n\nimport (\n\t"legacy.test/routes"\n\n\t"go.uber.org/fx"\n)\n\n'
+        "func main() { _ = fx.Invoke(routes.Register) }\n"
+    ),
+}
+
+
+@needs_sidecar
+def test_the_handlers_phase_runs_every_rule_based_step_with_undo(tmp_path: Path) -> None:
+    """Handlers, then the wiring, then the DTOs -- before the model's first
+    turn, each file snapshotted for revert, routes.go included."""
+    root = tmp_path
+    for rel, body in ROUTED.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8", newline="")
+    (root / "handler" / "objection.go").write_text(
+        LEGACY["handler/objection.go"].replace("\tctx.JSON(200, req)\n", "\thandleSuccess(ctx, req)\n"),
+        encoding="utf-8",
+    )
+    (root / "handler" / "response.go").write_text(
+        'package handler\n\nimport "github.com/gin-gonic/gin"\n\n'
+        "func handleSuccess(ctx *gin.Context, data any) { ctx.JSON(200, data) }\n",
+        encoding="utf-8",
+    )
+    with GoTools(root) as sidecar:
+        undo = UndoStore(root, "s1")
+        router = Router(Workspace.at(root), handlers_for(sidecar), undo=undo)
+        loop = _migrating(root, router, closed=("branch", "dependencies"))
+        events = list(loop._convert_mechanically())
+
+    gate = [e.data for e in events if e.type is EventType.GATE and e.data.get("kind") == "convert"]
+    assert gate and gate[0]["converted"] >= 1, events
+    assert not (root / "routes" / "routes.go").exists(), "routes.go is retired"
+    assert undo.state("routes/routes.go").name == "FILE", "and can be put back"
+    assert "func (h *ObjectionHandler) Routes() []serverRoute.Route" in (root / "handler" / "objection.go").read_text(encoding="utf-8")
+    told = [m.content for m in loop.context.build() if m.role.value == "user"]
+    assert any("TODO(migration)" in t for t in told), "the model is told how to register what it converts"
+
+
+def test_a_file_the_code_shows_converted_is_not_left_whatever_its_steps_say() -> None:
+    """Live run 2026-10-14 kept the handlers phase open over handler/objection.go
+    at 12 of 12 converted: steps planned in one session and finished in another
+    stayed "pending" in the record, and every new session was told the file was
+    still to plan."""
+    state = MigrationState(active=True)
+    state.adopt(ROADMAP)
+    _record(state, "pending")
+    state.note_planned("handlers", ["handler/paogen.go"])
+
+    assert state.outstanding("handlers", lambda path: True) == []
+    assert state.outstanding("handlers", lambda path: False) == ["handler/paogen.go"]
+    assert state.outstanding("handlers", lambda path: None) == ["handler/paogen.go"], "no evidence: the steps stand"
+
+
+def test_the_dependency_phase_closes_on_evidence_before_the_model_starts(tmp_path: Path) -> None:
+    """Run 9cf7760f4801 and after: go.mod already held every n-api module and
+    the model spent three sessions hand-editing code in the dependency phase,
+    which closed only when its plan settled. It closes on go.mod now."""
+    swapped = GO_MOD_LEGACY.replace(
+        ")\n",
+        "\tgitlab.cept.gov.in/it-2.0-common/n-api-server v0.0.23\n"
+        "\tgitlab.cept.gov.in/it-2.0-common/n-api-log v0.0.5\n)\n",
+    )
+    (tmp_path / "go.mod").write_text(swapped, encoding="utf-8")
+    loop = _migrating(tmp_path)
+    loop._save_progress = lambda: None
+    calls: list[str] = []
+    loop.router.run_gate_tool = lambda name, args=None: calls.append(name)
+
+    events = list(loop._settle_dependencies())
+
+    assert loop.state.migration.current[1].name == "handlers"
+    assert any(e.data.get("closed") == "dependencies" for e in events)
+    assert calls == [], "nothing to fetch"
+
+
+def test_the_dependency_phase_is_left_to_the_model_when_a_module_cannot_be_fetched(tmp_path: Path) -> None:
+    (tmp_path / "go.mod").write_text(GO_MOD_LEGACY, encoding="utf-8")
+    loop = _migrating(tmp_path)
+    loop._save_progress = lambda: None
+    loop.router.run_gate_tool = lambda name, args=None: _ok()  # fetches "succeed", go.mod unchanged
+
+    assert list(loop._settle_dependencies()) == []
+    assert loop.state.migration.current[1].name == "dependencies"

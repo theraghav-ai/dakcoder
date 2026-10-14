@@ -188,6 +188,18 @@ class GatePhase(Wire):
     phases: int
 
 
+class GateConvert(Wire):
+    """The rule-based conversion ran before the model's first turn of a
+    migration's handlers phase: handlers, service wiring and request DTOs."""
+
+    kind: Literal["convert"]
+    converted: int
+    helpers: int
+    left: int
+    pending_routes: int
+    files: list[str]
+
+
 class GateRoutes(Wire):
     """The route inventory was saved before a migration touched anything."""
 
@@ -245,6 +257,7 @@ class GatePayload(
                 GateToolChoiceUnsupported,
                 GateOverflowRecovery,
                 GatePhase,
+                GateConvert,
                 GateRoutes,
                 GateReplan,
                 GateCompaction,

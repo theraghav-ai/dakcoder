@@ -4,6 +4,102 @@
   "contract": "C1",
   "tools": [
     {
+      "name": "convert_dtos",
+      "description": "Move request DTOs into handler/request/request.go and give each a Validate(): govalid where its tags allow, the legacy validator where custom tags need it.",
+      "mutates": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "description": "report what would change without writing",
+            "type": "boolean"
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "already": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "generated": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "moved": {
+            "type": "integer"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "removed": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "report": {
+            "type": "string"
+          },
+          "runtime": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "null",
+                "array"
+              ]
+            },
+            "type": "object"
+          },
+          "written": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "moved",
+          "dry_run",
+          "report"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "name": "convert_handlers",
       "description": "Convert legacy gin handlers to the template shape by rule, and repository methods to context.Context. A method no rule fits is left unchanged, with the reason.",
       "mutates": true,
@@ -173,6 +269,141 @@
           "converted",
           "left",
           "helpers",
+          "dry_run",
+          "report"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "convert_service",
+      "description": "Move routes.go into each handler's Routes(), register handlers as controllers in bootstrap, retire routes.go, swap the legacy libraries and rebuild the test harness.",
+      "mutates": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "description": "report what would change without writing",
+            "type": "boolean"
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dropped": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          },
+          "handlers": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "file": {
+                  "type": "string"
+                },
+                "pending": {
+                  "type": "integer"
+                },
+                "prefix": {
+                  "type": "string"
+                },
+                "routes": {
+                  "type": "integer"
+                },
+                "type": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "file",
+                "prefix",
+                "routes"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "pending": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "report": {
+            "type": "string"
+          },
+          "retired": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "tests": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "wired": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "written": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "handlers",
           "dry_run",
           "report"
         ],

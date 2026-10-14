@@ -783,6 +783,31 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
             meta={**result.meta, **meta},
         )
 
+    def _convert_step(tool: str) -> Any:
+        def handler(inv: Invocation) -> ToolResult:
+            args: dict[str, Any] = {"dry_run": True} if inv.arg("dry_run") else {}
+            reply = sidecar.call(tool, args)
+            result = _report(reply, _rendered)
+            if reply.is_error or not result.ok:
+                return result
+            payload = _json(reply.text)
+            written = [str(p) for p in payload.get("written") or []]
+            removed = [str(p) for p in payload.get("removed") or []]
+            removed += [str(p) for p in payload.get("retired") or []]
+            meta = {
+                # What a dry run would touch: the harness snapshots these first.
+                "changes": sorted(set(written) | set(removed)),
+                "pending": [str(p) for p in payload.get("pending") or []],
+                "moved": int(payload.get("moved") or 0),
+            }
+            if args.get("dry_run"):
+                return replace(result, meta={**result.meta, **meta})
+            mutations = [Mutation(p, MutationKind.MODIFY) for p in written]
+            mutations += [Mutation(p, MutationKind.DELETE) for p in removed]
+            return replace(result, mutations=tuple(mutations), meta={**result.meta, **meta})
+
+        return handler
+
     def impact(inv: Invocation) -> ToolResult:
         return _report(sidecar.call("impact", {"symbol": inv.arg("symbol")}), _rendered)
 
@@ -791,6 +816,8 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
         "unit_check": unit_check,
         "impact": impact,
         "convert_handlers": convert_handlers,
+        "convert_service": _convert_step("convert_service"),
+        "convert_dtos": _convert_step("convert_dtos"),
         "repo_map": repo_map,
         "rules_lint": rules_lint,
         "legacy_audit": legacy_audit,
@@ -1082,6 +1109,7 @@ def _scope(root: Path | None, raw: Any) -> list[str]:
     """
     if root is None:
         return _list(raw)
+    root = Path(root)
     out: list[str] = []
     for part in _list(raw):
         rel = part.replace("\\", "/").strip()

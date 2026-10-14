@@ -77,6 +77,8 @@ var mutatingTools = map[string]bool{
 	"fx_wire":           true,
 	// Rewrites handler and repository files in place.
 	"convert_handlers": true,
+	"convert_service":  true,
+	"convert_dtos":     true,
 }
 
 // Build reads the catalogue out of a freshly constructed MCP server.

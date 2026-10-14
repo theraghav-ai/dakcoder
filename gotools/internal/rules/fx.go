@@ -147,9 +147,23 @@ func ScanFX(ws *workspace.Workspace) FXScan {
 			scan.Ctors = append(scan.Ctors, c)
 		}
 	}
+	rpc := connectHandlers(ws)
 	for _, f := range ws.FilesIn(workspace.LayerHandler) {
 		add(f, FXHandler, "Handler")
 	}
+	// A Connect/gRPC handler is not an HTTP controller: it is registered
+	// through the gRPC registry (bootstrapper.FxGrpc), never the controller
+	// group, so the annotation this rule asks for would be wrong for it.
+	// pao-backend's three were reported on every run and no edit could
+	// satisfy the rule without breaking startup.
+	kept := scan.Ctors[:0]
+	for _, c := range scan.Ctors {
+		if c.Kind == FXHandler && rpc[c.Name] {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	scan.Ctors = kept
 	for _, f := range ws.FilesIn(workspace.LayerRepo) {
 		add(f, FXRepo, "Repository")
 	}
@@ -339,4 +353,55 @@ func bareName(e ast.Expr) string {
 		return t.Sel.Name
 	}
 	return ""
+}
+
+// connectHandlers names the constructors whose handler type serves Connect
+// RPCs -- methods taking (context.Context, *connect.Request[...]) -- and no
+// HTTP route: no Routes(), no gin or serverRoute context parameter.
+func connectHandlers(ws *workspace.Workspace) map[string]bool {
+	rpcTypes := map[string]bool{}
+	httpTypes := map[string]bool{}
+	files := ws.FilesIn(workspace.LayerHandler)
+	for _, f := range files {
+		funcsIn(f, func(fd *ast.FuncDecl) {
+			recv, isMethod := receiverType(fd)
+			if !isMethod {
+				return
+			}
+			recv = strings.TrimPrefix(recv, "*")
+			if fd.Name.Name == "Routes" {
+				httpTypes[recv] = true
+				return
+			}
+			if fd.Type.Params == nil {
+				return
+			}
+			for _, p := range fd.Type.Params.List {
+				t := f.Text(p.Type)
+				switch {
+				case strings.Contains(t, "connect.Request"):
+					rpcTypes[recv] = true
+				case strings.Contains(t, "gin.Context") || strings.HasSuffix(t, "Route.Context") || strings.HasSuffix(t, "route.Context"):
+					httpTypes[recv] = true
+				}
+			}
+		})
+	}
+	out := map[string]bool{}
+	for _, f := range files {
+		funcsIn(f, func(fd *ast.FuncDecl) {
+			if _, isMethod := receiverType(fd); isMethod || !strings.HasPrefix(fd.Name.Name, "New") {
+				return
+			}
+			rs := results(fd)
+			if len(rs) == 0 {
+				return
+			}
+			typ := strings.TrimPrefix(rs[0], "*")
+			if rpcTypes[typ] && !httpTypes[typ] {
+				out[fd.Name.Name] = true
+			}
+		})
+	}
+	return out
 }

@@ -343,7 +343,9 @@ def test_every_mutating_tool_is_either_gated_or_justified() -> None:
         if spec.mutates and spec.approval is Approval.NONE:
             # convert_handlers: gate-only, run by the harness for a /migration
             # the developer asked for, every file snapshotted before it writes.
-            assert spec.name in {"gofmt", "govalid_gen", "fx_wire", "convert_handlers"}
+            assert spec.name in {
+                "gofmt", "govalid_gen", "fx_wire", "convert_handlers", "convert_service", "convert_dtos",
+            }
 
 
 def test_no_mode_is_offered_a_tool_the_runtime_cannot_run(router: Router) -> None:

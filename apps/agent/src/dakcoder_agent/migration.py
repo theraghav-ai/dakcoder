@@ -755,6 +755,15 @@ class MigrationState:
         key = _key(phase)
         left: list[str] = []
         for path in self.backlog.get(key, []):
+            # The code is the evidence. A file handler_map reports fully
+            # converted is finished whatever its recorded steps say: steps
+            # planned in one session and done in another -- or done by the
+            # rule-based conversion before any step ran -- stayed "pending" in
+            # the record, and live run 2026-10-14 kept the handlers phase open
+            # over handler/objection.go at 12 of 12 converted, telling every
+            # new session it was "still to plan".
+            if converted is not None and converted(path) is True:
+                continue
             units = [
                 u for u in self.units.values()
                 if u.get("phase_key") == key and u.get("file") == path
