@@ -66,6 +66,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdRepoMap(args[1:], stdout, stderr)
 	case "routes":
 		return cmdRoutes(args[1:], stdout, stderr)
+	case "convert":
+		return cmdConvert(args[1:], stdout, stderr)
 	case "db-roundtrip-audit":
 		return cmdDBRoundTripAudit(args[1:], stdout, stderr)
 	case "validation-audit":
@@ -109,6 +111,8 @@ USAGE
   gotools repo-map           [flags]   module, package tree, exported symbols, FX graph
   gotools routes             [flags]   every registered route; --save before a migration,
                                        --against after it, to prove none were lost
+  gotools convert            [flags]   convert legacy gin handlers to the template shape
+                                       by rule (dry run unless --write)
   gotools db-roundtrip-audit [flags]   per-method database round trips, N+1s first
   gotools validation-audit   [flags]   request fields and what their validate tags miss
   gotools temporal-audit     [flags]   work on the request path that may belong off it

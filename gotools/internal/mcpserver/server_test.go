@@ -176,6 +176,8 @@ func TestToolNamesAreStable(t *testing.T) {
 		// The migration's call map: what a handler file splits into, whether a
 		// step is done, and who calls a repository method.
 		"handler_map", "unit_check", "impact",
+		// Its deterministic half: the edits a conversion is made of, by rule.
+		"convert_handlers",
 	}
 	for _, name := range want {
 		if !got[name] {

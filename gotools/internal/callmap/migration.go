@@ -90,6 +90,14 @@ func Classify(fn *Func) Status {
 			st.Shape = ShapeLegacy
 			st.Reasons = append(st.Reasons, "writes its own response (handleSuccess)")
 		}
+		// The hollow conversion: the template signature over a gin body. Live
+		// run f756001b8845 rewrote five signatures and left every ctx.JSON and
+		// apierrors.HandleDBError(ctx, err) beneath them, and a check that read
+		// only the signature called that converted.
+		if why := ginResponse(fd.Body); why != "" {
+			st.Shape = ShapeLegacy
+			st.Reasons = append(st.Reasons, why)
+		}
 	}
 	if st.Shape == ShapeLegacy || workspace.LayerRepo == layerOf(fn.File) {
 		return st
@@ -116,6 +124,38 @@ func layerOf(rel string) workspace.Layer {
 		return workspace.LayerHandler
 	}
 	return workspace.LayerOther
+}
+
+// ginResponse names a statement that still writes the response through gin:
+// x.JSON(...), or an apierrors.HandleXxx(ctx, ...) handed a context variable.
+// The template's own HandleErrorWithStatusCodeAndMessage(status, msg, err)
+// takes no context and is not one.
+func ginResponse(body *ast.BlockStmt) string {
+	why := ""
+	ast.Inspect(body, func(n ast.Node) bool {
+		if why != "" {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, _ := sel.X.(*ast.Ident)
+		switch {
+		case sel.Sel.Name == "JSON" && len(call.Args) == 2:
+			why = "writes its own response (" + sel.Sel.Name + ")"
+		case pkg != nil && pkg.Name == "apierrors" && strings.HasPrefix(sel.Sel.Name, "Handle") && len(call.Args) > 0:
+			if _, isIdent := call.Args[0].(*ast.Ident); isIdent {
+				why = "writes its own error response (apierrors." + sel.Sel.Name + ")"
+			}
+		}
+		return why == ""
+	})
+	return why
 }
 
 func bodyCalls(body *ast.BlockStmt, name string) bool {

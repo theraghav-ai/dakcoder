@@ -132,6 +132,12 @@ class TaskState:
     #: apiece to learn it again.
     routes_saved: bool = False
     routes_before: int = 0
+    #: Whether this task has run the rule-based handler conversion. Once per
+    #: task: it is idempotent, but a second dry run per message is a module
+    #: load for nothing.
+    mechanical_done: bool = False
+    #: Whether a plan that skipped an open migration phase has been sent back.
+    skip_objected: bool = False
     #: Files the open migration phase still has to finish, when its plan has
     #: settled and the phase has not closed. Named by the phase checkpoint.
     phase_left: tuple[str, ...] = ()

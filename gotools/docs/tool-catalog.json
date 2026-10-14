@@ -4,6 +4,182 @@
   "contract": "C1",
   "tools": [
     {
+      "name": "convert_handlers",
+      "description": "Convert legacy gin handlers to the template shape by rule, and repository methods to context.Context. A method no rule fits is left unchanged, with the reason.",
+      "mutates": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "description": "report what would change without writing",
+            "type": "boolean"
+          },
+          "methods": {
+            "description": "only these handler methods",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "paths": {
+            "description": "handler files to convert; omit for every handler file",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "root": {
+            "description": "workspace root; omit to use the server's default",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "converted": {
+            "type": "integer"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "files": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "changed": {
+                  "type": "boolean"
+                },
+                "converted": {
+                  "type": "integer"
+                },
+                "error": {
+                  "type": "string"
+                },
+                "file": {
+                  "type": "string"
+                },
+                "helpers": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "left": {
+                  "type": "integer"
+                },
+                "methods": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "created": {
+                        "type": "boolean"
+                      },
+                      "end": {
+                        "type": "integer"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "notes": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": [
+                          "null",
+                          "array"
+                        ]
+                      },
+                      "reasons": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": [
+                          "null",
+                          "array"
+                        ]
+                      },
+                      "request": {
+                        "type": "string"
+                      },
+                      "response": {
+                        "type": "string"
+                      },
+                      "start": {
+                        "type": "integer"
+                      },
+                      "status": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "status",
+                      "start",
+                      "end"
+                    ],
+                    "type": "object"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                }
+              },
+              "required": [
+                "file",
+                "changed",
+                "converted",
+                "left"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "helpers": {
+            "type": "integer"
+          },
+          "left": {
+            "type": "integer"
+          },
+          "report": {
+            "type": "string"
+          },
+          "written": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "files",
+          "converted",
+          "left",
+          "helpers",
+          "dry_run",
+          "report"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "name": "db_roundtrip_audit",
       "description": "Per repository method: database calls, whether any is in a loop, batched, in a transaction, plus a verdict. Worst first. Call before optimising by eye.",
       "mutates": false,

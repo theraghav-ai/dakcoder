@@ -263,6 +263,39 @@ Three divergences from the reference template are deliberate. Each is recorded
 with its reasoning and its cost to reverse in
 [docs/DIVERGENCES.md](docs/DIVERGENCES.md).
 
+### `convert` (MCP: `convert_handlers`)
+
+Converts legacy gin handlers to the template shape **by rule**, so a migration's
+handler phase does not depend on a model doing the same five edits a hundred
+times:
+
+| Legacy | Template |
+|---|---|
+| `func (h *H) M(ctx *gin.Context)` | `func (h *H) M(sctx *serverRoute.Context, req T) (*R, error)` — `T` is what the body bound into, `R` what it responded with |
+| `ShouldBind*` / `validation.ValidateStruct` blocks | removed: the server binds and validates `req` |
+| `var req []E` bound from JSON | `type MRequest []E` with a `Validate()` — the payload clients send is unchanged |
+| `apierrors.HandleXxxError(ctx, err); return` | `return nil, err` (the server's error middleware maps it as `HandleDBError` did) |
+| `NewAppError` + `NewAPIErrorResponse` + `ctx.JSON`, or `ctx.JSON(4xx, gin.H{...})` | `return nil, apierrors.HandleErrorWithStatusCodeAndMessage(...)` with the same status and message |
+| `handleSuccess(ctx, rsp)` / `handleCreateSuccess` | `return &rsp, nil` (a 201 is marked in a comment for the route) |
+| other uses of `ctx` | `sctx.Ctx` |
+| repository/helper `gctx *gin.Context` used only as a context | `gctx context.Context`; `gctx.Request.Context()` becomes `gctx` |
+
+**All or nothing, per method.** A method with any statement no rule fits —
+`ctx.Query`, a custom success body, two bound structs, code that runs after the
+response is written — is left byte-for-byte unchanged and reported with the
+reason. Every converted method is parsed on its own and must end in a
+terminating statement before it is accepted. Edits are made at byte offsets, so
+swagger annotations and line endings survive.
+
+Measured on pao-backend (2026-10-14): 76 of 103 legacy handlers and 137
+repository methods/helpers converted; the handler and repository packages then
+pass `go vet` against n-api-server.
+
+```bash
+gotools convert --root ../svc            # dry run: what would change, what is left and why
+gotools convert --root ../svc --write    # do it
+```
+
 ---
 
 ## What it publishes

@@ -564,7 +564,7 @@ def test_a_file_too_big_for_one_reply_may_not_have_one_step(tmp_path: Path) -> N
     loop = _loop(tmp_path)
 
     objection = plan_objection(
-        MigrationState(active=True),
+        _at_handlers(),
         _phases(),
         [PlanStep("handler/paogen.go", "convert it", "go build", phase="handlers")],
         lines=loop._line_count,

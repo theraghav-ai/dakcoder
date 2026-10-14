@@ -245,6 +245,11 @@ _SAFE_MUTATORS = frozenset(
         # approval here would make the common path a two-step interaction for no
         # decision the developer can meaningfully make.
         "fx_wire",
+        # The migration's rule-based handler conversion. Run by the harness on
+        # the gate path when a /migration's handlers phase opens -- the
+        # developer asked for the conversion when they typed /migration -- and
+        # every file it writes is snapshotted for revert first.
+        "convert_handlers",
     }
 )
 
@@ -978,6 +983,27 @@ _SPECS: tuple[ToolSpec, ...] = (
         required=("kind", "ctor"),
         modes=_ACTS,
         mutates=True,
+        provider=Provider.GOTOOLS,
+    ),
+    # The deterministic half of a handler conversion. Gate-only: the harness
+    # runs it when the handlers phase opens, so the model never spends a turn on
+    # what a rule can do -- the live run of 2026-10-13 converted 8 of 103
+    # handlers in fifteen minutes by hand, the rule converts 76 in a second --
+    # and the model is planned only onto the methods it reports as left.
+    ToolSpec(
+        name="convert_handlers",
+        description=(
+            "Convert legacy gin handlers and repository methods to the template shape by "
+            "rule. A method no rule fits is left unchanged, with the reason."
+        ),
+        parameters=_obj(
+            paths=_str("Files the conversion may write, comma-separated. Omit for all."),
+            methods=_str("Only these handler methods, comma-separated."),
+            dry_run=_bool("Report what would change without writing."),
+        ),
+        modes=frozenset(),
+        mutates=True,
+        gate_only=True,
         provider=Provider.GOTOOLS,
     ),
     ToolSpec(

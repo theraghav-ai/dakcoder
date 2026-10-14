@@ -75,6 +75,8 @@ var mutatingTools = map[string]bool{
 	"resource_scaffold": true,
 	"project_scaffold":  true,
 	"fx_wire":           true,
+	// Rewrites handler and repository files in place.
+	"convert_handlers": true,
 }
 
 // Build reads the catalogue out of a freshly constructed MCP server.

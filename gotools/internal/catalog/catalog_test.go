@@ -44,7 +44,7 @@ func TestCatalogueCoversEveryTool(t *testing.T) {
 	// asked to and never touches the service, which is why it is read-only here
 	// while having a `save` argument.
 	want := []string{
-		"db_roundtrip_audit", "fx_wire", "handler_map", "impact", "legacy_audit",
+		"convert_handlers", "db_roundtrip_audit", "fx_wire", "handler_map", "impact", "legacy_audit",
 		"lib_version_check", "list_rules", "project_scaffold", "repo_map",
 		"resource_scaffold", "route_inventory", "rules_lint", "temporal_audit",
 		"unit_check", "validation_audit",

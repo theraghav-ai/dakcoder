@@ -34,7 +34,11 @@ ROADMAP = (
 
 
 def _state() -> MigrationState:
-    return MigrationState(active=True)
+    """Branch and deps closed: the handler steps below plan the open phase, so
+    what each test reaches is its own objection rather than the skip check."""
+    state = MigrationState(active=True)
+    state.adopt(tuple(replace(p, status="done") if p.name in ("branch", "deps") else p for p in ROADMAP))
+    return state
 
 
 def _step(accepts: str, phase: str = "handlers", file: str = "handler/objection.go") -> PlanStep:

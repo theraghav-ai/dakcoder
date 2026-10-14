@@ -125,6 +125,7 @@ from .migration import (
     size_objection,
     split_files,
     steps_for_phase,
+    SKIP_OBJECTION,
 )
 from .modes import CONTEXT_WINDOW, Intent, Mode, config_for
 from .plan import PlanRecord
@@ -214,6 +215,8 @@ _TASK_SCOPED: tuple[str, ...] = (
     "churn",
     "retired",
     "phase_left",
+    "mechanical_done",
+    "skip_objected",
     "awaiting",
     "finish_refused",
     "plan_objections",
@@ -432,6 +435,8 @@ _OWNER: dict[str, str] = {
     "churn": "task",
     "retired": "task",
     "routes_saved": "task",
+    "mechanical_done": "task",
+    "skip_objected": "task",
     "routes_before": "task",
     "phase_left": "task",
     "previous_outcome": "task",
@@ -1597,6 +1602,9 @@ class AgentLoop:
         # baseline of a half-converted service is exactly what must not be taken.
         if not continued or new_task:
             self._resume_migration()
+        # Before the model's first turn: what a rule can convert is converted,
+        # and the model is planned onto what is left.
+        yield from self._convert_mechanically()
 
         self._switch(self._opening_mode(decided, continued=continued))
         # Only a run that may write needs to know what was already broken.
@@ -5113,8 +5121,15 @@ class AgentLoop:
             # this file keeps rebuilding by accident, and a migration planned in
             # two phases is worse than one planned in seven but much better than
             # a run that spends its budget arguing about the shape of the plan.
-            if self.state.plan_objections < MAX_PLAN_OBJECTIONS:
-                self.state.plan_objections += 1
+            # A skipped phase has a budget of its own: once, whatever the
+            # other objections spent. It is the one that decides which phase
+            # the work lands in.
+            skip_once = objection.startswith(SKIP_OBJECTION) and not self.state.skip_objected
+            if skip_once or self.state.plan_objections < MAX_PLAN_OBJECTIONS:
+                if skip_once:
+                    self.state.skip_objected = True
+                else:
+                    self.state.plan_objections += 1
                 self.context.append_user(
                     f"That plan was not adopted: {objection}.\n\n"
                     "Call `submit_plan` again with the whole thing — `phases` for the "
@@ -7871,6 +7886,94 @@ class AgentLoop:
                 },
             )
         )
+
+    def _convert_mechanically(self) -> Iterator[Event]:
+        """Convert every handler a rule can, before the model sees the phase.
+
+        The handlers phase is five edits repeated over every method, and the
+        model is bad at mechanical work at scale. The live run of 2026-10-13
+        spent 216 turns over six sessions on pao-backend and converted no
+        handler; with every harness fix in, a second run converted 8 of 103 in
+        fifteen minutes. `convert_handlers` converts 76 of them, and 137
+        repository methods, in about a second -- and the package compiles.
+
+        So the model is not asked to do that part. It is told what was done,
+        and planned onto the methods the rule left, each with the reason it
+        did not fit: a small, specific job instead of the whole phase.
+
+        Once per task, only when the open phase is the handlers phase and the
+        workspace is on the migration's branch. A dry run first names the files
+        it will write, so the conversion is dispatched with them as `paths`
+        and every one is snapshotted for revert before it changes.
+        """
+        migration = self.state.migration
+        if self.state.mechanical_done or not migration.active or migration.expected_branch:
+            return
+        here = migration.current
+        if here is None:
+            return
+        _, phase = here
+        said = f"{phase.name} {phase.covers} {getattr(phase, 'parts', '')}".lower()
+        if "handler" not in said:
+            return
+        self.state.mechanical_done = True
+        try:
+            dry = self.router.run_gate_tool("convert_handlers", {"dry_run": True})
+        except Exception:  # noqa: BLE001 - the model can still do it by hand
+            return
+        if not isinstance(dry, ToolResult) or not dry.ok:
+            return
+        changes = [str(p) for p in dry.meta.get("changes") or []]
+        done = dry
+        if changes:
+            # Before the first write, as for every write in a migration.
+            self._save_routes()
+            try:
+                done = self.router.run_gate_tool("convert_handlers", {"paths": ",".join(changes)})
+            except Exception:  # noqa: BLE001
+                return
+            if not isinstance(done, ToolResult) or not done.ok:
+                return
+        converted = int(done.meta.get("converted") or 0)
+        helpers = int(done.meta.get("helpers") or 0)
+        # From the dry run, which saw every file: the write is scoped to the
+        # files that change, so a file with nothing convertible is not in its
+        # report -- and that file's methods are exactly what is left.
+        left: dict[str, list[dict]] = dict(dry.meta.get("left_methods") or {})
+        yield Event(
+            EventType.GATE,
+            {
+                "kind": "convert",
+                "converted": converted,
+                "helpers": helpers,
+                "left": sum(len(v) for v in left.values()),
+                "files": [m.path for m in done.mutations],
+            },
+        )
+        if not converted and not helpers and not left:
+            return
+        lines = [
+            f"The handlers phase was started by rule, before this turn: {converted} handler "
+            f"method(s) and {helpers} repository method(s)/helper(s) were converted and "
+            "written (signature, binding, errors, response, context). They are done -- "
+            "do not plan, read or re-check them; handler_map marks them converted.",
+        ]
+        if left:
+            lines.append("")
+            lines.append(
+                "These methods did not fit a rule and are still on gin. They are the "
+                "phase's remaining work -- plan one step per file, naming its methods; "
+                "each reason says what to change:"
+            )
+            for path, methods in sorted(left.items()):
+                lines.append(f"  {path}:")
+                for m in methods[:STATE_ITEMS * 3]:
+                    why = "; ".join(str(r) for r in (m.get("reasons") or [])[:2])
+                    lines.append(f"    - {m.get('name')}: {why}")
+        else:
+            lines.append("No handler method is left on gin; the phase's handler work is done.")
+        self.context.append_user("\n".join(lines))
+        self._refresh_scope()
 
     def _save_progress(self) -> None:
         """Write the migration's progress where the next session can read it.

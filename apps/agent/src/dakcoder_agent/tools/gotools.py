@@ -739,6 +739,50 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
             ]
         return replace(result, meta={**result.meta, "callmap": facts})
 
+    def convert_handlers(inv: Invocation) -> ToolResult:
+        args: dict[str, Any] = {}
+        if inv.arg("paths"):
+            args["paths"] = _list(inv.arg("paths"))
+        if inv.arg("methods"):
+            args["methods"] = _list(inv.arg("methods"))
+        if inv.arg("dry_run"):
+            args["dry_run"] = True
+        reply = sidecar.call("convert_handlers", args)
+        result = _report(reply, _rendered)
+        if reply.is_error or not result.ok:
+            return result
+        payload = _json(reply.text)
+        files = [f for f in payload.get("files") or [] if isinstance(f, Mapping)]
+        written = [str(p) for p in payload.get("written") or []]
+        meta = {
+            "converted": int(payload.get("converted") or 0),
+            "left": int(payload.get("left") or 0),
+            "helpers": int(payload.get("helpers") or 0),
+            # What a dry run would write: the harness snapshots these for undo
+            # before it lets the conversion touch them.
+            "changes": [str(f.get("file")) for f in files if f.get("changed")],
+            "left_methods": {
+                str(f.get("file")): [
+                    {"name": m.get("name"), "reasons": m.get("reasons") or []}
+                    for m in f.get("methods") or []
+                    if isinstance(m, Mapping) and m.get("status") == "left"
+                ]
+                for f in files
+                if any(isinstance(m, Mapping) and m.get("status") == "left" for m in f.get("methods") or [])
+            },
+            "created": sorted(
+                str(m.get("name"))
+                for f in files
+                for m in f.get("methods") or []
+                if isinstance(m, Mapping) and m.get("created")
+            ),
+        }
+        return replace(
+            result,
+            mutations=tuple(Mutation(p, MutationKind.MODIFY) for p in written),
+            meta={**result.meta, **meta},
+        )
+
     def impact(inv: Invocation) -> ToolResult:
         return _report(sidecar.call("impact", {"symbol": inv.arg("symbol")}), _rendered)
 
@@ -746,6 +790,7 @@ def handlers_for(sidecar: GoTools) -> dict[str, Any]:
         "handler_map": handler_map,
         "unit_check": unit_check,
         "impact": impact,
+        "convert_handlers": convert_handlers,
         "repo_map": repo_map,
         "rules_lint": rules_lint,
         "legacy_audit": legacy_audit,

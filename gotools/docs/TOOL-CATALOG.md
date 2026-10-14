@@ -12,6 +12,7 @@ C1 limits: at most **6 parameters** per tool, description at most **200 characte
 
 | Tool | Mutates | Params | Description |
 |---|---|---|---|
+| [`convert_handlers`](#convert_handlers) | ✓ | 4 | Convert legacy gin handlers to the template shape by rule, and repository methods to context.Context. A method no rule fits is left unchanged, with the reason. |
 | [`db_roundtrip_audit`](#db_roundtrip_audit) |  | 1 | Per repository method: database calls, whether any is in a loop, batched, in a transaction, plus a verdict. Worst first. Call before optimising by eye. |
 | [`fx_wire`](#fx_wire) | ✓ | 4 | Register a repository or handler in bootstrap/bootstrapper.go with the correct annotation. Never hand-edit it: an unannotated handler serves no routes. |
 | [`handler_map`](#handler_map) |  | 3 | One handler file split into conversion steps: every method with its lines, route and the repository methods it calls. Plan a migration's handler steps from this. |
@@ -32,6 +33,206 @@ A tool marked **Mutates** writes to the workspace and passes through the
 approval gate (Part A §7.2). Each of them takes `dry_run`, which returns the
 full result without touching the working tree — that is what the gate uses to
 show a diff before anything is written.
+
+---
+
+## convert_handlers
+
+Convert legacy gin handlers to the template shape by rule, and repository methods to context.Context. A method no rule fits is left unchanged, with the reason.
+
+**Mutates the workspace.** Approval-gated.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `dry_run` | boolean |  | report what would change without writing |
+| `methods` | null or array |  | only these handler methods |
+| `paths` | null or array |  | handler files to convert; omit for every handler file |
+| `root` | string |  | workspace root; omit to use the server's default |
+
+<details><summary>Input schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "dry_run": {
+      "description": "report what would change without writing",
+      "type": "boolean"
+    },
+    "methods": {
+      "description": "only these handler methods",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "paths": {
+      "description": "handler files to convert; omit for every handler file",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "root": {
+      "description": "workspace root; omit to use the server's default",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+</details>
+
+<details><summary>Output schema</summary>
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "converted": {
+      "type": "integer"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "files": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "changed": {
+            "type": "boolean"
+          },
+          "converted": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "helpers": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "left": {
+            "type": "integer"
+          },
+          "methods": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "created": {
+                  "type": "boolean"
+                },
+                "end": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "notes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "reasons": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                },
+                "request": {
+                  "type": "string"
+                },
+                "response": {
+                  "type": "string"
+                },
+                "start": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "status",
+                "start",
+                "end"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "file",
+          "changed",
+          "converted",
+          "left"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "helpers": {
+      "type": "integer"
+    },
+    "left": {
+      "type": "integer"
+    },
+    "report": {
+      "type": "string"
+    },
+    "written": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    }
+  },
+  "required": [
+    "files",
+    "converted",
+    "left",
+    "helpers",
+    "dry_run",
+    "report"
+  ],
+  "type": "object"
+}
+```
+
+</details>
 
 ---
 

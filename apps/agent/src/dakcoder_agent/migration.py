@@ -1438,6 +1438,12 @@ def plan_objection(
             + ", ".join(p.name for p in roadmap)
         )
 
+    # Before the size rule: a plan for the wrong phase is wrong whatever size
+    # its steps are, and live run 9389d9bfe6ef spent both objections on parts
+    # and splitting before this one was ever reached.
+    if objection := skip_objection(state, roadmap, steps):
+        return objection
+
     # A plan that spans phases is *trimmed*, not refused. See `steps_for_phase`.
     spread = {str(s.phase).strip().lower() for s in steps}
 
@@ -1492,29 +1498,44 @@ def plan_objection(
             + ", ".join(p.name for p in roadmap if p.name.strip().lower() not in closed)
         )
 
-    # A plan that starts past an open phase skips it. `steps_for_phase` opens
-    # the phase the earliest step names, so steps for handlers alone opened
-    # handlers with dependencies still pending: session 37ecc37866e8 and live
-    # run f756001b8845 converted handlers to `serverRoute` against a go.mod
-    # still on api-*. Only a branch-only phase may be passed over -- the
-    # acting phase cuts the branch whatever the plan says.
+    return ""
+
+
+#: The opening words of `skip_objection`'s answer, which the loop recognises to
+#: give it a budget of its own.
+SKIP_OBJECTION = "the steps start at a later phase"
+
+
+def skip_objection(state: "MigrationState", roadmap: Sequence[Phase], steps: Sequence[Any]) -> str:
+    """Why this plan skips an open phase, or ``""``.
+
+    `steps_for_phase` opens the phase the earliest step names, so steps for
+    handlers alone opened handlers with dependencies still pending: session
+    37ecc37866e8 and live runs f756001b8845 and 9389d9bfe6ef converted
+    handlers to `serverRoute` against a go.mod still on api-*. Only a
+    branch-only phase may be passed over -- the acting phase cuts the branch
+    whatever the plan says.
+    """
+    closed = {p.name.strip().lower() for p in state.phases if p.status == "done"}
+    spread = {str(getattr(s, "phase", "") or "").strip().lower() for s in steps}
     order = [p.name.strip().lower() for p in roadmap]
     named = [order.index(k) for k in spread - closed if k in order]
-    if named:
-        skipped = [
-            p for p in roadmap[: min(named)]
-            if p.name.strip().lower() not in closed and not _branch_only(p)
-        ]
-        if skipped:
-            first = skipped[0]
-            return (
-                f"the steps start at a later phase while {first.name} ("
-                f"{first.covers or 'the phase before it'}) is still open, and a phase "
-                "cannot be skipped. Send the steps for "
-                f"{first.name} now -- only those; the later phases are planned when "
-                "they open"
-            )
-    return ""
+    if not named:
+        return ""
+    skipped = [
+        p for p in roadmap[: min(named)]
+        if p.name.strip().lower() not in closed and not _branch_only(p)
+    ]
+    if not skipped:
+        return ""
+    first = skipped[0]
+    return (
+        f"{SKIP_OBJECTION} while {first.name} ("
+        f"{first.covers or 'the phase before it'}) is still open, and a phase "
+        "cannot be skipped. Send the steps for "
+        f"{first.name} now -- only those; the later phases are planned when "
+        "they open"
+    )
 
 
 #: Where the plan document lives, workspace-relative.

@@ -497,3 +497,65 @@ def test_an_unsplit_migration_step_advances_only_when_unit_check_agrees(tmp_path
     step = loop.state.plan[0]
     assert step.status == "pending", step
     assert "0 of 1 methods converted" in step.note and "FetchObjectionHandler" in step.note
+
+
+# ── the mechanical part, without the model ──────────────────────────────────
+
+
+@needs_sidecar
+def test_the_handlers_phase_opens_with_the_rule_conversion_done(tmp_path: Path) -> None:
+    """2026-10-14: the model converted 8 of 103 pao handlers in fifteen
+    minutes; the rule converts 76 in a second. A run resumed at the handlers
+    phase converts by rule before its first turn, snapshots every file it
+    writes, and hands the model only what the rule left."""
+    root = _service(tmp_path)
+    (root / "handler" / "objection.go").write_text(
+        LEGACY["handler/objection.go"].replace("\tctx.JSON(200, req)\n", "\thandleSuccess(ctx, req)\n"),
+        encoding="utf-8",
+    )
+    (root / "handler" / "response.go").write_text(
+        'package handler\n\nimport "github.com/gin-gonic/gin"\n\n'
+        "func handleSuccess(ctx *gin.Context, data any) { ctx.JSON(200, data) }\n",
+        encoding="utf-8",
+    )
+    with GoTools(root) as sidecar:
+        undo = UndoStore(root, "s1")
+        router = Router(Workspace.at(root), handlers_for(sidecar), undo=undo)
+        loop = _migrating(root, router, closed=("branch", "dependencies"))
+        events = list(loop._convert_mechanically())
+
+    converted = [e for e in events if e.type is EventType.GATE and e.data.get("kind") == "convert"]
+    assert converted and converted[0].data["files"] == ["handler/objection.go"], events
+    body = (root / "handler" / "objection.go").read_text(encoding="utf-8")
+    assert "FetchObjectionHandler(sctx *serverRoute.Context, req struct" in body, body
+    assert undo.state("handler/objection.go").name == "FILE", "snapshotted before the write"
+    told = [m.content for m in loop.context.build() if m.role.value == "user"]
+    assert any("started by rule" in t and "do not plan, read or re-check them" in t for t in told), told
+    # paogen's ListPAOHandler answers with ctx.JSON(200, nil): left, and named
+    assert any("handler/paogen.go" in t and "ListPAOHandler" in t for t in told), told
+    assert loop.state.mechanical_done
+
+
+def test_no_other_phase_runs_the_conversion(tmp_path: Path) -> None:
+    loop = _migrating(tmp_path, closed=("branch",))
+    calls: list[str] = []
+    loop.router.run_gate_tool = lambda name, args=None: calls.append(name)
+
+    assert list(loop._convert_mechanically()) == []
+    assert calls == [], "the dependencies phase is open; handlers are not converted yet"
+
+
+def test_the_skip_objection_comes_first_and_has_its_own_budget(tmp_path: Path) -> None:
+    """9389d9bfe6ef spent both plan objections on parts and splitting; the
+    third plan, steps for handlers alone, was adopted with dependencies open."""
+    loop = _migrating(tmp_path)
+    loop.state.plan_objections = 2  # the shared budget, spent
+
+    list(loop._phase_ended("submit_plan", _ok(meta={"steps": [
+        {"file": "handler/objection.go", "action": "convert", "accepts": "unit_check", "phase": "handlers"}
+    ]})))
+
+    told = [m.content for m in loop.context.build() if m.role.value == "user"]
+    assert any("cannot be skipped" in t for t in told), told
+    assert not loop.state.plan, "nothing adopted"
+    assert loop.state.skip_objected
